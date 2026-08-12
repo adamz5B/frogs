@@ -1,0 +1,11 @@
+{
+  "_hash": "a10e497fcb72acea",
+  "id": "integer",
+  "bookId": "integer",
+  "bookTitle": "string",
+  "memberId": "integer",
+  "memberName": "string",
+  "checkedOutAt": "string (date-time)",
+  "dueAt": "string (date-time)",
+  "returnedAt": "string (date-time)"
+}

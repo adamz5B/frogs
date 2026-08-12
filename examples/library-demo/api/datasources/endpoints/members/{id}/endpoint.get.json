@@ -1,0 +1,29 @@
+{
+  "operationId": "getMember",
+  "sources": {
+    "member": {
+      "type": "sql",
+      "connection": "library_db",
+      "script": "get_member.sql",
+      "cardinality": "one",
+      "parameters": [
+        {
+          "name": "id",
+          "from": "path.id"
+        }
+      ]
+    }
+  },
+  "response": {
+    "id": {
+      "from": "sources.member.id",
+      "format": "integer"
+    },
+    "name": "sources.member.name",
+    "email": "sources.member.email",
+    "deleted": {
+      "from": "sources.member.deleted",
+      "format": "boolean"
+    }
+  }
+}

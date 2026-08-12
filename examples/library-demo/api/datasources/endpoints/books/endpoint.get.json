@@ -1,0 +1,23 @@
+{
+  "operationId": "listBooks",
+  "sources": {
+    "books": {
+      "type": "sql",
+      "connection": "library_db",
+      "script": "list_books.sql",
+      "cardinality": "many"
+    }
+  },
+  "response": {
+    "type": "array",
+    "source": "sources.books",
+    "items": {
+      "id": { "from": "id", "format": "integer" },
+      "title": "title",
+      "author": "author",
+      "isbn": "isbn",
+      "available": { "from": "available", "format": "boolean" },
+      "deleted": { "from": "deleted", "format": "boolean" }
+    }
+  }
+}

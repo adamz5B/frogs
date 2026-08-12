@@ -1,0 +1,24 @@
+{
+  "operationId": "lookupBooks",
+  "sources": {
+    "results": {
+      "type": "http",
+      "request": "open_library_search.json",
+      "cardinality": "one",
+      "onError": 502,
+      "parameters": [
+        { "name": "title", "from": "query.title" }
+      ]
+    }
+  },
+  "response": {
+    "type": "array",
+    "source": "sources.results",
+    "items": {
+      "title": "title",
+      "author_name": "author_name",
+      "isbn": "isbn",
+      "first_publish_year": { "from": "first_publish_year", "format": "integer" }
+    }
+  }
+}

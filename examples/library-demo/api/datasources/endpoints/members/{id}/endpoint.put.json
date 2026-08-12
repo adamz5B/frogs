@@ -1,0 +1,37 @@
+{
+  "operationId": "updateMember",
+  "sources": {
+    "member": {
+      "type": "sql",
+      "connection": "library_db",
+      "script": "update_member.sql",
+      "cardinality": "one",
+      "parameters": [
+        {
+          "name": "id",
+          "from": "path.id"
+        },
+        {
+          "name": "name",
+          "from": "body.name"
+        },
+        {
+          "name": "email",
+          "from": "body.email"
+        }
+      ]
+    }
+  },
+  "response": {
+    "id": {
+      "from": "sources.member.id",
+      "format": "integer"
+    },
+    "name": "sources.member.name",
+    "email": "sources.member.email",
+    "deleted": {
+      "from": "sources.member.deleted",
+      "format": "boolean"
+    }
+  }
+}

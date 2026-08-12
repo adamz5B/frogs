@@ -1,0 +1,21 @@
+{
+  "operationId": "listDeletedMembers",
+  "sources": {
+    "members": {
+      "type": "sql",
+      "connection": "library_db",
+      "script": "list_deleted_members.sql",
+      "cardinality": "many"
+    }
+  },
+  "response": {
+    "type": "array",
+    "source": "sources.members",
+    "items": {
+      "id": { "from": "id", "format": "integer" },
+      "name": "name",
+      "email": "email",
+      "deleted": { "from": "deleted", "format": "boolean" }
+    }
+  }
+}

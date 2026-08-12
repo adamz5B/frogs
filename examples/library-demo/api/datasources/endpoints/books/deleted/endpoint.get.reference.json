@@ -1,0 +1,24 @@
+{
+  "operationId": "listDeletedBooks",
+  "_hash": "f2a8496d32b38ff6",
+  "security": null,
+  "request": {
+    "query": [],
+    "path": [],
+    "header": [],
+    "body": null
+  },
+  "response": {
+    "type": "array",
+    "items": {
+      "$component": "Book",
+      "id": "integer",
+      "title": "string",
+      "author": "string",
+      "isbn": "string",
+      "available": "boolean",
+      "deleted": "boolean"
+    }
+  },
+  "availableParameterSources": []
+}

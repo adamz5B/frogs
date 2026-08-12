@@ -1,0 +1,25 @@
+{
+  "operationId": "restoreBook",
+  "_hash": "d9c37e6c0cb9eba1",
+  "security": null,
+  "request": {
+    "query": [],
+    "path": [
+      "id"
+    ],
+    "header": [],
+    "body": null
+  },
+  "response": {
+    "$component": "Book",
+    "id": "integer",
+    "title": "string",
+    "author": "string",
+    "isbn": "string",
+    "available": "boolean",
+    "deleted": "boolean"
+  },
+  "availableParameterSources": [
+    "path.id"
+  ]
+}

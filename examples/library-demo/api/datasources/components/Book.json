@@ -1,0 +1,9 @@
+{
+  "_hash": "a6c9e2ad36423634",
+  "id": "integer",
+  "title": "string",
+  "author": "string",
+  "isbn": "string",
+  "available": "boolean",
+  "deleted": "boolean"
+}

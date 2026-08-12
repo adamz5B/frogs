@@ -1,0 +1,10 @@
+{
+  "type": "sql",
+  "connection": "vehicles_db",
+  "script": "verify_api_key.sql",
+  "parameters": [
+    { "name": "key", "from": "header.X-Api-Key" }
+  ],
+  "validIf": "row.active = true",
+  "cacheTtlSeconds": 30
+}

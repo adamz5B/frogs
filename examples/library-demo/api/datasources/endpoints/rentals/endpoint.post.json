@@ -1,0 +1,23 @@
+{
+  "operationId": "checkoutBook",
+  "successStatus": 201,
+  "sources": {
+    "rental": {
+      "type": "sql",
+      "connection": "library_db",
+      "script": "checkout_book.sql",
+      "cardinality": "one",
+      "parameters": [
+        { "name": "bookId", "from": "body.bookId" },
+        { "name": "memberId", "from": "body.memberId" }
+      ]
+    }
+  },
+  "response": {
+    "id": { "from": "sources.rental.id", "format": "integer" },
+    "bookId": { "from": "sources.rental.book_id", "format": "integer" },
+    "memberId": { "from": "sources.rental.member_id", "format": "integer" },
+    "checkedOutAt": { "from": "sources.rental.checked_out_at", "format": "date-time" },
+    "dueAt": { "from": "sources.rental.due_at", "format": "date-time" }
+  }
+}

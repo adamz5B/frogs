@@ -1,0 +1,18 @@
+{
+  "operationId": "deleteMember",
+  "sources": {
+    "member": {
+      "type": "sql",
+      "connection": "library_db",
+      "script": "delete_member.sql",
+      "cardinality": "one",
+      "parameters": [
+        { "name": "id", "from": "path.id" }
+      ]
+    }
+  },
+  "response": {
+    "id": { "from": "sources.member.id", "format": "integer" },
+    "deleted": { "from": "sources.member.deleted", "format": "boolean" }
+  }
+}

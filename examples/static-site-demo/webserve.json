@@ -1,0 +1,5 @@
+{
+  "startPage": "index.html",
+  "port": 8090,
+  "notFoundPage": "404.html"
+}

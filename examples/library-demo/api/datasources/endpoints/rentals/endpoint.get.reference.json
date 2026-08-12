@@ -1,0 +1,26 @@
+{
+  "operationId": "listRentals",
+  "_hash": "c2b64aff22753d2b",
+  "security": null,
+  "request": {
+    "query": [],
+    "path": [],
+    "header": [],
+    "body": null
+  },
+  "response": {
+    "type": "array",
+    "items": {
+      "$component": "Rental",
+      "id": "integer",
+      "bookId": "integer",
+      "bookTitle": "string",
+      "memberId": "integer",
+      "memberName": "string",
+      "checkedOutAt": "string (date-time)",
+      "dueAt": "string (date-time)",
+      "returnedAt": "string (date-time)"
+    }
+  },
+  "availableParameterSources": []
+}

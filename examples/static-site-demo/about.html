@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>About — a frogs static-site demo</title>
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+  <div class="pond">
+    <nav class="nav">
+      <a href="/">Home</a>
+      <a href="/about.html" class="active">About</a>
+    </nav>
+
+    <main class="card">
+      <h1><span class="emoji">🪷</span> About this pond</h1>
+      <p>
+        This example is a <strong>static-content project</strong> — a frogs project whose only
+        config is <code>webserve.json</code>, naming a start page, a port, and (optionally) a
+        custom 404 page:
+      </p>
+      <pre><code>{
+  "startPage": "index.html",
+  "port": 8090,
+  "notFoundPage": "404.html"
+}</code></pre>
+      <p>
+        Beyond the start page, <strong>frogs</strong> resolves every request straight to a
+        matching file on disk — <code>css/style.css</code>, <code>js/app.js</code>, this page
+        itself — with a small built-in MIME table, safe path resolution (a <code>..</code> in the
+        URL is rejected outright, and a symlink pointing outside the project is caught too), and
+        basic HTTP caching via <code>ETag</code>/<code>Last-Modified</code>.
+      </p>
+      <p>
+        A frogs project is always <em>either</em> an API (<code>openapi.yaml</code>) <em>or</em> a
+        static site (<code>webserve.json</code>) — never both at once.
+      </p>
+      <p><a href="/">← back home</a></p>
+    </main>
+
+    <footer>
+      <p>Served by <strong>frogs</strong> — Free Rust OpenAPI Generated Server</p>
+    </footer>
+  </div>
+</body>
+</html>

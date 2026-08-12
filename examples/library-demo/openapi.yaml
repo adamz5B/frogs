@@ -1,0 +1,387 @@
+openapi: 3.0.3
+info:
+  title: Library Management System
+  description: >
+    A very small library API — books, members, and a rental registry —
+    paired with a static front-desk UI served from the same frogs process.
+    Demonstrates Phase 6's both-role support: openapi.yaml + api/ on one
+    side, index.html/webserve.json on the other, one listener, one apiRoot.
+  version: 1.0.0
+paths:
+  /books:
+    get:
+      operationId: listBooks
+      responses:
+        '200':
+          description: Every book in the catalog, with live availability.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Book'
+    post:
+      operationId: createBook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BookInput'
+      responses:
+        '201':
+          description: The newly added book.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Book'
+  /books/deleted:
+    get:
+      operationId: listDeletedBooks
+      description: >
+        Soft-deleted books, for the librarian to review and restore —
+        deleting never removes a row, see DELETE /books/{id}.
+      responses:
+        '200':
+          description: Every deleted book.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Book'
+  /books/lookup:
+    get:
+      operationId: lookupBooks
+      description: >
+        Searches the Open Library catalog by title — no API key needed —
+        so a book can be added without typing its author/ISBN by hand.
+      parameters:
+        - name: title
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Up to 5 matching works from Open Library.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BookLookupResult'
+  /books/{id}:
+    get:
+      operationId: getBook
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: One book, with live availability.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Book'
+    put:
+      operationId: updateBook
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BookInput'
+      responses:
+        '200':
+          description: The updated book.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Book'
+    delete:
+      operationId: deleteBook
+      description: >
+        Soft delete — sets `deleted: true` rather than removing the row.
+        A deleted book can't be checked out and drops out of GET /books,
+        but can be brought back at any time via POST /books/{id}/restore.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: Confirmation of deletion. 404 if the book doesn't exist.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteResult'
+  /books/{id}/restore:
+    post:
+      operationId: restoreBook
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: The restored book, available again.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Book'
+  /members:
+    get:
+      operationId: listMembers
+      responses:
+        '200':
+          description: Every registered member.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Member'
+    post:
+      operationId: createMember
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemberInput'
+      responses:
+        '201':
+          description: The newly registered member.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Member'
+  /members/deleted:
+    get:
+      operationId: listDeletedMembers
+      description: >
+        Soft-deleted members, for the librarian to review and restore —
+        deleting never removes a row, see DELETE /members/{id}.
+      responses:
+        '200':
+          description: Every deleted member.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Member'
+  /members/{id}:
+    get:
+      operationId: getMember
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: One member.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Member'
+    put:
+      operationId: updateMember
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemberInput'
+      responses:
+        '200':
+          description: The updated member.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Member'
+    delete:
+      operationId: deleteMember
+      description: >
+        Soft delete — sets `deleted: true` rather than removing the row.
+        A deleted member can't check out new books and drops out of
+        GET /members, but can be brought back at any time via
+        POST /members/{id}/restore.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: Confirmation of deletion. 404 if the member doesn't exist.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteResult'
+  /members/{id}/restore:
+    post:
+      operationId: restoreMember
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: The restored member, able to check out books again.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Member'
+  /rentals:
+    get:
+      operationId: listRentals
+      responses:
+        '200':
+          description: Every rental, past and present, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Rental'
+    post:
+      operationId: checkoutBook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bookId, memberId]
+              properties:
+                bookId: { type: integer }
+                memberId: { type: integer }
+      responses:
+        '201':
+          description: >
+            A new rental, due back per the library's current
+            rentalPeriodDays setting. Blocked (404) if the book or member
+            is deleted, or the book is already checked out.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NewRental'
+  /rentals/{id}/return:
+    post:
+      operationId: returnBook
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: The rental, now marked returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NewRental'
+  /settings:
+    get:
+      operationId: getSettings
+      responses:
+        '200':
+          description: Library-wide settings.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Settings'
+components:
+  schemas:
+    Book:
+      type: object
+      properties:
+        id: { type: integer }
+        title: { type: string }
+        author: { type: string }
+        isbn: { type: string }
+        available: { type: boolean }
+        deleted: { type: boolean }
+    BookInput:
+      type: object
+      required: [title, author, isbn]
+      properties:
+        title: { type: string }
+        author: { type: string }
+        isbn: { type: string }
+    BookLookupResult:
+      type: object
+      description: >
+        Passed through close to Open Library's own shape — title plus
+        raw author/ISBN arrays (a work usually has several editions) —
+        rather than collapsed to one guessed value server-side.
+      properties:
+        title: { type: string }
+        author_name:
+          type: array
+          items: { type: string }
+        isbn:
+          type: array
+          items: { type: string }
+        first_publish_year: { type: integer }
+    DeleteResult:
+      type: object
+      properties:
+        id: { type: integer }
+        deleted: { type: boolean }
+    Member:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        email: { type: string }
+        deleted: { type: boolean }
+    MemberInput:
+      type: object
+      required: [name, email]
+      properties:
+        name: { type: string }
+        email: { type: string }
+    Rental:
+      type: object
+      properties:
+        id: { type: integer }
+        bookId: { type: integer }
+        bookTitle: { type: string }
+        memberId: { type: integer }
+        memberName: { type: string }
+        checkedOutAt: { type: string, format: date-time }
+        dueAt: { type: string, format: date-time }
+        returnedAt: { type: string, format: date-time, nullable: true }
+    NewRental:
+      type: object
+      properties:
+        id: { type: integer }
+        bookId: { type: integer }
+        memberId: { type: integer }
+        checkedOutAt: { type: string, format: date-time }
+        dueAt: { type: string, format: date-time }
+        returnedAt: { type: string, format: date-time, nullable: true }
+    Settings:
+      type: object
+      properties:
+        rentalPeriodDays: { type: integer }
+        librarianUsername: { type: string }
+        librarianPassword: { type: string }

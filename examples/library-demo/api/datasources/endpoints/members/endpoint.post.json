@@ -1,0 +1,35 @@
+{
+  "operationId": "createMember",
+  "successStatus": 201,
+  "sources": {
+    "member": {
+      "type": "sql",
+      "connection": "library_db",
+      "script": "create_member.sql",
+      "cardinality": "one",
+      "onError": 500,
+      "parameters": [
+        {
+          "name": "name",
+          "from": "body.name"
+        },
+        {
+          "name": "email",
+          "from": "body.email"
+        }
+      ]
+    }
+  },
+  "response": {
+    "id": {
+      "from": "sources.member.id",
+      "format": "integer"
+    },
+    "name": "sources.member.name",
+    "email": "sources.member.email",
+    "deleted": {
+      "from": "sources.member.deleted",
+      "format": "boolean"
+    }
+  }
+}

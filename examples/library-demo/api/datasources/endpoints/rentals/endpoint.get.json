@@ -1,0 +1,25 @@
+{
+  "operationId": "listRentals",
+  "sources": {
+    "rentals": {
+      "type": "sql",
+      "connection": "library_db",
+      "script": "list_rentals.sql",
+      "cardinality": "many"
+    }
+  },
+  "response": {
+    "type": "array",
+    "source": "sources.rentals",
+    "items": {
+      "id": { "from": "id", "format": "integer" },
+      "bookId": { "from": "book_id", "format": "integer" },
+      "bookTitle": "book_title",
+      "memberId": { "from": "member_id", "format": "integer" },
+      "memberName": "member_name",
+      "checkedOutAt": { "from": "checked_out_at", "format": "date-time" },
+      "dueAt": { "from": "due_at", "format": "date-time" },
+      "returnedAt": { "from": "returned_at", "format": "date-time" }
+    }
+  }
+}

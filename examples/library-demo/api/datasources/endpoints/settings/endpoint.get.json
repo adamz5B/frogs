@@ -1,0 +1,16 @@
+{
+  "operationId": "getSettings",
+  "sources": {
+    "settings": {
+      "type": "sql",
+      "connection": "library_db",
+      "script": "get_settings.sql",
+      "cardinality": "one"
+    }
+  },
+  "response": {
+    "rentalPeriodDays": { "from": "sources.settings.rental_period_days", "format": "integer" },
+    "librarianUsername": "sources.settings.librarian_username",
+    "librarianPassword": "sources.settings.librarian_password"
+  }
+}

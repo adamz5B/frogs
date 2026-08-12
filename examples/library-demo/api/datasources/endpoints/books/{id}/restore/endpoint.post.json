@@ -1,0 +1,22 @@
+{
+  "operationId": "restoreBook",
+  "sources": {
+    "book": {
+      "type": "sql",
+      "connection": "library_db",
+      "script": "restore_book.sql",
+      "cardinality": "one",
+      "parameters": [
+        { "name": "id", "from": "path.id" }
+      ]
+    }
+  },
+  "response": {
+    "id": { "from": "sources.book.id", "format": "integer" },
+    "title": "sources.book.title",
+    "author": "sources.book.author",
+    "isbn": "sources.book.isbn",
+    "available": { "from": "sources.book.available", "format": "boolean" },
+    "deleted": { "from": "sources.book.deleted", "format": "boolean" }
+  }
+}

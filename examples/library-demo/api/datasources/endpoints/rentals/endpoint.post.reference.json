@@ -1,0 +1,21 @@
+{
+  "operationId": "checkoutBook",
+  "_hash": "fcd0473779442772",
+  "security": null,
+  "request": {
+    "query": [],
+    "path": [],
+    "header": [],
+    "body": null
+  },
+  "response": {
+    "$component": "NewRental",
+    "id": "integer",
+    "bookId": "integer",
+    "memberId": "integer",
+    "checkedOutAt": "string (date-time)",
+    "dueAt": "string (date-time)",
+    "returnedAt": "string (date-time)"
+  },
+  "availableParameterSources": []
+}

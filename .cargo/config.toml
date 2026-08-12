@@ -1,0 +1,16 @@
+[alias]
+# A fully standalone Windows release build: no VCRUNTIME140.dll dependency,
+# since the C runtime is statically linked in instead of relying on the
+# system's Visual C++ Redistributable. Trade-off (see README): the binary
+# is a little larger, and many instances running on one host lose the
+# memory-sharing benefit a system-wide CRT DLL would otherwise give them —
+# so this is opt-in, not the default `cargo build --release`.
+#
+# Writes to target/standalone/release/ (not target/release/) so both
+# variants can exist on disk at once without one overwriting the other.
+build-standalone = [
+    "build",
+    "--release",
+    "--target-dir", "target/standalone",
+    "--config", "target.x86_64-pc-windows-msvc.rustflags=[\"-C\", \"target-feature=+crt-static\"]",
+]

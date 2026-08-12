@@ -1,0 +1,81 @@
+openapi: 3.0.3
+info:
+  title: Cars Demo API
+  version: 0.1.0
+paths:
+  /cars:
+    get:
+      operationId: getCarInfo
+      parameters:
+        - name: maker
+          in: query
+          required: true
+          schema: { type: string }
+        - name: model
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: A single matching car, with pricing if available
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CarWithPrice'
+    post:
+      operationId: createCar
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [maker, model, year]
+              properties:
+                maker: { type: string }
+                model: { type: string }
+                year:  { type: integer }
+      responses:
+        '201':
+          description: The newly created car
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CarWithPrice'
+  /cars/{vin}:
+    get:
+      operationId: getCarByVin
+      security:
+        - apiKeyAuth: []
+      parameters:
+        - name: vin
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The car with this VIN
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CarWithPrice'
+        '404':
+          description: No car with this VIN
+components:
+  securitySchemes:
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+  schemas:
+    CarWithPrice:
+      type: object
+      required: [maker, model, year, vin]
+      properties:
+        maker:    { type: string }
+        model:    { type: string }
+        year:     { type: integer }
+        vin:      { type: string }
+        price:    { type: number }
+        currency: { type: string }
+        listedAt: { type: string, format: date-time }

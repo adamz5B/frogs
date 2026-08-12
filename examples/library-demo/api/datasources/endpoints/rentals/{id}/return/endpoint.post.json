@@ -1,0 +1,22 @@
+{
+  "operationId": "returnBook",
+  "sources": {
+    "rental": {
+      "type": "sql",
+      "connection": "library_db",
+      "script": "return_book.sql",
+      "cardinality": "one",
+      "parameters": [
+        { "name": "id", "from": "path.id" }
+      ]
+    }
+  },
+  "response": {
+    "id": { "from": "sources.rental.id", "format": "integer" },
+    "bookId": { "from": "sources.rental.book_id", "format": "integer" },
+    "memberId": { "from": "sources.rental.member_id", "format": "integer" },
+    "checkedOutAt": { "from": "sources.rental.checked_out_at", "format": "date-time" },
+    "dueAt": { "from": "sources.rental.due_at", "format": "date-time" },
+    "returnedAt": { "from": "sources.rental.returned_at", "format": "date-time" }
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "operationId": "lookupBooks",
+  "_hash": "726069223250beef",
+  "security": null,
+  "request": {
+    "query": [
+      "title"
+    ],
+    "path": [],
+    "header": [],
+    "body": null
+  },
+  "response": {
+    "type": "array",
+    "items": {
+      "$component": "BookLookupResult",
+      "title": "string",
+      "author_name": {
+        "type": "array",
+        "items": "string"
+      },
+      "isbn": {
+        "type": "array",
+        "items": "string"
+      },
+      "first_publish_year": "integer"
+    }
+  },
+  "availableParameterSources": [
+    "query.title"
+  ]
+}

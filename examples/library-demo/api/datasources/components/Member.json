@@ -1,0 +1,7 @@
+{
+  "_hash": "84985634003c11c4",
+  "id": "integer",
+  "name": "string",
+  "email": "string",
+  "deleted": "boolean"
+}

@@ -1,0 +1,6 @@
+{
+  "method": "GET",
+  "url": "https://openlibrary.org/search.json?title={{title}}&limit=5&fields=title,author_name,isbn,first_publish_year",
+  "timeoutMs": 5000,
+  "responsePath": "docs"
+}

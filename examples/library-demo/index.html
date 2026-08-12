@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Front Desk — Library Management System</title>
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>📚 Front Desk</h1>
+    <p class="subtitle">
+      This whole page is static content served by <strong>frogs</strong>; every table on it is filled in by
+      calling the API — <code>GET/POST <span id="api-root-label">/api</span>/…</code> — running from the
+      <em>same process, same port</em>. Open dev tools → Network to watch it happen.
+    </p>
+  </header>
+
+  <main class="layout">
+    <section class="card" id="checkout-card">
+      <h2>Check out a book</h2>
+      <form id="checkout-form">
+        <label>
+          Book
+          <select id="checkout-book" required></select>
+        </label>
+        <label>
+          Member
+          <select id="checkout-member" required></select>
+        </label>
+        <button type="submit">Check out</button>
+      </form>
+      <p class="hint" id="rental-period-hint"></p>
+      <p class="status" id="checkout-status"></p>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <h2>Books</h2>
+        <button type="button" class="add-button" id="add-book-button">+ Add book</button>
+      </div>
+      <table id="books-table">
+        <thead>
+          <tr><th>Title</th><th>Author</th><th>ISBN</th><th>Available</th><th></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <h2>Members</h2>
+        <button type="button" class="add-button" id="add-member-button">+ Add member</button>
+      </div>
+      <table id="members-table">
+        <thead>
+          <tr><th>Name</th><th>Email</th><th></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section class="card wide">
+      <h2>Rentals</h2>
+      <table id="rentals-table">
+        <thead>
+          <tr><th>Book</th><th>Member</th><th>Checked out</th><th>Due</th><th>Returned</th><th></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>Deleted books</h2>
+      <p class="hint">
+        Soft-deleted, not gone — <code>DELETE /api/books/{id}</code> flips a flag, it never removes
+        the row. Restorable at any time.
+      </p>
+      <table id="deleted-books-table">
+        <thead>
+          <tr><th>Title</th><th>Author</th><th></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>Deleted members</h2>
+      <p class="hint">Same story as deleted books — restorable at any time.</p>
+      <table id="deleted-members-table">
+        <thead>
+          <tr><th>Name</th><th>Email</th><th></th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </main>
+
+  <footer>
+    <p>Served by <strong>frogs</strong> — API and static content, one process, one port.</p>
+  </footer>
+
+  <dialog id="book-dialog">
+    <h2 id="book-dialog-title">Add a book</h2>
+
+    <div id="book-lookup-section">
+      <label>
+        Search Open Library by title
+        <div class="search-row">
+          <input type="text" id="book-lookup-query" placeholder="e.g. Dune" />
+          <button type="button" id="book-lookup-button">Search</button>
+        </div>
+      </label>
+      <p class="status" id="book-lookup-status"></p>
+      <ul id="book-lookup-results"></ul>
+    </div>
+
+    <form id="book-form">
+      <label>
+        Title
+        <input type="text" id="book-title" required />
+      </label>
+      <label>
+        Author
+        <input type="text" id="book-author" required />
+      </label>
+      <label>
+        ISBN
+        <input type="text" id="book-isbn" required />
+      </label>
+      <p class="status" id="book-form-status"></p>
+      <div class="dialog-actions">
+        <button type="button" class="secondary" id="book-cancel-button">Cancel</button>
+        <button type="submit" id="book-submit-button">Add book</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="member-dialog">
+    <h2 id="member-dialog-title">Add a member</h2>
+    <form id="member-form">
+      <label>
+        Name
+        <input type="text" id="member-name" required />
+      </label>
+      <label>
+        Email
+        <input type="email" id="member-email" required />
+      </label>
+      <p class="status" id="member-form-status"></p>
+      <div class="dialog-actions">
+        <button type="button" class="secondary" id="member-cancel-button">Cancel</button>
+        <button type="submit" id="member-submit-button">Add member</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/js/app.js"></script>
+</body>
+</html>

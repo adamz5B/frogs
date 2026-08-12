@@ -1,0 +1,21 @@
+{
+  "operationId": "deleteMember",
+  "_hash": "ceccc151238359e2",
+  "security": null,
+  "request": {
+    "query": [],
+    "path": [
+      "id"
+    ],
+    "header": [],
+    "body": null
+  },
+  "response": {
+    "$component": "DeleteResult",
+    "id": "integer",
+    "deleted": "boolean"
+  },
+  "availableParameterSources": [
+    "path.id"
+  ]
+}

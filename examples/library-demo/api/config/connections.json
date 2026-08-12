@@ -1,0 +1,6 @@
+{
+  "library_db": {
+    "driver": "sqlite",
+    "database": "api/library.db"
+  }
+}

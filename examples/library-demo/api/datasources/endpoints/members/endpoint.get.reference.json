@@ -1,0 +1,22 @@
+{
+  "operationId": "listMembers",
+  "_hash": "b6e25c9bd4ad4a77",
+  "security": null,
+  "request": {
+    "query": [],
+    "path": [],
+    "header": [],
+    "body": null
+  },
+  "response": {
+    "type": "array",
+    "items": {
+      "$component": "Member",
+      "id": "integer",
+      "name": "string",
+      "email": "string",
+      "deleted": "boolean"
+    }
+  },
+  "availableParameterSources": []
+}

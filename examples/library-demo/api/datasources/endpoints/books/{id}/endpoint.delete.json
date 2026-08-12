@@ -1,0 +1,18 @@
+{
+  "operationId": "deleteBook",
+  "sources": {
+    "book": {
+      "type": "sql",
+      "connection": "library_db",
+      "script": "delete_book.sql",
+      "cardinality": "one",
+      "parameters": [
+        { "name": "id", "from": "path.id" }
+      ]
+    }
+  },
+  "response": {
+    "id": { "from": "sources.book.id", "format": "integer" },
+    "deleted": { "from": "sources.book.deleted", "format": "boolean" }
+  }
+}

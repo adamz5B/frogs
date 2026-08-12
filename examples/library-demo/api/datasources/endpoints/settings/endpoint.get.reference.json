@@ -1,0 +1,18 @@
+{
+  "operationId": "getSettings",
+  "_hash": "648a262562c3e3a1",
+  "security": null,
+  "request": {
+    "query": [],
+    "path": [],
+    "header": [],
+    "body": null
+  },
+  "response": {
+    "$component": "Settings",
+    "rentalPeriodDays": "integer",
+    "librarianUsername": "string",
+    "librarianPassword": "string"
+  },
+  "availableParameterSources": []
+}

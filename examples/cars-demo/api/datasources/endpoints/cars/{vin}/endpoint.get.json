@@ -1,0 +1,52 @@
+{
+  "operationId": "getCarByVin",
+  "security": "apiKeyAuth",
+  "sources": {
+    "car": {
+      "type": "sql",
+      "connection": "vehicles_db",
+      "script": "get_car_by_vin.sql",
+      "cardinality": "one",
+      "onError": 500,
+      "parameters": [
+        {
+          "name": "vin",
+          "from": "path.vin"
+        }
+      ]
+    },
+    "pricing": {
+      "type": "http",
+      "request": "pricing_lookup.json",
+      "cardinality": "one",
+      "onError": 502,
+      "optional": true,
+      "parameters": [
+        {
+          "name": "vin",
+          "from": "path.vin"
+        }
+      ]
+    }
+  },
+  "response": {
+    "maker": "sources.car.maker",
+    "model": "sources.car.model",
+    "year": {
+      "from": "sources.car.year",
+      "format": "integer"
+    },
+    "vin": "sources.car.vin",
+    "price": {
+      "from": "sources.pricing.amount",
+      "format": "decimal",
+      "precision": 2
+    },
+    "currency": "sources.pricing.currency",
+    "listedAt": {
+      "from": "sources.car.listed_at",
+      "format": "date-time",
+      "sourceFormat": "unix-seconds"
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "_hash": "c86e42a03e07555c",
+  "rentalPeriodDays": "integer",
+  "librarianUsername": "string",
+  "librarianPassword": "string"
+}

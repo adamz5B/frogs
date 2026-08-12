@@ -1,0 +1,45 @@
+[package]
+name = "frogs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+axum = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
+sqlx = { version = "0.8", optional = true, default-features = false, features = [
+    "runtime-tokio",
+    "chrono",
+] }
+# rustls (not native-tls/openssl) to stay consistent with the sqlx driver
+# choice and avoid pulling in a second TLS stack — matters for binary size.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_yaml = "0.9"
+# Already an indirect dependency via reqwest -> url; pulled in directly here
+# so http::execute can percent-encode a templated value before it's spliced
+# into a URL, instead of hand-rolling encoding logic for something this
+# easy to get subtly wrong.
+percent-encoding = "2"
+
+[features]
+default = ["postgres"]
+# Compile-time driver selection, per the design doc's "fast and lightweight"
+# priority: a binary only carries the SQL drivers it was actually built with.
+# Each feature pulls in `sqlx` plus only the sub-feature it actually needs —
+# enabling both just unifies into one binary carrying both drivers, same as
+# the doc's "server-full" build; enabling neither drops `sqlx` entirely.
+postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/tls-rustls"]
+sqlite = ["dep:sqlx", "sqlx/sqlite"]
+
+[profile.release]
+opt-level = "z"     # optimize for size over speed
+lto = true          # whole-program dead-code elimination across crates
+codegen-units = 1    # more optimization opportunity at the cost of build time
+strip = true         # drop debug symbols from the final binary

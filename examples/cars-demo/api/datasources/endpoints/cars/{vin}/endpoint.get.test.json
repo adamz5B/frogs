@@ -1,0 +1,41 @@
+{
+  "cases": [
+    {
+      "name": "happy path",
+      "request": { "path": { "vin": "1HGCM82633A004352" } },
+      "mocks": {
+        "verifier": { "active": true },
+        "car":     { "vin": "1HGCM82633A004352", "maker": "Honda", "model": "Accord" },
+        "pricing": { "amount": 24500, "currency": "USD" }
+      },
+      "expect": { "status": 200, "body": { "maker": "Honda", "price": 24500 } }
+    },
+    {
+      "name": "pricing service down — optional source, should degrade gracefully",
+      "request": { "path": { "vin": "1HGCM82633A004352" } },
+      "mocks": {
+        "verifier": { "active": true },
+        "car":     { "vin": "1HGCM82633A004352", "maker": "Honda" },
+        "pricing": { "fail": "datasource.http.timeout" }
+      },
+      "expect": { "status": 200, "body": { "price": null } }
+    },
+    {
+      "name": "car not found",
+      "request": { "path": { "vin": "UNKNOWN" } },
+      "mocks": {
+        "verifier": { "active": true },
+        "car": { "fail": "datasource.sql.not_found" }
+      },
+      "expect": { "status": 404 }
+    },
+    {
+      "name": "no api key — verifier mocked as inactive",
+      "request": { "path": { "vin": "1HGCM82633A004352" } },
+      "mocks": {
+        "verifier": { "active": false }
+      },
+      "expect": { "status": 401 }
+    }
+  ]
+}

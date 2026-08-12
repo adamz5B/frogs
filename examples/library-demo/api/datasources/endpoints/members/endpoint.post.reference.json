@@ -1,0 +1,19 @@
+{
+  "operationId": "createMember",
+  "_hash": "fcc4448ce0b49972",
+  "security": null,
+  "request": {
+    "query": [],
+    "path": [],
+    "header": [],
+    "body": null
+  },
+  "response": {
+    "$component": "Member",
+    "id": "integer",
+    "name": "string",
+    "email": "string",
+    "deleted": "boolean"
+  },
+  "availableParameterSources": []
+}

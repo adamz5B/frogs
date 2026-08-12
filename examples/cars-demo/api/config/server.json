@@ -1,0 +1,13 @@
+{
+  "debugMode": false,
+  "features": {
+    "metrics": true,
+    "readyzCheck": true,
+    "requestCorrelation": true,
+    "rateLimiting": false,
+    "serviceRegistry": false,
+    "requestValidation": true
+  },
+  "autoMigrateEndpoints": true,
+  "discoveredErrorsWarnThreshold": 20
+}

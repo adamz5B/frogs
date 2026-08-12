@@ -1,0 +1,26 @@
+{
+  "operationId": "getCarByVin",
+  "_hash": "3eb273f100d19967",
+  "security": "apiKeyAuth",
+  "request": {
+    "query": [],
+    "path": [
+      "vin"
+    ],
+    "header": [],
+    "body": null
+  },
+  "response": {
+    "$component": "CarWithPrice",
+    "maker": "string",
+    "model": "string",
+    "year": "integer",
+    "vin": "string",
+    "price": "number",
+    "currency": "string",
+    "listedAt": "string (date-time)"
+  },
+  "availableParameterSources": [
+    "path.vin"
+  ]
+}
