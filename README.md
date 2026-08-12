@@ -117,3 +117,7 @@ docs/                  # the full design spec and phased implementation roadmap
 Every feature above was verified by actually running the built binary — real SQLite files, a real chained SQL+HTTP endpoint with the HTTP dependency killed mid-test to confirm graceful degradation, two concurrent `frogs run` processes calling each other, a real static site served and cached correctly behind `frogs run`/`frogs stop`, a real SQL-backed API endpoint and a real static site served together from one `frogs run` process with the API correctly mounted under a custom `apiRoot`, a raw TCP request proving a path-traversal attempt is rejected server-side (not just by an HTTP client's own URL normalization) — not just unit tests. For a fake upstream HTTP dependency in a test, an in-memory-SQLite-backed `frogs run` instance with a literal `SELECT <value> AS <field>` script (no table, no seeding) works well as a zero-setup stand-in; see `src/sql/sqlite.rs`'s tests for the same idea as an actual unit test.
 
 The mock-substitution testing framework (`frogs test`) is frogs' own equivalent for a *project built with frogs* — it exists precisely so a project's author doesn't need real infrastructure running to test their endpoints either.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
