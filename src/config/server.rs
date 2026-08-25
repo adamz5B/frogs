@@ -12,6 +12,35 @@ fn default_port() -> u16 {
     8080
 }
 
+fn default_requests_per_second() -> u32 {
+    20
+}
+
+fn default_burst() -> u32 {
+    40
+}
+
+/// Token-bucket parameters for `features.rateLimiting` — a single shared
+/// bucket for the whole process (not one per client), a deliberate scope
+/// choice: fair per-client throttling needs real client-IP plumbing (harder
+/// to get right behind a reverse proxy without also handling
+/// `X-Forwarded-For`) that nothing in this server does yet, while a global
+/// cap is still a legitimate backend-protection safety valve on its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitConfig {
+    #[serde(default = "default_requests_per_second")]
+    pub requests_per_second: u32,
+    #[serde(default = "default_burst")]
+    pub burst: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        RateLimitConfig { requests_per_second: default_requests_per_second(), burst: default_burst() }
+    }
+}
+
 /// Independently toggleable capabilities — none of them imply a deployment
 /// "mode"; a monolith and a split-out microservice both just pick whichever
 /// of these they need. `metrics`/`readyzCheck`/`requestCorrelation` and
@@ -64,6 +93,11 @@ pub struct ServerConfig {
     pub auto_migrate_endpoints: bool,
     #[serde(default = "default_warn_threshold")]
     pub discovered_errors_warn_threshold: u32,
+    /// Only actually consulted when `features.rateLimiting` is on — same
+    /// "the file can hold settings for a feature that's currently off"
+    /// posture the rest of `server.json` already has.
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
     /// Not part of the original design doc (which never pins down a port) —
     /// a sensible default so `frogs run` has somewhere to bind.
     #[serde(default = "default_port")]
@@ -85,6 +119,7 @@ impl Default for ServerConfig {
             features: Features::default(),
             auto_migrate_endpoints: true,
             discovered_errors_warn_threshold: 20,
+            rate_limit: RateLimitConfig::default(),
             port: 8080,
             api_root: String::new(),
         }
@@ -111,6 +146,21 @@ mod tests {
     fn default_config_serializes_with_a_visible_empty_api_root() {
         let json = serde_json::to_string(&ServerConfig::default()).unwrap();
         assert!(json.contains(r#""apiRoot":"""#), "apiRoot should be written out, not hidden, even when empty: {json}");
+    }
+
+    #[test]
+    fn rate_limit_defaults_when_absent_from_the_file() {
+        let config: ServerConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.rate_limit.requests_per_second, 20);
+        assert_eq!(config.rate_limit.burst, 40);
+    }
+
+    #[test]
+    fn rate_limit_is_read_as_camel_case() {
+        let config: ServerConfig =
+            serde_json::from_str(r#"{ "rateLimit": { "requestsPerSecond": 5, "burst": 15 } }"#).unwrap();
+        assert_eq!(config.rate_limit.requests_per_second, 5);
+        assert_eq!(config.rate_limit.burst, 15);
     }
 
     #[test]

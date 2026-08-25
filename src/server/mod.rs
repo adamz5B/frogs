@@ -178,6 +178,88 @@ async fn metrics_middleware(State(metrics): State<Arc<Metrics>>, req: Request, n
     response
 }
 
+/// A global (not per-client — see `config::RateLimitConfig`'s doc comment)
+/// token bucket: `capacity` tokens to start, refilling continuously at
+/// `refill_per_second`, capped back at `capacity`. One request costs exactly
+/// one token; a request that would take the bucket below zero is rejected
+/// instead. `state` is a single short-lived `Mutex` (never held across an
+/// `.await`) around both fields together — refilling and spending must be
+/// one atomic step, or two concurrent requests could each read the same
+/// pre-refill token count and both spend it.
+#[derive(Debug)]
+pub struct RateLimiter {
+    capacity: f64,
+    refill_per_second: f64,
+    state: Mutex<RateLimiterState>,
+}
+
+#[derive(Debug)]
+struct RateLimiterState {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+/// What a rejected request should do — a whole-second `retry_after` (HTTP's
+/// `Retry-After` only has whole-second granularity) rounded up from however
+/// long until the bucket would actually have a full token again, never 0
+/// (a caller retrying in the same instant would just be rejected again).
+struct RateLimitExceeded {
+    retry_after_secs: u64,
+}
+
+impl RateLimiter {
+    pub fn new(requests_per_second: u32, burst: u32) -> Self {
+        RateLimiter {
+            capacity: burst.max(1) as f64,
+            refill_per_second: requests_per_second.max(1) as f64,
+            state: Mutex::new(RateLimiterState { tokens: burst.max(1) as f64, last_refill: Instant::now() }),
+        }
+    }
+
+    fn try_acquire(&self) -> Result<(), RateLimitExceeded> {
+        let mut state = self.state.lock().unwrap();
+
+        let now = Instant::now();
+        let elapsed = now.duration_since(state.last_refill).as_secs_f64();
+        state.tokens = (state.tokens + elapsed * self.refill_per_second).min(self.capacity);
+        state.last_refill = now;
+
+        if state.tokens >= 1.0 {
+            state.tokens -= 1.0;
+            Ok(())
+        } else {
+            let seconds_needed = (1.0 - state.tokens) / self.refill_per_second;
+            Err(RateLimitExceeded { retry_after_secs: seconds_needed.ceil().max(1.0) as u64 })
+        }
+    }
+}
+
+/// Applies the rate-limiting middleware — same "call this last, after every
+/// route is registered" requirement `apply_middleware`/`apply_metrics` both
+/// have, for the same reason (`Router::layer` only wraps routes already
+/// present on that specific `Router` value).
+pub fn apply_rate_limit(router: Router, limiter: Arc<RateLimiter>) -> Router {
+    router.layer(middleware::from_fn_with_state(limiter, rate_limit_middleware))
+}
+
+async fn rate_limit_middleware(State(limiter): State<Arc<RateLimiter>>, req: Request, next: Next) -> Response {
+    match limiter.try_acquire() {
+        Ok(()) => next.run(req).await,
+        Err(exceeded) => {
+            let body = serde_json::json!({
+                "code": 429,
+                "name": "rate_limit_exceeded",
+                "detail": "rate limit exceeded, try again later"
+            });
+            let mut response = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
+            if let Ok(value) = HeaderValue::from_str(&exceeded.retry_after_secs.to_string()) {
+                response.headers_mut().insert(HeaderName::from_static("retry-after"), value);
+            }
+            response
+        }
+    }
+}
+
 /// A single leading slash, no trailing one — the exact form `Router::nest`
 /// expects — or `None` for a blank/all-slashes value, meaning "mount
 /// unprefixed." Accepts `api`, `/api`, and `/api/` alike, since a
@@ -452,5 +534,67 @@ mod tests {
 
         let unprefixed = reqwest::get(format!("http://{addr}/healthz")).await.unwrap();
         assert_eq!(unprefixed.status(), 404, "the old unprefixed path must not still work once apiRoot is set");
+    }
+
+    #[test]
+    fn a_fresh_limiter_starts_with_a_full_bucket_of_burst_size() {
+        let limiter = RateLimiter::new(10, 3);
+        assert!(limiter.try_acquire().is_ok());
+        assert!(limiter.try_acquire().is_ok());
+        assert!(limiter.try_acquire().is_ok());
+        assert!(limiter.try_acquire().is_err(), "a 4th request beyond burst=3 must be rejected");
+    }
+
+    #[test]
+    fn a_rejected_request_reports_a_nonzero_retry_after() {
+        // 1 request/second means the very next token is at most 1s away.
+        let limiter = RateLimiter::new(1, 1);
+        assert!(limiter.try_acquire().is_ok());
+        let err = limiter.try_acquire().expect_err("the bucket should be empty after the first request");
+        assert!(err.retry_after_secs >= 1, "retry-after must never be 0 — an immediate retry would just fail again");
+    }
+
+    #[test]
+    fn tokens_refill_over_time_up_to_the_burst_cap() {
+        // 100/s: fast enough that 50ms of sleep easily refills a token, but
+        // slow enough that the microseconds-scale gap between the two
+        // back-to-back `try_acquire()` calls below can't accidentally
+        // refill one on its own (that would need >= 1/100th of a second to
+        // elapse between them, orders of magnitude more than a bare
+        // function call plus a mutex lock actually takes).
+        let limiter = RateLimiter::new(100, 1);
+        assert!(limiter.try_acquire().is_ok());
+        assert!(limiter.try_acquire().is_err(), "the single-token bucket should be empty immediately after");
+
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(limiter.try_acquire().is_ok(), "50ms at 100/s should easily have refilled one token");
+    }
+
+    #[test]
+    fn refilling_never_exceeds_the_burst_capacity() {
+        let limiter = RateLimiter::new(1_000, 2);
+        std::thread::sleep(Duration::from_millis(50));
+        // Capacity is 2, however long this thread happened to sleep for —
+        // a 3rd immediate request must still be rejected, not "however many
+        // tokens accumulated."
+        assert!(limiter.try_acquire().is_ok());
+        assert!(limiter.try_acquire().is_ok());
+        assert!(limiter.try_acquire().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_real_request_over_the_limit_gets_429_with_a_retry_after_header() {
+        let limiter = Arc::new(RateLimiter::new(10, 1));
+        let addr = spawn(apply_rate_limit(router(), limiter)).await;
+
+        let first = reqwest::get(format!("http://{addr}/healthz")).await.unwrap();
+        assert_eq!(first.status(), 200);
+
+        let second = reqwest::get(format!("http://{addr}/healthz")).await.unwrap();
+        assert_eq!(second.status(), 429);
+        assert!(second.headers().get("retry-after").is_some());
+        let body: serde_json::Value = second.json().await.unwrap();
+        assert_eq!(body["code"], 429);
+        assert_eq!(body["name"], "rate_limit_exceeded");
     }
 }

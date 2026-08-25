@@ -104,6 +104,7 @@ impl Serialize for MockOutcome {
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_sources(
     endpoint: &EndpointFile,
+    services: &HashMap<String, String>,
     drivers: &HashMap<String, Box<dyn SqlDriver>>,
     sql_root: &Path,
     http_root: &Path,
@@ -143,6 +144,7 @@ pub async fn resolve_sources(
                 }
                 SourceDef::Http { request, cardinality, parameters, .. } => {
                     run_http_source(
+                        services,
                         http_root,
                         http_client,
                         request,
@@ -226,6 +228,7 @@ async fn run_sql_source(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_http_source(
+    services: &HashMap<String, String>,
     http_root: &Path,
     client: &reqwest::Client,
     request: &str,
@@ -252,6 +255,17 @@ async fn run_http_source(
         .map_err(|e| SourceErrorCause::Config(format!("invalid JSON in {}: {e}", request_path.display())))?;
 
     let mut bound = HashMap::new();
+    // The service registry (design doc, `config/services.json`): a logical
+    // name → base URL lookup, reachable from a `url`/`body` template as
+    // `{{services.<name>}}` — no new template syntax needed, just more
+    // entries in the same `{{name}}` substitution map every other parameter
+    // already goes through. Seeded before `parameters` below so an endpoint
+    // author can't accidentally shadow a registry entry with a same-named
+    // declared parameter without it being obvious which one wins (`parameters`
+    // wins, since it's inserted second).
+    for (name, base_url) in services {
+        bound.insert(format!("services.{name}"), SqlValue::Text(base_url.clone()));
+    }
     let mut array_params = HashSet::new();
     for param in parameters {
         bound.insert(param.name.clone(), resolve_from(&param.from, path_params, query_params, body, transaction_id));
@@ -523,6 +537,7 @@ mod tests {
         let path_params = HashMap::from([("vin".to_string(), "1HGCM82633A004352".to_string())]);
         let resolved = resolve_sources(
             &endpoint,
+            &HashMap::new(),
             &drivers,
             &root,
             &root.join("http"),
@@ -550,6 +565,7 @@ mod tests {
         let client = reqwest::Client::new();
         let resolved = resolve_sources(
             &endpoint,
+            &HashMap::new(),
             &drivers,
             &root,
             &root.join("http"),
@@ -577,6 +593,7 @@ mod tests {
         let client = reqwest::Client::new();
         let failure = resolve_sources(
             &endpoint,
+            &HashMap::new(),
             &drivers,
             &root,
             &root.join("http"),
@@ -618,6 +635,7 @@ mod tests {
         let client = reqwest::Client::new();
         let failure = resolve_sources(
             &endpoint,
+            &HashMap::new(),
             &drivers,
             &root,
             &root.join("http"),
@@ -644,6 +662,7 @@ mod tests {
         let client = reqwest::Client::new();
         let failure = resolve_sources(
             &endpoint,
+            &HashMap::new(),
             &drivers,
             &root,
             &root.join("http"),
@@ -704,6 +723,7 @@ mod tests {
         let client = reqwest::Client::new();
         let resolved = resolve_sources(
             &endpoint,
+            &HashMap::new(),
             &drivers,
             &root,
             &root.join("http"),
@@ -719,6 +739,140 @@ mod tests {
 
         let body = build_response(&endpoint, &resolved);
         assert_eq!(body["price"], 24500);
+    }
+
+    /// The service registry (`config/services.json`): a `url` template can
+    /// reference a logical name — `{{services.pricing}}` — instead of a
+    /// hardcoded base URL, resolved through the exact same `{{name}}`
+    /// substitution every other parameter already goes through (see
+    /// `run_http_source`'s doc comment for why no new template syntax was
+    /// needed for this).
+    #[tokio::test]
+    async fn a_url_can_reference_the_service_registry_by_name() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let app = Router::new().route(
+            "/price",
+            get(|| async { Json(serde_json::json!({ "amount": 24500, "currency": "USD" })) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(
+            root.join("http/pricing.json"),
+            r#"{ "method": "GET", "url": "{{services.pricing}}/price" }"#,
+        )
+        .unwrap();
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "pricing": {
+                    "type": "http",
+                    "request": "pricing.json",
+                    "onError": 502,
+                    "optional": false
+                }
+            },
+            "response": { "price": "sources.pricing.amount" }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+
+        let mut services = HashMap::new();
+        services.insert("pricing".to_string(), format!("http://{addr}"));
+
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &services,
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .expect("the registry-resolved URL should reach the real server");
+
+        let body = build_response(&endpoint, &resolved);
+        assert_eq!(body["price"], 24500);
+    }
+
+    /// An empty/absent service registry (the default, and what every project
+    /// with `serviceRegistry` off always gets) leaves `{{services.<name>}}`
+    /// unresolved — the same "unresolvable placeholder becomes an empty
+    /// string" behavior every other `{{name}}` template already has, not a
+    /// distinct failure mode.
+    #[tokio::test]
+    async fn a_services_reference_with_no_matching_registry_entry_resolves_to_an_empty_string() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        // If `{{services.pricing}}` resolved to anything other than an empty
+        // string, the request would land on some other path than exactly
+        // `/price` and this handler would never be hit at all.
+        let app = Router::new().route("/price", get(|| async { Json(serde_json::json!({ "seen": true })) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        // No `{{services.pricing}}` entry in the (empty) registry below, so
+        // it resolves to "" — the request lands on this same server anyway,
+        // just at `/price` instead of `http://elsewhere/price`, proving the
+        // placeholder didn't panic or error, only came up empty.
+        std::fs::write(
+            root.join("http/pricing.json"),
+            format!(r#"{{ "method": "GET", "url": "http://{addr}{{{{services.pricing}}}}/price" }}"#),
+        )
+        .unwrap();
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "pricing": {
+                    "type": "http",
+                    "request": "pricing.json",
+                    "onError": 502,
+                    "optional": false
+                }
+            },
+            "response": { "seen": "sources.pricing.seen" }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .expect("an empty-but-present placeholder should still resolve, not fail");
+
+        let body = build_response(&endpoint, &resolved);
+        assert_eq!(body["seen"], true);
     }
 
     #[tokio::test]
@@ -746,7 +900,7 @@ mod tests {
         let root = temp_project_root();
         let client = reqwest::Client::new();
         let resolved =
-            resolve_sources(&endpoint, &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
+            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
                 .await
                 .expect("a many-cardinality source with rows should resolve");
 
@@ -774,7 +928,7 @@ mod tests {
         let root = temp_project_root();
         let client = reqwest::Client::new();
         let resolved =
-            resolve_sources(&endpoint, &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
+            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
                 .await
                 .expect("zero rows is a valid result for a list, not a failure");
 
@@ -807,7 +961,7 @@ mod tests {
         let root = temp_project_root();
         let client = reqwest::Client::new();
         let resolved =
-            resolve_sources(&endpoint, &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
+            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
                 .await
                 .unwrap();
 
@@ -847,7 +1001,7 @@ mod tests {
         let root = temp_project_root();
         let client = reqwest::Client::new();
         let resolved =
-            resolve_sources(&endpoint, &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
+            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
                 .await
                 .unwrap();
 
@@ -876,6 +1030,7 @@ mod tests {
         let path_params = HashMap::from([("vin".to_string(), "AAA".to_string())]);
         let resolved = resolve_sources(
             &endpoint,
+            &HashMap::new(),
             &drivers,
             &root,
             &root.join("http"),
@@ -908,7 +1063,7 @@ mod tests {
         let root = temp_project_root();
         let client = reqwest::Client::new();
         let failure =
-            resolve_sources(&endpoint, &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
+            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
             .await
             .expect_err("cardinality 'many' has no response-assembly support yet, even before the request file is read");
 
@@ -925,7 +1080,7 @@ mod tests {
         let root = temp_project_root();
         let client = reqwest::Client::new();
         let failure =
-            resolve_sources(&endpoint, &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
+            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
             .await
             .expect_err("a source referencing a connection that isn't configured must fail clearly");
 
@@ -949,7 +1104,7 @@ mod tests {
         let root = temp_project_root(); // only creates db/q.sql, not does_not_exist.sql
         let client = reqwest::Client::new();
         let failure =
-            resolve_sources(&endpoint, &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
+            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
             .await
             .expect_err("a script file that isn't on disk must fail before ever reaching the driver");
 
@@ -991,7 +1146,7 @@ mod tests {
         let root_http = root.join("http");
         let client = reqwest::Client::new();
         let failure =
-            resolve_sources(&endpoint, &drivers, &root, &root_http, &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
+            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root_http, &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
             .await
             .expect_err("a non-optional http source returning a server error must fail the request");
 
@@ -1059,7 +1214,7 @@ mod tests {
         let path_params = HashMap::from([("vin".to_string(), "1HGCM82633A004352".to_string())]);
         let client = reqwest::Client::new();
         let resolved =
-            resolve_sources(&endpoint, &drivers, &root, &root.join("http"), &client, &path_params, &HashMap::new(), &Value::Null, "", &HashMap::new())
+            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &path_params, &HashMap::new(), &Value::Null, "", &HashMap::new())
             .await
             .expect("both sources should resolve independently");
 
@@ -1166,6 +1321,7 @@ mod tests {
         let client = reqwest::Client::new();
         resolve_sources(
             &endpoint,
+            &HashMap::new(),
             &drivers,
             &root,
             &root.join("http"),
@@ -1237,6 +1393,7 @@ mod tests {
         let client = reqwest::Client::new();
         resolve_sources(
             &endpoint,
+            &HashMap::new(),
             &drivers,
             &root,
             &root.join("http"),
@@ -1303,7 +1460,7 @@ mod tests {
         let client = reqwest::Client::new();
         let body = serde_json::json!({ "maker": "Honda" });
         let resolved =
-            resolve_sources(&endpoint, &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &body, "", &HashMap::new())
+            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &body, "", &HashMap::new())
                 .await
                 .expect("the sql source should resolve using the body-derived parameter");
 
@@ -1359,7 +1516,7 @@ mod tests {
         let root = temp_project_root();
         let client = reqwest::Client::new();
         let body = serde_json::json!({ "items": [{ "maker": "Honda" }, { "maker": "Ford" }] });
-        resolve_sources(&endpoint, &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &body, "", &HashMap::new())
+        resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &body, "", &HashMap::new())
             .await
             .expect("the sql source should resolve using the array-typed body parameter");
 
@@ -1399,6 +1556,7 @@ mod tests {
 
         let resolved = resolve_sources(
             &endpoint,
+            &HashMap::new(),
             &drivers,
             &root,
             &root.join("http"),
@@ -1428,6 +1586,7 @@ mod tests {
 
         let failure = resolve_sources(
             &endpoint,
+            &HashMap::new(),
             &drivers,
             &root,
             &root.join("http"),
@@ -1458,6 +1617,7 @@ mod tests {
 
         let resolved = resolve_sources(
             &endpoint,
+            &HashMap::new(),
             &drivers,
             &root,
             &root.join("http"),
@@ -1513,6 +1673,7 @@ mod tests {
 
         let resolved = resolve_sources(
             &endpoint,
+            &HashMap::new(),
             &drivers,
             &root,
             &root.join("http"), // never actually read — the http source is mocked
@@ -1552,6 +1713,7 @@ mod tests {
 
         let resolved = resolve_sources(
             &endpoint,
+            &HashMap::new(),
             &drivers,
             &root,
             &root.join("http"),

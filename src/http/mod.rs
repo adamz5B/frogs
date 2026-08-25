@@ -188,11 +188,18 @@ fn sql_value_to_string(value: &SqlValue) -> String {
 /// Walks `template`, replacing every `{{name}}` with `encode`'s transform
 /// of the matching parameter's string form (an unresolvable name
 /// substitutes an empty string either way — the same "say so via a failed
-/// request, don't crash" posture used elsewhere). Static template text
-/// outside `{{...}}` is never touched, only the substituted values are —
-/// shared by `substitute_string` (URL context, percent-encoded) and
+/// request, don't crash" posture used elsewhere). `encode` sees the
+/// placeholder's own name alongside its value, so a caller can vary the
+/// transform per-placeholder (see `substitute_string`'s `services.`
+/// carve-out) rather than only per-template. Static template text outside
+/// `{{...}}` is never touched, only the substituted values are — shared by
+/// `substitute_string` (URL context, percent-encoded) and
 /// `substitute_literal` (JSON body context, verbatim) below.
-fn substitute_template(template: &str, params: &HashMap<String, SqlValue>, encode: impl Fn(&str) -> String) -> String {
+fn substitute_template(
+    template: &str,
+    params: &HashMap<String, SqlValue>,
+    encode: impl Fn(&str, &str) -> String,
+) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
     while let Some(start) = rest.find("{{") {
@@ -202,7 +209,7 @@ fn substitute_template(template: &str, params: &HashMap<String, SqlValue>, encod
             Some(end) => {
                 let name = rest[..end].trim();
                 let raw = sql_value_to_string(params.get(name).unwrap_or(&SqlValue::Null));
-                out.push_str(&encode(&raw));
+                out.push_str(&encode(name, &raw));
                 rest = &rest[end + 2..];
             }
             None => {
@@ -215,21 +222,38 @@ fn substitute_template(template: &str, params: &HashMap<String, SqlValue>, encod
     out
 }
 
+/// The reserved namespace `run_http_source` (`endpoint::resolve`) seeds
+/// `bound` with for the service registry (`config/services.json`) — a
+/// server-operator-authored base URL, not caller input, so (unlike every
+/// other substituted value) it must reach the URL verbatim: percent-encoding
+/// it would mangle its own `://` and `:<port>` into something reqwest can't
+/// parse at all.
+const SERVICE_REGISTRY_PREFIX: &str = "services.";
+
 /// Substitutes `{{param}}` into a URL template, percent-encoding each
 /// substituted value (see `URL_COMPONENT`) — critical when the value came
 /// from a caller-controlled source, like a security verifier binding a
 /// request header directly into a token-introspection URL. Without this, a
 /// crafted header value could inject its own `&extra=param` and change
-/// which query parameters the receiving server sees.
+/// which query parameters the receiving server sees. The one exception is a
+/// `services.<name>` placeholder (see `SERVICE_REGISTRY_PREFIX`), passed
+/// through unencoded since it's a trusted base URL, not a value a caller
+/// could have influenced.
 fn substitute_string(template: &str, params: &HashMap<String, SqlValue>) -> String {
-    substitute_template(template, params, |v| utf8_percent_encode(v, URL_COMPONENT).to_string())
+    substitute_template(template, params, |name, v| {
+        if name.starts_with(SERVICE_REGISTRY_PREFIX) {
+            v.to_string()
+        } else {
+            utf8_percent_encode(v, URL_COMPONENT).to_string()
+        }
+    })
 }
 
 /// Substitutes `{{param}}` verbatim — no percent-encoding — for JSON body
 /// templates, where a substituted value is a body *value*, not a URL
 /// component, so encoding it would corrupt rather than protect it.
 fn substitute_literal(template: &str, params: &HashMap<String, SqlValue>) -> String {
-    substitute_template(template, params, |v| v.to_string())
+    substitute_template(template, params, |_name, v| v.to_string())
 }
 
 /// Walks a JSON body template, substituting `{{param}}` into every string

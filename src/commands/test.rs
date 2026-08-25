@@ -100,6 +100,7 @@ pub async fn run(cwd: &Path) -> io::Result<()> {
             let (status, response_body) = resolve_for_test(
                 &endpoint,
                 &config.security,
+                &config.services,
                 &drivers,
                 &sql_root,
                 &http_root,
@@ -195,6 +196,7 @@ pub async fn record(cwd: &Path, path: &str, method: &str) -> io::Result<()> {
 
     let (status, response_body, resolved) = match crate::endpoint::record_sources(
         &endpoint,
+        &config.services,
         &drivers,
         &sql_root,
         &http_root,

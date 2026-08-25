@@ -94,8 +94,15 @@ mod tests {
     /// `api/` scaffolded underneath since that's where `errors freeze`
     /// actually reads/writes.
     fn temp_project() -> PathBuf {
+        // A per-process atomic counter alongside PID+nanosecond timestamp —
+        // the timestamp alone has occasionally collided under heavy parallel
+        // `cargo test` load on Windows (coarser effective clock resolution
+        // than raw nanoseconds suggest); see the same fix in
+        // `commands::generate`'s and `config::mod`'s own test helpers.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "frogs-errors-freeze-test-{}-{}",
+            "frogs-errors-freeze-test-{}-{}-{n}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));

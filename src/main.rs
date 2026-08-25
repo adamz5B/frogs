@@ -53,6 +53,14 @@ enum Command {
         #[command(subcommand)]
         action: ErrorsCommand,
     },
+    /// Inspect which SQL drivers this binary was built with
+    Drivers {
+        #[command(subcommand)]
+        action: DriversCommand,
+    },
+    /// Dry-run every startup check (config, SQL connections, endpoint
+    /// files) without binding a port — safe to run repeatedly, e.g. in CI
+    Validate,
     /// Print an overview of frogs and the current project's status
     Help,
 }
@@ -62,6 +70,12 @@ enum ErrorsCommand {
     /// Batch every entry in config/errors.discovered.json into a new,
     /// dated file under config/errors/, then purge the scratch file
     Freeze,
+}
+
+#[derive(Subcommand)]
+enum DriversCommand {
+    /// Print which SQL drivers are compiled into this binary
+    List,
 }
 
 #[derive(Subcommand)]
@@ -98,6 +112,8 @@ async fn main() {
             commands::test::record(&cwd, &path, &method).await
         }
         Command::Errors { action: ErrorsCommand::Freeze } => commands::errors::freeze(&cwd),
+        Command::Drivers { action: DriversCommand::List } => commands::drivers::list(),
+        Command::Validate => commands::validate::run(&cwd).await,
         Command::Help => commands::help::run(&cwd),
     };
 
@@ -172,6 +188,21 @@ mod tests {
     #[test]
     fn parses_errors_freeze() {
         assert!(matches!(parse(&["errors", "freeze"]), Command::Errors { action: ErrorsCommand::Freeze }));
+    }
+
+    #[test]
+    fn parses_drivers_list() {
+        assert!(matches!(parse(&["drivers", "list"]), Command::Drivers { action: DriversCommand::List }));
+    }
+
+    #[test]
+    fn drivers_with_no_action_is_a_parse_error() {
+        assert!(Cli::try_parse_from(["frogs", "drivers"]).is_err());
+    }
+
+    #[test]
+    fn parses_validate() {
+        assert!(matches!(parse(&["validate"]), Command::Validate));
     }
 
     #[test]

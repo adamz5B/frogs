@@ -10,10 +10,14 @@ USAGE:
     frogs <COMMAND>
 
 COMMANDS:
-    generate    Generate datasource stub/reference files from openapi.yaml
-    run         Start the server for the current project
-    stop        Stop the running server for the current project
-    help        Print this message
+    generate       Generate datasource stub/reference files from openapi.yaml
+    run            Start the server for the current project
+    stop           Stop the running server for the current project
+    test           Run *.test.json cases, or record a new one from a real request
+    errors freeze  Batch config/errors.discovered.json into the canonical registry
+    drivers list   Print which SQL drivers this binary was built with
+    validate       Dry-run config/SQL/endpoint checks without starting the server
+    help           Print this message
 
 A frogs project is any directory containing an openapi.yaml file (or, for a
 static-webpage project with no API, at least one .html file) — frogs never

@@ -43,6 +43,11 @@ struct RouteState {
     http_client: reqwest::Client,
     errors: Arc<ErrorRegistry>,
     security: Arc<SecurityConfig>,
+    /// The service registry (`config/services.json`), name → base URL —
+    /// only ever non-empty when `features.serviceRegistry` is on (see
+    /// `config::Config::load`); reachable from an HTTP source's `url`/`body`
+    /// templates as `{{services.<name>}}`.
+    services: Arc<HashMap<String, String>>,
     /// Shared across every route (not one cache per route), so two
     /// endpoints protected by the same scheme reuse one cached result for
     /// the same credential instead of each paying their own round-trip.
@@ -71,6 +76,7 @@ pub fn build_router(
     drivers: Arc<HashMap<String, Box<dyn SqlDriver>>>,
     errors: Arc<ErrorRegistry>,
     security: Arc<SecurityConfig>,
+    services: Arc<HashMap<String, String>>,
     discovered_errors: Arc<Mutex<DiscoveredErrors>>,
     debug_mode: bool,
 ) -> Router {
@@ -128,6 +134,7 @@ pub fn build_router(
             http_client: http_client.clone(),
             errors: errors.clone(),
             security: security.clone(),
+            services: services.clone(),
             verifier_cache: verifier_cache.clone(),
             discovered_errors: discovered_errors.clone(),
             discovered_errors_path: discovered_errors_path.clone(),
@@ -149,6 +156,47 @@ pub fn build_router(
         router = router.route(&url_path, method_router);
     }
     router
+}
+
+/// Parses every discovered endpoint file and reports problems without
+/// building any routes — `frogs validate`'s read-only counterpart to
+/// `build_router`'s own per-file loop. Deliberately not sharing code with
+/// `build_router` itself: that function also constructs a route/
+/// `RouteState` per file, which a dry run has no use for, and the actual
+/// check logic (parse JSON, confirm a declared security scheme resolves)
+/// is small enough that duplicating it here stays cheaper than
+/// restructuring `build_router` to serve both callers.
+pub(crate) fn validate_endpoint_files(endpoints_root: &Path, security: &SecurityConfig) -> (usize, Vec<String>) {
+    let discovered = discover_endpoint_files(endpoints_root);
+    let count = discovered.len();
+    let mut problems = Vec::new();
+
+    for (_, _, file_path) in discovered {
+        let contents = match std::fs::read_to_string(&file_path) {
+            Ok(c) => c,
+            Err(e) => {
+                problems.push(format!("{}: {e}", file_path.display()));
+                continue;
+            }
+        };
+        let endpoint: EndpointFile = match serde_json::from_str(&contents) {
+            Ok(e) => e,
+            Err(e) => {
+                problems.push(format!("{}: invalid JSON: {e}", file_path.display()));
+                continue;
+            }
+        };
+        if let Some(scheme) = &endpoint.security {
+            if !security.verifiers.contains_key(scheme) {
+                problems.push(format!(
+                    "{}: security scheme '{scheme}' has no matching entry in security/schemes.json",
+                    file_path.display()
+                ));
+            }
+        }
+    }
+
+    (count, problems)
 }
 
 async fn handle_request(
@@ -184,6 +232,7 @@ async fn handle_request(
     let (http_status, response_body) = resolve_for_test(
         &state.endpoint,
         &state.security,
+        &state.services,
         &state.drivers,
         &state.sql_root,
         &state.http_root,
@@ -221,6 +270,7 @@ async fn handle_request(
 pub(crate) async fn resolve_for_test(
     endpoint: &EndpointFile,
     security: &SecurityConfig,
+    services: &HashMap<String, String>,
     drivers: &HashMap<String, Box<dyn SqlDriver>>,
     sql_root: &Path,
     http_root: &Path,
@@ -277,6 +327,7 @@ pub(crate) async fn resolve_for_test(
 
     match resolve::resolve_sources(
         endpoint,
+        services,
         drivers,
         sql_root,
         http_root,
@@ -337,6 +388,7 @@ pub(crate) async fn resolve_for_test(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn record_sources(
     endpoint: &EndpointFile,
+    services: &HashMap<String, String>,
     drivers: &HashMap<String, Box<dyn SqlDriver>>,
     sql_root: &Path,
     http_root: &Path,
@@ -348,6 +400,7 @@ pub(crate) async fn record_sources(
 ) -> Result<(u16, Value, HashMap<String, Option<Value>>), (String, String, String)> {
     match resolve::resolve_sources(
         endpoint,
+        services,
         drivers,
         sql_root,
         http_root,
@@ -653,6 +706,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             errors: Arc::new(ErrorRegistry::load(&root.join("errors")).unwrap()),
             security,
+            services: Arc::new(HashMap::new()),
             verifier_cache: Arc::new(crate::security::VerifierCache::new()),
             discovered_errors: Arc::new(Mutex::new(DiscoveredErrors::default())),
             discovered_errors_path: root.join("errors.discovered.json"),
@@ -723,6 +777,7 @@ mod tests {
             Arc::new(drivers),
             errors,
             security,
+            Arc::new(HashMap::new()),
             Arc::new(Mutex::new(DiscoveredErrors::default())),
             false,
         );
@@ -805,6 +860,7 @@ mod tests {
             Arc::new(drivers),
             errors,
             security,
+            Arc::new(HashMap::new()),
             Arc::new(Mutex::new(DiscoveredErrors::default())),
             false,
         );
@@ -972,7 +1028,15 @@ mod tests {
         let errors = Arc::new(ErrorRegistry::load(&root.join("config/errors")).unwrap());
         let security = Arc::new(SecurityConfig::default());
         let router =
-            build_router(&root, Arc::new(drivers), errors, security, Arc::new(Mutex::new(DiscoveredErrors::default())), true);
+            build_router(
+                &root,
+                Arc::new(drivers),
+                errors,
+                security,
+                Arc::new(HashMap::new()),
+                Arc::new(Mutex::new(DiscoveredErrors::default())),
+                true,
+            );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

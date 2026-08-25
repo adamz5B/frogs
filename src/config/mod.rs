@@ -2,7 +2,7 @@ mod connections;
 mod server;
 
 pub use connections::ConnectionConfig;
-pub use server::{Features, ServerConfig};
+pub use server::{Features, RateLimitConfig, ServerConfig};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -69,6 +69,13 @@ pub struct Config {
     pub errors: ErrorRegistry,
     pub discovered_errors: DiscoveredErrors,
     pub security: SecurityConfig,
+    /// `config/services.json` — a logical name → base URL lookup an HTTP
+    /// source can reference via `{{services.<name>}}` instead of a
+    /// hardcoded base URL. Only ever loaded (non-empty) when
+    /// `server.features.service_registry` is on — same "the toggle actually
+    /// gates behavior, not just documents intent" posture `readyz_check`/
+    /// `metrics` already have in `commands::run`.
+    pub services: HashMap<String, String>,
 }
 
 impl Config {
@@ -98,6 +105,18 @@ impl Config {
         let security =
             SecurityConfig::load(&project_root.join("security")).map_err(ConfigLoadError::Security)?;
 
+        // Gated on the feature flag, not just the file's presence — a
+        // project that's turned `serviceRegistry` off gets an empty map
+        // (every `{{services.*}}` reference resolves to an empty string,
+        // same as any other unresolvable template placeholder) even if a
+        // `services.json` happens to still be sitting on disk from before
+        // the toggle was flipped off.
+        let services = if server.features.service_registry {
+            load_json_file::<HashMap<String, String>>(&config_dir.join("services.json"))?.unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
         Ok(Config {
             root: project_root.to_path_buf(),
             server,
@@ -105,6 +124,7 @@ impl Config {
             errors,
             discovered_errors,
             security,
+            services,
         })
     }
 
@@ -191,6 +211,48 @@ mod tests {
         assert!(config.server.features.request_correlation);
         assert!(config.connections.is_empty());
         assert!(config.errors.contains(crate::errors::UNEXPECTED_ERROR_CODE));
+        assert!(config.services.is_empty());
+    }
+
+    #[test]
+    fn services_json_loads_when_the_service_registry_feature_is_on() {
+        let root = tempdir();
+        fs::create_dir_all(root.path().join("config")).unwrap();
+        fs::write(
+            root.path().join("config/server.json"),
+            r#"{ "features": { "serviceRegistry": true } }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("config/services.json"),
+            r#"{ "pricing": "https://pricing.example.com" }"#,
+        )
+        .unwrap();
+
+        let config = Config::load(root.path()).expect("fixture should load cleanly");
+        assert_eq!(config.services.get("pricing"), Some(&"https://pricing.example.com".to_string()));
+    }
+
+    #[test]
+    fn services_json_is_ignored_when_the_service_registry_feature_is_off() {
+        // Off by default, and explicitly off here — a `services.json` still
+        // sitting on disk (e.g. left over from testing with the feature on)
+        // must not leak in once the toggle is flipped back off.
+        let root = tempdir();
+        fs::create_dir_all(root.path().join("config")).unwrap();
+        fs::write(
+            root.path().join("config/server.json"),
+            r#"{ "features": { "serviceRegistry": false } }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("config/services.json"),
+            r#"{ "pricing": "https://pricing.example.com" }"#,
+        )
+        .unwrap();
+
+        let config = Config::load(root.path()).expect("fixture should load cleanly");
+        assert!(config.services.is_empty());
     }
 
     #[test]
@@ -256,8 +318,15 @@ mod tests {
     }
 
     fn tempdir() -> TempDir {
+        // A per-process atomic counter alongside PID+nanosecond timestamp —
+        // the timestamp alone has occasionally collided under heavy parallel
+        // `cargo test` load on Windows (coarser effective clock resolution
+        // than raw nanoseconds suggest); see the same fix in
+        // `commands::generate`'s own test helper.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "frogs-config-test-{}-{}",
+            "frogs-config-test-{}-{}-{n}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

@@ -163,9 +163,17 @@ async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
     let debug_mode = config.server.debug_mode;
     let errors = std::sync::Arc::new(config.errors);
     let security = std::sync::Arc::new(config.security);
+    let services = std::sync::Arc::new(config.services);
     let discovered_errors = std::sync::Arc::new(std::sync::Mutex::new(config.discovered_errors));
-    let endpoint_router =
-        crate::endpoint::build_router(&api_dir, drivers.clone(), errors, security, discovered_errors, debug_mode);
+    let endpoint_router = crate::endpoint::build_router(
+        &api_dir,
+        drivers.clone(),
+        errors,
+        security,
+        services,
+        discovered_errors,
+        debug_mode,
+    );
     let mut router = crate::server::router().merge(endpoint_router);
 
     // Each is a separate, independently-stated router merged in only when
@@ -183,12 +191,21 @@ async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
     let router = crate::server::mount_under(router, &config.server.api_root);
     // Applied last, after every route is registered (nesting under
     // apiRoot included) — see `server::apply_middleware`'s doc comment for
-    // why this ordering matters; `apply_metrics` has the same requirement,
-    // for the same reason.
+    // why this ordering matters; `apply_metrics`/`apply_rate_limit` have the
+    // same requirement, for the same reason.
     let router = crate::server::apply_middleware(router);
     let router = match metrics {
         Some(metrics) => crate::server::apply_metrics(router, metrics),
         None => router,
+    };
+    let router = if config.server.features.rate_limiting {
+        let limiter = std::sync::Arc::new(crate::server::RateLimiter::new(
+            config.server.rate_limit.requests_per_second,
+            config.server.rate_limit.burst,
+        ));
+        crate::server::apply_rate_limit(router, limiter)
+    } else {
+        router
     };
 
     Ok((router, config.server))

@@ -100,34 +100,51 @@ pub trait SqlDriver: Send + Sync + std::fmt::Debug {
     ) -> Result<Vec<SqlRow>, SqlError>;
 }
 
-/// Connects every entry in `connections.json` to a compiled-in driver
-/// implementation. A connection whose `"driver"` isn't compiled into this
-/// binary fails startup immediately with a message telling the user which
-/// Cargo feature would need to be enabled — matching the design doc's
-/// "startup validation" requirement, rather than failing confusingly on the
-/// first query.
+/// Connects one entry to a compiled-in driver implementation. A connection
+/// whose `"driver"` isn't compiled into this binary fails immediately with
+/// a message telling the user which Cargo feature would need to be enabled —
+/// matching the design doc's "startup validation" requirement, rather than
+/// failing confusingly on the first query. Shared by `connect_all` (fails
+/// fast on the first bad connection — the right posture for actually
+/// starting the server) and `try_connect_each` (tries every connection
+/// independently — what `frogs validate` needs instead).
+async fn connect_one(name: &str, conn: &ConnectionConfig) -> Result<Box<dyn SqlDriver>, SqlError> {
+    match conn.driver.as_str() {
+        #[cfg(feature = "postgres")]
+        "postgres" => Ok(Box::new(postgres::PostgresDriver::connect(conn).await?)),
+        #[cfg(feature = "sqlite")]
+        "sqlite" => Ok(Box::new(sqlite::SqliteDriver::connect(conn).await?)),
+        other => Err(SqlError::ConnectionFailed(format!(
+            "connection '{name}' uses driver '{other}', which isn't compiled into this binary \
+             (rebuild with `--features {other}` or use a build that includes it)"
+        ))),
+    }
+}
+
+/// Connects every entry in `connections.json`. Fails fast on the first bad
+/// connection — `frogs run` has no use for a half-connected set of drivers,
+/// so there's no reason to keep trying the rest once one has already failed.
 pub async fn connect_all(
     connections: &HashMap<String, ConnectionConfig>,
 ) -> Result<HashMap<String, Box<dyn SqlDriver>>, SqlError> {
     let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
-
     for (name, conn) in connections {
-        let driver: Box<dyn SqlDriver> = match conn.driver.as_str() {
-            #[cfg(feature = "postgres")]
-            "postgres" => Box::new(postgres::PostgresDriver::connect(conn).await?),
-            #[cfg(feature = "sqlite")]
-            "sqlite" => Box::new(sqlite::SqliteDriver::connect(conn).await?),
-            other => {
-                return Err(SqlError::ConnectionFailed(format!(
-                    "connection '{name}' uses driver '{other}', which isn't compiled into this binary \
-                     (rebuild with `--features {other}` or use a build that includes it)"
-                )));
-            }
-        };
-        drivers.insert(name.clone(), driver);
+        drivers.insert(name.clone(), connect_one(name, conn).await?);
     }
-
     Ok(drivers)
+}
+
+/// Tries every connection independently, collecting each one's own
+/// pass/fail result instead of stopping at the first failure — a full
+/// picture of what's broken in one pass, which is what `frogs validate`
+/// needs; `connect_all`'s fail-fast posture would only ever report the
+/// first problem found.
+pub async fn try_connect_each(connections: &HashMap<String, ConnectionConfig>) -> Vec<(String, Result<(), SqlError>)> {
+    let mut results = Vec::new();
+    for (name, conn) in connections {
+        results.push((name.clone(), connect_one(name, conn).await.map(|_driver| ())));
+    }
+    results
 }
 
 #[cfg(test)]
@@ -165,6 +182,33 @@ mod tests {
         let connections = HashMap::new();
         let drivers = connect_all(&connections).await.expect("an empty connections map is a valid, if unusual, project");
         assert!(drivers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_connect_each_reports_every_connection_not_just_the_first_failure() {
+        let mut connections = HashMap::new();
+        connections.insert(
+            "primary".to_string(),
+            ConnectionConfig { driver: "mssql".to_string(), settings: HashMap::new() },
+        );
+        connections.insert(
+            "secondary".to_string(),
+            ConnectionConfig { driver: "oracle".to_string(), settings: HashMap::new() },
+        );
+
+        let results = try_connect_each(&connections).await;
+        assert_eq!(results.len(), 2, "both connections must be attempted, not just the first");
+
+        let by_name: HashMap<&str, &Result<(), SqlError>> =
+            results.iter().map(|(name, result)| (name.as_str(), result)).collect();
+        assert!(by_name["primary"].is_err());
+        assert!(by_name["secondary"].is_err());
+    }
+
+    #[tokio::test]
+    async fn try_connect_each_of_an_empty_map_is_an_empty_report() {
+        let results = try_connect_each(&HashMap::new()).await;
+        assert!(results.is_empty());
     }
 
     #[test]
