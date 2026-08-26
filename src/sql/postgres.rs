@@ -259,6 +259,15 @@ mod tests {
     /// default since this dev environment has neither Docker nor a local
     /// Postgres. To run it: start a Postgres instance, then
     /// `DATABASE_URL_TEST=postgres://user:pass@localhost:5432/db cargo test --features postgres -- --ignored`.
+    ///
+    /// Deliberately *not* `CREATE TEMP TABLE`: a temp table is scoped to
+    /// the single session that created it, but `driver.pool` is a
+    /// connection *pool* (`PostgresDriver::connect`, `max_connections(5)`)
+    /// — the follow-up `INSERT`/`SELECT` can easily land on a different
+    /// physical connection than the one that ran the `CREATE`, where the
+    /// temp table simply doesn't exist. A real table, dropped both before
+    /// (in case a previous run panicked before cleanup) and after, avoids
+    /// that trap.
     #[tokio::test]
     #[ignore]
     async fn queries_a_real_postgres_instance() {
@@ -267,7 +276,8 @@ mod tests {
         let pool = sqlx::PgPool::connect(&url).await.expect("failed to connect");
         let driver = PostgresDriver { pool };
 
-        sqlx::query("CREATE TEMP TABLE frogs_smoke_test (vin TEXT, year INT4)")
+        sqlx::query("DROP TABLE IF EXISTS frogs_smoke_test").execute(&driver.pool).await.unwrap();
+        sqlx::query("CREATE TABLE frogs_smoke_test (vin TEXT, year INT4)")
             .execute(&driver.pool)
             .await
             .unwrap();
@@ -289,5 +299,7 @@ mod tests {
             Some(&SqlValue::Text("1HGCM82633A004352".to_string()))
         );
         assert_eq!(rows[0].get("year"), Some(&SqlValue::Int(2003)));
+
+        sqlx::query("DROP TABLE frogs_smoke_test").execute(&driver.pool).await.unwrap();
     }
 }

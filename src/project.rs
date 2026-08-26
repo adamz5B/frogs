@@ -46,10 +46,28 @@ fn is_project_root(dir: &Path) -> bool {
 /// the marker — never a hardcoded path, since a frogs project can live
 /// anywhere the user creates it.
 pub fn find_project_root(start: &Path) -> Option<PathBuf> {
+    find_project_root_within(start, None)
+}
+
+/// `find_project_root`'s real logic, plus an optional `boundary`: once the
+/// walk has checked `boundary` itself, it stops instead of continuing to
+/// `boundary`'s parent. `find_project_root` always passes `None` (climb
+/// all the way to the filesystem root — the real, intended behavior).
+/// `boundary` exists purely so a test can own the *entire* directory range
+/// the walk will ever look at, rather than the walk continuing past
+/// whatever the test created into real, ambient ancestor directories (like
+/// the OS temp directory) that are outside the test's control — see
+/// `neither_marker_present_finds_nothing`, which caught exactly this: a
+/// stray `.html` file sitting directly in `%TEMP%` made an unbounded walk
+/// from a temp subdirectory find a false "project root" there.
+fn find_project_root_within(start: &Path, boundary: Option<&Path>) -> Option<PathBuf> {
     let mut dir = start;
     loop {
         if is_project_root(dir) {
             return Some(dir.to_path_buf());
+        }
+        if boundary == Some(dir) {
+            return None;
         }
         dir = dir.parent()?;
     }
@@ -160,7 +178,26 @@ mod tests {
     fn neither_marker_present_finds_nothing() {
         let dir = tempdir();
         std::fs::write(dir.path().join("readme.txt"), "").unwrap();
-        assert_eq!(find_project_root(dir.path()), None);
+        // Bounded at `dir.path()` itself: the walk must never climb past
+        // the one directory this test actually owns and cleans up — real,
+        // ambient parents (like the OS temp directory) are outside the
+        // test's control and shouldn't matter to the result either way.
+        assert_eq!(find_project_root_within(dir.path(), Some(dir.path())), None);
+    }
+
+    #[test]
+    fn the_boundary_stops_the_walk_even_when_a_real_marker_exists_further_up() {
+        let dir = tempdir();
+        std::fs::write(dir.path().join("openapi.yaml"), "").unwrap();
+        let boundary = dir.path().join("sub");
+        let leaf = boundary.join("leaf");
+        std::fs::create_dir_all(&leaf).unwrap();
+
+        // A real marker sits at `dir` — reachable by an *unbounded* walk —
+        // but the boundary is `sub`, one level below it, so a bounded walk
+        // from `leaf` must stop at `sub` without ever checking `dir`.
+        assert_eq!(find_project_root_within(&leaf, Some(&boundary)), None);
+        assert_eq!(find_project_root(&leaf), Some(dir.path().to_path_buf()));
     }
 
     #[test]
