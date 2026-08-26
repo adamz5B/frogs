@@ -3,7 +3,7 @@ use std::path::Path;
 
 use axum::Router;
 
-use crate::config::{Config, ServerConfig};
+use crate::config::{Config, ManualTlsConfig, ServerConfig, TlsConfig, TlsMode};
 use crate::project::{require_project_root, MANIFEST_FILE};
 use crate::server::pidfile;
 use crate::webserve::WebServeConfig;
@@ -57,7 +57,8 @@ async fn run_api(root: &Path) -> io::Result<()> {
         operational_routes_display(&server_config).join(", ")
     );
 
-    serve(root, router, server_config.port).await
+    let api_dir = crate::project::api_base(root);
+    serve(root, router, server_config.port, &server_config.tls, &api_dir).await
 }
 
 /// `/healthz` (always) plus `/readyz`/`/metrics` (only when their feature
@@ -87,7 +88,10 @@ async fn run_web(root: &Path) -> io::Result<()> {
         config.not_found_page.as_ref().map(|p| format!(", notFoundPage: {p}")).unwrap_or_default()
     );
 
-    serve(root, router, config.port).await
+    // No `api/` subfolder in a web-only project — `certPath`/`keyPath`
+    // resolve relative to the project root itself, right alongside
+    // `webserve.json`.
+    serve(root, router, config.port, &config.tls, root).await
 }
 
 async fn run_both(root: &Path) -> io::Result<()> {
@@ -109,6 +113,14 @@ async fn run_both(root: &Path) -> io::Result<()> {
             web_config.port, server_config.port
         );
     }
+    if web_config.tls.mode != TlsMode::Off {
+        // Same authority split as `port` just above, for the same reason —
+        // one listener, one TLS configuration.
+        println!(
+            "note: webserve.json's own tls settings are ignored while serving both roles — config/server.json's \
+             tls settings are authoritative"
+        );
+    }
 
     // `Router::merge` combines the two as siblings: the API side's specific
     // routes (already nested under `apiRoot`, already middleware-wrapped)
@@ -118,7 +130,10 @@ async fn run_both(root: &Path) -> io::Result<()> {
     // the two (see `server::apply_middleware`'s own doc comment).
     let router = api_router.merge(web_router);
 
-    serve(root, router, server_config.port).await
+    // `config/server.json`'s `tls` is authoritative here too — same
+    // single-listener reasoning as the port-authority note above.
+    let api_dir = crate::project::api_base(root);
+    serve(root, router, server_config.port, &server_config.tls, &api_dir).await
 }
 
 /// Loads config, connects every SQL driver, and builds the fully-nested,
@@ -230,7 +245,14 @@ fn build_web_router(root: &Path) -> (Router, WebServeConfig) {
 /// Binds `port`, writes the PID file, serves `router` until Ctrl+C or an
 /// external `frogs stop`, then cleans the PID file up — the tail end every
 /// run mode (`run_api`/`run_web`/`run_both`) shares once its own router is
-/// built, regardless of which role(s) that router serves.
+/// built, regardless of which role(s) that router serves. `tls` selects
+/// plain HTTP (`TlsMode::Off`, unchanged behavior) or HTTPS via a
+/// user-supplied cert/key pair (`TlsMode::Manual`) — see
+/// `docs/frogs-https-development.md`. `tls_base` is where `tls.manual`'s
+/// `certPath`/`keyPath` resolve relative to — `api_base(root)` for
+/// `run_api`/`run_both` (matching where `config/server.json` itself, and
+/// every other path it reads, already resolve from), or `root` itself for
+/// `run_web` (no `api/` subfolder exists in a web-only project).
 ///
 /// No graceful in-flight-request draining — a deliberate scope decision,
 /// not an oversight: frogs holds no state of its own across a request (the
@@ -240,10 +262,26 @@ fn build_web_router(root: &Path) -> (Router, WebServeConfig) {
 /// clean shutdown signal wouldn't fully eliminate either, since the write
 /// can already have committed upstream before the signal arrives. Ctrl+C
 /// and an external `frogs stop` both just end the process; the `select!`
-/// below only makes sure `.frogs/run.json` doesn't linger after the
-/// terminal (Ctrl+C) case specifically, since `frogs stop` already removes
-/// it itself after terminating the process externally.
-async fn serve(root: &Path, router: Router, port: u16) -> io::Result<()> {
+/// in both `serve_http`/`serve_https` below only makes sure
+/// `.frogs/run.json` doesn't linger after the terminal (Ctrl+C) case
+/// specifically, since `frogs stop` already removes it itself after
+/// terminating the process externally.
+async fn serve(root: &Path, router: Router, port: u16, tls: &TlsConfig, tls_base: &Path) -> io::Result<()> {
+    match tls.mode {
+        TlsMode::Off => serve_http(root, router, port).await,
+        TlsMode::Manual => {
+            let manual = tls.manual.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "tls.mode is \"manual\" but tls.manual (certPath/keyPath) is missing",
+                )
+            })?;
+            serve_https(root, router, port, manual, tls_base).await
+        }
+    }
+}
+
+async fn serve_http(root: &Path, router: Router, port: u16) -> io::Result<()> {
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
@@ -253,6 +291,64 @@ async fn serve(root: &Path, router: Router, port: u16) -> io::Result<()> {
 
     let result = tokio::select! {
         result = axum::serve(listener, router) => result,
+        _ = tokio::signal::ctrl_c() => {
+            println!("received Ctrl+C, shutting down");
+            Ok(())
+        }
+    };
+
+    pidfile::remove(root)?;
+    result
+}
+
+/// `manual.certPath`/`keyPath` resolve relative to `tls_base` — see
+/// `serve`'s own doc comment for which base each caller passes and why.
+async fn serve_https(
+    root: &Path,
+    router: Router,
+    port: u16,
+    manual: &ManualTlsConfig,
+    tls_base: &Path,
+) -> io::Result<()> {
+    let addr_str = format!("0.0.0.0:{port}");
+    let addr: std::net::SocketAddr = addr_str
+        .parse()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid port {port}: {e}")))?;
+
+    let cert_path = tls_base.join(&manual.cert_path);
+    let key_path = tls_base.join(&manual.key_path);
+    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path).await.map_err(
+        |e| {
+            io::Error::new(
+                e.kind(),
+                format!("failed to load TLS cert/key ({}, {}): {e}", cert_path.display(), key_path.display()),
+            )
+        },
+    )?;
+
+    // A `std::net::TcpListener` (not tokio's), bound synchronously here so a
+    // port-already-in-use failure surfaces as an immediate `?` — same
+    // fail-before-writing-the-pidfile ordering `serve_http` gets for free
+    // from `tokio::net::TcpListener::bind`'s own early `?`. Must be put in
+    // non-blocking mode explicitly before tokio adopts it: on Unix, tokio
+    // asserts this itself (and panics in debug builds if it's missed), but
+    // that check is a silent no-op on Windows (it can't query the flag),
+    // so skipping this here would still register a *blocking* socket with
+    // the async reactor — its `accept()` calls then block the whole
+    // executor thread instead of yielding, which on the single-threaded
+    // runtime `#[tokio::test]` defaults to is a real, observed deadlock:
+    // the server's own accept loop starves every other task on that same
+    // thread, including a test's own client request waiting on it.
+    let listener = std::net::TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    let server = axum_server::from_tcp_rustls(listener, rustls_config)?;
+
+    pidfile::write(root, &pidfile::RunInfo { pid: std::process::id(), port, started_at: chrono::Utc::now() })?;
+
+    println!("listening on https://{addr_str} (Ctrl+C to stop, or `frogs stop` from another terminal)");
+
+    let result = tokio::select! {
+        result = server.serve(router.into_make_service()) => result,
         _ = tokio::signal::ctrl_c() => {
             println!("received Ctrl+C, shutting down");
             Ok(())
@@ -296,5 +392,218 @@ mod tests {
         // discovered error, including having zero of them — not a
         // never-warn setting.
         assert!(should_warn_about_discovered_errors(0, 0));
+    }
+
+    fn temp_project() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-run-tls-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// `main()`'s own `install_default()` call never runs under `cargo
+    /// test` (the test binary has no `main` of its own) — each test that
+    /// actually performs a TLS handshake needs the same install itself.
+    /// `Once`-guarded since installing twice in one test binary would
+    /// otherwise error on the second call.
+    fn ensure_crypto_provider() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
+    /// An OS-assigned free port, released immediately so `serve` (which
+    /// takes a fixed `port: u16`, not "any free port") can bind it for
+    /// real — the same small, standard bind-then-drop trick used to hand a
+    /// synchronous port number to an API that doesn't accept one directly.
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// `tls.mode: "manual"` with no `tls.manual` block at all — a config
+    /// mistake that must fail loudly before ever binding a port, not panic
+    /// or silently fall back to plain HTTP.
+    #[tokio::test]
+    async fn manual_mode_with_no_manual_config_is_a_clear_error() {
+        let root = temp_project();
+        let tls = TlsConfig { mode: TlsMode::Manual, manual: None };
+        let router = Router::new();
+
+        let err = serve(&root, router, free_port(), &tls, &root)
+            .await
+            .expect_err("tls.mode: manual with no tls.manual block must fail, not silently serve plain HTTP");
+        assert!(err.to_string().contains("tls.manual"));
+
+        // Nothing should have been bound or written for a config error this
+        // early.
+        assert!(pidfile::read(&root).unwrap().is_none());
+    }
+
+    /// A `certPath`/`keyPath` that doesn't actually resolve to a real file —
+    /// must fail with a clear message naming both paths, not panic or hang
+    /// waiting on a listener that never gets bound.
+    #[tokio::test]
+    async fn a_missing_cert_file_is_a_clear_error() {
+        ensure_crypto_provider();
+        let root = temp_project();
+        let tls = TlsConfig {
+            mode: TlsMode::Manual,
+            manual: Some(ManualTlsConfig {
+                cert_path: "does-not-exist-cert.pem".to_string(),
+                key_path: "does-not-exist-key.pem".to_string(),
+            }),
+        };
+        let router = Router::new();
+
+        let err = serve(&root, router, free_port(), &tls, &root)
+            .await
+            .expect_err("a nonexistent cert file must fail to load, not panic or hang");
+        assert!(err.to_string().contains("does-not-exist-cert.pem"));
+        assert!(err.to_string().contains("does-not-exist-key.pem"));
+
+        assert!(pidfile::read(&root).unwrap().is_none());
+    }
+
+    /// Real end-to-end proof of the whole manual-TLS path: a genuine
+    /// self-signed cert (via `rcgen`, matching this project's own
+    /// `docs/frogs-https-development.md` testing guidance — no committed
+    /// cert fixtures, no external tool needed), the real `serve` function
+    /// loading it exactly the way `run_api`/`run_both` do (from PEM files
+    /// on disk, via `config/server.json`'s `tls.manual`), and a real
+    /// `reqwest` client that only trusts *this* generated cert's own root —
+    /// proving actual TLS validation succeeds, not just "any cert accepted."
+    #[tokio::test]
+    async fn a_real_https_request_succeeds_against_a_manually_configured_cert() {
+        ensure_crypto_provider();
+        let root = temp_project();
+        // `serve`'s `tls_base` for `run_api`/`run_both` is `api_base(root)`
+        // (`<root>/api`) — see `serve`'s own doc comment — so the cert has
+        // to actually live there for this test to exercise the real path.
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = key.cert.pem();
+        std::fs::write(api_dir.join("cert.pem"), &cert_pem).unwrap();
+        std::fs::write(api_dir.join("key.pem"), key.key_pair.serialize_pem()).unwrap();
+
+        let tls = TlsConfig {
+            mode: TlsMode::Manual,
+            manual: Some(ManualTlsConfig { cert_path: "cert.pem".to_string(), key_path: "key.pem".to_string() }),
+        };
+        let port = free_port();
+        let router = Router::new().route("/hello", axum::routing::get(|| async { "hi" }));
+
+        let spawned_root = root.clone();
+        let spawned_api_dir = api_dir.clone();
+        tokio::spawn(async move {
+            let _ = serve(&spawned_root, router, port, &tls, &spawned_api_dir).await;
+        });
+        // Brief wait for the spawned task to actually bind the listener
+        // before the client below tries to connect to it.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let trusted_root = reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap();
+        let client = reqwest::Client::builder().add_root_certificate(trusted_root).build().unwrap();
+
+        let response = client
+            .get(format!("https://localhost:{port}/hello"))
+            .send()
+            .await
+            .expect("a real HTTPS request against a cert this client actually trusts should succeed");
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "hi");
+    }
+
+    /// The exact inverse of the test above: a client that does *not* trust
+    /// the self-signed cert's root must have its request rejected — proof
+    /// this is real certificate validation, not a server that happens to
+    /// accept any TLS connection regardless of trust.
+    #[tokio::test]
+    async fn a_client_that_does_not_trust_the_cert_is_rejected() {
+        ensure_crypto_provider();
+        let root = temp_project();
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(&api_dir).unwrap();
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        std::fs::write(api_dir.join("cert.pem"), key.cert.pem()).unwrap();
+        std::fs::write(api_dir.join("key.pem"), key.key_pair.serialize_pem()).unwrap();
+
+        let tls = TlsConfig {
+            mode: TlsMode::Manual,
+            manual: Some(ManualTlsConfig { cert_path: "cert.pem".to_string(), key_path: "key.pem".to_string() }),
+        };
+        let port = free_port();
+        let router = Router::new().route("/hello", axum::routing::get(|| async { "hi" }));
+
+        let spawned_root = root.clone();
+        let spawned_api_dir = api_dir.clone();
+        tokio::spawn(async move {
+            let _ = serve(&spawned_root, router, port, &tls, &spawned_api_dir).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // The default client trusts the normal public CA roots, not this
+        // one-off self-signed cert.
+        let client = reqwest::Client::new();
+        let result = client.get(format!("https://localhost:{port}/hello")).send().await;
+        assert!(result.is_err(), "a client with no reason to trust this self-signed cert must reject the connection");
+    }
+
+    /// The web-only counterpart to the two tests above: `run_web` (no
+    /// `api/` at all) resolving `webserve.json`'s own `tls.manual` — proof
+    /// that a purely static-content project really does get real HTTPS,
+    /// with `certPath`/`keyPath` resolving against the project root
+    /// (there's no `api/` subfolder to nest them under here), not
+    /// `api_base(root)` the way `run_api`/`run_both` do.
+    #[tokio::test]
+    async fn run_web_serves_real_https_from_its_own_webserve_json_tls_config() {
+        ensure_crypto_provider();
+        let root = temp_project();
+        std::fs::write(root.join("index.html"), "hello from static content").unwrap();
+
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = key.cert.pem();
+        std::fs::write(root.join("cert.pem"), &cert_pem).unwrap();
+        std::fs::write(root.join("key.pem"), key.key_pair.serialize_pem()).unwrap();
+
+        let port = free_port();
+        std::fs::write(
+            root.join("webserve.json"),
+            format!(
+                r#"{{
+                    "startPage": "index.html",
+                    "port": {port},
+                    "tls": {{
+                        "mode": "manual",
+                        "manual": {{ "certPath": "cert.pem", "keyPath": "key.pem" }}
+                    }}
+                }}"#
+            ),
+        )
+        .unwrap();
+
+        let spawned_root = root.clone();
+        tokio::spawn(async move {
+            let _ = run_web(&spawned_root).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let trusted_root = reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap();
+        let client = reqwest::Client::builder().add_root_certificate(trusted_root).build().unwrap();
+
+        let response = client
+            .get(format!("https://localhost:{port}/"))
+            .send()
+            .await
+            .expect("a real HTTPS request against run_web's own tls config should succeed");
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "hello from static content");
     }
 }

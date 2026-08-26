@@ -297,7 +297,7 @@ mod tests {
     async fn serves_the_start_page_at_root() {
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "<html>hi</html>").unwrap();
-        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None };
+        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None, tls: Default::default() };
         let addr = spawn(router(dir.clone(), config)).await;
 
         let response = reqwest::get(format!("http://{addr}/")).await.unwrap();
@@ -314,7 +314,7 @@ mod tests {
         std::fs::write(dir.join("index.html"), "home").unwrap();
         std::fs::create_dir_all(dir.join("css")).unwrap();
         std::fs::write(dir.join("css/style.css"), "body { color: red; }").unwrap();
-        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None };
+        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None, tls: Default::default() };
         let addr = spawn(router(dir.clone(), config)).await;
 
         let response = reqwest::get(format!("http://{addr}/css/style.css")).await.unwrap();
@@ -329,7 +329,7 @@ mod tests {
     async fn a_missing_file_with_no_not_found_page_gets_a_generic_404() {
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "home").unwrap();
-        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None };
+        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None, tls: Default::default() };
         let addr = spawn(router(dir.clone(), config)).await;
 
         let response = reqwest::get(format!("http://{addr}/nope.html")).await.unwrap();
@@ -348,6 +348,7 @@ mod tests {
             start_page: "index.html".to_string(),
             port: 8080,
             not_found_page: Some("404.html".to_string()),
+            tls: Default::default(),
         };
         let addr = spawn(router(dir.clone(), config)).await;
 
@@ -375,7 +376,7 @@ mod tests {
         // A real file that must stay unreachable, sitting right outside the
         // served root — proves containment, not just the `..` string check.
         std::fs::write(dir.join("../frogs-webserve-outside-secret.txt"), "top secret").unwrap();
-        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None };
+        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None, tls: Default::default() };
         let addr = spawn(router(dir.clone(), config)).await;
 
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -397,7 +398,7 @@ mod tests {
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "home").unwrap();
         std::fs::write(dir.join("webserve.json"), r#"{"startPage":"index.html"}"#).unwrap();
-        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None };
+        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None, tls: Default::default() };
         let addr = spawn(router(dir.clone(), config)).await;
 
         let response = reqwest::get(format!("http://{addr}/webserve.json")).await.unwrap();
@@ -411,7 +412,7 @@ mod tests {
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "home").unwrap();
         std::fs::create_dir_all(dir.join("css")).unwrap();
-        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None };
+        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None, tls: Default::default() };
         let addr = spawn(router(dir.clone(), config)).await;
 
         let response = reqwest::get(format!("http://{addr}/css")).await.unwrap();
@@ -458,7 +459,7 @@ mod tests {
     async fn a_fresh_request_gets_etag_and_last_modified_headers() {
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "home").unwrap();
-        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None };
+        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None, tls: Default::default() };
         let addr = spawn(router(dir.clone(), config)).await;
 
         let response = reqwest::get(format!("http://{addr}/")).await.unwrap();
@@ -474,7 +475,7 @@ mod tests {
     async fn a_matching_if_none_match_gets_a_304_with_no_body() {
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "home").unwrap();
-        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None };
+        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None, tls: Default::default() };
         let addr = spawn(router(dir.clone(), config)).await;
         let client = reqwest::Client::new();
 
@@ -494,7 +495,7 @@ mod tests {
     async fn a_non_matching_if_none_match_gets_a_fresh_200() {
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "home").unwrap();
-        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None };
+        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None, tls: Default::default() };
         let addr = spawn(router(dir.clone(), config)).await;
         let client = reqwest::Client::new();
 
@@ -514,7 +515,7 @@ mod tests {
     async fn a_matching_if_modified_since_gets_a_304() {
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "home").unwrap();
-        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None };
+        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None, tls: Default::default() };
         let addr = spawn(router(dir.clone(), config)).await;
         let client = reqwest::Client::new();
 
@@ -536,7 +537,7 @@ mod tests {
     async fn an_if_modified_since_from_before_the_files_mtime_gets_a_fresh_200() {
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "home").unwrap();
-        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None };
+        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None, tls: Default::default() };
         let addr = spawn(router(dir.clone(), config)).await;
         let client = reqwest::Client::new();
 
@@ -560,7 +561,7 @@ mod tests {
         // matching) If-Modified-Since and produce a false 304.
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "home").unwrap();
-        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None };
+        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None, tls: Default::default() };
         let addr = spawn(router(dir.clone(), config)).await;
         let client = reqwest::Client::new();
 

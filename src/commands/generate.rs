@@ -278,7 +278,8 @@ fn generate_web(root: &Path, web_files: &[PathBuf]) -> io::Result<()> {
 
     let not_found_page = names.iter().find(|name| name.as_str() == "404.html").cloned();
 
-    let config = crate::webserve::WebServeConfig { start_page, port: 8080, not_found_page };
+    let config =
+        crate::webserve::WebServeConfig { start_page, port: 8080, not_found_page, tls: Default::default() };
     crate::webserve::save_to(&webserve_path, &config)?;
 
     println!(

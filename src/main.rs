@@ -93,6 +93,14 @@ enum TestCommand {
 
 #[tokio::main]
 async fn main() {
+    // Must happen before any TLS operation (an HTTPS `frogs run`, or any
+    // outbound `reqwest`/`sqlx` TLS connection) — see the doc comment on
+    // this dependency in Cargo.toml for why rustls needs this told to it
+    // explicitly rather than picking a default on its own.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("installing the process-wide rustls crypto provider should only ever be attempted once");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

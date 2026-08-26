@@ -41,6 +41,48 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// TLS mode for `frogs run`'s listener — `off` (default, unchanged plain
+/// HTTP) or `manual` (a user-supplied cert+key PEM pair). `acme` (automatic
+/// Let's Encrypt provisioning, per `docs/frogs-https-development.md`) is a
+/// deliberate follow-up, not built yet — `"mode": "acme"` fails to parse
+/// with a clear error rather than silently falling back to plain HTTP,
+/// since quietly serving plaintext instead of whatever TLS mode was
+/// actually configured would be exactly the wrong failure mode here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsMode {
+    #[default]
+    Off,
+    Manual,
+}
+
+/// A user-supplied certificate + private key PEM pair — the "boring,
+/// expected option, for anyone already managing certs another way" per
+/// `docs/frogs-https-development.md`. Paths are relative to the project
+/// root, same convention `connections.json`'s SQLite `database` field
+/// already uses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualTlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
+}
+
+/// `config/server.json`'s `tls` block (also reused by `webserve.json` for a
+/// purely static-content project — see `webserve::WebServeConfig::tls` —
+/// since either config surface can be the one and only listener a project
+/// actually serves). `manual` is only actually read when `mode` is
+/// `Manual` — same "the file can hold settings for a mode that isn't
+/// active" posture `rateLimit`/`services.json` already have.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsConfig {
+    #[serde(default)]
+    pub mode: TlsMode,
+    #[serde(default)]
+    pub manual: Option<ManualTlsConfig>,
+}
+
 /// Independently toggleable capabilities — none of them imply a deployment
 /// "mode"; a monolith and a split-out microservice both just pick whichever
 /// of these they need. `metrics`/`readyzCheck`/`requestCorrelation` and
@@ -98,6 +140,11 @@ pub struct ServerConfig {
     /// posture the rest of `server.json` already has.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    /// Off by default — see `TlsMode`'s doc comment. When `manual`, `frogs
+    /// run` serves HTTPS via `axum-server`'s rustls acceptor instead of
+    /// plain HTTP, using this same field's `manual.certPath`/`keyPath`.
+    #[serde(default)]
+    pub tls: TlsConfig,
     /// Not part of the original design doc (which never pins down a port) —
     /// a sensible default so `frogs run` has somewhere to bind.
     #[serde(default = "default_port")]
@@ -120,6 +167,7 @@ impl Default for ServerConfig {
             auto_migrate_endpoints: true,
             discovered_errors_warn_threshold: 20,
             rate_limit: RateLimitConfig::default(),
+            tls: TlsConfig::default(),
             port: 8080,
             api_root: String::new(),
         }
@@ -161,6 +209,34 @@ mod tests {
             serde_json::from_str(r#"{ "rateLimit": { "requestsPerSecond": 5, "burst": 15 } }"#).unwrap();
         assert_eq!(config.rate_limit.requests_per_second, 5);
         assert_eq!(config.rate_limit.burst, 15);
+    }
+
+    #[test]
+    fn tls_defaults_to_off_with_no_manual_config_when_absent_from_the_file() {
+        let config: ServerConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.tls.mode, TlsMode::Off);
+        assert!(config.tls.manual.is_none());
+    }
+
+    #[test]
+    fn tls_manual_mode_is_read_as_camel_case() {
+        let config: ServerConfig = serde_json::from_str(
+            r#"{ "tls": { "mode": "manual", "manual": { "certPath": "tls/cert.pem", "keyPath": "tls/key.pem" } } }"#,
+        )
+        .unwrap();
+        assert_eq!(config.tls.mode, TlsMode::Manual);
+        let manual = config.tls.manual.expect("manual config should be present");
+        assert_eq!(manual.cert_path, "tls/cert.pem");
+        assert_eq!(manual.key_path, "tls/key.pem");
+    }
+
+    #[test]
+    fn tls_mode_acme_is_not_yet_a_recognized_value() {
+        // Deliberate: `acme` isn't built yet (see `TlsMode`'s doc comment) —
+        // this must fail to parse, not silently fall back to `off`.
+        let err = serde_json::from_str::<ServerConfig>(r#"{ "tls": { "mode": "acme" } }"#)
+            .expect_err("an unimplemented TLS mode must fail to parse, not silently serve plain HTTP");
+        assert!(err.to_string().contains("acme") || err.to_string().to_lowercase().contains("unknown variant"));
     }
 
     #[test]

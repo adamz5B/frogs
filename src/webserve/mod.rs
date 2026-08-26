@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) use serve::router;
 
+use crate::config::TlsConfig;
+
 fn default_port() -> u16 {
     8080
 }
@@ -29,6 +31,14 @@ pub struct WebServeConfig {
     /// `webserve::serve::not_found_response`.
     #[serde(rename = "notFoundPage", default, skip_serializing_if = "Option::is_none")]
     pub not_found_page: Option<String>,
+    /// Only meaningful for a standalone web-only `frogs run` — a project
+    /// serving both roles gets its TLS settings from `config/server.json`
+    /// instead (see `commands::run::run_both`), same authority split its
+    /// `port` field already has. `certPath`/`keyPath` resolve relative to
+    /// the project root here (there's no `api/` subfolder in a web-only
+    /// project to nest them under).
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 #[derive(Debug)]
@@ -84,7 +94,7 @@ mod tests {
 
     #[test]
     fn a_missing_not_found_page_is_omitted_from_the_written_file() {
-        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None };
+        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None, tls: Default::default() };
         let json = serde_json::to_string(&config).unwrap();
         assert!(!json.contains("notFoundPage"));
     }
@@ -95,6 +105,7 @@ mod tests {
             start_page: "index.html".to_string(),
             port: 8081,
             not_found_page: Some("404.html".to_string()),
+            tls: TlsConfig::default(),
         };
         let dir = std::env::temp_dir().join(format!(
             "frogs-webserve-test-{}-{}",

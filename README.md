@@ -2,7 +2,7 @@
 
 **F**ree **R**ust **O**penAPI **G**enerated **S**erver — a config-driven API server. Give it an OpenAPI spec plus per-endpoint mapping files (SQL/HTTP "sources" mapped onto response fields), and it serves real traffic without hand-written handler code.
 
-> **Status: early development.** This is a from-scratch, work-in-progress implementation of the design in [`docs/`](docs/) — useful as a look at where the project is, not yet something to run in production. See [Current status](#current-status-vs-the-roadmap) below for exactly what works today.
+> **Status: early development.** This is a from-scratch, work-in-progress implementation — useful as a look at where the project is, not yet something to run in production. See [Current status](#current-status-vs-the-roadmap) below for exactly what works today.
 
 ## What it does today
 
@@ -25,6 +25,7 @@
 - **Rate limiting**: a global (whole-process, not per-client) token bucket, on only when `features.rateLimiting` is set — `config/server.json`'s `rateLimit.requestsPerSecond`/`burst` control refill rate and how much burst traffic is absorbed before a request gets a `429` with a `Retry-After` header.
 - **`frogs drivers list`**: prints which SQL drivers this specific binary was compiled with — a compile-time fact, not a project setting, so it works the same from anywhere. `connections.json` referencing a driver the binary wasn't built with already fails fast at startup with a clear message, not a confusing failure on the first query.
 - **`frogs validate`**: a read-only dry run of everything `frogs run` would otherwise only surface by actually starting — config loading, every configured SQL connection (tried independently, so one bad connection doesn't hide problems with the rest), `openapi.yaml`/`webserve.json` parsing, and every endpoint file (malformed JSON, a security scheme with no matching verifier). Never binds a port or writes `.frogs/` state; exits non-zero if anything's wrong — safe to run repeatedly, e.g. as a pre-deploy CI check.
+- **HTTPS**: `config/server.json`'s `tls.mode` — `off` (default, unchanged plain HTTP) or `manual` (a user-supplied `tls.manual.certPath`/`keyPath` PEM pair, served via `rustls` — no OpenSSL/system-TLS dependency). Only for API-role projects (`run`/`run_both`), since a purely static-content project has no `server.json` to hold the setting. Automatic Let's Encrypt provisioning (`acme` mode) is designed but not built yet — setting `"mode": "acme"` fails to parse rather than silently falling back to plain HTTP.
 - **Small binaries**: a size-tuned release profile plus per-driver feature flags keep a Postgres-only build around 3.7MB, SQLite-only around 3.2MB.
 
 ## Quickstart
@@ -46,7 +47,7 @@ Or start a project of your own from scratch:
 mkdir my-api && cd my-api
 # ... write your own openapi.yaml here, then ...
 frogs generate              # scaffolds api/config/, api/security/, and a stub per operation
-# ... fill in each stub's sources/response mapping under api/datasources/endpoints/ (see docs/) ...
+# ... fill in each stub's sources/response mapping under api/datasources/endpoints/ ...
 frogs run
 frogs stop                  # from another terminal
 ```
@@ -96,13 +97,7 @@ examples/
 ├── cars-demo/         # an API project — openapi.yaml at root, everything else under api/
 ├── library-demo/      # both roles at once — a real SQLite-backed API plus a static front end, one process
 └── static-site-demo/  # a static-content project — no api/ at all, just webserve.json + assets
-docs/                  # the full design spec and phased implementation roadmap
 ```
-
-## Documentation
-
-- [`docs/datasource-schema-design.md`](docs/datasource-schema-design.md) — the full config/schema design: directory layout, endpoint mapping format, error registry, OpenAPI-to-stub generation algorithm, plugin system, testing framework. This is the authoritative spec; the code aims to match it, and any deliberate deviation is called out in code comments where it happens.
-- [`docs/implementation-roadmap.md`](docs/implementation-roadmap.md) — the phased build order this project follows.
 
 ## Current status vs. the roadmap
 
@@ -112,7 +107,7 @@ docs/                  # the full design spec and phased implementation roadmap
 - **Phase 3 (Security): done.** `security/schemes.json` + `security/verifiers/*.json` config loading (fails closed at startup on a missing/malformed verifier), `validIf` parsing and evaluation, verifier execution and route enforcement (a protected route rejects a missing/wrong credential and accepts a valid one), TTL-based verifier result caching, and `openapi.yaml` → `generate` wiring so a protected operation's scheme is baked into a freshly generated stub automatically.
 - **Phase 4 (Write operations): done.** POST/PUT/PATCH/DELETE routing with `successStatus` applied to the real response, `body.*`/bare-`body` parameters, array-typed parameters (JSON-encoded for SQL, real JSON passthrough for an HTTP body's whole-value `"{{name}}"` form), and `context.transactionId` shared across every source in a request. Verified against a real, file-backed SQLite database with a genuine `INSERT ... RETURNING` — the row was still there after the server was stopped, read back by a separate process.
 - **Phase 5 (Testing framework): done.** `*.test.json` schema, mock-substitution execution (a per-source literal value or a `{"fail": "<code>"}`), `$any`/`$type:<name>` expectation matching, the `frogs test` runner, request/response sequencing with per-file `memory` and save/transform steps, and `frogs test record` to capture a real request's actual per-source values as a new case's mocks.
-- **Phase 6 (Web server / static-content serving): done.** Now a real phase in [`docs/implementation-roadmap.md`](docs/implementation-roadmap.md), not just an ad-hoc extension. A real `webserve.json` schema plus `generate --role api|web`; safe static file serving (percent-decoded paths, `..` rejected outright, canonicalize-and-contain against symlink escapes, a small built-in MIME table, a custom 404 page); basic HTTP caching (weak `ETag`/`Last-Modified`, real `304 Not Modified` responses honoring `If-None-Match`/`If-Modified-Since` with correct RFC 7232 precedence). A project can be an API, a static site, or **both from one process**: API-side content always lives under a fixed `api/` subfolder (so a static site's own content only has to avoid one reserved name, not several), `config/server.json`'s `apiRoot` field mounts the whole API under a URL prefix via a real router-level nest so both roles can coexist without colliding on the same paths, and `generate` now scaffolds every config file (`server.json`, `config/errors/core.json` with real working defaults; `connections.json`/`security/schemes.json` left empty, since only a human can supply real credentials or verifier logic) rather than just endpoint stubs. `frogs run`/`frogs stop` pick API-only, web-only, or both-merged-into-one-listener from what's on disk, with zero changes needed to `frogs stop` itself.
+- **Phase 6 (Web server / static-content serving): done.** Not part of the original design, added later. A real `webserve.json` schema plus `generate --role api|web`; safe static file serving (percent-decoded paths, `..` rejected outright, canonicalize-and-contain against symlink escapes, a small built-in MIME table, a custom 404 page); basic HTTP caching (weak `ETag`/`Last-Modified`, real `304 Not Modified` responses honoring `If-None-Match`/`If-Modified-Since` with correct RFC 7232 precedence). A project can be an API, a static site, or **both from one process**: API-side content always lives under a fixed `api/` subfolder (so a static site's own content only has to avoid one reserved name, not several), `config/server.json`'s `apiRoot` field mounts the whole API under a URL prefix via a real router-level nest so both roles can coexist without colliding on the same paths, and `generate` now scaffolds every config file (`server.json`, `config/errors/core.json` with real working defaults; `connections.json`/`security/schemes.json` left empty, since only a human can supply real credentials or verifier logic) rather than just endpoint stubs. `frogs run`/`frogs stop` pick API-only, web-only, or both-merged-into-one-listener from what's on disk, with zero changes needed to `frogs stop` itself.
 - **Phase 7** (deployment/operational polish): **all application-level items done.** `/metrics` and `/readyz`; the `discoveredErrorsWarnThreshold` startup notice, backed by real observe-time recording of unclassified error codes into `config/errors.discovered.json` (this didn't exist before Phase 7 — only the read side did); `frogs errors freeze` to batch that scratch file into the canonical registry; the service registry (`config/services.json`, gated on `features.serviceRegistry`, reachable from an HTTP source as `{{services.<name>}}`); rate limiting (a global token bucket, gated on `features.rateLimiting`, configured via `server.json`'s `rateLimit`); `frogs drivers list` plus the startup validation half of the driver-matrix item; and `frogs validate`. The one item left isn't application code at all: the *official CI-published prebuilt-binary release matrix* (actual GitHub Actions building/publishing `server-postgres`/`server-sqlite`/`server-full` binaries) is release/CI infrastructure, genuinely a different kind of work from everything else on this list.
 - **Phase 8** (WASM plugins): postponed — the design needs another pass (`wasmtime` is a real, sizable dependency, worth reconsidering against this project's "small binaries" priority) before it's scheduled for real.
 

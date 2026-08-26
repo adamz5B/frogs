@@ -198,6 +198,40 @@ mod tests {
         assert!(purged.is_empty());
     }
 
+    /// The one case `skips_an_entry_already_classified_in_config_errors`
+    /// doesn't cover: *every* discovered entry is already classified, so
+    /// there's nothing left to actually write — `to_write` stays empty.
+    /// Real, previously-unverified question: does `freeze` correctly skip
+    /// creating `config/errors/discovered-<date>.json` at all in that case
+    /// (rather than writing an empty file), while still purging the
+    /// scratch file and reporting what it skipped?
+    #[test]
+    fn nothing_new_to_write_when_every_discovered_entry_is_already_classified() {
+        let root = temp_project();
+        fs::create_dir_all(root.join("api/config/errors")).unwrap();
+        fs::write(
+            root.join("api/config/errors/core.json"),
+            r#"{ "auth.invalid_credentials": { "httpStatus": 401, "exposeDetail": true } }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("api/config/errors.discovered.json"),
+            format!(r#"{{ "auth.invalid_credentials": {} }}"#, discovered_entry_json(403, true)),
+        )
+        .unwrap();
+
+        assert!(freeze(&root).is_ok());
+
+        assert!(
+            !dated_output_path(&root).exists(),
+            "nothing new to freeze means no dated file should be written at all"
+        );
+
+        let purged = fs::read_to_string(root.join("api/config/errors.discovered.json")).unwrap();
+        let purged: HashMap<String, serde_json::Value> = serde_json::from_str(&purged).unwrap();
+        assert!(purged.is_empty(), "the scratch file should still be purged even when nothing was frozen");
+    }
+
     #[test]
     fn a_second_freeze_the_same_day_merges_rather_than_clobbers() {
         let root = temp_project();

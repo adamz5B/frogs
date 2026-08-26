@@ -22,12 +22,31 @@ sqlx = { version = "0.8", optional = true, default-features = false, features = 
 # rustls (not native-tls/openssl) to stay consistent with the sqlx driver
 # choice and avoid pulling in a second TLS stack — matters for binary size.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Serves the axum `Router` over TLS — `rustls`, not its default
+# `tls-native-tls`, for the same reason every other TLS choice in this
+# project is rustls: no OpenSSL/system-TLS dependency, keeps the
+# single-static-binary promise intact. See docs/frogs-https-development.md.
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls"] }
+# Selects one process-wide TLS crypto provider explicitly. rustls 0.23
+# refuses to guess when a dependency graph this size ends up with more than
+# one candidate compiled in (reqwest, axum-server, and sqlx's own
+# rustls-tls features each pull rustls independently, and don't all agree
+# on a default) — `ring` over `aws-lc-rs`: no C/cmake build toolchain
+# required, consistent with this project's "just run it" priority.
+# Installed once, at process startup — see `main`'s first line.
+rustls = { version = "0.23", features = ["ring"] }
 serde_yaml = "0.9"
 # Already an indirect dependency via reqwest -> url; pulled in directly here
 # so http::execute can percent-encode a templated value before it's spliced
 # into a URL, instead of hand-rolling encoding logic for something this
 # easy to get subtly wrong.
 percent-encoding = "2"
+
+[dev-dependencies]
+# Generates a self-signed cert + key entirely in-memory at test time — no
+# committed cert fixtures, no external tool (mkcert) needed in CI. See
+# docs/frogs-https-development.md's "Automated/integration tests" section.
+rcgen = "0.13"
 
 [features]
 default = ["postgres"]

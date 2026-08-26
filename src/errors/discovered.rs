@@ -122,6 +122,21 @@ mod tests {
     }
 
     #[test]
+    fn a_hand_corrupted_file_starts_empty_rather_than_failing_to_load() {
+        // Per this struct's own doc comment: an auto-managed scratch file
+        // that's been hand-corrupted or truncated shouldn't block startup —
+        // starting fresh is the safe recovery, same "collapse to nothing to
+        // act on" posture `server::pidfile::read` has for its own run.json.
+        let path = tempfile();
+        fs::write(&path, "{ not valid json").unwrap();
+
+        let discovered = DiscoveredErrors::load(&path).unwrap();
+        assert!(discovered.is_empty(), "a corrupted scratch file must load as empty, not error out");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn record_then_reload_round_trips() {
         let path = tempfile();
         let mut discovered = DiscoveredErrors::load(&path).unwrap();

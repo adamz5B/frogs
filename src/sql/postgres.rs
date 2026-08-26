@@ -196,6 +196,65 @@ mod tests {
         assert_eq!(order, vec!["id"]);
     }
 
+    fn config_with(settings: &[(&str, serde_json::Value)]) -> ConnectionConfig {
+        ConnectionConfig {
+            driver: "postgres".to_string(),
+            settings: settings.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+        }
+    }
+
+    #[test]
+    fn missing_database_is_a_clear_connection_error() {
+        let config = config_with(&[]);
+        let err = build_connection_url(&config).expect_err("missing 'database' must fail, not build a broken URL");
+        assert!(matches!(err, SqlError::ConnectionFailed(_)));
+        assert!(err.to_string().contains("database"));
+    }
+
+    #[test]
+    fn defaults_host_port_and_user_when_not_configured() {
+        let config = config_with(&[("database", serde_json::json!("vehicles"))]);
+        let url = build_connection_url(&config).unwrap();
+        assert_eq!(url, "postgres://postgres:@localhost:5432/vehicles");
+    }
+
+    #[test]
+    fn uses_explicit_host_port_user_and_database() {
+        let config = config_with(&[
+            ("host", serde_json::json!("db.internal")),
+            ("port", serde_json::json!(6543)),
+            ("user", serde_json::json!("app")),
+            ("database", serde_json::json!("vehicles")),
+        ]);
+        let url = build_connection_url(&config).unwrap();
+        assert_eq!(url, "postgres://app:@db.internal:6543/vehicles");
+    }
+
+    #[test]
+    fn resolves_the_password_from_the_named_env_var() {
+        // SAFETY: this test doesn't run concurrently with anything else
+        // that reads/writes this specific env var.
+        unsafe {
+            std::env::set_var("FROGS_TEST_PG_PASSWORD", "s3cret");
+        }
+        let config = config_with(&[
+            ("database", serde_json::json!("vehicles")),
+            ("passwordEnv", serde_json::json!("FROGS_TEST_PG_PASSWORD")),
+        ]);
+        let url = build_connection_url(&config).unwrap();
+        assert_eq!(url, "postgres://postgres:s3cret@localhost:5432/vehicles");
+    }
+
+    #[test]
+    fn an_unset_password_env_var_falls_back_to_an_empty_password_not_an_error() {
+        let config = config_with(&[
+            ("database", serde_json::json!("vehicles")),
+            ("passwordEnv", serde_json::json!("FROGS_TEST_PG_PASSWORD_DEFINITELY_UNSET")),
+        ]);
+        let url = build_connection_url(&config).unwrap();
+        assert_eq!(url, "postgres://postgres:@localhost:5432/vehicles");
+    }
+
     /// Real round-trip test against a live Postgres instance — not run by
     /// default since this dev environment has neither Docker nor a local
     /// Postgres. To run it: start a Postgres instance, then
