@@ -182,10 +182,6 @@ impl ErrorRegistry {
             .unwrap_or_else(|| &self.codes[UNEXPECTED_ERROR_CODE])
     }
 
-    pub fn contains(&self, code: &str) -> bool {
-        self.codes.contains_key(code)
-    }
-
     pub fn len(&self) -> usize {
         self.codes.len()
     }
@@ -213,7 +209,7 @@ mod tests {
             }"#,
         );
         let registry = ErrorRegistry::load(dir.path()).expect("fixture should load cleanly");
-        assert!(registry.contains(UNEXPECTED_ERROR_CODE));
+        assert!(registry.get(UNEXPECTED_ERROR_CODE).is_some());
         assert_eq!(registry.lookup("auth.invalid_credentials").http_status, 401);
     }
 
@@ -223,7 +219,7 @@ mod tests {
         let missing = dir.path().join("does-not-exist");
         let registry = ErrorRegistry::load(&missing).expect("missing dir should not fail load");
         assert_eq!(registry.len(), 1); // just the synthesized unexpected.error
-        assert!(registry.contains(UNEXPECTED_ERROR_CODE));
+        assert!(registry.get(UNEXPECTED_ERROR_CODE).is_some());
     }
 
     #[test]

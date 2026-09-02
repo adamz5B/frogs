@@ -177,16 +177,16 @@ impl ResponseField {
     /// `resolve::build_field`/`build_field_against_row`) before ever
     /// reaching here — an array field has no single dot-path, it has a
     /// `source` and an `items` map instead.
-    pub fn from_path(&self) -> &str {
+    pub fn dot_path(&self) -> &str {
         match self {
             ResponseField::Plain(path) => path,
             ResponseField::Detailed(detail) => &detail.from,
-            ResponseField::Array(_) => unreachable!("ResponseField::Array must be handled before from_path is called"),
+            ResponseField::Array(_) => unreachable!("ResponseField::Array must be handled before dot_path is called"),
         }
     }
 
     /// `None` for a `Plain` field — nothing to format, pass the resolved
-    /// value straight through. Never called for `Array` — see `from_path`.
+    /// value straight through. Never called for `Array` — see `dot_path`.
     pub fn detail(&self) -> Option<&DetailedField> {
         match self {
             ResponseField::Plain(_) => None,
@@ -243,8 +243,8 @@ mod tests {
         let ResponseShape::Fields(response) = &endpoint.response else {
             panic!("getCarByVin's response is an ordinary flat field map, not an array");
         };
-        assert_eq!(response["vin"].from_path(), "sources.car.vin");
-        assert_eq!(response["price"].from_path(), "sources.pricing.amount");
+        assert_eq!(response["vin"].dot_path(), "sources.car.vin");
+        assert_eq!(response["price"].dot_path(), "sources.pricing.amount");
 
         assert_eq!(response["year"].detail().unwrap().format.as_deref(), Some("integer"));
         let price = response["price"].detail().unwrap();
@@ -346,7 +346,7 @@ mod tests {
             panic!("expected a top-level array response");
         };
         assert_eq!(array.source, "sources.cars");
-        assert_eq!(array.items["vin"].from_path(), "vin");
+        assert_eq!(array.items["vin"].dot_path(), "vin");
     }
 
     #[test]
@@ -364,7 +364,7 @@ mod tests {
             panic!("expected the ordinary flat field map");
         };
         assert!(matches!(&fields["items"], ResponseField::Array(array) if array.source == "sources.cars"));
-        assert_eq!(fields["total"].from_path(), "sources.count.total");
+        assert_eq!(fields["total"].dot_path(), "sources.count.total");
     }
 
     #[test]

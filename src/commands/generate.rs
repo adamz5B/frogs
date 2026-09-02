@@ -1186,9 +1186,9 @@ mod tests {
         scaffold_config(&api_root).unwrap();
 
         let registry = crate::errors::ErrorRegistry::load(&api_root.join("config/errors")).unwrap();
-        assert!(registry.contains("datasource.sql.not_found"));
-        assert!(registry.contains("auth.invalid_credentials"));
-        assert!(registry.contains(crate::errors::UNEXPECTED_ERROR_CODE));
+        assert!(registry.get("datasource.sql.not_found").is_some());
+        assert!(registry.get("auth.invalid_credentials").is_some());
+        assert!(registry.get(crate::errors::UNEXPECTED_ERROR_CODE).is_some());
 
         let _ = std::fs::remove_dir_all(&root);
     }

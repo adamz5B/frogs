@@ -2,7 +2,7 @@ mod connections;
 mod server;
 
 pub use connections::ConnectionConfig;
-pub use server::{Features, ManualTlsConfig, RateLimitConfig, ServerConfig, TlsConfig, TlsMode};
+pub use server::{ManualTlsConfig, ServerConfig, TlsConfig, TlsMode};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -63,7 +63,6 @@ fn load_json_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, ConfigL
 /// plus the sibling `<project root>/security/` directory.
 #[derive(Debug)]
 pub struct Config {
-    pub root: PathBuf,
     pub server: ServerConfig,
     pub connections: HashMap<String, ConnectionConfig>,
     pub errors: ErrorRegistry,
@@ -118,7 +117,6 @@ impl Config {
         };
 
         Ok(Config {
-            root: project_root.to_path_buf(),
             server,
             connections,
             errors,
@@ -195,7 +193,7 @@ mod tests {
             .expect("connections.json should define vehicles_db");
         assert_eq!(vehicles_db.driver, "postgres");
 
-        assert!(config.errors.contains("auth.invalid_credentials"));
+        assert!(config.errors.get("auth.invalid_credentials").is_some());
         assert!(config.discovered_errors.is_empty());
 
         assert_eq!(config.security.schemes["apiKeyAuth"].verifier, "apiKeyVerifier.json");
@@ -210,7 +208,7 @@ mod tests {
         assert!(!config.server.debug_mode);
         assert!(config.server.features.request_correlation);
         assert!(config.connections.is_empty());
-        assert!(config.errors.contains(crate::errors::UNEXPECTED_ERROR_CODE));
+        assert!(config.errors.get(crate::errors::UNEXPECTED_ERROR_CODE).is_some());
         assert!(config.services.is_empty());
     }
 

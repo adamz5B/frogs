@@ -232,11 +232,10 @@ fn file_response(status: StatusCode, path: &Path, request_headers: Option<&Heade
 }
 
 fn not_found_response(state: &ServeState) -> Response {
-    if let Some(page) = &state.config.not_found_page {
-        if let Some(path) = safe_existing_file(state, page) {
+    if let Some(page) = &state.config.not_found_page
+        && let Some(path) = safe_existing_file(state, page) {
             return file_response(StatusCode::NOT_FOUND, &path, None);
         }
-    }
     (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/plain; charset=utf-8")], "404 Not Found").into_response()
 }
 

@@ -241,9 +241,11 @@ mod tests {
 
     #[test]
     fn round_trips_through_serialize_and_deserialize() {
-        let mut config = ServerConfig::default();
-        config.api_root = "/api".to_string();
-        config.port = 9090;
+        let config = ServerConfig {
+            api_root: "/api".to_string(),
+            port: 9090,
+            ..ServerConfig::default()
+        };
 
         let json = serde_json::to_string(&config).unwrap();
         let reloaded: ServerConfig = serde_json::from_str(&json).unwrap();

@@ -57,6 +57,14 @@ impl DiscoveredErrors {
         fs::write(path, json)
     }
 
+    /// Not called anywhere in the live request path yet — the design doc's
+    /// 3-tier lookup (canonical registry -> `errors.discovered.json` ->
+    /// `unexpected.error`) only has tiers 1 and 3 wired up in
+    /// `endpoint::error_envelope` today, so a hand-edited discovered entry
+    /// (before `errors freeze` promotes it) currently has no effect on a
+    /// live response. Kept, tested, and documented rather than deleted:
+    /// this is a real gap to close deliberately, not dead code to discard.
+    #[allow(dead_code)]
     pub fn lookup(&self, key: &str) -> Option<&DiscoveredEntry> {
         self.entries.get(key)
     }

@@ -20,15 +20,14 @@ pub struct Mismatch {
 pub fn evaluate(expect: &Expectation, actual_status: u16, actual_body: &Value) -> Vec<Mismatch> {
     let mut mismatches = Vec::new();
 
-    if let Some(expected_status) = expect.status {
-        if expected_status != actual_status {
+    if let Some(expected_status) = expect.status
+        && expected_status != actual_status {
             mismatches.push(Mismatch {
                 path: "status".to_string(),
                 expected: expected_status.to_string(),
                 actual: actual_status.to_string(),
             });
         }
-    }
 
     if let Some(expected_body) = &expect.body {
         compare(expected_body, actual_body, "body", &mut mismatches);
@@ -45,14 +44,13 @@ pub fn evaluate(expect: &Expectation, actual_status: u16, actual_body: &Value) -
 /// `currency`, `listedAt`) without listing every single one — a case
 /// declares what it cares about, nothing more.
 fn compare(expected: &Value, actual: &Value, path: &str, out: &mut Vec<Mismatch>) {
-    if let Value::String(token) = expected {
-        if let Some(matched) = check_matcher(token, actual) {
+    if let Value::String(token) = expected
+        && let Some(matched) = check_matcher(token, actual) {
             if !matched {
                 out.push(Mismatch { path: path.to_string(), expected: token.clone(), actual: describe(actual) });
             }
             return;
         }
-    }
 
     match expected {
         Value::Object(expected_fields) => {

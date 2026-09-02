@@ -1,0 +1,380 @@
+# frogs
+
+> Free Rust OpenAPI Generated Server — a config-driven API server. Give it an
+> OpenAPI spec plus per-endpoint JSON mapping files (SQL/HTTP "sources"
+> mapped onto response fields), and it serves real traffic with no
+> hand-written handler code — you never write a controller/route function,
+> only config files.
+
+This document is a self-contained reference for an AI agent helping someone
+build or edit a frogs project. It is not frogs' own source code — it
+describes the CLI and the file formats a *user's* frogs project is made of.
+
+## Mental model
+
+A frogs project is a directory. `frogs` never scaffolds itself invisibly —
+every file it reads is something the user (or `frogs generate`) actually
+wrote to disk, and every field below is the complete vocabulary; there is no
+larger schema to guess at. Two project-root markers, checked by walking
+**up** from the current directory the way `cargo` finds `Cargo.toml`:
+
+- `openapi.yaml` at the root → an **API** project.
+- At least one `.html` file at the root → a **static-content** project.
+- Both present → the project serves **both roles from one process**, one
+  listener, on `config/server.json`'s port.
+
+A project can be either, or both. Nothing else marks a directory as a frogs
+project.
+
+## Project layout
+
+```
+my-project/
+├── openapi.yaml                  # API role marker — hand-authored, frogs never writes it
+├── webserve.json                 # static-content role marker (see "Static content" below)
+├── index.html, css/, js/, ...    # static assets, served from the project root
+└── api/                          # everything API-related lives here, always this exact name
+    ├── config/
+    │   ├── server.json           # global settings — see full reference below
+    │   ├── connections.json      # named SQL connections
+    │   ├── services.json         # optional: logical name -> base URL for HTTP sources
+    │   ├── errors/                    # directory — every *.json file here is merged
+    │   │   └── core.json              #   code -> { httpStatus, exposeDetail }
+    │   └── errors.discovered.json     # auto-managed scratch file, never hand-edit
+    ├── security/
+    │   ├── schemes.json           # OpenAPI security scheme name -> verifier file
+    │   └── verifiers/
+    │       └── <name>.json        # sql/http verifier definition
+    └── datasources/
+        ├── components/            # server-generated resolved schema components (generate output)
+        ├── endpoints/
+        │   └── <path>/                     # one folder per URL path
+        │       ├── endpoint.get.json           # hand-edited mapping — sources + response
+        │       ├── endpoint.get.reference.json # server-regenerated guide, never hand-edit
+        │       ├── endpoint.get.test.json       # optional *.test.json mock-based test cases
+        │       └── {param}/                    # OpenAPI {param} braces name a path segment
+        ├── sql/
+        │   └── <connection-name>/
+        │       └── <script>.sql        # one script per source, :name placeholders
+        └── http/
+            └── <request>.json          # one HTTP request definition per source
+```
+
+Path folders use OpenAPI's own `{param}` brace syntax (e.g. `cars/{vin}/`),
+translated internally to axum's `:param` route syntax — you never write the
+`:param` form yourself.
+
+## CLI commands
+
+```
+frogs generate [--role api|web]   # openapi.yaml/webserve.json -> stub files. Never overwrites
+                                   # a hand-edited stub; --role forces one side when both markers
+                                   # exist. Also scaffolds api/config/server.json,
+                                   # api/config/errors/core.json with working defaults on first run.
+frogs run                          # start the server (blocks; Ctrl+C or `frogs stop` to end)
+frogs stop                         # stop the running server for this project
+frogs validate                     # read-only dry run: config, every SQL connection, every
+                                   # endpoint file, openapi.yaml/webserve.json parsing.
+                                   # Never binds a port. Exit code non-zero if anything's wrong.
+                                   # Safe to run in CI as a pre-deploy check.
+frogs test                         # run every *.test.json file's mock-substitution cases
+frogs test record <path> <method>  # run one real request, append its actual per-source
+                                   # output as a new *.test.json case (you edit the name/expect after)
+frogs errors freeze                # batch config/errors.discovered.json into a new dated file
+                                   # under config/errors/, skip already-classified codes, purge the scratch file
+frogs drivers list                 # print which SQL drivers this binary was compiled with
+frogs help                         # overview + whether the cwd is inside a project
+```
+
+There is no `frogs init`. You create `openapi.yaml` (or an `.html` file)
+yourself; `frogs generate` only ever adds files under `api/`, never writes
+the marker itself.
+
+## Endpoint file: `sources` + `response`
+
+One file per HTTP method per path: `datasources/endpoints/<path>/endpoint.<method>.json`.
+Supported methods: `get`, `post`, `put`, `patch`, `delete`.
+
+```json
+{
+  "operationId": "getCarByVin",
+  "security": "apiKeyAuth",
+  "successStatus": 200,
+  "sources": {
+    "car": {
+      "type": "sql",
+      "connection": "vehicles_db",
+      "script": "get_car_by_vin.sql",
+      "cardinality": "one",
+      "onError": 500,
+      "optional": false,
+      "parameters": [
+        { "name": "vin", "from": "path.vin" }
+      ]
+    },
+    "pricing": {
+      "type": "http",
+      "request": "pricing_lookup.json",
+      "cardinality": "one",
+      "onError": 502,
+      "optional": true,
+      "parameters": [
+        { "name": "vin", "from": "path.vin" }
+      ]
+    }
+  },
+  "response": {
+    "vin": "sources.car.vin",
+    "maker": "sources.car.maker",
+    "year": { "from": "sources.car.year", "format": "integer" },
+    "price": { "from": "sources.pricing.amount", "format": "decimal", "precision": 2 },
+    "listedAt": { "from": "sources.car.listed_at", "format": "date-time", "sourceFormat": "unix-seconds" }
+  }
+}
+```
+
+**`security`** (optional): one scheme name from `security/schemes.json`.
+Omit for a public endpoint. Only ever one scheme, not OpenAPI's full
+alternative-requirements grammar.
+
+**`successStatus`** (optional): HTTP status for a successful response,
+validated at `generate` time against the operation's own declared response
+codes in `openapi.yaml`. Omitted defaults to 200.
+
+**`sources`**: a map of arbitrary source names to either:
+- `"type": "sql"` — `connection` (a key in `connections.json`), `script`
+  (a file under `datasources/sql/<connection>/`), `cardinality`
+  (`"one"` default, or `"many"` for an array of rows).
+- `"type": "http"` — `request` (a file under `datasources/http/`).
+  `cardinality: "many"` is **not supported** for HTTP sources — config error.
+
+Both source types share:
+- `onError` (optional `u16`): fixes this source's failure status regardless
+  of the classified error code. Omitted → the error registry's `httpStatus`
+  for the classified code decides (e.g. a not-found row naturally → 404).
+- `optional` (bool, default `false`): if `true`, a failure degrades every
+  field reading from this source to `null` instead of failing the whole
+  request.
+- `parameters`: list of `{ "name": "...", "from": "..." }`. Valid `from`
+  prefixes: `path.<name>`, `query.<name>`, `body.<field>` (dot-path into
+  the JSON request body), bare `body` (the whole body), `context.transactionId`
+  (one shared ID per request, for write auditing/correlation).
+  **`sources.<name>.<field>` is *not* a valid `parameters[].from` value** —
+  see Gotchas below. `header.*` is also not valid here (verifiers only).
+
+**`response`**: a map of output field name to either a plain dot-path
+string (`"sources.<sourceName>.<field>"`), or an object with `from` plus
+formatting: `format` (`integer`/`decimal`/`boolean`/`date-time`/`date`/`string`),
+`precision` (for `decimal`), `sourceFormat` (`unix-seconds`/`unix-millis`/`rfc3339`,
+for `date-time`/`date`), `trim`/`uppercase`/`lowercase` (bool, for `string`).
+
+**Array output**: either the whole response, or one field within it, can be
+`{ "source": "<manyCardinalitySourceName>", "items": { "<outField>": "<bareColumnName>", ... } }`
+— `items`' own paths are bare column names (`"vin"`, not `"sources.x.vin"`)
+since `source` already picks which rows.
+
+**Write operations** (POST/PUT/PATCH/DELETE): identical shape. A SQL write
+source is just a function/procedure call returning a result set —
+`"script": "create_car.sql"` containing `SELECT * FROM insert_car(:maker, :model, :year);`
+— mapped by `response` exactly like a SELECT. Body fields bind via
+`"from": "body.maker"`; an array-typed body field passes through to SQL as
+JSON-encoded text, or to an HTTP body's bare `"{{name}}"` template as real JSON.
+
+## HTTP source file: `datasources/http/<name>.json`
+
+```json
+{
+  "method": "GET",
+  "url": "https://pricing.example.com/api/v1/vehicles/{{vin}}/price",
+  "auth": { "type": "bearer", "tokenEnv": "PRICING_API_KEY" },
+  "timeoutMs": 3000,
+  "responsePath": "data"
+}
+```
+
+- `url`/`body`: `{{name}}` templates substitute a bound parameter's value.
+  In `url`, substituted values are percent-encoded (safe against injecting
+  extra query params from caller-controlled input) — except a
+  `{{services.<name>}}` placeholder (see Service registry), which is a
+  trusted server-config base URL and is passed through unencoded.
+- `auth.type`: `"bearer"` (`tokenEnv`), `"apiKey"` (`headerName` + `valueEnv`),
+  `"basic"` (`userEnv` + `passwordEnv`). `"forward"` parses but is **not
+  executable yet** (caller-header passthrough isn't wired up) — using it
+  fails every request.
+- `responsePath` (optional): dot-path to unwrap an envelope, e.g. `"data"`
+  for `{"data": {...}}`.
+- Secrets are always `*Env` — an environment variable **name**, never an
+  inline value, so datasource files stay safe to commit.
+
+## Security: schemes + verifiers
+
+`security/schemes.json`:
+```json
+{ "apiKeyAuth": { "verifier": "apiKeyVerifier.json" } }
+```
+
+`security/verifiers/apiKeyVerifier.json` — same `sql`/`http` shape as an
+endpoint source, plus `validIf`:
+```json
+{
+  "type": "sql",
+  "connection": "vehicles_db",
+  "script": "verify_api_key.sql",
+  "parameters": [{ "name": "key", "from": "header.X-Api-Key" }],
+  "validIf": "row.active = true",
+  "cacheTtlSeconds": 30
+}
+```
+
+- A verifier's `parameters[].from` supports **only `header.*`** (the
+  caller's own request headers) — not `path.`/`query.`/`body.`.
+  `header.Authorization` etc. work the same way.
+- `validIf`: grammar is exactly `<label>.<field> = <value>` — equality
+  only, no boolean combinators. The leading label (`row`/`response`) is
+  just for readability and isn't matched against anything; drop or rename
+  it freely. A value the field path doesn't reach at all evaluates `false`
+  (fail closed), not an error.
+- `cacheTtlSeconds` (optional): caches the pass/fail result per
+  scheme+credential. Omitted → every request re-runs the verifier.
+- A route whose `security` scheme has no matching entry in `schemes.json`
+  is refused registration entirely at startup (fails closed, logs a warning) — it
+  never silently serves unprotected.
+
+## Error registry
+
+Every `*.json` file directly inside `config/errors/` is merged (multiple
+files, identical duplicate definitions across files are fine, conflicting
+ones are a startup error). Shape:
+```json
+{
+  "datasource.sql.not_found": { "httpStatus": 404, "exposeDetail": true },
+  "auth.invalid_credentials": { "httpStatus": 401, "exposeDetail": true }
+}
+```
+`exposeDetail: false` hides the real error message from the caller unless
+`debugMode` is on (`debugMode` always shows it, for every code).
+
+Fixed set of codes a source/verifier failure classifies into — these are
+not arbitrary strings, they're exactly this list:
+`datasource.sql.connection_failed`, `datasource.sql.query_failed`,
+`datasource.sql.constraint_violation`, `datasource.sql.not_found`,
+`datasource.http.timeout`, `datasource.http.not_found`,
+`datasource.http.upstream_error`, `auth.invalid_credentials`,
+`auth.verifier_unavailable`, `unexpected.error` (the catch-all, always
+implicitly present even with an empty `config/errors/`). A code with no
+entry in the merged registry falls back to `unexpected.error`'s status.
+
+In `debugMode`, an otherwise-unclassified code is logged and recorded into
+`config/errors.discovered.json` (never hand-edit this file). `frogs run`
+warns at startup once it passes `server.json`'s `discoveredErrorsWarnThreshold`
+entries. `frogs errors freeze` batches it into a new dated file under
+`config/errors/` and purges the scratch file.
+
+## Service registry (optional)
+
+`config/services.json`, only read when `server.json`'s
+`features.serviceRegistry` is `true`:
+```json
+{ "pricing": "https://pricing.internal.example.com" }
+```
+Reference it from an HTTP source's `url`/`body` as `{{services.pricing}}`
+instead of a hardcoded base URL — resolved through the same `{{name}}`
+templating every other value uses.
+
+## `config/server.json` — full reference
+
+```json
+{
+  "debugMode": false,
+  "features": {
+    "metrics": true,
+    "readyzCheck": true,
+    "requestCorrelation": true,
+    "rateLimiting": false,
+    "serviceRegistry": false,
+    "requestValidation": true
+  },
+  "autoMigrateEndpoints": true,
+  "discoveredErrorsWarnThreshold": 20,
+  "rateLimit": { "requestsPerSecond": 20, "burst": 40 },
+  "tls": {
+    "mode": "off",
+    "manual": { "certPath": "config/cert.pem", "keyPath": "config/key.pem" }
+  },
+  "port": 8080,
+  "apiRoot": ""
+}
+```
+
+Every field is optional in the file itself; a missing `server.json`
+altogether gets these exact defaults. `frogs generate` writes this file
+with defaults on first run, so in practice it always exists.
+
+- `features.metrics`/`readyzCheck`: expose `/metrics` (Prometheus text
+  format) and `/readyz` (pings every configured SQL connection). `/healthz`
+  is always on regardless of any feature flag.
+- `features.rateLimiting` + `rateLimit`: a single **global** (whole-process,
+  not per-client) token bucket. `burst` = starting/max tokens, `requestsPerSecond`
+  = refill rate. Exceeded → `429` with a `Retry-After` header.
+- `tls.mode`: `"off"` (default) or `"manual"` (serves HTTPS via
+  `rustls` from a user-supplied PEM cert/key pair — `certPath`/`keyPath`
+  resolve relative to `api/`). `"acme"` is designed but **not implemented** —
+  setting it is a config parse error, not a silent fallback to HTTP.
+- `apiRoot`: URL prefix the whole API mounts under (e.g. `/api`) — matters
+  when a project serves both an API and static content from one process,
+  so they don't collide on the same paths.
+
+## Static content: `webserve.json`
+
+At the project root (not under `api/`):
+```json
+{
+  "startPage": "index.html",
+  "port": 8080,
+  "notFoundPage": "404.html",
+  "tls": { "mode": "off" }
+}
+```
+Same `tls` shape as `server.json`, but `certPath`/`keyPath` here resolve
+relative to the **project root** (there's no `api/` folder in a pure
+static-content project) — whereas `server.json`'s own `tls.manual` paths
+resolve relative to `api/`. When a project serves **both** roles,
+`server.json`'s `port`/`tls` win — `webserve.json`'s own values are ignored
+(a startup log line says so). Safe path resolution is automatic (percent-decoded,
+`..` rejected, symlink-escape guarded) — nothing to configure for it.
+
+## Gotchas an agent should know about
+
+- **`sources.<name>.<field>` only works in `response` field mappings, not
+  in a `parameters[].from`.** A source cannot read another source's
+  resolved output as one of its own bound parameters — that "chaining"
+  capability is not implemented (`resolve_sources` runs sources in
+  arbitrary map order with no dependency graph). A parameter with
+  `"from": "sources.x.y"` silently resolves to `null` every time — no error,
+  no warning. If a value needs to flow from one source into another
+  (e.g. a SQL row's `vin` into a follow-up HTTP call), bind that HTTP
+  source's parameter from the *original request* instead (`path.vin`,
+  `query.vin`, `body.vin`) if the value is already available there, rather
+  than from the other source's result.
+- **Path/query parameters always bind as raw text to SQL, regardless of
+  the OpenAPI parameter's declared `type`.** Comparing a text-bound value
+  against a non-text column (`WHERE id = :id` where `id` is `integer`)
+  works on SQLite (weakly typed) but **fails on Postgres** with
+  `operator does not exist: integer = text`. Fix: an explicit cast in the
+  SQL script itself — `WHERE id = :id::integer`. Same applies to calling a
+  Postgres function with a specific integer width: frogs always binds
+  integers as `bigint`/`int8`; a function declared to take `int4` needs
+  `:quantity::int4` in the call.
+- **`"forward"` auth type parses but does nothing executable** — using it
+  makes every request using that HTTP source fail.
+- **A hand-edited `endpoint.<method>.json` is never overwritten** by
+  `frogs generate`, even after the OpenAPI spec changes — only the sibling
+  `.reference.json` regenerates. If a response field or source looks stale
+  after editing `openapi.yaml`, check the `.reference.json` for what
+  changed, then hand-edit the real file.
+- **`config/errors.discovered.json` and every `*.reference.json`/`_backups/`
+  file are server-managed** — never hand-edit them; changes are overwritten
+  or ignored.
+- `validIf` and `format` are both deliberately small, fixed vocabularies —
+  don't invent new operators/formats expecting them to work; unrecognized
+  keys are silently ignored, not errors.

@@ -111,17 +111,21 @@ pub fn build_router(
         // the route at all rather than accidentally leaving it open, the
         // same "skip with a loud warning" posture used for a malformed
         // endpoint file above.
-        if let Some(scheme) = &endpoint.security {
-            if !security.verifiers.contains_key(scheme) {
+        if let Some(scheme) = &endpoint.security
+            && !security.verifiers.contains_key(scheme) {
                 tracing::warn!(
                     "skipping {}: security scheme '{scheme}' has no matching entry in security/schemes.json",
                     file_path.display()
                 );
                 continue;
             }
-        }
 
-        tracing::info!("{} {url_path} -> {}", method.to_uppercase(), file_path.display());
+        tracing::info!(
+            "{} {url_path} -> {} (operationId: {})",
+            method.to_uppercase(),
+            file_path.display(),
+            endpoint.operation_id
+        );
         // Each route gets its own `RouteState` baked in via `with_state` —
         // this is what lets one shared `handle_request` function serve
         // every endpoint file: axum's `State` extractor pulls out whichever
@@ -186,14 +190,13 @@ pub(crate) fn validate_endpoint_files(endpoints_root: &Path, security: &Security
                 continue;
             }
         };
-        if let Some(scheme) = &endpoint.security {
-            if !security.verifiers.contains_key(scheme) {
+        if let Some(scheme) = &endpoint.security
+            && !security.verifiers.contains_key(scheme) {
                 problems.push(format!(
                     "{}: security scheme '{scheme}' has no matching entry in security/schemes.json",
                     file_path.display()
                 ));
             }
-        }
     }
 
     (count, problems)
@@ -501,11 +504,10 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String, PathBuf)>) {
                 continue;
             }
             walk(root, &path, out);
-        } else if let Some(method) = routable_method(&path) {
-            if let Some(url_path) = url_path_for(root, &path) {
+        } else if let Some(method) = routable_method(&path)
+            && let Some(url_path) = url_path_for(root, &path) {
                 out.push((url_path, method.to_string(), path.clone()));
             }
-        }
     }
 }
 

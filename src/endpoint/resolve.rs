@@ -60,13 +60,11 @@ impl<'de> Deserialize<'de> for MockOutcome {
         D: Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
-        if let Value::Object(map) = &value {
-            if map.len() == 1 {
-                if let Some(Value::String(code)) = map.get("fail") {
+        if let Value::Object(map) = &value
+            && map.len() == 1
+                && let Some(Value::String(code)) = map.get("fail") {
                     return Ok(MockOutcome::Fail(code.clone()));
                 }
-            }
-        }
         Ok(MockOutcome::Success(value))
     }
 }
@@ -349,7 +347,7 @@ fn build_field(mapping: &ResponseField, resolved: &ResolvedSources) -> Value {
     match mapping {
         ResponseField::Array(array) => build_array(array, resolved),
         ResponseField::Plain(_) | ResponseField::Detailed(_) => {
-            let value = lookup(mapping.from_path(), resolved);
+            let value = lookup(mapping.dot_path(), resolved);
             match mapping.detail() {
                 Some(detail) => super::format::apply(value, detail),
                 None => value,

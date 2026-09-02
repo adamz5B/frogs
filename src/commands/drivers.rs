@@ -6,6 +6,9 @@ use std::io;
 /// can be unit-tested directly against whatever features the test binary
 /// itself happens to be built with, rather than only exercised indirectly
 /// through `list`'s printed output.
+// clippy's `vec![...]` suggestion can't express a cfg-gated optional
+// element, so `Vec::new()` + conditional pushes is the actual idiom here.
+#[allow(clippy::vec_init_then_push)]
 fn compiled_drivers() -> Vec<&'static str> {
     let mut drivers = Vec::new();
     #[cfg(feature = "postgres")]

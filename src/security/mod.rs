@@ -7,8 +7,8 @@ mod verify;
 pub use cache::VerifierCache;
 pub use schemes::SchemeConfig;
 pub use valid_if::{ValidIf, ValidIfParseError};
-pub use verifier::{Parameter, VerifierDef};
-pub use verify::{verify, VerifyErrorCause};
+pub use verifier::VerifierDef;
+pub use verify::verify;
 
 use std::collections::HashMap;
 use std::fmt;

@@ -67,11 +67,10 @@ pub async fn verify(
     let ttl = verifier.def.cache_ttl_seconds();
     let key = ttl.map(|_| cache_key(scheme_name, &bound));
 
-    if let Some(key) = &key {
-        if let Some(valid) = cache.get(key) {
+    if let Some(key) = &key
+        && let Some(valid) = cache.get(key) {
             return if valid { Ok(()) } else { Err(VerifyErrorCause::Invalid) };
         }
-    }
 
     let resolved = match &verifier.def {
         VerifierDef::Sql { connection, script, .. } => run_sql(drivers, sql_root, connection, script, &bound).await?,

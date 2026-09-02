@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: ubuntu / postgres (default)
+            feature-flags: ""
+          - os: ubuntu-latest
+            name: ubuntu / postgres+sqlite
+            feature-flags: "--features sqlite"
+          - os: ubuntu-latest
+            name: ubuntu / sqlite-only
+            feature-flags: "--no-default-features --features sqlite"
+          - os: windows-latest
+            name: windows / postgres (default)
+            feature-flags: ""
+          - os: windows-latest
+            name: windows / postgres+sqlite
+            feature-flags: "--features sqlite"
+          - os: windows-latest
+            name: windows / sqlite-only
+            feature-flags: "--no-default-features --features sqlite"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.feature-flags }}
+
+      - name: Build
+        run: cargo build --locked ${{ matrix.feature-flags }}
+
+      - name: Test
+        run: cargo test --locked ${{ matrix.feature-flags }}
+
+  # A real Postgres instance, exercised via the one `#[ignore]`d live-DB
+  # test in src/sql/postgres.rs — Postgres service containers are a
+  # Linux-runner-only GitHub Actions feature, hence its own job rather
+  # than folded into the `test` matrix above.
+  postgres-integration:
+    name: postgres integration test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the live-Postgres test
+        env:
+          DATABASE_URL_TEST: postgres://postgres:postgres@localhost:5432/postgres
+        run: cargo test --locked --features postgres -- --ignored
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  # Advisory only, not blocking: this codebase predates `rustfmt.toml`
+  # (added alongside this workflow) and isn't fully compliant with it yet
+  # — bringing it into compliance is a large, purely-cosmetic reformatting
+  # pass that deserves its own deliberate commit, not a side effect of
+  # setting up CI. Remove `continue-on-error` once that pass has landed.
+  fmt:
+    name: fmt (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - run: cargo fmt --check
