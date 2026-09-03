@@ -8,10 +8,7 @@ pub fn run(cwd: &Path) -> io::Result<()> {
     let root = require_project_root(cwd);
 
     let Some(info) = pidfile::read(&root)? else {
-        println!(
-            "no running server found for this project ({} doesn't exist)",
-            pidfile::path(&root).display()
-        );
+        println!("no running server found for this project ({} doesn't exist)", pidfile::path(&root).display());
         return Ok(());
     };
 
@@ -42,10 +39,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "frogs-stop-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("openapi.yaml"), "openapi: 3.0.3\ninfo: { title: t, version: '1' }\npaths: {}\n").unwrap();
@@ -125,11 +119,19 @@ mod tests {
     #[test]
     fn a_live_process_is_actually_terminated_and_the_run_file_removed() {
         let root = temp_project();
-        let child = spawn_long_running_child();
+        let mut child = spawn_long_running_child();
         let pid = child.0.id();
         assert!(pidfile::is_alive(pid), "the freshly spawned child should be alive before run() stops it");
 
-        pidfile::write(&root, &RunInfo { pid, port: 8080, started_at: chrono::Utc::now() }).unwrap();
+        pidfile::write(
+            &root,
+            &RunInfo {
+                pid,
+                port: 8080,
+                started_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
 
         assert!(run(&root).is_ok());
 
@@ -144,6 +146,10 @@ mod tests {
         // immediately, same as `server::pidfile`'s own `terminate` test.
         let mut confirmed_dead = false;
         for _ in 0..20 {
+            // Reap eagerly — see `server::pidfile::tests::terminate_kills_a_real_process`'s
+            // matching comment: `is_alive` reports a zombie as alive until
+            // its parent reaps it, and this test is that parent.
+            let _ = child.0.try_wait();
             if !pidfile::is_alive(pid) {
                 confirmed_dead = true;
                 break;

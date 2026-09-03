@@ -18,11 +18,7 @@ impl SqliteDriver {
             .settings
             .get("database")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                SqlError::ConnectionFailed(
-                    "missing 'database' (a file path, or ':memory:') in connection settings".into(),
-                )
-            })?;
+            .ok_or_else(|| SqlError::ConnectionFailed("missing 'database' (a file path, or ':memory:') in connection settings".into()))?;
 
         let is_memory = database == ":memory:";
         let options = if is_memory {
@@ -66,10 +62,7 @@ impl SqlDriver for SqliteDriver {
             };
         }
 
-        let rows = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
+        let rows = query.fetch_all(&self.pool).await.map_err(|e| SqlError::QueryFailed(e.to_string()))?;
 
         rows.iter().map(convert_row).collect()
     }
@@ -99,8 +92,7 @@ fn translate_named_params(script: &str) -> (String, Vec<String>) {
             continue;
         }
 
-        if c == ':' && i + 1 < bytes.len() && (bytes[i + 1] as char == '_' || (bytes[i + 1] as char).is_alphabetic())
-        {
+        if c == ':' && i + 1 < bytes.len() && (bytes[i + 1] as char == '_' || (bytes[i + 1] as char).is_alphabetic()) {
             let start = i + 1;
             let mut end = start;
             while end < bytes.len() && ((bytes[end] as char == '_') || (bytes[end] as char).is_alphanumeric()) {
@@ -131,9 +123,7 @@ fn convert_row(row: &SqliteRow) -> Result<SqlRow, SqlError> {
         // via `try_get_raw`) — the only place that information is available.
         let declared = column.type_info().name();
         let value = if declared == "NULL" {
-            let raw = row
-                .try_get_raw(i)
-                .map_err(|e| SqlError::QueryFailed(format!("column '{}': {e}", column.name())))?;
+            let raw = row.try_get_raw(i).map_err(|e| SqlError::QueryFailed(format!("column '{}': {e}", column.name())))?;
             decode_column(row, i, column, raw.type_info().name())?
         } else {
             decode_column(row, i, column, declared)?
@@ -149,15 +139,10 @@ fn decode_column(row: &SqliteRow, i: usize, column: &SqliteColumn, type_name: &s
         "INTEGER" => row.try_get::<Option<i64>, _>(i).map(|v| v.map(SqlValue::Int)),
         "REAL" => row.try_get::<Option<f64>, _>(i).map(|v| v.map(SqlValue::Float)),
         "TEXT" => row.try_get::<Option<String>, _>(i).map(|v| v.map(SqlValue::Text)),
-        "DATETIME" => row
-            .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(i)
-            .map(|v| v.map(SqlValue::Timestamp)),
+        "DATETIME" => row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(i).map(|v| v.map(SqlValue::Timestamp)),
         "NULL" => Ok(None),
         other => {
-            return Err(SqlError::QueryFailed(format!(
-                "column '{}' has unsupported SQLite type '{other}'",
-                column.name()
-            )));
+            return Err(SqlError::QueryFailed(format!("column '{}' has unsupported SQLite type '{other}'", column.name())));
         }
     };
     value

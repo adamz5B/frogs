@@ -2,7 +2,7 @@ use std::io;
 use std::path::Path;
 
 use crate::config::Config;
-use crate::project::{api_base, require_project_root, MANIFEST_FILE};
+use crate::project::{MANIFEST_FILE, api_base, require_project_root};
 
 /// A read-only dry run of everything `frogs run` would otherwise only
 /// surface as a side effect of actually starting: config loading, every
@@ -21,10 +21,7 @@ pub async fn run(cwd: &Path) -> io::Result<()> {
     let has_web = root.join("webserve.json").is_file();
 
     if !has_api && !has_web {
-        eprintln!(
-            "error: no {MANIFEST_FILE} or webserve.json found at {} — run `frogs generate` first",
-            root.display()
-        );
+        eprintln!("error: no {MANIFEST_FILE} or webserve.json found at {} — run `frogs generate` first", root.display());
         std::process::exit(1);
     }
 

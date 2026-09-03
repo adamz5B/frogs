@@ -26,11 +26,7 @@ impl PostgresDriver {
 
 #[async_trait]
 impl SqlDriver for PostgresDriver {
-    async fn query(
-        &self,
-        script: &str,
-        params: &HashMap<String, SqlValue>,
-    ) -> Result<Vec<SqlRow>, SqlError> {
+    async fn query(&self, script: &str, params: &HashMap<String, SqlValue>) -> Result<Vec<SqlRow>, SqlError> {
         let (translated, param_order) = translate_named_params(script);
 
         let mut query = sqlx::query(&translated);
@@ -46,28 +42,18 @@ impl SqlDriver for PostgresDriver {
             };
         }
 
-        let rows = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| SqlError::QueryFailed(e.to_string()))?;
+        let rows = query.fetch_all(&self.pool).await.map_err(|e| SqlError::QueryFailed(e.to_string()))?;
 
         rows.iter().map(convert_row).collect()
     }
 }
 
 fn build_connection_url(config: &ConnectionConfig) -> Result<String, SqlError> {
-    let get_str = |key: &str| -> Option<String> {
-        config.settings.get(key).and_then(|v| v.as_str()).map(str::to_string)
-    };
+    let get_str = |key: &str| -> Option<String> { config.settings.get(key).and_then(|v| v.as_str()).map(str::to_string) };
 
     let host = get_str("host").unwrap_or_else(|| "localhost".to_string());
-    let port = config
-        .settings
-        .get("port")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(5432);
-    let database = get_str("database")
-        .ok_or_else(|| SqlError::ConnectionFailed("missing 'database' in connection settings".into()))?;
+    let port = config.settings.get("port").and_then(serde_json::Value::as_u64).unwrap_or(5432);
+    let database = get_str("database").ok_or_else(|| SqlError::ConnectionFailed("missing 'database' in connection settings".into()))?;
     let user = get_str("user").unwrap_or_else(|| "postgres".to_string());
     let password = match get_str("passwordEnv") {
         Some(env_name) => std::env::var(&env_name).unwrap_or_default(),
@@ -100,8 +86,7 @@ fn translate_named_params(script: &str) -> (String, Vec<String>) {
             continue;
         }
 
-        if c == ':' && i + 1 < bytes.len() && (bytes[i + 1] as char == '_' || (bytes[i + 1] as char).is_alphabetic())
-        {
+        if c == ':' && i + 1 < bytes.len() && (bytes[i + 1] as char == '_' || (bytes[i + 1] as char).is_alphabetic()) {
             let start = i + 1;
             let mut end = start;
             while end < bytes.len() && ((bytes[end] as char == '_') || (bytes[end] as char).is_alphanumeric()) {
@@ -134,28 +119,15 @@ fn convert_row(row: &PgRow) -> Result<SqlRow, SqlError> {
         let type_name = column.type_info().name();
         let value = match type_name {
             "BOOL" => row.try_get::<Option<bool>, _>(i).map(|v| v.map(SqlValue::Bool)),
-            "INT2" => row
-                .try_get::<Option<i16>, _>(i)
-                .map(|v| v.map(|n| SqlValue::Int(n as i64))),
-            "INT4" => row
-                .try_get::<Option<i32>, _>(i)
-                .map(|v| v.map(|n| SqlValue::Int(n as i64))),
+            "INT2" => row.try_get::<Option<i16>, _>(i).map(|v| v.map(|n| SqlValue::Int(n as i64))),
+            "INT4" => row.try_get::<Option<i32>, _>(i).map(|v| v.map(|n| SqlValue::Int(n as i64))),
             "INT8" => row.try_get::<Option<i64>, _>(i).map(|v| v.map(SqlValue::Int)),
-            "FLOAT4" => row
-                .try_get::<Option<f32>, _>(i)
-                .map(|v| v.map(|n| SqlValue::Float(n as f64))),
+            "FLOAT4" => row.try_get::<Option<f32>, _>(i).map(|v| v.map(|n| SqlValue::Float(n as f64))),
             "FLOAT8" => row.try_get::<Option<f64>, _>(i).map(|v| v.map(SqlValue::Float)),
-            "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" => {
-                row.try_get::<Option<String>, _>(i).map(|v| v.map(SqlValue::Text))
-            }
-            "TIMESTAMP" | "TIMESTAMPTZ" => row
-                .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(i)
-                .map(|v| v.map(SqlValue::Timestamp)),
+            "TEXT" | "VARCHAR" | "BPCHAR" | "NAME" => row.try_get::<Option<String>, _>(i).map(|v| v.map(SqlValue::Text)),
+            "TIMESTAMP" | "TIMESTAMPTZ" => row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(i).map(|v| v.map(SqlValue::Timestamp)),
             other => {
-                return Err(SqlError::QueryFailed(format!(
-                    "column '{}' has unsupported Postgres type '{other}'",
-                    column.name()
-                )));
+                return Err(SqlError::QueryFailed(format!("column '{}' has unsupported Postgres type '{other}'", column.name())));
             }
         };
         let value = value.map_err(|e| SqlError::QueryFailed(format!("column '{}': {e}", column.name())))?;
@@ -271,8 +243,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn queries_a_real_postgres_instance() {
-        let url = std::env::var("DATABASE_URL_TEST")
-            .expect("set DATABASE_URL_TEST to a reachable Postgres connection string to run this test");
+        let url = std::env::var("DATABASE_URL_TEST").expect("set DATABASE_URL_TEST to a reachable Postgres connection string to run this test");
         let pool = sqlx::PgPool::connect(&url).await.expect("failed to connect");
         let driver = PostgresDriver { pool };
 
@@ -294,10 +265,7 @@ mod tests {
             .expect("query should succeed");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get("vin"),
-            Some(&SqlValue::Text("1HGCM82633A004352".to_string()))
-        );
+        assert_eq!(rows[0].get("vin"), Some(&SqlValue::Text("1HGCM82633A004352".to_string())));
         assert_eq!(rows[0].get("year"), Some(&SqlValue::Int(2003)));
 
         sqlx::query("DROP TABLE frogs_smoke_test").execute(&driver.pool).await.unwrap();

@@ -93,11 +93,7 @@ pub trait SqlDriver: Send + Sync + std::fmt::Debug {
     /// Runs `script` (a driver-native SQL string using `:name` placeholders,
     /// as authored in `datasources/sql/<connection>/*.sql`) with `params`
     /// bound by name, returning every row of the result set.
-    async fn query(
-        &self,
-        script: &str,
-        params: &HashMap<String, SqlValue>,
-    ) -> Result<Vec<SqlRow>, SqlError>;
+    async fn query(&self, script: &str, params: &HashMap<String, SqlValue>) -> Result<Vec<SqlRow>, SqlError>;
 }
 
 /// Connects one entry to a compiled-in driver implementation. A connection
@@ -124,9 +120,7 @@ async fn connect_one(name: &str, conn: &ConnectionConfig) -> Result<Box<dyn SqlD
 /// Connects every entry in `connections.json`. Fails fast on the first bad
 /// connection — `frogs run` has no use for a half-connected set of drivers,
 /// so there's no reason to keep trying the rest once one has already failed.
-pub async fn connect_all(
-    connections: &HashMap<String, ConnectionConfig>,
-) -> Result<HashMap<String, Box<dyn SqlDriver>>, SqlError> {
+pub async fn connect_all(connections: &HashMap<String, ConnectionConfig>) -> Result<HashMap<String, Box<dyn SqlDriver>>, SqlError> {
     let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
     for (name, conn) in connections {
         drivers.insert(name.clone(), connect_one(name, conn).await?);
@@ -189,18 +183,23 @@ mod tests {
         let mut connections = HashMap::new();
         connections.insert(
             "primary".to_string(),
-            ConnectionConfig { driver: "mssql".to_string(), settings: HashMap::new() },
+            ConnectionConfig {
+                driver: "mssql".to_string(),
+                settings: HashMap::new(),
+            },
         );
         connections.insert(
             "secondary".to_string(),
-            ConnectionConfig { driver: "oracle".to_string(), settings: HashMap::new() },
+            ConnectionConfig {
+                driver: "oracle".to_string(),
+                settings: HashMap::new(),
+            },
         );
 
         let results = try_connect_each(&connections).await;
         assert_eq!(results.len(), 2, "both connections must be attempted, not just the first");
 
-        let by_name: HashMap<&str, &Result<(), SqlError>> =
-            results.iter().map(|(name, result)| (name.as_str(), result)).collect();
+        let by_name: HashMap<&str, &Result<(), SqlError>> = results.iter().map(|(name, result)| (name.as_str(), result)).collect();
         assert!(by_name["primary"].is_err());
         assert!(by_name["secondary"].is_err());
     }

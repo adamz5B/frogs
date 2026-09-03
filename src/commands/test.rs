@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::endpoint::{resolve_for_test, EndpointFile, MockOutcome};
+use crate::endpoint::{EndpointFile, MockOutcome, resolve_for_test};
 use crate::project::require_project_root;
 use crate::security::VerifierCache;
 
@@ -120,7 +120,10 @@ pub async fn run(cwd: &Path) -> io::Result<()> {
             .await;
 
             let expect_body = case.expect.body.as_ref().map(|b| memory.substitute(b));
-            let expect = crate::testing::Expectation { status: case.expect.status, body: expect_body };
+            let expect = crate::testing::Expectation {
+                status: case.expect.status,
+                body: expect_body,
+            };
             let mismatches = crate::testing::evaluate(&expect, status, &response_body);
             if mismatches.is_empty() {
                 println!("  \u{2713} {}", case.name);
@@ -232,13 +235,10 @@ pub async fn record(cwd: &Path, path: &str, method: &str) -> io::Result<()> {
         }
     }
 
-    let test_file_path =
-        endpoint_file_path.with_file_name(format!("endpoint.{method}.test.json"));
+    let test_file_path = endpoint_file_path.with_file_name(format!("endpoint.{method}.test.json"));
     let mut test_file = match crate::testing::load(&test_file_path) {
         Ok(file) => file,
-        Err(crate::testing::TestLoadError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
-            crate::testing::TestFile { cases: Vec::new() }
-        }
+        Err(crate::testing::TestLoadError::Io(e)) if e.kind() == io::ErrorKind::NotFound => crate::testing::TestFile { cases: Vec::new() },
         Err(e) => {
             eprintln!("error: {}: {e}", test_file_path.display());
             std::process::exit(1);
@@ -247,9 +247,17 @@ pub async fn record(cwd: &Path, path: &str, method: &str) -> io::Result<()> {
 
     test_file.cases.push(crate::testing::TestCase {
         name: format!("recorded {}", chrono::Utc::now().to_rfc3339()),
-        request: crate::testing::TestRequest { path: path_params, query: query_params, headers: HashMap::new(), body: None },
+        request: crate::testing::TestRequest {
+            path: path_params,
+            query: query_params,
+            headers: HashMap::new(),
+            body: None,
+        },
         mocks,
-        expect: crate::testing::Expectation { status: Some(status), body: Some(response_body) },
+        expect: crate::testing::Expectation {
+            status: Some(status),
+            body: Some(response_body),
+        },
         save: HashMap::new(),
     });
 
@@ -457,10 +465,7 @@ mod tests {
     #[test]
     fn test_file_method_ignores_the_stub_and_reference_siblings() {
         assert_eq!(test_file_method(Path::new("/proj/datasources/endpoints/cars/endpoint.get.json")), None);
-        assert_eq!(
-            test_file_method(Path::new("/proj/datasources/endpoints/cars/endpoint.get.reference.json")),
-            None
-        );
+        assert_eq!(test_file_method(Path::new("/proj/datasources/endpoints/cars/endpoint.get.reference.json")), None);
     }
 
     #[test]
@@ -507,8 +512,7 @@ mod tests {
     #[test]
     fn find_endpoint_file_matches_a_concrete_path_against_a_braced_template() {
         let fixture = sample_endpoints_root();
-        let (file, params) = find_endpoint_file(fixture.path(), "/cars/1HGCM82633A004352", "get")
-            .expect("should match the /cars/{vin} template");
+        let (file, params) = find_endpoint_file(fixture.path(), "/cars/1HGCM82633A004352", "get").expect("should match the /cars/{vin} template");
         assert!(file.ends_with("endpoint.get.json"));
         assert_eq!(params.get("vin"), Some(&"1HGCM82633A004352".to_string()));
     }
@@ -516,8 +520,7 @@ mod tests {
     #[test]
     fn find_endpoint_file_matches_a_flat_path_with_no_params() {
         let fixture = sample_endpoints_root();
-        let (file, params) =
-            find_endpoint_file(fixture.path(), "/cars", "get").expect("should match the /cars template");
+        let (file, params) = find_endpoint_file(fixture.path(), "/cars", "get").expect("should match the /cars template");
         assert!(file.ends_with("cars/endpoint.get.json"));
         assert!(params.is_empty());
     }

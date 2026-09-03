@@ -16,12 +16,7 @@ use clap::{Parser, Subcommand};
 use commands::generate::Role;
 
 #[derive(Parser)]
-#[command(
-    name = "frogs",
-    version,
-    about = "Free Rust OpenAPI Generated Server",
-    disable_help_subcommand = true
-)]
+#[command(name = "frogs", version, about = "Free Rust OpenAPI Generated Server", disable_help_subcommand = true)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -102,10 +97,7 @@ async fn main() {
         .expect("installing the process-wide rustls crypto provider should only ever be attempted once");
 
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
         .init();
 
     let cli = Cli::parse();
@@ -116,9 +108,9 @@ async fn main() {
         Command::Run => commands::run::run(&cwd).await,
         Command::Stop => commands::stop::run(&cwd),
         Command::Test { action: None } => commands::test::run(&cwd).await,
-        Command::Test { action: Some(TestCommand::Record { path, method }) } => {
-            commands::test::record(&cwd, &path, &method).await
-        }
+        Command::Test {
+            action: Some(TestCommand::Record { path, method }),
+        } => commands::test::record(&cwd, &path, &method).await,
         Command::Errors { action: ErrorsCommand::Freeze } => commands::errors::freeze(&cwd),
         Command::Drivers { action: DriversCommand::List } => commands::drivers::list(),
         Command::Validate => commands::validate::run(&cwd).await,
@@ -185,7 +177,9 @@ mod tests {
     #[test]
     fn parses_test_record_with_its_path_and_method() {
         match parse(&["test", "record", "/cars/1HGCM82633A004352", "get"]) {
-            Command::Test { action: Some(TestCommand::Record { path, method }) } => {
+            Command::Test {
+                action: Some(TestCommand::Record { path, method }),
+            } => {
                 assert_eq!(path, "/cars/1HGCM82633A004352");
                 assert_eq!(method, "get");
             }

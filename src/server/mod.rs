@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::{routing::get, Router};
+use axum::{Router, routing::get};
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -60,8 +60,7 @@ pub fn readyz_router(drivers: Arc<HashMap<String, Box<dyn SqlDriver>>>) -> Route
 async fn readyz(State(drivers): State<Arc<HashMap<String, Box<dyn SqlDriver>>>>) -> Response {
     for (name, driver) in drivers.iter() {
         if let Err(e) = driver.query("SELECT 1", &HashMap::new()).await {
-            return (StatusCode::SERVICE_UNAVAILABLE, format!("connection '{name}' is not reachable: {e}"))
-                .into_response();
+            return (StatusCode::SERVICE_UNAVAILABLE, format!("connection '{name}' is not reachable: {e}")).into_response();
         }
     }
     (StatusCode::OK, "ready").into_response()
@@ -212,7 +211,10 @@ impl RateLimiter {
         RateLimiter {
             capacity: burst.max(1) as f64,
             refill_per_second: requests_per_second.max(1) as f64,
-            state: Mutex::new(RateLimiterState { tokens: burst.max(1) as f64, last_refill: Instant::now() }),
+            state: Mutex::new(RateLimiterState {
+                tokens: burst.max(1) as f64,
+                last_refill: Instant::now(),
+            }),
         }
     }
 
@@ -229,7 +231,9 @@ impl RateLimiter {
             Ok(())
         } else {
             let seconds_needed = (1.0 - state.tokens) / self.refill_per_second;
-            Err(RateLimitExceeded { retry_after_secs: seconds_needed.ceil().max(1.0) as u64 })
+            Err(RateLimitExceeded {
+                retry_after_secs: seconds_needed.ceil().max(1.0) as u64,
+            })
         }
     }
 }
@@ -267,11 +271,7 @@ async fn rate_limit_middleware(State(limiter): State<Arc<RateLimiter>>, req: Req
 /// right to work.
 pub(crate) fn normalize_api_root(raw: &str) -> Option<String> {
     let trimmed = raw.trim().trim_matches('/');
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(format!("/{trimmed}"))
-    }
+    if trimmed.is_empty() { None } else { Some(format!("/{trimmed}")) }
 }
 
 /// Applies the correlation-ID/tracing middleware. Call this **last**, after
@@ -319,9 +319,7 @@ async fn correlation_id_middleware(mut req: Request, next: Next) -> Response {
     .await;
 
     if let Ok(value) = HeaderValue::from_str(&id) {
-        response
-            .headers_mut()
-            .insert(HeaderName::from_static(CORRELATION_HEADER), value);
+        response.headers_mut().insert(HeaderName::from_static(CORRELATION_HEADER), value);
     }
     response
 }
@@ -357,11 +355,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SqlDriver for FakeDriver {
-        async fn query(
-            &self,
-            _script: &str,
-            _params: &HashMap<String, crate::sql::SqlValue>,
-        ) -> Result<Vec<crate::sql::SqlRow>, crate::sql::SqlError> {
+        async fn query(&self, _script: &str, _params: &HashMap<String, crate::sql::SqlValue>) -> Result<Vec<crate::sql::SqlRow>, crate::sql::SqlError> {
             if self.fail {
                 Err(crate::sql::SqlError::ConnectionFailed("simulated failure".to_string()))
             } else {
@@ -454,10 +448,7 @@ mod tests {
     async fn generates_a_request_id_when_the_caller_sends_none() {
         let addr = spawn(apply_middleware(router())).await;
         let response = reqwest::get(format!("http://{addr}/healthz")).await.unwrap();
-        let id = response
-            .headers()
-            .get(CORRELATION_HEADER)
-            .expect("middleware should always set this header");
+        let id = response.headers().get(CORRELATION_HEADER).expect("middleware should always set this header");
         assert!(Uuid::parse_str(id.to_str().unwrap()).is_ok());
     }
 

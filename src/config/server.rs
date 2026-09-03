@@ -37,7 +37,10 @@ pub struct RateLimitConfig {
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
-        RateLimitConfig { requests_per_second: default_requests_per_second(), burst: default_burst() }
+        RateLimitConfig {
+            requests_per_second: default_requests_per_second(),
+            burst: default_burst(),
+        }
     }
 }
 
@@ -205,8 +208,7 @@ mod tests {
 
     #[test]
     fn rate_limit_is_read_as_camel_case() {
-        let config: ServerConfig =
-            serde_json::from_str(r#"{ "rateLimit": { "requestsPerSecond": 5, "burst": 15 } }"#).unwrap();
+        let config: ServerConfig = serde_json::from_str(r#"{ "rateLimit": { "requestsPerSecond": 5, "burst": 15 } }"#).unwrap();
         assert_eq!(config.rate_limit.requests_per_second, 5);
         assert_eq!(config.rate_limit.burst, 15);
     }
@@ -220,10 +222,8 @@ mod tests {
 
     #[test]
     fn tls_manual_mode_is_read_as_camel_case() {
-        let config: ServerConfig = serde_json::from_str(
-            r#"{ "tls": { "mode": "manual", "manual": { "certPath": "tls/cert.pem", "keyPath": "tls/key.pem" } } }"#,
-        )
-        .unwrap();
+        let config: ServerConfig =
+            serde_json::from_str(r#"{ "tls": { "mode": "manual", "manual": { "certPath": "tls/cert.pem", "keyPath": "tls/key.pem" } } }"#).unwrap();
         assert_eq!(config.tls.mode, TlsMode::Manual);
         let manual = config.tls.manual.expect("manual config should be present");
         assert_eq!(manual.cert_path, "tls/cert.pem");

@@ -20,9 +20,7 @@ pub fn find_files_with_extensions(dir: &Path, extensions: &[&str]) -> Vec<PathBu
     entries
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| extensions.contains(&ext))
-        })
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| extensions.contains(&ext)))
         .collect()
 }
 
@@ -107,10 +105,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "frogs-project-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&path).unwrap();
         TempDir { path }

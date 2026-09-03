@@ -52,8 +52,7 @@ impl DiscoveredErrors {
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        let json =
-            serde_json::to_string_pretty(&self.entries).expect("discovered entries always serialize");
+        let json = serde_json::to_string_pretty(&self.entries).expect("discovered entries always serialize");
         fs::write(path, json)
     }
 
@@ -115,10 +114,7 @@ mod tests {
         std::env::temp_dir().join(format!(
             "frogs-discovered-test-{}-{}.json",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ))
     }
 
@@ -157,9 +153,7 @@ mod tests {
         discovered.save(&path).unwrap();
 
         let reloaded = DiscoveredErrors::load(&path).unwrap();
-        let entry = reloaded
-            .lookup("datasource.sql.unknown:PoolTimedOut")
-            .expect("recorded entry should round-trip");
+        let entry = reloaded.lookup("datasource.sql.unknown:PoolTimedOut").expect("recorded entry should round-trip");
         assert_eq!(entry.occurrences, 1);
         assert!(entry.discovered);
 

@@ -53,12 +53,36 @@ pub fn remove(project_root: &Path) -> io::Result<()> {
     }
 }
 
+/// A `pid` read back from `.frogs/run.json` is untrusted input — the file
+/// can be stale, hand-edited, or corrupted. `0` and anything above
+/// `i32::MAX` can never be a real process id (Unix `pid_t` is a signed
+/// 32-bit int; Windows PIDs come from the same practical range), so both
+/// are rejected here before either ever reaches a `kill`/`taskkill`
+/// subprocess. This matters beyond just correctness on Unix: passing a
+/// value like `u32::MAX` (4294967295) to the *external* `kill` binary
+/// overflows into `-1` as a signed 32-bit `pid_t` — and POSIX gives PID
+/// `-1` special meaning to `kill`: signal *every* process the caller has
+/// permission to signal, not "no such process." `kill -0 -1` trivially
+/// succeeds (there's always at least the caller itself), so without this
+/// guard `is_alive` reports a bogus giant PID as alive, and `terminate`
+/// then broadcasts a real `SIGTERM` to the caller's entire process group —
+/// observed for real via this project's own test suite on Linux, where it
+/// took the whole `cargo test` process down with it (bash's builtin `kill`
+/// happens to reject the same value cleanly, which is why this didn't show
+/// up in a plain shell).
+fn is_plausible_pid(pid: u32) -> bool {
+    pid != 0 && pid <= i32::MAX as u32
+}
+
 /// Whether `pid` still refers to a live process. Shelled out to the
 /// platform's own process-listing tool rather than a signals/WinAPI crate —
 /// one dependency-free implementation per OS, matching how little this
 /// project needs from either.
 #[cfg(unix)]
 pub fn is_alive(pid: u32) -> bool {
+    if !is_plausible_pid(pid) {
+        return false;
+    }
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .status()
@@ -68,6 +92,9 @@ pub fn is_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 pub fn is_alive(pid: u32) -> bool {
+    if !is_plausible_pid(pid) {
+        return false;
+    }
     let output = Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH"]).output();
     match output {
         Ok(output) => String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()),
@@ -84,6 +111,9 @@ pub fn is_alive(pid: u32) -> bool {
 /// write can already have committed upstream before the signal arrives.
 #[cfg(unix)]
 pub fn terminate(pid: u32) -> io::Result<()> {
+    if !is_plausible_pid(pid) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("refusing to signal implausible pid {pid}")));
+    }
     let status = Command::new("kill").args(["-TERM", &pid.to_string()]).status()?;
     if status.success() {
         Ok(())
@@ -94,6 +124,9 @@ pub fn terminate(pid: u32) -> io::Result<()> {
 
 #[cfg(windows)]
 pub fn terminate(pid: u32) -> io::Result<()> {
+    if !is_plausible_pid(pid) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("refusing to signal implausible pid {pid}")));
+    }
     let status = Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).status()?;
     if status.success() {
         Ok(())
@@ -135,7 +168,11 @@ mod tests {
     }
 
     fn sample_info() -> RunInfo {
-        RunInfo { pid: 4242, port: 8080, started_at: Utc::now() }
+        RunInfo {
+            pid: 4242,
+            port: 8080,
+            started_at: Utc::now(),
+        }
     }
 
     #[test]
@@ -255,6 +292,14 @@ mod tests {
         // immediately.
         let mut confirmed_dead = false;
         for _ in 0..20 {
+            // Reap eagerly so the child doesn't sit as a zombie under this
+            // process specifically — `kill(pid, 0)` (what `is_alive` uses)
+            // reports a zombie as "alive" right up until its parent reaps
+            // it, since the PID stays allocated until then. A real
+            // supervisor (shell, systemd, ...) reaps almost immediately in
+            // production; here *this test* is the parent, so without this
+            // `is_alive` would never observe the termination at all.
+            let _ = child.0.try_wait();
             if !is_alive(pid) {
                 confirmed_dead = true;
                 break;

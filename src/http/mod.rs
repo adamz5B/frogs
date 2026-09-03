@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::sql::{sql_value_to_json, SqlValue};
+use crate::sql::{SqlValue, sql_value_to_json};
 
 /// RFC 3986 "unreserved" characters (`ALPHA / DIGIT / "-" / "." / "_" / "~"`)
 /// are the only bytes left unescaped when substituting a value into a URL
@@ -118,14 +118,12 @@ pub async fn execute(
     array_params: &HashSet<String>,
 ) -> Result<Value, HttpError> {
     let url = substitute_string(&request.url, params);
-    let method = reqwest::Method::from_bytes(request.method.as_bytes())
-        .map_err(|e| HttpError::InvalidMethod(format!("{}: {e}", request.method)))?;
+    let method = reqwest::Method::from_bytes(request.method.as_bytes()).map_err(|e| HttpError::InvalidMethod(format!("{}: {e}", request.method)))?;
 
     let mut builder = client.request(method, &url).timeout(Duration::from_millis(request.timeout_ms));
 
     if let Some(body) = &request.body {
-        let substituted =
-            whole_value_passthrough(body, params, array_params).unwrap_or_else(|| substitute_value(body, params));
+        let substituted = whole_value_passthrough(body, params, array_params).unwrap_or_else(|| substitute_value(body, params));
         builder = builder.json(&substituted);
     }
 
@@ -150,20 +148,16 @@ pub async fn execute(
 fn apply_auth(builder: reqwest::RequestBuilder, auth: &HttpAuth) -> Result<reqwest::RequestBuilder, HttpError> {
     match auth {
         HttpAuth::Bearer { token_env } => {
-            let token = std::env::var(token_env)
-                .map_err(|_| HttpError::Auth(format!("env var '{token_env}' not set for bearer auth")))?;
+            let token = std::env::var(token_env).map_err(|_| HttpError::Auth(format!("env var '{token_env}' not set for bearer auth")))?;
             Ok(builder.bearer_auth(token))
         }
         HttpAuth::ApiKey { header_name, value_env } => {
-            let value = std::env::var(value_env)
-                .map_err(|_| HttpError::Auth(format!("env var '{value_env}' not set for apiKey auth")))?;
+            let value = std::env::var(value_env).map_err(|_| HttpError::Auth(format!("env var '{value_env}' not set for apiKey auth")))?;
             Ok(builder.header(header_name, value))
         }
         HttpAuth::Basic { user_env, password_env } => {
-            let user = std::env::var(user_env)
-                .map_err(|_| HttpError::Auth(format!("env var '{user_env}' not set for basic auth")))?;
-            let password = std::env::var(password_env)
-                .map_err(|_| HttpError::Auth(format!("env var '{password_env}' not set for basic auth")))?;
+            let user = std::env::var(user_env).map_err(|_| HttpError::Auth(format!("env var '{user_env}' not set for basic auth")))?;
+            let password = std::env::var(password_env).map_err(|_| HttpError::Auth(format!("env var '{password_env}' not set for basic auth")))?;
             Ok(builder.basic_auth(user, Some(password)))
         }
         HttpAuth::Forward { .. } => Err(HttpError::Auth(
@@ -195,11 +189,7 @@ fn sql_value_to_string(value: &SqlValue) -> String {
 /// `{{...}}` is never touched, only the substituted values are — shared by
 /// `substitute_string` (URL context, percent-encoded) and
 /// `substitute_literal` (JSON body context, verbatim) below.
-fn substitute_template(
-    template: &str,
-    params: &HashMap<String, SqlValue>,
-    encode: impl Fn(&str, &str) -> String,
-) -> String {
+fn substitute_template(template: &str, params: &HashMap<String, SqlValue>, encode: impl Fn(&str, &str) -> String) -> String {
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
     while let Some(start) = rest.find("{{") {
@@ -266,9 +256,7 @@ fn substitute_value(value: &Value, params: &HashMap<String, SqlValue>) -> Value 
     match value {
         Value::String(s) => Value::String(substitute_literal(s, params)),
         Value::Array(items) => Value::Array(items.iter().map(|v| substitute_value(v, params)).collect()),
-        Value::Object(map) => {
-            Value::Object(map.iter().map(|(k, v)| (k.clone(), substitute_value(v, params))).collect())
-        }
+        Value::Object(map) => Value::Object(map.iter().map(|(k, v)| (k.clone(), substitute_value(v, params))).collect()),
         other => other.clone(),
     }
 }
@@ -506,7 +494,9 @@ mod tests {
     #[tokio::test]
     async fn forward_auth_is_not_executable_yet() {
         let mut request = request_file("http://127.0.0.1:1/unreachable".to_string());
-        request.auth = Some(HttpAuth::Forward { header: "Authorization".to_string() });
+        request.auth = Some(HttpAuth::Forward {
+            header: "Authorization".to_string(),
+        });
 
         let err = execute(&reqwest::Client::new(), &request, &HashMap::new(), &HashSet::new())
             .await
@@ -577,10 +567,7 @@ mod tests {
         let array_params = HashSet::from(["items".to_string()]);
 
         let body = Value::String("{{items}}".to_string());
-        assert_eq!(
-            whole_value_passthrough(&body, &params, &array_params),
-            Some(Value::String("not json".to_string()))
-        );
+        assert_eq!(whole_value_passthrough(&body, &params, &array_params), Some(Value::String("not json".to_string())));
     }
 
     /// The design doc's own array-passthrough example, proven against a

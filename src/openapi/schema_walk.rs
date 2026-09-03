@@ -77,8 +77,7 @@ impl<'a> SchemaWalker<'a> {
         }
 
         if let Some(props) = obj.get("properties").and_then(Value::as_object) {
-            let fields =
-                props.iter().map(|(key, prop_schema)| (key.clone(), self.walk(prop_schema, in_progress, depth + 1)));
+            let fields = props.iter().map(|(key, prop_schema)| (key.clone(), self.walk(prop_schema, in_progress, depth + 1)));
             return Value::Object(fields.collect());
         }
 
@@ -130,8 +129,7 @@ impl<'a> SchemaWalker<'a> {
     /// `"oneOf<A, B>"` string; picking a stub value from the first variant
     /// is the stub-generation milestone's job, not this one's.
     fn walk_one_of(&self, variants: &[Value], in_progress: &mut HashSet<String>, depth: usize) -> Value {
-        let rendered: Vec<String> =
-            variants.iter().map(|variant| render_compact(&self.walk(variant, in_progress, depth + 1))).collect();
+        let rendered: Vec<String> = variants.iter().map(|variant| render_compact(&self.walk(variant, in_progress, depth + 1))).collect();
         Value::String(format!("oneOf<{}>", rendered.join(", ")))
     }
 }
@@ -199,14 +197,17 @@ fn walk_response_schema_at(schema: &Value, cache: &HashMap<String, Value>, depth
     }
 
     if let Some(variants) = obj.get("oneOf").or_else(|| obj.get("anyOf")).and_then(Value::as_array) {
-        let rendered: Vec<String> =
-            variants.iter().map(|variant| render_compact(&walk_response_schema_at(variant, cache, depth + 1))).collect();
+        let rendered: Vec<String> = variants
+            .iter()
+            .map(|variant| render_compact(&walk_response_schema_at(variant, cache, depth + 1)))
+            .collect();
         return Value::String(format!("oneOf<{}>", rendered.join(", ")));
     }
 
     if let Some(props) = obj.get("properties").and_then(Value::as_object) {
-        let fields =
-            props.iter().map(|(key, prop_schema)| (key.clone(), walk_response_schema_at(prop_schema, cache, depth + 1)));
+        let fields = props
+            .iter()
+            .map(|(key, prop_schema)| (key.clone(), walk_response_schema_at(prop_schema, cache, depth + 1)));
         return Value::Object(fields.collect());
     }
 
@@ -255,7 +256,10 @@ pub fn stub_from_descriptor(descriptor: &Value) -> Value {
             if fields.get("type").and_then(Value::as_str) == Some("array") && fields.contains_key("items") {
                 return serde_json::json!({ "type": "array", "source": null, "items": null });
             }
-            let nested = fields.iter().filter(|(key, _)| *key != "$component").map(|(key, value)| (key.clone(), stub_from_descriptor(value)));
+            let nested = fields
+                .iter()
+                .filter(|(key, _)| *key != "$component")
+                .map(|(key, value)| (key.clone(), stub_from_descriptor(value)));
             Value::Object(nested.collect())
         }
         _ => Value::Null,
@@ -328,9 +332,7 @@ fn is_mapping(value: &Value) -> bool {
 fn is_structural_object(value: &Value) -> bool {
     match value {
         Value::Null => true,
-        Value::Object(fields) => {
-            !fields.contains_key("from") && fields.get("type").and_then(Value::as_str) != Some("array")
-        }
+        Value::Object(fields) => !fields.contains_key("from") && fields.get("type").and_then(Value::as_str) != Some("array"),
         _ => false,
     }
 }
@@ -339,8 +341,11 @@ fn render_compact(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
         Value::Object(fields) => {
-            let parts: Vec<String> =
-                fields.iter().filter(|(k, _)| *k != "$component").map(|(k, v)| format!("{k}: {}", render_compact(v))).collect();
+            let parts: Vec<String> = fields
+                .iter()
+                .filter(|(k, _)| *k != "$component")
+                .map(|(k, v)| format!("{k}: {}", render_compact(v)))
+                .collect();
             format!("object{{{}}}", parts.join(", "))
         }
         Value::Array(_) => "array".to_string(),
@@ -556,8 +561,7 @@ mod tests {
 
     #[test]
     fn walk_response_schema_handles_arrays_of_a_cached_component() {
-        let schema: Value =
-            serde_json::from_str(r##"{ "type": "array", "items": { "$ref": "#/components/schemas/Owner" } }"##).unwrap();
+        let schema: Value = serde_json::from_str(r##"{ "type": "array", "items": { "$ref": "#/components/schemas/Owner" } }"##).unwrap();
         let mut cache = HashMap::new();
         cache.insert("Owner".to_string(), serde_json::json!({ "name": "string" }));
 

@@ -112,13 +112,14 @@ pub fn build_router(
         // same "skip with a loud warning" posture used for a malformed
         // endpoint file above.
         if let Some(scheme) = &endpoint.security
-            && !security.verifiers.contains_key(scheme) {
-                tracing::warn!(
-                    "skipping {}: security scheme '{scheme}' has no matching entry in security/schemes.json",
-                    file_path.display()
-                );
-                continue;
-            }
+            && !security.verifiers.contains_key(scheme)
+        {
+            tracing::warn!(
+                "skipping {}: security scheme '{scheme}' has no matching entry in security/schemes.json",
+                file_path.display()
+            );
+            continue;
+        }
 
         tracing::info!(
             "{} {url_path} -> {} (operationId: {})",
@@ -191,12 +192,13 @@ pub(crate) fn validate_endpoint_files(endpoints_root: &Path, security: &Security
             }
         };
         if let Some(scheme) = &endpoint.security
-            && !security.verifiers.contains_key(scheme) {
-                problems.push(format!(
-                    "{}: security scheme '{scheme}' has no matching entry in security/schemes.json",
-                    file_path.display()
-                ));
-            }
+            && !security.verifiers.contains_key(scheme)
+        {
+            problems.push(format!(
+                "{}: security scheme '{scheme}' has no matching entry in security/schemes.json",
+                file_path.display()
+            ));
+        }
     }
 
     (count, problems)
@@ -474,13 +476,7 @@ fn error_envelope(
 /// doc's own worked example. Saves to disk synchronously, right here,
 /// which only ever runs against a development-time trickle of unclassified
 /// errors, never production request volume.
-fn record_discovered_error(
-    discovered_errors: &Mutex<DiscoveredErrors>,
-    path: &Path,
-    code: &str,
-    definition: &crate::errors::ErrorDefinition,
-    message: &str,
-) {
+fn record_discovered_error(discovered_errors: &Mutex<DiscoveredErrors>, path: &Path, code: &str, definition: &crate::errors::ErrorDefinition, message: &str) {
     let mut discovered = discovered_errors.lock().unwrap();
     discovered.record(code, definition.http_status, definition.expose_detail, message);
     if let Err(e) = discovered.save(path) {
@@ -505,9 +501,10 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String, PathBuf)>) {
             }
             walk(root, &path, out);
         } else if let Some(method) = routable_method(&path)
-            && let Some(url_path) = url_path_for(root, &path) {
-                out.push((url_path, method.to_string(), path.clone()));
-            }
+            && let Some(url_path) = url_path_for(root, &path)
+        {
+            out.push((url_path, method.to_string(), path.clone()));
+        }
     }
 }
 
@@ -581,8 +578,7 @@ mod tests {
         std::fs::write(root.join("cars/{vin}/endpoint.get.test.json"), "{}").unwrap();
         std::fs::write(root.join("cars/{vin}/_backups/endpoint.get.2026-07-30T15-45-40Z.json"), "{}").unwrap();
 
-        let mut found: Vec<(String, String)> =
-            discover_endpoint_files(&root).into_iter().map(|(path, method, _)| (path, method)).collect();
+        let mut found: Vec<(String, String)> = discover_endpoint_files(&root).into_iter().map(|(path, method, _)| (path, method)).collect();
         found.sort();
         let _ = std::fs::remove_dir_all(&root);
 
@@ -644,11 +640,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl SqlDriver for FakeDriver {
-            async fn query(
-                &self,
-                _script: &str,
-                params: &HashMap<String, SqlValue>,
-            ) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
+            async fn query(&self, _script: &str, params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
                 match params.get("key") {
                     Some(SqlValue::Text(k)) if k == "good-key" => {
                         let mut row = HashMap::new();
@@ -687,15 +679,18 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let verifier = LoadedVerifier { valid_if: ValidIf::parse(def.valid_if()).unwrap(), def };
+        let verifier = LoadedVerifier {
+            valid_if: ValidIf::parse(def.valid_if()).unwrap(),
+            def,
+        };
         let mut verifiers = HashMap::new();
         verifiers.insert("apiKeyAuth".to_string(), verifier);
-        let security = Arc::new(SecurityConfig { schemes: HashMap::new(), verifiers });
+        let security = Arc::new(SecurityConfig {
+            schemes: HashMap::new(),
+            verifiers,
+        });
 
-        let endpoint: EndpointFile = serde_json::from_str(
-            r#"{ "operationId": "getSecret", "security": "apiKeyAuth", "sources": {}, "response": {} }"#,
-        )
-        .unwrap();
+        let endpoint: EndpointFile = serde_json::from_str(r#"{ "operationId": "getSecret", "security": "apiKeyAuth", "sources": {}, "response": {} }"#).unwrap();
 
         let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
         drivers.insert("db".to_string(), Box::new(FakeDriver));
@@ -727,20 +722,10 @@ mod tests {
         let resp = client.get(format!("http://{addr}/secret")).send().await.unwrap();
         assert_eq!(resp.status(), 401, "no credential at all must be rejected");
 
-        let resp = client
-            .get(format!("http://{addr}/secret"))
-            .header("X-Api-Key", "wrong-key")
-            .send()
-            .await
-            .unwrap();
+        let resp = client.get(format!("http://{addr}/secret")).header("X-Api-Key", "wrong-key").send().await.unwrap();
         assert_eq!(resp.status(), 401, "an unrecognized key must be rejected");
 
-        let resp = client
-            .get(format!("http://{addr}/secret"))
-            .header("X-Api-Key", "good-key")
-            .send()
-            .await
-            .unwrap();
+        let resp = client.get(format!("http://{addr}/secret")).header("X-Api-Key", "good-key").send().await.unwrap();
         assert_eq!(resp.status(), 200, "a valid, active key must be accepted");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -760,11 +745,7 @@ mod tests {
         ));
         let dir = root.join("datasources/endpoints/things");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("endpoint.get.json"),
-            r#"{ "operationId": "getThing", "sources": {}, "response": {} }"#,
-        )
-        .unwrap();
+        std::fs::write(dir.join("endpoint.get.json"), r#"{ "operationId": "getThing", "sources": {}, "response": {} }"#).unwrap();
         std::fs::write(
             dir.join("endpoint.post.json"),
             r#"{ "operationId": "createThing", "successStatus": 201, "sources": {}, "response": {} }"#,
@@ -987,11 +968,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl SqlDriver for EmptyResultDriver {
-            async fn query(
-                &self,
-                _script: &str,
-                _params: &HashMap<String, crate::sql::SqlValue>,
-            ) -> Result<Vec<crate::sql::SqlRow>, crate::sql::SqlError> {
+            async fn query(&self, _script: &str, _params: &HashMap<String, crate::sql::SqlValue>) -> Result<Vec<crate::sql::SqlRow>, crate::sql::SqlError> {
                 Ok(vec![])
             }
         }
@@ -1029,16 +1006,15 @@ mod tests {
         // zero-row "one"-cardinality source classifies to) is unclassified.
         let errors = Arc::new(ErrorRegistry::load(&root.join("config/errors")).unwrap());
         let security = Arc::new(SecurityConfig::default());
-        let router =
-            build_router(
-                &root,
-                Arc::new(drivers),
-                errors,
-                security,
-                Arc::new(HashMap::new()),
-                Arc::new(Mutex::new(DiscoveredErrors::default())),
-                true,
-            );
+        let router = build_router(
+            &root,
+            Arc::new(drivers),
+            errors,
+            security,
+            Arc::new(HashMap::new()),
+            Arc::new(Mutex::new(DiscoveredErrors::default())),
+            true,
+        );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1055,8 +1031,7 @@ mod tests {
         assert_eq!(response.status(), 500);
 
         let discovered_path = root.join("config/errors.discovered.json");
-        let discovered = DiscoveredErrors::load(&discovered_path)
-            .expect("a real unclassified failure in debugMode must be saved to config/errors.discovered.json");
+        let discovered = DiscoveredErrors::load(&discovered_path).expect("a real unclassified failure in debugMode must be saved to config/errors.discovered.json");
         assert_eq!(discovered.len(), 1);
         let entry = discovered.lookup("datasource.sql.not_found").expect("recorded under its real classification code");
         assert_eq!(entry.occurrences, 1);

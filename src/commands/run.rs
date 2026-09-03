@@ -4,7 +4,7 @@ use std::path::Path;
 use axum::Router;
 
 use crate::config::{Config, ManualTlsConfig, ServerConfig, TlsConfig, TlsMode};
-use crate::project::{require_project_root, MANIFEST_FILE};
+use crate::project::{MANIFEST_FILE, require_project_root};
 use crate::server::pidfile;
 use crate::webserve::WebServeConfig;
 
@@ -35,10 +35,7 @@ pub async fn run(cwd: &Path) -> io::Result<()> {
 
     match (has_api, has_web) {
         (false, false) => {
-            eprintln!(
-                "error: no {MANIFEST_FILE} or webserve.json found at {} — run `frogs generate` first",
-                root.display()
-            );
+            eprintln!("error: no {MANIFEST_FILE} or webserve.json found at {} — run `frogs generate` first", root.display());
             std::process::exit(1);
         }
         (true, false) => run_api(&root).await,
@@ -100,7 +97,10 @@ async fn run_both(root: &Path) -> io::Result<()> {
     let (web_router, web_config) = build_web_router(root);
 
     let api_root_display = crate::server::normalize_api_root(&server_config.api_root).unwrap_or_else(|| "unprefixed".to_string());
-    println!("serving both an API ({api_root_display}) and static content (startPage: {}) from one process", web_config.start_page);
+    println!(
+        "serving both an API ({api_root_display}) and static content (startPage: {}) from one process",
+        web_config.start_page
+    );
     println!("API operational routes: {}", operational_routes_display(&server_config).join(", "));
     if web_config.port != server_config.port {
         // Only one process, only one listener — `config/server.json`'s port
@@ -180,15 +180,7 @@ async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
     let security = std::sync::Arc::new(config.security);
     let services = std::sync::Arc::new(config.services);
     let discovered_errors = std::sync::Arc::new(std::sync::Mutex::new(config.discovered_errors));
-    let endpoint_router = crate::endpoint::build_router(
-        &api_dir,
-        drivers.clone(),
-        errors,
-        security,
-        services,
-        discovered_errors,
-        debug_mode,
-    );
+    let endpoint_router = crate::endpoint::build_router(&api_dir, drivers.clone(), errors, security, services, discovered_errors, debug_mode);
     let mut router = crate::server::router().merge(endpoint_router);
 
     // Each is a separate, independently-stated router merged in only when
@@ -270,12 +262,10 @@ async fn serve(root: &Path, router: Router, port: u16, tls: &TlsConfig, tls_base
     match tls.mode {
         TlsMode::Off => serve_http(root, router, port).await,
         TlsMode::Manual => {
-            let manual = tls.manual.as_ref().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "tls.mode is \"manual\" but tls.manual (certPath/keyPath) is missing",
-                )
-            })?;
+            let manual = tls
+                .manual
+                .as_ref()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "tls.mode is \"manual\" but tls.manual (certPath/keyPath) is missing"))?;
             serve_https(root, router, port, manual, tls_base).await
         }
     }
@@ -285,7 +275,14 @@ async fn serve_http(root: &Path, router: Router, port: u16) -> io::Result<()> {
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    pidfile::write(root, &pidfile::RunInfo { pid: std::process::id(), port, started_at: chrono::Utc::now() })?;
+    pidfile::write(
+        root,
+        &pidfile::RunInfo {
+            pid: std::process::id(),
+            port,
+            started_at: chrono::Utc::now(),
+        },
+    )?;
 
     println!("listening on http://{addr} (Ctrl+C to stop, or `frogs stop` from another terminal)");
 
@@ -303,13 +300,7 @@ async fn serve_http(root: &Path, router: Router, port: u16) -> io::Result<()> {
 
 /// `manual.certPath`/`keyPath` resolve relative to `tls_base` — see
 /// `serve`'s own doc comment for which base each caller passes and why.
-async fn serve_https(
-    root: &Path,
-    router: Router,
-    port: u16,
-    manual: &ManualTlsConfig,
-    tls_base: &Path,
-) -> io::Result<()> {
+async fn serve_https(root: &Path, router: Router, port: u16, manual: &ManualTlsConfig, tls_base: &Path) -> io::Result<()> {
     let addr_str = format!("0.0.0.0:{port}");
     let addr: std::net::SocketAddr = addr_str
         .parse()
@@ -317,14 +308,12 @@ async fn serve_https(
 
     let cert_path = tls_base.join(&manual.cert_path);
     let key_path = tls_base.join(&manual.key_path);
-    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path).await.map_err(
-        |e| {
-            io::Error::new(
-                e.kind(),
-                format!("failed to load TLS cert/key ({}, {}): {e}", cert_path.display(), key_path.display()),
-            )
-        },
-    )?;
+    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path).await.map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("failed to load TLS cert/key ({}, {}): {e}", cert_path.display(), key_path.display()),
+        )
+    })?;
 
     // A `std::net::TcpListener` (not tokio's), bound synchronously here so a
     // port-already-in-use failure surfaces as an immediate `?` — same
@@ -343,7 +332,14 @@ async fn serve_https(
     listener.set_nonblocking(true)?;
     let server = axum_server::from_tcp_rustls(listener, rustls_config)?;
 
-    pidfile::write(root, &pidfile::RunInfo { pid: std::process::id(), port, started_at: chrono::Utc::now() })?;
+    pidfile::write(
+        root,
+        &pidfile::RunInfo {
+            pid: std::process::id(),
+            port,
+            started_at: chrono::Utc::now(),
+        },
+    )?;
 
     println!("listening on https://{addr_str} (Ctrl+C to stop, or `frogs stop` from another terminal)");
 
@@ -433,7 +429,10 @@ mod tests {
     #[tokio::test]
     async fn manual_mode_with_no_manual_config_is_a_clear_error() {
         let root = temp_project();
-        let tls = TlsConfig { mode: TlsMode::Manual, manual: None };
+        let tls = TlsConfig {
+            mode: TlsMode::Manual,
+            manual: None,
+        };
         let router = Router::new();
 
         let err = serve(&root, router, free_port(), &tls, &root)
@@ -495,7 +494,10 @@ mod tests {
 
         let tls = TlsConfig {
             mode: TlsMode::Manual,
-            manual: Some(ManualTlsConfig { cert_path: "cert.pem".to_string(), key_path: "key.pem".to_string() }),
+            manual: Some(ManualTlsConfig {
+                cert_path: "cert.pem".to_string(),
+                key_path: "key.pem".to_string(),
+            }),
         };
         let port = free_port();
         let router = Router::new().route("/hello", axum::routing::get(|| async { "hi" }));
@@ -537,7 +539,10 @@ mod tests {
 
         let tls = TlsConfig {
             mode: TlsMode::Manual,
-            manual: Some(ManualTlsConfig { cert_path: "cert.pem".to_string(), key_path: "key.pem".to_string() }),
+            manual: Some(ManualTlsConfig {
+                cert_path: "cert.pem".to_string(),
+                key_path: "key.pem".to_string(),
+            }),
         };
         let port = free_port();
         let router = Router::new().route("/hello", axum::routing::get(|| async { "hi" }));

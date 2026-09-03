@@ -29,14 +29,8 @@ pub fn run(cwd: &Path) -> io::Result<()> {
     println!("{OVERVIEW}");
 
     match find_project_root(cwd) {
-        Some(root) => println!(
-            "\ncurrently inside a project at {} — try `frogs generate` or `frogs run`",
-            root.display()
-        ),
-        None => println!(
-            "\nno project found from {} — create an openapi.yaml (or an .html file) to start one",
-            cwd.display()
-        ),
+        Some(root) => println!("\ncurrently inside a project at {} — try `frogs generate` or `frogs run`", root.display()),
+        None => println!("\nno project found from {} — create an openapi.yaml (or an .html file) to start one", cwd.display()),
     }
 
     Ok(())
@@ -51,10 +45,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "frogs-help-test-{name}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
         root

@@ -8,7 +8,7 @@ use std::path::Path;
 use serde_json::{Map, Value};
 
 pub use change_detection::{content_hash, referenced_component_names};
-pub use schema_walk::{merge_stub_response, stub_from_descriptor, walk_response_schema, SchemaWalker};
+pub use schema_walk::{SchemaWalker, merge_stub_response, stub_from_descriptor, walk_response_schema};
 
 /// The HTTP methods OpenAPI's Path Item Object recognizes as operations —
 /// any other key under a path (`parameters`, `summary`, ...) is ignored.
@@ -171,7 +171,10 @@ fn operation_security(operation: &Map<String, Value>, document_default: Option<&
 /// `security:` array — see `Operation::security`'s doc comment for why
 /// this collapses OpenAPI's fuller OR/AND grammar down to a single name.
 fn first_scheme_name(security: &Value) -> Option<String> {
-    security.as_array()?.iter().find_map(|requirement| requirement.as_object().and_then(|obj| obj.keys().next().cloned()))
+    security
+        .as_array()?
+        .iter()
+        .find_map(|requirement| requirement.as_object().and_then(|obj| obj.keys().next().cloned()))
 }
 
 /// The first `2xx` response's `application/json` schema on an operation
@@ -185,8 +188,10 @@ fn success_response_schema(operation: &Map<String, Value>) -> Option<Value> {
         if !status.starts_with('2') {
             continue;
         }
-        let schema =
-            response.get("content").and_then(|content| content.get("application/json")).and_then(|json| json.get("schema"));
+        let schema = response
+            .get("content")
+            .and_then(|content| content.get("application/json"))
+            .and_then(|json| json.get("schema"));
         if let Some(schema) = schema {
             return Some(schema.clone());
         }
@@ -221,7 +226,10 @@ pub enum OpenApiError {
     /// file for logging/traceability — it has to actually exist in the spec
     /// for that to be possible, so a missing one is a spec error, not
     /// something to silently paper over with a synthesized id.
-    MissingOperationId { path: String, method: String },
+    MissingOperationId {
+        path: String,
+        method: String,
+    },
 }
 
 impl fmt::Display for OpenApiError {
@@ -255,13 +263,15 @@ pub fn load(path: &Path) -> Result<OpenApiDocument, OpenApiError> {
         for (path, item) in paths {
             let Some(item) = item.as_object() else { continue };
             for method in HTTP_METHODS {
-                let Some(operation_obj) = item.get(*method).and_then(Value::as_object) else { continue };
-                let operation_id =
-                    operation_obj.get("operationId").and_then(Value::as_str).ok_or_else(|| {
-                        OpenApiError::MissingOperationId {
-                            path: path.clone(),
-                            method: method.to_string(),
-                        }
+                let Some(operation_obj) = item.get(*method).and_then(Value::as_object) else {
+                    continue;
+                };
+                let operation_id = operation_obj
+                    .get("operationId")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| OpenApiError::MissingOperationId {
+                        path: path.clone(),
+                        method: method.to_string(),
                     })?;
                 operations.push(Operation {
                     path: path.clone(),
@@ -367,8 +377,14 @@ mod tests {
                     operation_id: "getCarInfo".to_string(),
                     response_schema: car_with_price_ref.clone(),
                     parameters: vec![
-                        ParameterInfo { name: "maker".to_string(), location: "query".to_string() },
-                        ParameterInfo { name: "model".to_string(), location: "query".to_string() },
+                        ParameterInfo {
+                            name: "maker".to_string(),
+                            location: "query".to_string()
+                        },
+                        ParameterInfo {
+                            name: "model".to_string(),
+                            location: "query".to_string()
+                        },
                     ],
                     response_status_codes: vec![200],
                     security: None,
@@ -387,7 +403,10 @@ mod tests {
                     method: "get".to_string(),
                     operation_id: "getCarByVin".to_string(),
                     response_schema: car_with_price_ref,
-                    parameters: vec![ParameterInfo { name: "vin".to_string(), location: "path".to_string() }],
+                    parameters: vec![ParameterInfo {
+                        name: "vin".to_string(),
+                        location: "path".to_string()
+                    }],
                     response_status_codes: vec![200, 404],
                     security: Some("apiKeyAuth".to_string()),
                 },
@@ -403,9 +422,18 @@ mod tests {
             operation_id: "test".to_string(),
             response_schema: None,
             parameters: vec![
-                ParameterInfo { name: "id".to_string(), location: "path".to_string() },
-                ParameterInfo { name: "limit".to_string(), location: "query".to_string() },
-                ParameterInfo { name: "Authorization".to_string(), location: "header".to_string() },
+                ParameterInfo {
+                    name: "id".to_string(),
+                    location: "path".to_string(),
+                },
+                ParameterInfo {
+                    name: "limit".to_string(),
+                    location: "query".to_string(),
+                },
+                ParameterInfo {
+                    name: "Authorization".to_string(),
+                    location: "header".to_string(),
+                },
             ],
             response_status_codes: vec![200],
             security: None,
@@ -499,10 +527,7 @@ mod tests {
     #[test]
     fn an_operations_own_security_scheme_is_used() {
         let operation = serde_json::json!({ "security": [{ "apiKeyAuth": [] }] });
-        assert_eq!(
-            operation_security(operation.as_object().unwrap(), None),
-            Some("apiKeyAuth".to_string())
-        );
+        assert_eq!(operation_security(operation.as_object().unwrap(), None), Some("apiKeyAuth".to_string()));
     }
 
     #[test]
@@ -537,10 +562,7 @@ mod tests {
         // OpenAPI's own OR semantics: either scheme would satisfy this
         // operation. v1 collapses that down to just the first alternative.
         let operation = serde_json::json!({ "security": [{ "apiKeyAuth": [] }, { "bearerAuth": [] }] });
-        assert_eq!(
-            operation_security(operation.as_object().unwrap(), None),
-            Some("apiKeyAuth".to_string())
-        );
+        assert_eq!(operation_security(operation.as_object().unwrap(), None), Some("apiKeyAuth".to_string()));
     }
 
     #[test]
@@ -551,9 +573,6 @@ mod tests {
         // `preserve_order` feature, so the object's key order matches the
         // order it was written in.
         let operation = serde_json::json!({ "security": [{ "apiKeyAuth": [], "bearerAuth": [] }] });
-        assert_eq!(
-            operation_security(operation.as_object().unwrap(), None),
-            Some("apiKeyAuth".to_string())
-        );
+        assert_eq!(operation_security(operation.as_object().unwrap(), None), Some("apiKeyAuth".to_string()));
     }
 }

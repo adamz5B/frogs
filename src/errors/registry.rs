@@ -121,15 +121,8 @@ impl ErrorRegistry {
         let mut conflicts = Vec::new();
 
         for file in files {
-            let contents = fs::read_to_string(&file).map_err(|source| LoadError::Io {
-                file: file.clone(),
-                source,
-            })?;
-            let defs: HashMap<String, ErrorDefinition> = serde_json::from_str(&contents)
-                .map_err(|source| LoadError::Parse {
-                    file: file.clone(),
-                    source,
-                })?;
+            let contents = fs::read_to_string(&file).map_err(|source| LoadError::Io { file: file.clone(), source })?;
+            let defs: HashMap<String, ErrorDefinition> = serde_json::from_str(&contents).map_err(|source| LoadError::Parse { file: file.clone(), source })?;
 
             for (code, def) in defs {
                 match codes.get(&code) {
@@ -159,9 +152,7 @@ impl ErrorRegistry {
             return Err(LoadError::Conflicts(conflicts));
         }
 
-        codes
-            .entry(UNEXPECTED_ERROR_CODE.to_string())
-            .or_insert_with(default_unexpected_error);
+        codes.entry(UNEXPECTED_ERROR_CODE.to_string()).or_insert_with(default_unexpected_error);
 
         Ok(ErrorRegistry { codes })
     }
@@ -177,9 +168,7 @@ impl ErrorRegistry {
     /// unclassified. `unexpected.error` is always present after `load`, so
     /// this never panics.
     pub fn lookup(&self, code: &str) -> &ErrorDefinition {
-        self.codes
-            .get(code)
-            .unwrap_or_else(|| &self.codes[UNEXPECTED_ERROR_CODE])
+        self.codes.get(code).unwrap_or_else(|| &self.codes[UNEXPECTED_ERROR_CODE])
     }
 
     pub fn len(&self) -> usize {
@@ -239,16 +228,8 @@ mod tests {
     #[test]
     fn identical_duplicate_across_files_is_allowed() {
         let dir = tempdir();
-        write_json(
-            dir.path(),
-            "a.json",
-            r#"{ "auth.invalid_credentials": { "httpStatus": 401, "exposeDetail": true } }"#,
-        );
-        write_json(
-            dir.path(),
-            "b.json",
-            r#"{ "auth.invalid_credentials": { "httpStatus": 401, "exposeDetail": true } }"#,
-        );
+        write_json(dir.path(), "a.json", r#"{ "auth.invalid_credentials": { "httpStatus": 401, "exposeDetail": true } }"#);
+        write_json(dir.path(), "b.json", r#"{ "auth.invalid_credentials": { "httpStatus": 401, "exposeDetail": true } }"#);
         let registry = ErrorRegistry::load(dir.path()).expect("identical duplicates are fine");
         assert_eq!(registry.lookup("auth.invalid_credentials").http_status, 401);
     }
@@ -256,16 +237,8 @@ mod tests {
     #[test]
     fn differing_duplicate_across_files_is_a_conflict() {
         let dir = tempdir();
-        write_json(
-            dir.path(),
-            "a.json",
-            r#"{ "auth.invalid_credentials": { "httpStatus": 401, "exposeDetail": true } }"#,
-        );
-        write_json(
-            dir.path(),
-            "b.json",
-            r#"{ "auth.invalid_credentials": { "httpStatus": 403, "exposeDetail": true } }"#,
-        );
+        write_json(dir.path(), "a.json", r#"{ "auth.invalid_credentials": { "httpStatus": 401, "exposeDetail": true } }"#);
+        write_json(dir.path(), "b.json", r#"{ "auth.invalid_credentials": { "httpStatus": 403, "exposeDetail": true } }"#);
         let err = ErrorRegistry::load(dir.path()).expect_err("differing duplicates must fail");
         match err {
             LoadError::Conflicts(conflicts) => {
@@ -282,10 +255,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "frogs-errors-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         fs::create_dir_all(&path).unwrap();
         TempDir { path }

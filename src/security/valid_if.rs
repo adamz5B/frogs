@@ -58,10 +58,7 @@ impl ValidIf {
     pub fn parse(expr: &str) -> Result<Self, ValidIfParseError> {
         let mut parts = expr.splitn(2, '=');
         let left = parts.next().unwrap_or("").trim();
-        let right = parts
-            .next()
-            .ok_or_else(|| ValidIfParseError::MissingEquals(expr.to_string()))?
-            .trim();
+        let right = parts.next().ok_or_else(|| ValidIfParseError::MissingEquals(expr.to_string()))?.trim();
 
         let mut segments: Vec<String> = left.split('.').map(str::trim).map(str::to_string).collect();
         if segments.len() < 2 || segments.iter().any(String::is_empty) {
@@ -73,7 +70,10 @@ impl ValidIf {
             return Err(ValidIfParseError::MissingValue(expr.to_string()));
         }
 
-        Ok(ValidIf { path: segments, expected: parse_literal(right) })
+        Ok(ValidIf {
+            path: segments,
+            expected: parse_literal(right),
+        })
     }
 
     /// Checks `resolved` (a verifier's resolved source result — a SQL row
@@ -109,10 +109,7 @@ fn parse_literal(raw: &str) -> Value {
             } else if let Ok(f) = raw.parse::<f64>() {
                 serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null)
             } else {
-                let unquoted = raw
-                    .strip_prefix('"')
-                    .and_then(|s| s.strip_suffix('"'))
-                    .unwrap_or(raw);
+                let unquoted = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(raw);
                 Value::String(unquoted.to_string())
             }
         }
@@ -126,7 +123,13 @@ mod tests {
     #[test]
     fn parses_a_boolean_check_dropping_the_source_label() {
         let valid_if = ValidIf::parse("row.active = true").unwrap();
-        assert_eq!(valid_if, ValidIf { path: vec!["active".to_string()], expected: Value::Bool(true) });
+        assert_eq!(
+            valid_if,
+            ValidIf {
+                path: vec!["active".to_string()],
+                expected: Value::Bool(true)
+            }
+        );
     }
 
     #[test]

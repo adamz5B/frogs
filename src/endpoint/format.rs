@@ -90,10 +90,7 @@ fn format_datetime(value: &Value, source_format: Option<&str>, date_only: bool) 
     let parsed: Option<DateTime<Utc>> = match source_format {
         Some("unix-seconds") => as_epoch_millis().and_then(|secs| DateTime::from_timestamp(secs, 0)),
         Some("unix-millis") => as_epoch_millis().and_then(DateTime::from_timestamp_millis),
-        Some("rfc3339") | None => value
-            .as_str()
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Utc)),
+        Some("rfc3339") | None => value.as_str().and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|dt| dt.with_timezone(&Utc)),
         Some(_) => None,
     };
 

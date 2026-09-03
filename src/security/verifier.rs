@@ -58,9 +58,7 @@ impl VerifierDef {
 
     pub fn cache_ttl_seconds(&self) -> Option<u64> {
         match self {
-            VerifierDef::Sql { cache_ttl_seconds, .. } | VerifierDef::Http { cache_ttl_seconds, .. } => {
-                *cache_ttl_seconds
-            }
+            VerifierDef::Sql { cache_ttl_seconds, .. } | VerifierDef::Http { cache_ttl_seconds, .. } => *cache_ttl_seconds,
         }
     }
 
@@ -86,7 +84,10 @@ mod tests {
             "cacheTtlSeconds": 30
         }"#;
         let verifier: VerifierDef = serde_json::from_str(json).unwrap();
-        let VerifierDef::Sql { connection, script, parameters, .. } = &verifier else {
+        let VerifierDef::Sql {
+            connection, script, parameters, ..
+        } = &verifier
+        else {
             panic!("expected a Sql verifier");
         };
         assert_eq!(connection, "vehicles_db");

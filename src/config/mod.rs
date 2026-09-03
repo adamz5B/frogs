@@ -88,21 +88,17 @@ impl Config {
 
         let server = load_json_file::<ServerConfig>(&config_dir.join("server.json"))?.unwrap_or_default();
 
-        let connections =
-            load_json_file::<HashMap<String, ConnectionConfig>>(&config_dir.join("connections.json"))?
-                .unwrap_or_default();
+        let connections = load_json_file::<HashMap<String, ConnectionConfig>>(&config_dir.join("connections.json"))?.unwrap_or_default();
 
         let errors = ErrorRegistry::load(&config_dir.join("errors")).map_err(ConfigLoadError::Errors)?;
 
         let discovered_errors_path = config_dir.join("errors.discovered.json");
-        let discovered_errors =
-            DiscoveredErrors::load(&discovered_errors_path).map_err(|source| ConfigLoadError::Io {
-                file: discovered_errors_path,
-                source,
-            })?;
+        let discovered_errors = DiscoveredErrors::load(&discovered_errors_path).map_err(|source| ConfigLoadError::Io {
+            file: discovered_errors_path,
+            source,
+        })?;
 
-        let security =
-            SecurityConfig::load(&project_root.join("security")).map_err(ConfigLoadError::Security)?;
+        let security = SecurityConfig::load(&project_root.join("security")).map_err(ConfigLoadError::Security)?;
 
         // Gated on the feature flag, not just the file's presence — a
         // project that's turned `serviceRegistry` off gets an empty map
@@ -131,10 +127,7 @@ impl Config {
     /// config, mirroring `project::require_project_root`.
     pub fn load_or_exit(project_root: &Path) -> Self {
         Self::load(project_root).unwrap_or_else(|err| {
-            eprintln!(
-                "error: failed to load config for project at {}:\n{err}",
-                project_root.display()
-            );
+            eprintln!("error: failed to load config for project at {}:\n{err}", project_root.display());
             std::process::exit(1);
         })
     }
@@ -187,10 +180,7 @@ mod tests {
         assert!(config.server.features.request_validation);
         assert!(!config.server.features.rate_limiting);
 
-        let vehicles_db = config
-            .connections
-            .get("vehicles_db")
-            .expect("connections.json should define vehicles_db");
+        let vehicles_db = config.connections.get("vehicles_db").expect("connections.json should define vehicles_db");
         assert_eq!(vehicles_db.driver, "postgres");
 
         assert!(config.errors.get("auth.invalid_credentials").is_some());
@@ -216,16 +206,8 @@ mod tests {
     fn services_json_loads_when_the_service_registry_feature_is_on() {
         let root = tempdir();
         fs::create_dir_all(root.path().join("config")).unwrap();
-        fs::write(
-            root.path().join("config/server.json"),
-            r#"{ "features": { "serviceRegistry": true } }"#,
-        )
-        .unwrap();
-        fs::write(
-            root.path().join("config/services.json"),
-            r#"{ "pricing": "https://pricing.example.com" }"#,
-        )
-        .unwrap();
+        fs::write(root.path().join("config/server.json"), r#"{ "features": { "serviceRegistry": true } }"#).unwrap();
+        fs::write(root.path().join("config/services.json"), r#"{ "pricing": "https://pricing.example.com" }"#).unwrap();
 
         let config = Config::load(root.path()).expect("fixture should load cleanly");
         assert_eq!(config.services.get("pricing"), Some(&"https://pricing.example.com".to_string()));
@@ -238,16 +220,8 @@ mod tests {
         // must not leak in once the toggle is flipped back off.
         let root = tempdir();
         fs::create_dir_all(root.path().join("config")).unwrap();
-        fs::write(
-            root.path().join("config/server.json"),
-            r#"{ "features": { "serviceRegistry": false } }"#,
-        )
-        .unwrap();
-        fs::write(
-            root.path().join("config/services.json"),
-            r#"{ "pricing": "https://pricing.example.com" }"#,
-        )
-        .unwrap();
+        fs::write(root.path().join("config/server.json"), r#"{ "features": { "serviceRegistry": false } }"#).unwrap();
+        fs::write(root.path().join("config/services.json"), r#"{ "pricing": "https://pricing.example.com" }"#).unwrap();
 
         let config = Config::load(root.path()).expect("fixture should load cleanly");
         assert!(config.services.is_empty());
@@ -305,11 +279,7 @@ mod tests {
         // shape as `security::mod`'s own `a_scheme_naming_a_verifier_file_
         // that_does_not_exist_fails_closed` test, but exercised here through
         // the full config-loading entry point.
-        fs::write(
-            security_dir.join("schemes.json"),
-            r#"{ "apiKeyAuth": { "verifier": "apiKeyVerifier.json" } }"#,
-        )
-        .unwrap();
+        fs::write(security_dir.join("schemes.json"), r#"{ "apiKeyAuth": { "verifier": "apiKeyVerifier.json" } }"#).unwrap();
 
         let err = Config::load(root.path()).expect_err("a broken security/ directory must fail the whole config load");
         assert!(matches!(err, ConfigLoadError::Security(_)));
@@ -326,10 +296,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "frogs-config-test-{}-{}-{n}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         fs::create_dir_all(&path).unwrap();
         TempDir { path }

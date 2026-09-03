@@ -304,7 +304,10 @@ mod tests {
         let mut memory = Memory::new();
         let save = HashMap::from([(
             "nextPosition".to_string(),
-            SaveEntry::Detailed { from: "response.body.queuePosition".to_string(), transform: Some("add:1".to_string()) },
+            SaveEntry::Detailed {
+                from: "response.body.queuePosition".to_string(),
+                transform: Some("add:1".to_string()),
+            },
         )]);
         memory.save(&save, 200, &serde_json::json!({ "queuePosition": 5 }));
 
@@ -326,7 +329,10 @@ mod tests {
     #[test]
     fn an_unresolvable_placeholder_is_left_as_is() {
         let memory = Memory::new();
-        assert_eq!(memory.substitute(&serde_json::json!("{{memory.neverSaved}}")), serde_json::json!("{{memory.neverSaved}}"));
+        assert_eq!(
+            memory.substitute(&serde_json::json!("{{memory.neverSaved}}")),
+            serde_json::json!("{{memory.neverSaved}}")
+        );
     }
 
     #[test]
@@ -362,7 +368,10 @@ mod tests {
         let mut memory = Memory::new();
         let save = HashMap::from([(
             "bad".to_string(),
-            SaveEntry::Detailed { from: "response.body.id".to_string(), transform: Some("frobnicate".to_string()) },
+            SaveEntry::Detailed {
+                from: "response.body.id".to_string(),
+                transform: Some("frobnicate".to_string()),
+            },
         )]);
         memory.save(&save, 200, &serde_json::json!({ "id": 42 }));
         assert!(memory.values.is_empty());

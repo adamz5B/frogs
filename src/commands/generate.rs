@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::config::{Config, ServerConfig};
-use crate::openapi::{content_hash, stub_from_descriptor, merge_stub_response, Operation, OpenApiDocument};
-use crate::project::{find_files_with_extensions, require_project_root, MANIFEST_FILE};
+use crate::openapi::{OpenApiDocument, Operation, content_hash, merge_stub_response, stub_from_descriptor};
+use crate::project::{MANIFEST_FILE, find_files_with_extensions, require_project_root};
 
 /// Files `generate --role web` scans the project root for (non-recursive —
 /// see `find_files_with_extensions`) to confirm there's a static project
@@ -128,14 +128,7 @@ fn generate_api(root: &Path) -> io::Result<()> {
         }
 
         let restored_set: HashSet<(String, String)> = restored.into_iter().collect();
-        let summary = write_endpoint_files(
-            &api_root,
-            &doc,
-            &components,
-            &changed_components,
-            &restored_set,
-            config.server.auto_migrate_endpoints,
-        )?;
+        let summary = write_endpoint_files(&api_root, &doc, &components, &changed_components, &restored_set, config.server.auto_migrate_endpoints)?;
         println!(
             "endpoints: {} unchanged (skipped), {} newly generated, {} migrated, {} drifted but left alone \
              (autoMigrateEndpoints off)",
@@ -254,8 +247,10 @@ fn generate_web(root: &Path, web_files: &[PathBuf]) -> io::Result<()> {
         return Ok(());
     }
 
-    let mut names: Vec<String> =
-        web_files.iter().filter_map(|path| path.file_name().and_then(|n| n.to_str()).map(str::to_string)).collect();
+    let mut names: Vec<String> = web_files
+        .iter()
+        .filter_map(|path| path.file_name().and_then(|n| n.to_str()).map(str::to_string))
+        .collect();
     names.sort();
 
     let Some(start_page) = names
@@ -278,8 +273,12 @@ fn generate_web(root: &Path, web_files: &[PathBuf]) -> io::Result<()> {
 
     let not_found_page = names.iter().find(|name| name.as_str() == "404.html").cloned();
 
-    let config =
-        crate::webserve::WebServeConfig { start_page, port: 8080, not_found_page, tls: Default::default() };
+    let config = crate::webserve::WebServeConfig {
+        start_page,
+        port: 8080,
+        not_found_page,
+        tls: Default::default(),
+    };
     crate::webserve::save_to(&webserve_path, &config)?;
 
     println!(
@@ -315,10 +314,7 @@ fn resolve_and_write_components(root: &Path, doc: &OpenApiDocument) -> io::Resul
             changed.insert(name.clone());
         }
 
-        std::fs::write(
-            &path,
-            serde_json::to_string_pretty(&with_hash(&new_hash, descriptor)).expect("always serializes"),
-        )?;
+        std::fs::write(&path, serde_json::to_string_pretty(&with_hash(&new_hash, descriptor)).expect("always serializes"))?;
     }
 
     Ok((descriptors, changed))
@@ -384,8 +380,11 @@ fn walk_active_endpoint_files(root: &Path, dir: &Path, out: &mut Vec<(String, St
                 continue;
             }
             walk_active_endpoint_files(root, &path, out);
-        } else if let Some(method) =
-            path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix("endpoint.")).and_then(|n| n.strip_suffix(".json"))
+        } else if let Some(method) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("endpoint."))
+            .and_then(|n| n.strip_suffix(".json"))
         {
             // A real HTTP method (`get`, `post`, ...) never contains a dot —
             // this excludes `.reference.json` and `.test.json` siblings
@@ -543,8 +542,7 @@ fn write_endpoint_files(
         let current_hash = op.response_schema_hash();
         let stored_reference = read_json(&reference_path);
         let stored_hash = stored_reference.as_ref().and_then(|v| v.get("_hash").and_then(Value::as_str).map(str::to_string));
-        let stored_security =
-            stored_reference.as_ref().and_then(|v| v.get("security").and_then(Value::as_str).map(str::to_string));
+        let stored_security = stored_reference.as_ref().and_then(|v| v.get("security").and_then(Value::as_str).map(str::to_string));
         let references_a_changed_component = op.referenced_components().iter().any(|name| changed_components.contains(name));
         // No stored hash at all (first-ever generation for this endpoint)
         // counts as drifted too — there's nothing to skip yet. A just-
@@ -626,7 +624,6 @@ fn migrate_stub(stub_path: &Path, response_descriptor: &Value) -> io::Result<()>
     std::fs::write(stub_path, serde_json::to_string_pretty(&stub).expect("always serializes"))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,7 +691,15 @@ mod tests {
         let components = HashMap::new();
 
         let summary = write_endpoint_files(&root, &doc, &components, &HashSet::new(), &HashSet::new(), true).unwrap();
-        assert_eq!(summary, GenerateSummary { skipped: 0, created: 1, migrated: 0, drift_warned: 0 });
+        assert_eq!(
+            summary,
+            GenerateSummary {
+                skipped: 0,
+                created: 1,
+                migrated: 0,
+                drift_warned: 0
+            }
+        );
 
         let dir = root.join("datasources/endpoints/ping");
         assert!(dir.join("endpoint.get.reference.json").is_file());
@@ -732,7 +737,15 @@ mod tests {
         let components = HashMap::new();
 
         let summary = write_endpoint_files(&root, &doc, &components, &HashSet::new(), &HashSet::new(), true).unwrap();
-        assert_eq!(summary, GenerateSummary { skipped: 0, created: 1, migrated: 0, drift_warned: 0 });
+        assert_eq!(
+            summary,
+            GenerateSummary {
+                skipped: 0,
+                created: 1,
+                migrated: 0,
+                drift_warned: 0
+            }
+        );
 
         let dir = root.join("datasources/endpoints/ping");
         let stub = read_json(&dir.join("endpoint.get.json")).unwrap();
@@ -784,14 +797,19 @@ mod tests {
 
         // The response schema changes (string -> object), which does
         // trigger migration, but the spec's security scheme name doesn't.
-        let changed_yaml = PROTECTED_PING_YAML.replace(
-            "schema: { type: string }",
-            "schema: { type: object, properties: { value: { type: string } } }",
-        );
+        let changed_yaml = PROTECTED_PING_YAML.replace("schema: { type: string }", "schema: { type: object, properties: { value: { type: string } } }");
         let doc_v2 = doc_from_yaml(&changed_yaml);
 
         let summary = write_endpoint_files(&root, &doc_v2, &components, &HashSet::new(), &HashSet::new(), true).unwrap();
-        assert_eq!(summary, GenerateSummary { skipped: 0, created: 0, migrated: 1, drift_warned: 0 });
+        assert_eq!(
+            summary,
+            GenerateSummary {
+                skipped: 0,
+                created: 0,
+                migrated: 1,
+                drift_warned: 0
+            }
+        );
 
         let stub = read_json(&stub_path).unwrap();
         assert_eq!(stub["security"], "apiKeyAuth", "migration must not touch an existing stub's security field");
@@ -816,7 +834,15 @@ mod tests {
         // Same response schema as PING_YAML — only `security:` is new.
         let doc_v2 = doc_from_yaml(PROTECTED_PING_YAML);
         let summary = write_endpoint_files(&root, &doc_v2, &components, &HashSet::new(), &HashSet::new(), true).unwrap();
-        assert_eq!(summary, GenerateSummary { skipped: 0, created: 0, migrated: 1, drift_warned: 0 });
+        assert_eq!(
+            summary,
+            GenerateSummary {
+                skipped: 0,
+                created: 0,
+                migrated: 1,
+                drift_warned: 0
+            }
+        );
 
         assert_eq!(read_json(&reference_path).unwrap()["security"], "apiKeyAuth");
 
@@ -834,7 +860,15 @@ mod tests {
         let modified_before = std::fs::metadata(&stub_path).unwrap().modified().unwrap();
 
         let summary = write_endpoint_files(&root, &doc, &components, &HashSet::new(), &HashSet::new(), true).unwrap();
-        assert_eq!(summary, GenerateSummary { skipped: 1, created: 0, migrated: 0, drift_warned: 0 });
+        assert_eq!(
+            summary,
+            GenerateSummary {
+                skipped: 1,
+                created: 0,
+                migrated: 0,
+                drift_warned: 0
+            }
+        );
         assert_eq!(std::fs::metadata(&stub_path).unwrap().modified().unwrap(), modified_before);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -848,22 +882,23 @@ mod tests {
         write_endpoint_files(&root, &doc_v1, &components, &HashSet::new(), &HashSet::new(), true).unwrap();
 
         let stub_path = root.join("datasources/endpoints/ping/endpoint.get.json");
-        std::fs::write(
-            &stub_path,
-            r#"{ "operationId": "ping", "sources": { "x": 1 }, "response": "sources.x.value" }"#,
-        )
-        .unwrap();
+        std::fs::write(&stub_path, r#"{ "operationId": "ping", "sources": { "x": 1 }, "response": "sources.x.value" }"#).unwrap();
 
         // Response schema changes from a bare string to an object — the old
         // "sources.x.value" mapping is now incompatible and must be dropped.
-        let changed_yaml = PING_YAML.replace(
-            "schema: { type: string }",
-            "schema: { type: object, properties: { value: { type: string } } }",
-        );
+        let changed_yaml = PING_YAML.replace("schema: { type: string }", "schema: { type: object, properties: { value: { type: string } } }");
         let doc_v2 = doc_from_yaml(&changed_yaml);
 
         let summary = write_endpoint_files(&root, &doc_v2, &components, &HashSet::new(), &HashSet::new(), true).unwrap();
-        assert_eq!(summary, GenerateSummary { skipped: 0, created: 0, migrated: 1, drift_warned: 0 });
+        assert_eq!(
+            summary,
+            GenerateSummary {
+                skipped: 0,
+                created: 0,
+                migrated: 1,
+                drift_warned: 0
+            }
+        );
 
         let backups_dir = root.join("datasources/endpoints/ping/_backups");
         assert_eq!(std::fs::read_dir(&backups_dir).unwrap().count(), 1, "expected exactly one backup file");
@@ -889,7 +924,15 @@ mod tests {
         let doc_v2 = doc_from_yaml(&changed_yaml);
 
         let summary = write_endpoint_files(&root, &doc_v2, &components, &HashSet::new(), &HashSet::new(), false).unwrap();
-        assert_eq!(summary, GenerateSummary { skipped: 0, created: 0, migrated: 0, drift_warned: 1 });
+        assert_eq!(
+            summary,
+            GenerateSummary {
+                skipped: 0,
+                created: 0,
+                migrated: 0,
+                drift_warned: 1
+            }
+        );
 
         let stub_contents = std::fs::read_to_string(&stub_path).unwrap();
         assert!(stub_contents.contains("hand-edited"), "autoMigrateEndpoints:false must leave the stub untouched");
@@ -940,9 +983,7 @@ mod tests {
         write_endpoint_files(&root, &doc_v1, &components, &HashSet::new(), &HashSet::new(), true).unwrap();
 
         // /ping no longer exists in the new spec.
-        let doc_v2 = doc_from_yaml(
-            "openapi: 3.0.3\ninfo: { title: t, version: 0.1.0 }\npaths: {}\n",
-        );
+        let doc_v2 = doc_from_yaml("openapi: 3.0.3\ninfo: { title: t, version: 0.1.0 }\npaths: {}\n");
 
         let orphaned = mark_orphaned_endpoints(&root, &doc_v2).unwrap();
         assert_eq!(orphaned, vec![("/ping".to_string(), "get".to_string())]);
@@ -965,8 +1006,7 @@ mod tests {
         // Hand-edit the stub before it gets orphaned, so we can prove the
         // mapping survives the whole orphan -> restore -> migrate round trip.
         let stub_path = root.join("datasources/endpoints/ping/endpoint.get.json");
-        std::fs::write(&stub_path, r#"{ "operationId": "ping", "sources": { "x": 1 }, "response": "sources.x.value" }"#)
-            .unwrap();
+        std::fs::write(&stub_path, r#"{ "operationId": "ping", "sources": { "x": 1 }, "response": "sources.x.value" }"#).unwrap();
 
         let empty_doc = doc_from_yaml("openapi: 3.0.3\ninfo: { title: t, version: 0.1.0 }\npaths: {}\n");
         mark_orphaned_endpoints(&root, &empty_doc).unwrap();
@@ -975,10 +1015,7 @@ mod tests {
         // /ping comes back, with a schema change (string -> object) at the
         // same time -- restoration must run through the same
         // backup-and-migrate flow as ordinary drift, not a fresh stub.
-        let changed_yaml = PING_YAML.replace(
-            "schema: { type: string }",
-            "schema: { type: object, properties: { value: { type: string } } }",
-        );
+        let changed_yaml = PING_YAML.replace("schema: { type: string }", "schema: { type: object, properties: { value: { type: string } } }");
         let doc_v2 = doc_from_yaml(&changed_yaml);
 
         let restored = restore_orphaned_endpoints(&root, &doc_v2).unwrap();

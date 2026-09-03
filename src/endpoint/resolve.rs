@@ -5,10 +5,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
 use super::error::SourceErrorCause;
-use super::schema::{
-    ArrayResponse, Cardinality, EndpointFile, Parameter, ParameterType, ResponseField, ResponseShape, SourceDef,
-};
-use crate::sql::{json_value_to_sql_value, sql_value_to_json, SqlDriver, SqlValue};
+use super::schema::{ArrayResponse, Cardinality, EndpointFile, Parameter, ParameterType, ResponseField, ResponseShape, SourceDef};
+use crate::sql::{SqlDriver, SqlValue, json_value_to_sql_value, sql_value_to_json};
 
 /// One resolved source's result, as plain JSON — a `Value::Object` whether
 /// it came from a SQL row (converted once here) or an HTTP response body
@@ -62,9 +60,10 @@ impl<'de> Deserialize<'de> for MockOutcome {
         let value = Value::deserialize(deserializer)?;
         if let Value::Object(map) = &value
             && map.len() == 1
-                && let Some(Value::String(code)) = map.get("fail") {
-                    return Ok(MockOutcome::Fail(code.clone()));
-                }
+            && let Some(Value::String(code)) = map.get("fail")
+        {
+            return Ok(MockOutcome::Fail(code.clone()));
+        }
         Ok(MockOutcome::Success(value))
     }
 }
@@ -125,7 +124,13 @@ pub async fn resolve_sources(
             Some(MockOutcome::Success(value)) => Ok(value.clone()),
             Some(MockOutcome::Fail(code)) => Err(SourceErrorCause::Mocked(code.clone())),
             None => match source {
-                SourceDef::Sql { connection, script, cardinality, parameters, .. } => {
+                SourceDef::Sql {
+                    connection,
+                    script,
+                    cardinality,
+                    parameters,
+                    ..
+                } => {
                     run_sql_source(
                         drivers,
                         sql_root,
@@ -140,7 +145,12 @@ pub async fn resolve_sources(
                     )
                     .await
                 }
-                SourceDef::Http { request, cardinality, parameters, .. } => {
+                SourceDef::Http {
+                    request,
+                    cardinality,
+                    parameters,
+                    ..
+                } => {
                     run_http_source(
                         services,
                         http_root,
@@ -197,8 +207,7 @@ async fn run_sql_source(
         .ok_or_else(|| SourceErrorCause::Config(format!("no connection named '{connection}'")))?;
 
     let script_path = sql_root.join(connection).join(script);
-    let script_contents = std::fs::read_to_string(&script_path)
-        .map_err(|e| SourceErrorCause::Config(format!("failed to read {}: {e}", script_path.display())))?;
+    let script_contents = std::fs::read_to_string(&script_path).map_err(|e| SourceErrorCause::Config(format!("failed to read {}: {e}", script_path.display())))?;
 
     let mut bound = HashMap::new();
     for param in parameters {
@@ -247,10 +256,9 @@ async fn run_http_source(
     }
 
     let request_path = http_root.join(request);
-    let contents = std::fs::read_to_string(&request_path)
-        .map_err(|e| SourceErrorCause::Config(format!("failed to read {}: {e}", request_path.display())))?;
-    let request_file: crate::http::HttpRequestFile = serde_json::from_str(&contents)
-        .map_err(|e| SourceErrorCause::Config(format!("invalid JSON in {}: {e}", request_path.display())))?;
+    let contents = std::fs::read_to_string(&request_path).map_err(|e| SourceErrorCause::Config(format!("failed to read {}: {e}", request_path.display())))?;
+    let request_file: crate::http::HttpRequestFile =
+        serde_json::from_str(&contents).map_err(|e| SourceErrorCause::Config(format!("invalid JSON in {}: {e}", request_path.display())))?;
 
     let mut bound = HashMap::new();
     // The service registry (design doc, `config/services.json`): a logical
@@ -272,7 +280,9 @@ async fn run_http_source(
         }
     }
 
-    crate::http::execute(client, &request_file, &bound, &array_params).await.map_err(SourceErrorCause::Http)
+    crate::http::execute(client, &request_file, &bound, &array_params)
+        .await
+        .map_err(SourceErrorCause::Http)
 }
 
 /// `path.`/`query.` look up the URL; `body.<field>` walks the parsed
@@ -290,13 +300,7 @@ async fn run_http_source(
 /// rather than an error: a script author who references a parameter that
 /// isn't available (or a body sent with a GET) gets a null bound value,
 /// not a crash.
-fn resolve_from(
-    from: &str,
-    path_params: &HashMap<String, String>,
-    query_params: &HashMap<String, String>,
-    body: &Value,
-    transaction_id: &str,
-) -> SqlValue {
+fn resolve_from(from: &str, path_params: &HashMap<String, String>, query_params: &HashMap<String, String>, body: &Value, transaction_id: &str) -> SqlValue {
     if let Some(name) = from.strip_prefix("path.") {
         return path_params.get(name).map(|v| SqlValue::Text(v.clone())).unwrap_or(SqlValue::Null);
     }
@@ -486,10 +490,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "frogs-resolve-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(root.join("db")).unwrap();
         std::fs::create_dir_all(root.join("http")).unwrap();
@@ -686,10 +687,7 @@ mod tests {
         use axum::routing::get;
         use axum::{Json, Router};
 
-        let app = Router::new().route(
-            "/price",
-            get(|| async { Json(serde_json::json!({ "amount": 24500, "currency": "USD" })) }),
-        );
+        let app = Router::new().route("/price", get(|| async { Json(serde_json::json!({ "amount": 24500, "currency": "USD" })) }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -697,11 +695,7 @@ mod tests {
         });
 
         let root = temp_project_root();
-        std::fs::write(
-            root.join("http/pricing.json"),
-            format!(r#"{{ "method": "GET", "url": "http://{addr}/price" }}"#),
-        )
-        .unwrap();
+        std::fs::write(root.join("http/pricing.json"), format!(r#"{{ "method": "GET", "url": "http://{addr}/price" }}"#)).unwrap();
 
         let json = r#"{
             "operationId": "test",
@@ -750,10 +744,7 @@ mod tests {
         use axum::routing::get;
         use axum::{Json, Router};
 
-        let app = Router::new().route(
-            "/price",
-            get(|| async { Json(serde_json::json!({ "amount": 24500, "currency": "USD" })) }),
-        );
+        let app = Router::new().route("/price", get(|| async { Json(serde_json::json!({ "amount": 24500, "currency": "USD" })) }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -761,11 +752,7 @@ mod tests {
         });
 
         let root = temp_project_root();
-        std::fs::write(
-            root.join("http/pricing.json"),
-            r#"{ "method": "GET", "url": "{{services.pricing}}/price" }"#,
-        )
-        .unwrap();
+        std::fs::write(root.join("http/pricing.json"), r#"{ "method": "GET", "url": "{{services.pricing}}/price" }"#).unwrap();
 
         let json = r#"{
             "operationId": "test",
@@ -887,20 +874,28 @@ mod tests {
         drivers.insert(
             "db".to_string(),
             Box::new(FakeDriver {
-                rows: vec![
-                    row(&[("vin", SqlValue::Text("AAA".to_string()))]),
-                    row(&[("vin", SqlValue::Text("BBB".to_string()))]),
-                ],
+                rows: vec![row(&[("vin", SqlValue::Text("AAA".to_string()))]), row(&[("vin", SqlValue::Text("BBB".to_string()))])],
                 fail: false,
             }),
         );
 
         let root = temp_project_root();
         let client = reqwest::Client::new();
-        let resolved =
-            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
-                .await
-                .expect("a many-cardinality source with rows should resolve");
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .expect("a many-cardinality source with rows should resolve");
 
         let Some(Value::Array(rows)) = resolved.get("cars").cloned().flatten() else {
             panic!("expected sources.cars to resolve to a JSON array");
@@ -925,10 +920,21 @@ mod tests {
 
         let root = temp_project_root();
         let client = reqwest::Client::new();
-        let resolved =
-            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
-                .await
-                .expect("zero rows is a valid result for a list, not a failure");
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .expect("zero rows is a valid result for a list, not a failure");
 
         assert_eq!(resolved.get("cars").cloned().flatten(), Some(Value::Array(Vec::new())));
     }
@@ -958,10 +964,21 @@ mod tests {
 
         let root = temp_project_root();
         let client = reqwest::Client::new();
-        let resolved =
-            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
-                .await
-                .unwrap();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
 
         let body = build_response(&endpoint, &resolved);
         assert_eq!(body, serde_json::json!([{ "vin": "AAA", "year": 2020 }]));
@@ -988,20 +1005,28 @@ mod tests {
         drivers.insert(
             "db".to_string(),
             Box::new(FakeDriver {
-                rows: vec![
-                    row(&[("vin", SqlValue::Text("AAA".to_string()))]),
-                    row(&[("vin", SqlValue::Text("BBB".to_string()))]),
-                ],
+                rows: vec![row(&[("vin", SqlValue::Text("AAA".to_string()))]), row(&[("vin", SqlValue::Text("BBB".to_string()))])],
                 fail: false,
             }),
         );
 
         let root = temp_project_root();
         let client = reqwest::Client::new();
-        let resolved =
-            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
-                .await
-                .unwrap();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
 
         let body = build_response(&endpoint, &resolved);
         assert_eq!(body["items"], serde_json::json!([{ "vin": "AAA" }, { "vin": "BBB" }]));
@@ -1020,7 +1045,10 @@ mod tests {
         let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
         drivers.insert(
             "db".to_string(),
-            Box::new(FakeDriver { rows: vec![row(&[("vin", SqlValue::Text("AAA".to_string()))])], fail: false }),
+            Box::new(FakeDriver {
+                rows: vec![row(&[("vin", SqlValue::Text("AAA".to_string()))])],
+                fail: false,
+            }),
         );
 
         let root = temp_project_root();
@@ -1060,10 +1088,21 @@ mod tests {
 
         let root = temp_project_root();
         let client = reqwest::Client::new();
-        let failure =
-            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
-            .await
-            .expect_err("cardinality 'many' has no response-assembly support yet, even before the request file is read");
+        let failure = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .expect_err("cardinality 'many' has no response-assembly support yet, even before the request file is read");
 
         assert_eq!(failure.cause.code(), "unexpected.error");
     }
@@ -1077,10 +1116,21 @@ mod tests {
 
         let root = temp_project_root();
         let client = reqwest::Client::new();
-        let failure =
-            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
-            .await
-            .expect_err("a source referencing a connection that isn't configured must fail clearly");
+        let failure = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .expect_err("a source referencing a connection that isn't configured must fail clearly");
 
         assert_eq!(failure.source_name, "car");
         assert_eq!(failure.cause.code(), "unexpected.error");
@@ -1101,10 +1151,21 @@ mod tests {
 
         let root = temp_project_root(); // only creates db/q.sql, not does_not_exist.sql
         let client = reqwest::Client::new();
-        let failure =
-            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
-            .await
-            .expect_err("a script file that isn't on disk must fail before ever reaching the driver");
+        let failure = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .expect_err("a script file that isn't on disk must fail before ever reaching the driver");
 
         assert_eq!(failure.cause.code(), "unexpected.error");
     }
@@ -1125,11 +1186,7 @@ mod tests {
         });
 
         let root = temp_project_root();
-        std::fs::write(
-            root.join("http/pricing.json"),
-            format!(r#"{{ "method": "GET", "url": "http://{addr}/price" }}"#),
-        )
-        .unwrap();
+        std::fs::write(root.join("http/pricing.json"), format!(r#"{{ "method": "GET", "url": "http://{addr}/price" }}"#)).unwrap();
 
         let json = r#"{
             "operationId": "test",
@@ -1143,10 +1200,21 @@ mod tests {
 
         let root_http = root.join("http");
         let client = reqwest::Client::new();
-        let failure =
-            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root_http, &client, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new())
-            .await
-            .expect_err("a non-optional http source returning a server error must fail the request");
+        let failure = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root_http,
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .expect_err("a non-optional http source returning a server error must fail the request");
 
         assert_eq!(failure.on_error, Some(502));
         assert_eq!(failure.cause.code(), "datasource.http.upstream_error");
@@ -1160,10 +1228,7 @@ mod tests {
         use axum::routing::get;
         use axum::{Json, Router};
 
-        let app = Router::new().route(
-            "/price",
-            get(|| async { Json(serde_json::json!({ "amount": 24500, "currency": "USD" })) }),
-        );
+        let app = Router::new().route("/price", get(|| async { Json(serde_json::json!({ "amount": 24500, "currency": "USD" })) }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1171,11 +1236,7 @@ mod tests {
         });
 
         let root = temp_project_root();
-        std::fs::write(
-            root.join("http/pricing.json"),
-            format!(r#"{{ "method": "GET", "url": "http://{addr}/price" }}"#),
-        )
-        .unwrap();
+        std::fs::write(root.join("http/pricing.json"), format!(r#"{{ "method": "GET", "url": "http://{addr}/price" }}"#)).unwrap();
 
         let json = r#"{
             "operationId": "getCarByVin",
@@ -1211,10 +1272,21 @@ mod tests {
 
         let path_params = HashMap::from([("vin".to_string(), "1HGCM82633A004352".to_string())]);
         let client = reqwest::Client::new();
-        let resolved =
-            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &path_params, &HashMap::new(), &Value::Null, "", &HashMap::new())
-            .await
-            .expect("both sources should resolve independently");
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &path_params,
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .expect("both sources should resolve independently");
 
         let body = build_response(&endpoint, &resolved);
         assert_eq!(body["vin"], "1HGCM82633A004352");
@@ -1226,7 +1298,10 @@ mod tests {
     #[test]
     fn resolve_from_reads_a_top_level_body_field() {
         let body = serde_json::json!({ "maker": "Honda" });
-        assert_eq!(resolve_from("body.maker", &HashMap::new(), &HashMap::new(), &body, ""), SqlValue::Text("Honda".to_string()));
+        assert_eq!(
+            resolve_from("body.maker", &HashMap::new(), &HashMap::new(), &body, ""),
+            SqlValue::Text("Honda".to_string())
+        );
     }
 
     #[test]
@@ -1285,11 +1360,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl SqlDriver for RecordingDriver {
-            async fn query(
-                &self,
-                _script: &str,
-                params: &HashMap<String, SqlValue>,
-            ) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
+            async fn query(&self, _script: &str, params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
                 self.received.lock().unwrap().push(params.clone());
                 Ok(vec![row(&[("id", SqlValue::Int(1))])])
             }
@@ -1428,11 +1499,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl SqlDriver for RecordingDriver {
-            async fn query(
-                &self,
-                _script: &str,
-                params: &HashMap<String, SqlValue>,
-            ) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
+            async fn query(&self, _script: &str, params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
                 *self.received.lock().unwrap() = Some(params.clone());
                 Ok(vec![row(&[("id", SqlValue::Int(1))])])
             }
@@ -1457,10 +1524,21 @@ mod tests {
         let root = temp_project_root();
         let client = reqwest::Client::new();
         let body = serde_json::json!({ "maker": "Honda" });
-        let resolved =
-            resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &body, "", &HashMap::new())
-                .await
-                .expect("the sql source should resolve using the body-derived parameter");
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &body,
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .expect("the sql source should resolve using the body-derived parameter");
 
         let response = build_response(&endpoint, &resolved);
         assert_eq!(response["id"], 1);
@@ -1485,11 +1563,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl SqlDriver for RecordingDriver {
-            async fn query(
-                &self,
-                _script: &str,
-                params: &HashMap<String, SqlValue>,
-            ) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
+            async fn query(&self, _script: &str, params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
                 *self.received.lock().unwrap() = Some(params.clone());
                 Ok(vec![row(&[("count", SqlValue::Int(2))])])
             }
@@ -1514,9 +1588,21 @@ mod tests {
         let root = temp_project_root();
         let client = reqwest::Client::new();
         let body = serde_json::json!({ "items": [{ "maker": "Honda" }, { "maker": "Ford" }] });
-        resolve_sources(&endpoint, &HashMap::new(), &drivers, &root, &root.join("http"), &client, &HashMap::new(), &HashMap::new(), &body, "", &HashMap::new())
-            .await
-            .expect("the sql source should resolve using the array-typed body parameter");
+        resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &body,
+            "",
+            &HashMap::new(),
+        )
+        .await
+        .expect("the sql source should resolve using the array-typed body parameter");
 
         let received_params = received.lock().unwrap().clone().unwrap();
         assert_eq!(
@@ -1547,10 +1633,7 @@ mod tests {
         let root = temp_project_root();
         let client = reqwest::Client::new();
         let mut mocks = HashMap::new();
-        mocks.insert(
-            "car".to_string(),
-            MockOutcome::Success(serde_json::json!({ "vin": "MOCKED-VIN" })),
-        );
+        mocks.insert("car".to_string(), MockOutcome::Success(serde_json::json!({ "vin": "MOCKED-VIN" })));
 
         let resolved = resolve_sources(
             &endpoint,

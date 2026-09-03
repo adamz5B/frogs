@@ -94,7 +94,12 @@ mod tests {
 
     #[test]
     fn a_missing_not_found_page_is_omitted_from_the_written_file() {
-        let config = WebServeConfig { start_page: "index.html".to_string(), port: 8080, not_found_page: None, tls: Default::default() };
+        let config = WebServeConfig {
+            start_page: "index.html".to_string(),
+            port: 8080,
+            not_found_page: None,
+            tls: Default::default(),
+        };
         let json = serde_json::to_string(&config).unwrap();
         assert!(!json.contains("notFoundPage"));
     }

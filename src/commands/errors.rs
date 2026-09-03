@@ -69,11 +69,7 @@ pub fn freeze(cwd: &Path) -> io::Result<()> {
     }
 
     if !skipped.is_empty() {
-        println!(
-            "skipped {} entries already classified in config/errors/: {}",
-            skipped.len(),
-            skipped.join(", ")
-        );
+        println!("skipped {} entries already classified in config/errors/: {}", skipped.len(), skipped.join(", "));
     }
 
     let discovered_path = api_dir.join("config/errors.discovered.json");

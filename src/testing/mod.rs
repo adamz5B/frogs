@@ -4,4 +4,4 @@ mod schema;
 
 pub use expect::evaluate;
 pub use memory::Memory;
-pub use schema::{load, save_to, Expectation, TestCase, TestFile, TestLoadError, TestRequest};
+pub use schema::{Expectation, TestCase, TestFile, TestLoadError, TestRequest, load, save_to};

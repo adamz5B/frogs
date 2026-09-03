@@ -5,10 +5,10 @@ use std::time::Duration;
 use axum::http::HeaderMap;
 use serde_json::Value;
 
+use super::LoadedVerifier;
 use super::cache::VerifierCache;
 use super::verifier::{Parameter, VerifierDef};
-use super::LoadedVerifier;
-use crate::sql::{sql_value_to_json, SqlDriver, SqlValue};
+use crate::sql::{SqlDriver, SqlValue, sql_value_to_json};
 
 /// Every way running a verifier can fail, classified for the same
 /// two-code split the design doc calls for: an infra problem behind the
@@ -68,9 +68,10 @@ pub async fn verify(
     let key = ttl.map(|_| cache_key(scheme_name, &bound));
 
     if let Some(key) = &key
-        && let Some(valid) = cache.get(key) {
-            return if valid { Ok(()) } else { Err(VerifyErrorCause::Invalid) };
-        }
+        && let Some(valid) = cache.get(key)
+    {
+        return if valid { Ok(()) } else { Err(VerifyErrorCause::Invalid) };
+    }
 
     let resolved = match &verifier.def {
         VerifierDef::Sql { connection, script, .. } => run_sql(drivers, sql_root, connection, script, &bound).await?,
@@ -86,11 +87,7 @@ pub async fn verify(
         cache.set(key, valid, Duration::from_secs(ttl));
     }
 
-    if valid {
-        Ok(())
-    } else {
-        Err(VerifyErrorCause::Invalid)
-    }
+    if valid { Ok(()) } else { Err(VerifyErrorCause::Invalid) }
 }
 
 /// Folds the scheme name and every bound parameter's value into one cache
@@ -135,8 +132,7 @@ async fn run_sql(
         .ok_or_else(|| VerifyErrorCause::Unavailable(format!("no connection named '{connection}'")))?;
 
     let script_path = sql_root.join(connection).join(script);
-    let script_contents = std::fs::read_to_string(&script_path)
-        .map_err(|e| VerifyErrorCause::Unavailable(format!("failed to read {}: {e}", script_path.display())))?;
+    let script_contents = std::fs::read_to_string(&script_path).map_err(|e| VerifyErrorCause::Unavailable(format!("failed to read {}: {e}", script_path.display())))?;
 
     let rows = driver
         .query(&script_contents, bound)
@@ -151,17 +147,11 @@ async fn run_sql(
     Ok(Value::Object(row.iter().map(|(k, v)| (k.clone(), sql_value_to_json(v))).collect()))
 }
 
-async fn run_http(
-    http_root: &Path,
-    client: &reqwest::Client,
-    request: &str,
-    bound: &HashMap<String, SqlValue>,
-) -> Result<Value, VerifyErrorCause> {
+async fn run_http(http_root: &Path, client: &reqwest::Client, request: &str, bound: &HashMap<String, SqlValue>) -> Result<Value, VerifyErrorCause> {
     let request_path = http_root.join(request);
-    let contents = std::fs::read_to_string(&request_path)
-        .map_err(|e| VerifyErrorCause::Unavailable(format!("failed to read {}: {e}", request_path.display())))?;
-    let request_file: crate::http::HttpRequestFile = serde_json::from_str(&contents)
-        .map_err(|e| VerifyErrorCause::Unavailable(format!("invalid JSON in {}: {e}", request_path.display())))?;
+    let contents = std::fs::read_to_string(&request_path).map_err(|e| VerifyErrorCause::Unavailable(format!("failed to read {}: {e}", request_path.display())))?;
+    let request_file: crate::http::HttpRequestFile =
+        serde_json::from_str(&contents).map_err(|e| VerifyErrorCause::Unavailable(format!("invalid JSON in {}: {e}", request_path.display())))?;
 
     // Every failure here is a genuine infra problem, not a rejected
     // credential: a token-introspection endpoint (the design doc's own
@@ -213,11 +203,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SqlDriver for FakeDriver {
-        async fn query(
-            &self,
-            _script: &str,
-            _params: &HashMap<String, SqlValue>,
-        ) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
+        async fn query(&self, _script: &str, _params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
             if self.fail {
                 Err(SqlError::QueryFailed("simulated failure".to_string()))
             } else {
@@ -230,10 +216,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "frogs-verify-test-{name}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(root.join("sql/db")).unwrap();
         std::fs::create_dir_all(root.join("http")).unwrap();
@@ -252,7 +235,10 @@ mod tests {
             }"#,
         )
         .unwrap();
-        LoadedVerifier { valid_if: ValidIf::parse(def.valid_if()).unwrap(), def }
+        LoadedVerifier {
+            valid_if: ValidIf::parse(def.valid_if()).unwrap(),
+            def,
+        }
     }
 
     fn headers_with(name: &str, value: &str) -> HeaderMap {
@@ -274,7 +260,10 @@ mod tests {
         let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
         drivers.insert(
             "db".to_string(),
-            Box::new(FakeDriver { rows: vec![row(&[("active", SqlValue::Bool(true))])], fail: false }),
+            Box::new(FakeDriver {
+                rows: vec![row(&[("active", SqlValue::Bool(true))])],
+                fail: false,
+            }),
         );
 
         let headers = headers_with("X-Api-Key", "good-key");
@@ -288,7 +277,8 @@ mod tests {
             &client,
             &headers,
             &VerifierCache::new(),
-        ).await;
+        )
+        .await;
 
         assert!(result.is_ok());
     }
@@ -299,7 +289,10 @@ mod tests {
         let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
         drivers.insert(
             "db".to_string(),
-            Box::new(FakeDriver { rows: vec![row(&[("active", SqlValue::Bool(false))])], fail: false }),
+            Box::new(FakeDriver {
+                rows: vec![row(&[("active", SqlValue::Bool(false))])],
+                fail: false,
+            }),
         );
 
         let headers = headers_with("X-Api-Key", "inactive-key");
@@ -314,8 +307,8 @@ mod tests {
             &headers,
             &VerifierCache::new(),
         )
-            .await
-            .expect_err("an inactive key must fail validIf");
+        .await
+        .expect_err("an inactive key must fail validIf");
 
         assert_eq!(err.code(), "auth.invalid_credentials");
     }
@@ -338,8 +331,8 @@ mod tests {
             &headers,
             &VerifierCache::new(),
         )
-            .await
-            .expect_err("zero rows must be treated as invalid credentials");
+        .await
+        .expect_err("zero rows must be treated as invalid credentials");
 
         assert_eq!(err.code(), "auth.invalid_credentials");
     }
@@ -363,8 +356,8 @@ mod tests {
             &headers,
             &VerifierCache::new(),
         )
-            .await
-            .expect_err("a request with no credential at all must be rejected");
+        .await
+        .expect_err("a request with no credential at all must be rejected");
 
         assert_eq!(err.code(), "auth.invalid_credentials");
     }
@@ -387,8 +380,8 @@ mod tests {
             &headers,
             &VerifierCache::new(),
         )
-            .await
-            .expect_err("a broken datasource must not be conflated with an invalid credential");
+        .await
+        .expect_err("a broken datasource must not be conflated with an invalid credential");
 
         assert_eq!(err.code(), "auth.verifier_unavailable");
     }
@@ -410,8 +403,8 @@ mod tests {
             &headers,
             &VerifierCache::new(),
         )
-            .await
-            .expect_err("a connection that isn't configured must fail as unavailable");
+        .await
+        .expect_err("a connection that isn't configured must fail as unavailable");
 
         assert_eq!(err.code(), "auth.verifier_unavailable");
     }
@@ -453,25 +446,21 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let verifier = LoadedVerifier { valid_if: ValidIf::parse(def.valid_if()).unwrap(), def };
+        let verifier = LoadedVerifier {
+            valid_if: ValidIf::parse(def.valid_if()).unwrap(),
+            def,
+        };
 
         let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
         let client = reqwest::Client::new();
         let cache = VerifierCache::new();
 
         let ok_headers = headers_with("Authorization", "good-token");
-        assert!(verify(
-            "bearerAuth",
-            &verifier,
-            &drivers,
-            &root.join("sql"),
-            &root.join("http"),
-            &client,
-            &ok_headers,
-            &cache,
-        )
-        .await
-        .is_ok());
+        assert!(
+            verify("bearerAuth", &verifier, &drivers, &root.join("sql"), &root.join("http"), &client, &ok_headers, &cache,)
+                .await
+                .is_ok()
+        );
 
         let bad_headers = headers_with("Authorization", "bad-token");
         let err = verify(
@@ -491,8 +480,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_cached_result_is_reused_without_rerunning_the_datasource() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         #[derive(Debug)]
         struct CountingDriver {
@@ -501,11 +490,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl SqlDriver for CountingDriver {
-            async fn query(
-                &self,
-                _script: &str,
-                _params: &HashMap<String, SqlValue>,
-            ) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
+            async fn query(&self, _script: &str, _params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(vec![row(&[("active", SqlValue::Bool(true))])])
             }
@@ -527,16 +512,17 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let verifier = LoadedVerifier { valid_if: ValidIf::parse(def.valid_if()).unwrap(), def };
+        let verifier = LoadedVerifier {
+            valid_if: ValidIf::parse(def.valid_if()).unwrap(),
+            def,
+        };
 
         let headers = headers_with("X-Api-Key", "good-key");
         let client = reqwest::Client::new();
         let cache = VerifierCache::new();
 
         for _ in 0..3 {
-            let result =
-                verify("apiKeyAuth", &verifier, &drivers, &root.join("sql"), &root.join("http"), &client, &headers, &cache)
-                    .await;
+            let result = verify("apiKeyAuth", &verifier, &drivers, &root.join("sql"), &root.join("http"), &client, &headers, &cache).await;
             assert!(result.is_ok());
         }
 
@@ -555,11 +541,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl SqlDriver for KeyAwareDriver {
-            async fn query(
-                &self,
-                _script: &str,
-                params: &HashMap<String, SqlValue>,
-            ) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
+            async fn query(&self, _script: &str, params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
                 match params.get("key") {
                     Some(SqlValue::Text(k)) if k == "good-key" => Ok(vec![row(&[("active", SqlValue::Bool(true))])]),
                     _ => Ok(vec![]),
@@ -582,15 +564,27 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let verifier = LoadedVerifier { valid_if: ValidIf::parse(def.valid_if()).unwrap(), def };
+        let verifier = LoadedVerifier {
+            valid_if: ValidIf::parse(def.valid_if()).unwrap(),
+            def,
+        };
         let client = reqwest::Client::new();
         let cache = VerifierCache::new();
 
         // Prime the cache for "good-key".
         let good_headers = headers_with("X-Api-Key", "good-key");
-        verify("apiKeyAuth", &verifier, &drivers, &root.join("sql"), &root.join("http"), &client, &good_headers, &cache)
-            .await
-            .expect("the first, real check for a good key should succeed");
+        verify(
+            "apiKeyAuth",
+            &verifier,
+            &drivers,
+            &root.join("sql"),
+            &root.join("http"),
+            &client,
+            &good_headers,
+            &cache,
+        )
+        .await
+        .expect("the first, real check for a good key should succeed");
 
         // A request with no key at all must still be rejected, not
         // accidentally reuse the cached "good-key" entry.
@@ -660,7 +654,10 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let verifier = LoadedVerifier { valid_if: ValidIf::parse(def.valid_if()).unwrap(), def };
+        let verifier = LoadedVerifier {
+            valid_if: ValidIf::parse(def.valid_if()).unwrap(),
+            def,
+        };
 
         let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
         let client = reqwest::Client::new();
@@ -738,8 +735,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_zero_second_ttl_still_goes_through_the_cache_path_but_never_effectively_caches() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         #[derive(Debug)]
         struct CountingDriver {
@@ -748,11 +745,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl SqlDriver for CountingDriver {
-            async fn query(
-                &self,
-                _script: &str,
-                _params: &HashMap<String, SqlValue>,
-            ) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
+            async fn query(&self, _script: &str, _params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok(vec![row(&[("active", SqlValue::Bool(true))])])
             }
@@ -774,7 +767,10 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let verifier = LoadedVerifier { valid_if: ValidIf::parse(def.valid_if()).unwrap(), def };
+        let verifier = LoadedVerifier {
+            valid_if: ValidIf::parse(def.valid_if()).unwrap(),
+            def,
+        };
 
         let headers = headers_with("X-Api-Key", "good-key");
         let client = reqwest::Client::new();
@@ -785,10 +781,7 @@ mod tests {
             // definitely expired by the time this iteration's `cache.get`
             // runs — same technique `VerifierCache`'s own expiry test uses.
             std::thread::sleep(std::time::Duration::from_millis(5));
-            let result = verify(
-                "apiKeyAuth", &verifier, &drivers, &root.join("sql"), &root.join("http"), &client, &headers, &cache,
-            )
-            .await;
+            let result = verify("apiKeyAuth", &verifier, &drivers, &root.join("sql"), &root.join("http"), &client, &headers, &cache).await;
             assert!(result.is_ok());
         }
 
