@@ -129,6 +129,9 @@ Supported methods: `get`, `post`, `put`, `patch`, `delete`.
     "year": { "from": "sources.car.year", "format": "integer" },
     "price": { "from": "sources.pricing.amount", "format": "decimal", "precision": 2 },
     "listedAt": { "from": "sources.car.listed_at", "format": "date-time", "sourceFormat": "unix-seconds" }
+  },
+  "errorOverrides": {
+    "datasource.sql.connection_failed": { "httpStatus": 503, "exposeDetail": true }
   }
 }
 ```
@@ -141,12 +144,40 @@ alternative-requirements grammar.
 validated at `generate` time against the operation's own declared response
 codes in `openapi.yaml`. Omitted defaults to 200.
 
+**`errorOverrides`** (optional, defaults to `{}`): per-endpoint
+`httpStatus`/`exposeDetail` overrides, keyed by error-registry code — either
+field alone, the other stays whatever the registry/discovered entry already
+says. Applies to any code this endpoint's requests can produce (source,
+verifier, or validation failures alike). A source's own `onError` is more
+specific and wins over this for `httpStatus` when both apply to the same
+failure.
+
+**`debugMode`** (optional boolean): overrides `server.json`'s global
+`debugMode` for just this endpoint — wins either direction (`true` or
+`false`), for both `detail`-exposure and discovered-error recording. Absent
+means "use the server-wide setting."
+
+**`rateLimit`** (optional): `{ "requestsPerSecond": ..., "burst": ... }` —
+this endpoint's own **additional** token bucket, on top of (not instead of)
+`server.json`'s global one. A request to this route must clear both. Same
+defaults as the global `rateLimit` for any field left unset.
+
+**`_generated`/`_todo`** (written by `frogs generate`, not something you
+add): while `_generated: true` is present, the server refuses to serve any
+real traffic for this endpoint — every request gets `501` with `_todo`'s
+own text as `detail`, before security, request validation, or any source
+runs. Delete both fields (or set `_generated: false`) once the file is
+actually filled in — nothing does this for you automatically once you've
+hand-edited the file.
+
 **`sources`**: a map of arbitrary source names to either:
 - `"type": "sql"` — `connection` (a key in `connections.json`), `script`
   (a file under `datasources/sql/<connection>/`), `cardinality`
   (`"one"` default, or `"many"` for an array of rows).
 - `"type": "http"` — `request` (a file under `datasources/http/`).
-  `cardinality: "many"` is **not supported** for HTTP sources — config error.
+  `cardinality: "many"` works too: the (`responsePath`-unwrapped, same as
+  `"one"`) response body must actually be a JSON array, or it's a clear
+  `datasource.http.upstream_error` failure.
 
 Both source types share:
 - `onError` (optional `u16`): fixes this source's failure status regardless
@@ -158,27 +189,54 @@ Both source types share:
 - `parameters`: list of `{ "name": "...", "from": "..." }`. Valid `from`
   prefixes: `path.<name>`, `query.<name>`, `body.<field>` (dot-path into
   the JSON request body), bare `body` (the whole body), `context.transactionId`
-  (one shared ID per request, for write auditing/correlation).
-  **`sources.<name>.<field>` is *not* a valid `parameters[].from` value** —
-  see Gotchas below. `header.*` is also not valid here (verifiers only).
+  (one shared ID per request, for write auditing/correlation), and
+  `sources.<name>` / `sources.<name>.<field...>` — chains another source's
+  already-resolved output (arbitrary depth, e.g. `sources.pricing.seller.name`)
+  into this source's own parameter; dependency order is resolved
+  automatically and a cycle is a clear request-time failure, not a hang.
+  `header.<name>` reads the caller's own request header (case-insensitive,
+  same lookup a security verifier's parameters use), null if absent.
+- `default`/`min`/`max` (optional integers, general clamping — the
+  pagination safety net, but applies to any parameter): declaring **any
+  one** switches this parameter into numeric mode — the resolved value is
+  parsed as an integer (`default` fills in a missing/unparseable one), then
+  clamped into `[min, max]`, and binds as a real integer, not the usual
+  all-text `path.`/`query.` binding. Off entirely if none of the three are set.
 
 **`response`**: a map of output field name to either a plain dot-path
-string (`"sources.<sourceName>.<field>"`), or an object with `from` plus
-formatting: `format` (`integer`/`decimal`/`boolean`/`date-time`/`date`/`string`),
+string (`"sources.<sourceName>.<field...>"` — `<field...>` walks arbitrarily
+deep into a nested object, e.g. `sources.car.owner.name`, not capped at one
+level), or an object with `from` plus formatting: `format`
+(`integer`/`decimal`/`boolean`/`date-time`/`date`/`string`),
 `precision` (for `decimal`), `sourceFormat` (`unix-seconds`/`unix-millis`/`rfc3339`,
 for `date-time`/`date`), `trim`/`uppercase`/`lowercase` (bool, for `string`).
 
 **Array output**: either the whole response, or one field within it, can be
 `{ "source": "<manyCardinalitySourceName>", "items": { "<outField>": "<bareColumnName>", ... } }`
 — `items`' own paths are bare column names (`"vin"`, not `"sources.x.vin"`)
-since `source` already picks which rows.
+since `source` already picks which rows. An unresolvable/wrong-cardinality
+`source` yields `[]`, not an error.
+
+**Array-of-one-field shorthand**: `"sources.<name>[].<field>"` as an
+ordinary field's value (or a detailed object's `from`) builds an array of
+just that one field across every row of a `cardinality: "many"` source —
+`["vin1", "vin2"]`, not `[{"vin": "vin1"}, ...]`. Distinct from the
+`array.source`+`items` form above, not an alias for it. `<field>` supports
+arbitrary nesting (`sources.cars[].owner.name`); `format`/etc. apply
+per-element. Only valid as an ordinary response field's value — not inside
+`items`, not as `array.source` itself.
 
 **Write operations** (POST/PUT/PATCH/DELETE): identical shape. A SQL write
 source is just a function/procedure call returning a result set —
 `"script": "create_car.sql"` containing `SELECT * FROM insert_car(:maker, :model, :year);`
 — mapped by `response` exactly like a SELECT. Body fields bind via
-`"from": "body.maker"`; an array-typed body field passes through to SQL as
-JSON-encoded text, or to an HTTP body's bare `"{{name}}"` template as real JSON.
+`"from": "body.maker"`; an array-typed body field passing through to SQL
+binds as a real native array (Postgres: `int8[]`/`float8[]`/`bool[]`/`text[]`
+when every element is the same scalar kind — `= ANY(:ids)`/`unnest(:ids)`
+directly, no unpacking needed; SQLite: always JSON-encoded text, queryable
+via `json_each(:ids)`; a mixed-element-type array falls back to JSON text
+on Postgres too) — or to an HTTP body's bare `"{{name}}"` template as real
+JSON.
 
 ## HTTP source file: `datasources/http/<name>.json`
 
@@ -198,9 +256,9 @@ JSON-encoded text, or to an HTTP body's bare `"{{name}}"` template as real JSON.
   `{{services.<name>}}` placeholder (see Service registry), which is a
   trusted server-config base URL and is passed through unencoded.
 - `auth.type`: `"bearer"` (`tokenEnv`), `"apiKey"` (`headerName` + `valueEnv`),
-  `"basic"` (`userEnv` + `passwordEnv`). `"forward"` parses but is **not
-  executable yet** (caller-header passthrough isn't wired up) — using it
-  fails every request.
+  `"basic"` (`userEnv` + `passwordEnv`), `"forward"` (`header` — passes the
+  *caller's own* request header through unchanged, under the same name, to
+  the upstream; fails clearly if the caller didn't send that header).
 - `responsePath` (optional): dot-path to unwrap an envelope, e.g. `"data"`
   for `{"data": {...}}`.
 - Secrets are always `*Env` — an environment variable **name**, never an
@@ -254,21 +312,30 @@ ones are a startup error). Shape:
 `exposeDetail: false` hides the real error message from the caller unless
 `debugMode` is on (`debugMode` always shows it, for every code).
 
-Fixed set of codes a source/verifier failure classifies into — these are
-not arbitrary strings, they're exactly this list:
+Fixed set of codes a source/verifier failure or a request-validation
+problem classifies into — these are not arbitrary strings, they're exactly
+this list:
 `datasource.sql.connection_failed`, `datasource.sql.query_failed`,
-`datasource.sql.constraint_violation`, `datasource.sql.not_found`,
+`datasource.sql.constraint_violation` (a unique/foreign-key/not-null/check
+violation specifically, detected via the driver's own portable error
+classification — same on Postgres and SQLite), `datasource.sql.not_found`,
 `datasource.http.timeout`, `datasource.http.not_found`,
 `datasource.http.upstream_error`, `auth.invalid_credentials`,
-`auth.verifier_unavailable`, `unexpected.error` (the catch-all, always
+`auth.verifier_unavailable`, `validation.missing_parameter`,
+`validation.invalid_type`, `unexpected.error` (the catch-all, always
 implicitly present even with an empty `config/errors/`). A code with no
-entry in the merged registry falls back to `unexpected.error`'s status.
+entry in the canonical registry falls back to its own matching entry in
+`config/errors.discovered.json` (see below) if one exists, then finally to
+`unexpected.error`'s status.
 
 In `debugMode`, an otherwise-unclassified code is logged and recorded into
-`config/errors.discovered.json` (never hand-edit this file). `frogs run`
-warns at startup once it passes `server.json`'s `discoveredErrorsWarnThreshold`
-entries. `frogs errors freeze` batches it into a new dated file under
-`config/errors/` and purges the scratch file.
+`config/errors.discovered.json`. Not meant to be hand-maintained long-term,
+but a hand-edit to an existing entry's `httpStatus`/`exposeDetail` there
+*does* take effect on the next matching request (the 3-tier lookup above) —
+`frogs errors freeze` is still the sanctioned way to make it permanent.
+`frogs run` warns at startup once it passes `server.json`'s
+`discoveredErrorsWarnThreshold` entries. `frogs errors freeze` batches it
+into a new dated file under `config/errors/` and purges the scratch file.
 
 ## Service registry (optional)
 
@@ -313,9 +380,23 @@ with defaults on first run, so in practice it always exists.
 - `features.metrics`/`readyzCheck`: expose `/metrics` (Prometheus text
   format) and `/readyz` (pings every configured SQL connection). `/healthz`
   is always on regardless of any feature flag.
+- `features.requestCorrelation` (default `true`): adds `X-Request-Id`
+  (reused if the caller sent one) to every response and tags that request's
+  log lines with it via a tracing span. `false` genuinely disables it —
+  `context.transactionId` then falls back to an empty string for every
+  source in that request instead of a real shared ID.
+- `features.requestValidation` (default `true`): checks a request's
+  path/query/header parameters and JSON body against `openapi.yaml`'s own
+  declared shape (required + type, recursively through the body) — after
+  the security check, before any source runs. Failure → `400` with
+  `validation.missing_parameter`/`validation.invalid_type`. Not full JSON
+  Schema: `oneOf`/`anyOf`/`pattern`/`min`/`max`/`nullable` aren't checked.
 - `features.rateLimiting` + `rateLimit`: a single **global** (whole-process,
   not per-client) token bucket. `burst` = starting/max tokens, `requestsPerSecond`
-  = refill rate. Exceeded → `429` with a `Retry-After` header.
+  = refill rate. Exceeded → `429` with a `Retry-After` header. An individual
+  endpoint file can declare its own top-level `"rateLimit": {...}` too — an
+  **additional** bucket layered on that one route, on top of (never instead
+  of) the global one; a request must clear both.
 - `tls.mode`: `"off"` (default) or `"manual"` (serves HTTPS via
   `rustls` from a user-supplied PEM cert/key pair — `certPath`/`keyPath`
   resolve relative to `api/`). `"acme"` is designed but **not implemented** —
@@ -345,17 +426,6 @@ resolve relative to `api/`. When a project serves **both** roles,
 
 ## Gotchas an agent should know about
 
-- **`sources.<name>.<field>` only works in `response` field mappings, not
-  in a `parameters[].from`.** A source cannot read another source's
-  resolved output as one of its own bound parameters — that "chaining"
-  capability is not implemented (`resolve_sources` runs sources in
-  arbitrary map order with no dependency graph). A parameter with
-  `"from": "sources.x.y"` silently resolves to `null` every time — no error,
-  no warning. If a value needs to flow from one source into another
-  (e.g. a SQL row's `vin` into a follow-up HTTP call), bind that HTTP
-  source's parameter from the *original request* instead (`path.vin`,
-  `query.vin`, `body.vin`) if the value is already available there, rather
-  than from the other source's result.
 - **Path/query parameters always bind as raw text to SQL, regardless of
   the OpenAPI parameter's declared `type`.** Comparing a text-bound value
   against a non-text column (`WHERE id = :id` where `id` is `integer`)
@@ -365,16 +435,20 @@ resolve relative to `api/`. When a project serves **both** roles,
   Postgres function with a specific integer width: frogs always binds
   integers as `bigint`/`int8`; a function declared to take `int4` needs
   `:quantity::int4` in the call.
-- **`"forward"` auth type parses but does nothing executable** — using it
-  makes every request using that HTTP source fail.
 - **A hand-edited `endpoint.<method>.json` is never overwritten** by
   `frogs generate`, even after the OpenAPI spec changes — only the sibling
   `.reference.json` regenerates. If a response field or source looks stale
   after editing `openapi.yaml`, check the `.reference.json` for what
   changed, then hand-edit the real file.
-- **`config/errors.discovered.json` and every `*.reference.json`/`_backups/`
-  file are server-managed** — never hand-edit them; changes are overwritten
-  or ignored.
+- **Every `*.reference.json` file and everything under `_backups/` is
+  server-managed** — never hand-edit them; changes are overwritten or
+  ignored.
+- **`config/errors.discovered.json` is also server-managed, but not quite
+  the same way** — it's not meant to be hand-maintained long-term, but a
+  hand-edit to an existing entry's `httpStatus`/`exposeDetail` *does* take
+  effect on the next matching request (see the error-registry section
+  above); it isn't silently overwritten until `frogs errors freeze` purges
+  it or a new occurrence of that same code updates it.
 - `validIf` and `format` are both deliberately small, fixed vocabularies —
   don't invent new operators/formats expecting them to work; unrecognized
   keys are silently ignored, not errors.

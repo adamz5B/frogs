@@ -9,7 +9,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::{Router, routing::get};
+use axum::{Router, routing::MethodRouter, routing::get};
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -244,6 +244,19 @@ impl RateLimiter {
 /// present on that specific `Router` value).
 pub fn apply_rate_limit(router: Router, limiter: Arc<RateLimiter>) -> Router {
     router.layer(middleware::from_fn_with_state(limiter, rate_limit_middleware))
+}
+
+/// The same middleware, scoped to a single route's own `MethodRouter`
+/// instead of the whole `Router` — what an endpoint's own `rateLimit`
+/// override (`EndpointFile::rate_limit`) attaches to just that route in
+/// `endpoint::build_router`, *in addition to* whatever `apply_rate_limit`
+/// above applies globally (a request through an overridden route must
+/// clear both buckets, since this doesn't replace the global one).
+pub fn apply_rate_limit_to_route<S>(method_router: MethodRouter<S>, limiter: Arc<RateLimiter>) -> MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    method_router.layer(middleware::from_fn_with_state(limiter, rate_limit_middleware))
 }
 
 async fn rate_limit_middleware(State(limiter): State<Arc<RateLimiter>>, req: Request, next: Next) -> Response {

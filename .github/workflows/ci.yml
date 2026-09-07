@@ -13,46 +13,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Full package only (both drivers, `--features sqlite` on top of the
+  # postgres default) — per-driver-combination legs were dropped since
+  # every driver's own logic is already covered by `sql::postgres`/
+  # `sql::sqlite`'s own unit tests regardless of which combination of
+  # features a given binary is built with; what's worth CI's time is
+  # proving the full package builds and passes on each OS.
   test:
-    name: test (${{ matrix.name }})
+    name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            name: ubuntu / postgres (default)
-            feature-flags: ""
-          - os: ubuntu-latest
-            name: ubuntu / postgres+sqlite
-            feature-flags: "--features sqlite"
-          - os: ubuntu-latest
-            name: ubuntu / sqlite-only
-            feature-flags: "--no-default-features --features sqlite"
-          - os: windows-latest
-            name: windows / postgres (default)
-            feature-flags: ""
-          - os: windows-latest
-            name: windows / postgres+sqlite
-            feature-flags: "--features sqlite"
-          - os: windows-latest
-            name: windows / sqlite-only
-            feature-flags: "--no-default-features --features sqlite"
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.os }}-${{ matrix.feature-flags }}
 
       - name: Build
-        run: cargo build --locked ${{ matrix.feature-flags }}
+        run: cargo build --locked --features sqlite
 
       - name: Test
-        run: cargo test --locked ${{ matrix.feature-flags }}
+        run: cargo test --locked --features sqlite
 
   # A real Postgres instance, exercised via the one `#[ignore]`d live-DB
   # test in src/sql/postgres.rs — Postgres service containers are a

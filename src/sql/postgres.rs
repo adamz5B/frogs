@@ -39,13 +39,64 @@ impl SqlDriver for PostgresDriver {
                 SqlValue::Float(f) => query.bind(f),
                 SqlValue::Text(s) => query.bind(s),
                 SqlValue::Timestamp(ts) => query.bind(ts),
+                SqlValue::Array(items) => bind_array(query, items),
             };
         }
 
-        let rows = query.fetch_all(&self.pool).await.map_err(|e| SqlError::QueryFailed(e.to_string()))?;
+        let rows = query.fetch_all(&self.pool).await.map_err(classify_query_error)?;
 
         rows.iter().map(convert_row).collect()
     }
+}
+
+/// Classifies a real query failure by sqlx's own portable `ErrorKind` —
+/// not by hand-parsing Postgres's SQLSTATE code — so a unique/foreign-key/
+/// not-null/check constraint violation becomes `SqlError::ConstraintViolation`
+/// (classifies to `datasource.sql.constraint_violation`) instead of the
+/// generic `QueryFailed` every other query error still falls back to.
+fn classify_query_error(e: sqlx::Error) -> SqlError {
+    use sqlx::error::ErrorKind;
+    match e.as_database_error().map(|db| db.kind()) {
+        Some(ErrorKind::UniqueViolation | ErrorKind::ForeignKeyViolation | ErrorKind::NotNullViolation | ErrorKind::CheckViolation) => {
+            SqlError::ConstraintViolation(e.to_string())
+        }
+        _ => SqlError::QueryFailed(e.to_string()),
+    }
+}
+
+/// Binds a `SqlValue::Array` as a real native Postgres array parameter when
+/// every element is the same scalar kind sqlx already knows how to encode
+/// as one (`int8[]`/`float8[]`/`bool[]`/`text[]`) — an empty array binds as
+/// `text[]`, arbitrarily, since there's no element to infer a type from.
+/// Anything else (mixed element types, or elements this doesn't model —
+/// nested arrays, timestamps) falls back to the same JSON-encoded-text
+/// shape `json_value_to_sql_value` used for *every* array before this
+/// function existed, rather than erroring on the harder cases.
+fn bind_array<'q>(
+    query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    items: Vec<SqlValue>,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    if items.is_empty() {
+        return query.bind(Vec::<String>::new());
+    }
+    if items.iter().all(|v| matches!(v, SqlValue::Int(_))) {
+        let values: Vec<i64> = items.into_iter().map(|v| if let SqlValue::Int(n) = v { n } else { unreachable!() }).collect();
+        return query.bind(values);
+    }
+    if items.iter().all(|v| matches!(v, SqlValue::Float(_))) {
+        let values: Vec<f64> = items.into_iter().map(|v| if let SqlValue::Float(f) = v { f } else { unreachable!() }).collect();
+        return query.bind(values);
+    }
+    if items.iter().all(|v| matches!(v, SqlValue::Bool(_))) {
+        let values: Vec<bool> = items.into_iter().map(|v| if let SqlValue::Bool(b) = v { b } else { unreachable!() }).collect();
+        return query.bind(values);
+    }
+    if items.iter().all(|v| matches!(v, SqlValue::Text(_))) {
+        let values: Vec<String> = items.into_iter().map(|v| if let SqlValue::Text(s) = v { s } else { unreachable!() }).collect();
+        return query.bind(values);
+    }
+    let json_text = serde_json::Value::Array(items.iter().map(super::sql_value_to_json).collect()).to_string();
+    query.bind(json_text)
 }
 
 fn build_connection_url(config: &ConnectionConfig) -> Result<String, SqlError> {
@@ -269,5 +320,88 @@ mod tests {
         assert_eq!(rows[0].get("year"), Some(&SqlValue::Int(2003)));
 
         sqlx::query("DROP TABLE frogs_smoke_test").execute(&driver.pool).await.unwrap();
+    }
+
+    /// A homogeneous scalar array binds as a real native Postgres array
+    /// (`= ANY($1)`, not a JSON-text blob a script would have to
+    /// `json_array_elements()` its way through) — the actual point of
+    /// `bind_array` existing at all. Same env-var-gated `#[ignore]`
+    /// convention as the smoke test above.
+    #[tokio::test]
+    #[ignore]
+    async fn an_array_parameter_binds_as_a_real_postgres_array() {
+        let url = std::env::var("DATABASE_URL_TEST").expect("set DATABASE_URL_TEST to a reachable Postgres connection string to run this test");
+        let pool = sqlx::PgPool::connect(&url).await.expect("failed to connect");
+        let driver = PostgresDriver { pool };
+
+        let mut params = HashMap::new();
+        params.insert(
+            "ids".to_string(),
+            SqlValue::Array(vec![SqlValue::Int(1), SqlValue::Int(2), SqlValue::Int(3)]),
+        );
+        let rows = driver
+            .query("SELECT unnest(:ids::int8[]) AS id ORDER BY id", &params)
+            .await
+            .expect("a homogeneous int array should bind as a real Postgres array, queryable via unnest");
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].get("id"), Some(&SqlValue::Int(1)));
+        assert_eq!(rows[1].get("id"), Some(&SqlValue::Int(2)));
+        assert_eq!(rows[2].get("id"), Some(&SqlValue::Int(3)));
+    }
+
+    /// A mixed-type array has no single native Postgres array type to bind
+    /// as, so it falls back to the same JSON-encoded-text shape every array
+    /// used before native binding existed — proven queryable via Postgres's
+    /// own `jsonb_array_length`, not just that it doesn't error.
+    #[tokio::test]
+    #[ignore]
+    async fn a_mixed_type_array_parameter_falls_back_to_json_text() {
+        let url = std::env::var("DATABASE_URL_TEST").expect("set DATABASE_URL_TEST to a reachable Postgres connection string to run this test");
+        let pool = sqlx::PgPool::connect(&url).await.expect("failed to connect");
+        let driver = PostgresDriver { pool };
+
+        let mut params = HashMap::new();
+        params.insert(
+            "mixed".to_string(),
+            SqlValue::Array(vec![SqlValue::Int(1), SqlValue::Text("two".to_string())]),
+        );
+        let rows = driver
+            .query("SELECT jsonb_array_length(:mixed::jsonb) AS n", &params)
+            .await
+            .expect("a mixed-type array should still bind as valid JSON text");
+
+        assert_eq!(rows[0].get("n"), Some(&SqlValue::Int(2)));
+    }
+
+    /// The point of `classify_query_error` existing at all: a real unique-
+    /// constraint violation against a real Postgres instance classifies as
+    /// `ConstraintViolation`, not the generic `QueryFailed` every other
+    /// query error still falls back to.
+    #[tokio::test]
+    #[ignore]
+    async fn a_unique_constraint_violation_classifies_distinctly() {
+        let url = std::env::var("DATABASE_URL_TEST").expect("set DATABASE_URL_TEST to a reachable Postgres connection string to run this test");
+        let pool = sqlx::PgPool::connect(&url).await.expect("failed to connect");
+        let driver = PostgresDriver { pool };
+
+        sqlx::query("DROP TABLE IF EXISTS frogs_constraint_test").execute(&driver.pool).await.unwrap();
+        sqlx::query("CREATE TABLE frogs_constraint_test (vin TEXT UNIQUE)").execute(&driver.pool).await.unwrap();
+
+        let mut params = HashMap::new();
+        params.insert("vin".to_string(), SqlValue::Text("1HGCM82633A004352".to_string()));
+        driver
+            .query("INSERT INTO frogs_constraint_test (vin) VALUES (:vin)", &params)
+            .await
+            .expect("the first insert should succeed");
+
+        let err = driver
+            .query("INSERT INTO frogs_constraint_test (vin) VALUES (:vin)", &params)
+            .await
+            .expect_err("a duplicate value against a UNIQUE column must fail");
+
+        assert!(matches!(err, SqlError::ConstraintViolation(_)), "expected ConstraintViolation, got {err:?}");
+
+        sqlx::query("DROP TABLE frogs_constraint_test").execute(&driver.pool).await.unwrap();
     }
 }

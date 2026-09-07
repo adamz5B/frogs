@@ -38,7 +38,6 @@ pub fn freeze(cwd: &Path) -> io::Result<()> {
             ErrorDefinition {
                 http_status: entry.http_status,
                 expose_detail: entry.expose_detail,
-                include_exception_name: false,
             },
         );
         frozen.push(code.clone());

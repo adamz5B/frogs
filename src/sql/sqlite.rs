@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use sqlx::sqlite::{SqliteColumn, SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column, Row, TypeInfo, ValueRef};
 
-use super::{SqlDriver, SqlError, SqlRow, SqlValue};
+use super::{SqlDriver, SqlError, SqlRow, SqlValue, sql_value_to_json};
 use crate::config::ConnectionConfig;
 
 #[derive(Debug)]
@@ -59,12 +59,32 @@ impl SqlDriver for SqliteDriver {
                 SqlValue::Float(f) => query.bind(f),
                 SqlValue::Text(s) => query.bind(s),
                 SqlValue::Timestamp(ts) => query.bind(ts),
+                // SQLite has no native array parameter type at all, unlike
+                // Postgres (see `postgres::bind_array`) — always the same
+                // JSON-encoded-text fallback `json_value_to_sql_value` used
+                // for every array before native binding existed anywhere.
+                SqlValue::Array(items) => query.bind(serde_json::Value::Array(items.iter().map(sql_value_to_json).collect()).to_string()),
             };
         }
 
-        let rows = query.fetch_all(&self.pool).await.map_err(|e| SqlError::QueryFailed(e.to_string()))?;
+        let rows = query.fetch_all(&self.pool).await.map_err(classify_query_error)?;
 
         rows.iter().map(convert_row).collect()
+    }
+}
+
+/// Classifies a real query failure by sqlx's own portable `ErrorKind` —
+/// not by hand-parsing SQLite's own result code — so a unique/foreign-key/
+/// not-null/check constraint violation becomes `SqlError::ConstraintViolation`
+/// (classifies to `datasource.sql.constraint_violation`) instead of the
+/// generic `QueryFailed` every other query error still falls back to.
+fn classify_query_error(e: sqlx::Error) -> SqlError {
+    use sqlx::error::ErrorKind;
+    match e.as_database_error().map(|db| db.kind()) {
+        Some(ErrorKind::UniqueViolation | ErrorKind::ForeignKeyViolation | ErrorKind::NotNullViolation | ErrorKind::CheckViolation) => {
+            SqlError::ConstraintViolation(e.to_string())
+        }
+        _ => SqlError::QueryFailed(e.to_string()),
     }
 }
 
@@ -213,6 +233,59 @@ mod tests {
         assert_eq!(rows[0].get("year"), Some(&SqlValue::Int(2003)));
         assert_eq!(rows[0].get("price"), Some(&SqlValue::Float(4500.5)));
         assert_eq!(rows[0].get("active"), Some(&SqlValue::Bool(true)));
+    }
+
+    /// SQLite has no native array parameter type — `SqlValue::Array` always
+    /// binds as JSON-encoded text, queryable via SQLite's own `json_each`
+    /// table-valued function to prove it's genuinely usable JSON on the
+    /// other end, not just an opaque blob.
+    #[tokio::test]
+    async fn an_array_parameter_binds_as_json_text_and_is_queryable_via_json_each() {
+        let driver = SqliteDriver::connect(&memory_config()).await.unwrap();
+
+        let mut params = HashMap::new();
+        params.insert("ids".to_string(), SqlValue::Array(vec![SqlValue::Int(1), SqlValue::Int(2), SqlValue::Int(3)]));
+        let rows = driver
+            .query("SELECT COUNT(*) AS n FROM json_each(:ids)", &params)
+            .await
+            .expect("a JSON-array-typed parameter should be queryable via json_each");
+
+        assert_eq!(rows[0].get("n"), Some(&SqlValue::Int(3)));
+    }
+
+    /// The point of `classify_query_error` existing at all: a real unique-
+    /// constraint violation against a real `:memory:` database classifies
+    /// as `ConstraintViolation`, not the generic `QueryFailed` every other
+    /// query error still falls back to.
+    #[tokio::test]
+    async fn a_unique_constraint_violation_classifies_distinctly() {
+        let driver = SqliteDriver::connect(&memory_config()).await.unwrap();
+        sqlx::query("CREATE TABLE cars (vin TEXT UNIQUE)").execute(&driver.pool).await.unwrap();
+
+        let mut params = HashMap::new();
+        params.insert("vin".to_string(), SqlValue::Text("1HGCM82633A004352".to_string()));
+        driver.query("INSERT INTO cars (vin) VALUES (:vin)", &params).await.expect("the first insert should succeed");
+
+        let err = driver
+            .query("INSERT INTO cars (vin) VALUES (:vin)", &params)
+            .await
+            .expect_err("a duplicate value against a UNIQUE column must fail");
+
+        assert!(matches!(err, SqlError::ConstraintViolation(_)), "expected ConstraintViolation, got {err:?}");
+    }
+
+    /// An ordinary bad-SQL failure (not a constraint violation at all) must
+    /// still classify as the generic `QueryFailed` — proves
+    /// `classify_query_error` doesn't over-eagerly reclassify everything.
+    #[tokio::test]
+    async fn an_ordinary_query_failure_is_not_misclassified_as_a_constraint_violation() {
+        let driver = SqliteDriver::connect(&memory_config()).await.unwrap();
+        let err = driver
+            .query("SELECT * FROM a_table_that_does_not_exist", &HashMap::new())
+            .await
+            .expect_err("querying a nonexistent table must fail");
+
+        assert!(matches!(err, SqlError::QueryFailed(_)), "expected the ordinary QueryFailed classification, got {err:?}");
     }
 
     #[tokio::test]

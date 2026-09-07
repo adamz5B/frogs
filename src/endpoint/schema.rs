@@ -28,6 +28,56 @@ pub struct EndpointFile {
     #[serde(default)]
     pub sources: HashMap<String, SourceDef>,
     pub response: ResponseShape,
+    /// Per-endpoint overrides of the global `config/errors/` registry —
+    /// `httpStatus`/`exposeDetail` for a specific code, scoped to just this
+    /// endpoint, without touching the registry every other endpoint shares.
+    /// Applies to *any* code this endpoint's requests can produce (a source
+    /// failure, a security-verifier failure, a validation failure) — not
+    /// just datasource codes, even though the design doc's own example only
+    /// shows one. A source's own `onError` (see `SourceDef`) is more
+    /// specific and wins over this for `httpStatus` when both apply to the
+    /// same failure; `exposeDetail` has no source-level equivalent, so this
+    /// is the only lever for it.
+    #[serde(rename = "errorOverrides", default)]
+    pub error_overrides: HashMap<String, ErrorOverride>,
+    /// Per-endpoint override of the global `config/server.json`'s
+    /// `debugMode` — `None` (the common case) means "use the server-wide
+    /// setting." Lets one sensitive or actively-being-debugged endpoint run
+    /// with verbose `detail`/discovery on (or off) without changing that
+    /// behavior for every other endpoint.
+    #[serde(rename = "debugMode", default)]
+    pub debug_mode: Option<bool>,
+    /// This endpoint's own token bucket, independent of (and in *addition*
+    /// to, not a replacement for) the global `features.rateLimiting` bucket
+    /// in `server.json` — a request must pass both. Only meaningful when
+    /// present at all; `None` (the common case) means this endpoint is
+    /// governed by the global bucket alone. Reuses `RateLimitConfig`'s
+    /// shape (`requestsPerSecond`/`burst`), same defaults if only one field
+    /// is set.
+    #[serde(rename = "rateLimit", default)]
+    pub rate_limit: Option<crate::config::RateLimitConfig>,
+    /// Whether `frogs generate` wrote this file and it hasn't been hand-
+    /// edited since — the generator writes `true` into every fresh stub,
+    /// and never touches a file again once it exists (see [Filling In
+    /// Generated Files]), so this stays `true` until a human deletes it or
+    /// flips it to `false` themselves. `resolve_for_test` refuses to serve
+    /// real traffic while it's `true` — see its own doc comment.
+    #[serde(rename = "_generated", default)]
+    pub generated: bool,
+    /// The generator's own note-to-self, shown verbatim in the `501` while
+    /// `generated` is `true` — not read for anything else.
+    #[serde(rename = "_todo", default)]
+    pub todo: Option<String>,
+}
+
+/// One entry in `errorOverrides` — either field can be set independently;
+/// omitting one leaves the registry's own value for it untouched.
+#[derive(Debug, Deserialize, Default)]
+pub struct ErrorOverride {
+    #[serde(rename = "httpStatus", default)]
+    pub http_status: Option<u16>,
+    #[serde(rename = "exposeDetail", default)]
+    pub expose_detail: Option<bool>,
 }
 
 /// The top-level `response` value: either the ordinary flat field map, or —
@@ -123,6 +173,18 @@ pub struct Parameter {
     /// is up to the datasource."
     #[serde(rename = "type", default)]
     pub param_type: ParameterType,
+    /// General-purpose numeric clamping — the safety net for a caller-
+    /// controlled `limit`/`offset` reaching a script unbounded (`limit=
+    /// 999999999`), but applies to any parameter, not just pagination.
+    /// Absent (the common case) means this parameter is left exactly as
+    /// `resolve_from` resolves it — clamping only ever kicks in when at
+    /// least one of these three is actually set. See `resolve::clamp_numeric`.
+    #[serde(default)]
+    pub default: Option<i64>,
+    #[serde(default)]
+    pub min: Option<i64>,
+    #[serde(default)]
+    pub max: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Default)]
@@ -146,6 +208,13 @@ pub enum ResponseField {
     Array(ArrayResponse),
     Plain(String),
     Detailed(DetailedField),
+    /// A bare JSON `null` — exactly what `frogs generate` writes for every
+    /// unmapped response field in a fresh stub (see the design doc's own
+    /// worked example). Without this variant, a freshly generated file
+    /// can't even be *parsed* (a bare `null` matches none of the other
+    /// three shapes), which would silently keep every new stub un-routable
+    /// rather than reachable-and-obviously-unfinished.
+    Null,
 }
 
 /// The `format` field's small, fixed vocabulary (`integer`, `decimal`,
@@ -182,16 +251,18 @@ impl ResponseField {
             ResponseField::Plain(path) => path,
             ResponseField::Detailed(detail) => &detail.from,
             ResponseField::Array(_) => unreachable!("ResponseField::Array must be handled before dot_path is called"),
+            ResponseField::Null => unreachable!("ResponseField::Null must be handled before dot_path is called"),
         }
     }
 
     /// `None` for a `Plain` field — nothing to format, pass the resolved
-    /// value straight through. Never called for `Array` — see `dot_path`.
+    /// value straight through. Never called for `Array`/`Null` — see `dot_path`.
     pub fn detail(&self) -> Option<&DetailedField> {
         match self {
             ResponseField::Plain(_) => None,
             ResponseField::Detailed(detail) => Some(detail),
             ResponseField::Array(_) => unreachable!("ResponseField::Array must be handled before detail is called"),
+            ResponseField::Null => unreachable!("ResponseField::Null must be handled before detail is called"),
         }
     }
 }
@@ -251,6 +322,65 @@ mod tests {
         assert_eq!(price.format.as_deref(), Some("decimal"));
         assert_eq!(price.precision, Some(2));
         assert_eq!(response["listedAt"].detail().unwrap().source_format.as_deref(), Some("unix-seconds"));
+    }
+
+    #[test]
+    fn parses_a_per_endpoint_rate_limit_override() {
+        let json = r#"{
+            "operationId": "test",
+            "sources": {},
+            "response": {},
+            "rateLimit": { "requestsPerSecond": 2, "burst": 1 }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let rate_limit = endpoint.rate_limit.expect("rateLimit should parse");
+        assert_eq!(rate_limit.requests_per_second, 2);
+        assert_eq!(rate_limit.burst, 1);
+    }
+
+    #[test]
+    fn a_partial_rate_limit_override_defaults_the_missing_field() {
+        let json = r#"{
+            "operationId": "test",
+            "sources": {},
+            "response": {},
+            "rateLimit": { "burst": 5 }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let rate_limit = endpoint.rate_limit.unwrap();
+        assert_eq!(rate_limit.burst, 5);
+        assert_eq!(rate_limit.requests_per_second, 20, "requestsPerSecond should fall back to RateLimitConfig's own default");
+    }
+
+    #[test]
+    fn no_rate_limit_field_at_all_is_none() {
+        let json = r#"{ "operationId": "test", "sources": {}, "response": {} }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        assert!(endpoint.rate_limit.is_none());
+    }
+
+    /// Exactly `frogs generate`'s own real output shape for a fresh stub
+    /// (every unmapped response field is a bare JSON `null`) — this must
+    /// parse cleanly, not fail with "data did not match any variant of
+    /// untagged enum ResponseShape" the way it did before `ResponseField`
+    /// grew its own `Null` variant.
+    #[test]
+    fn a_bare_null_response_field_parses_as_a_generated_stub_would_write_it() {
+        let json = r#"{
+            "operationId": "getCarInfo",
+            "_generated": true,
+            "_todo": "fill me in",
+            "sources": {},
+            "response": { "maker": null, "year": null }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).expect("a fresh frogs-generate stub with null response fields must parse");
+        assert!(endpoint.generated);
+
+        let ResponseShape::Fields(response) = &endpoint.response else {
+            panic!("expected the ordinary flat field map");
+        };
+        assert!(matches!(response["maker"], ResponseField::Null));
+        assert!(matches!(response["year"], ResponseField::Null));
     }
 
     #[test]

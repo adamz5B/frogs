@@ -226,11 +226,8 @@ fn default_core_errors() -> Value {
         "auth.invalid_credentials":            { "httpStatus": 401, "exposeDetail": true },
         "auth.verifier_unavailable":           { "httpStatus": 500, "exposeDetail": false },
         "validation.missing_parameter":        { "httpStatus": 400, "exposeDetail": true },
-        "unexpected.error": {
-            "httpStatus": 500,
-            "exposeDetail": false,
-            "includeExceptionName": false
-        }
+        "validation.invalid_type":             { "httpStatus": 400, "exposeDetail": true },
+        "unexpected.error": { "httpStatus": 500, "exposeDetail": false }
     })
 }
 

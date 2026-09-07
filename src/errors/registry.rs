@@ -14,7 +14,6 @@ fn default_unexpected_error() -> ErrorDefinition {
     ErrorDefinition {
         http_status: 500,
         expose_detail: false,
-        include_exception_name: false,
     }
 }
 
@@ -26,15 +25,6 @@ pub struct ErrorDefinition {
     pub http_status: u16,
     #[serde(rename = "exposeDetail")]
     pub expose_detail: bool,
-    // `skip_serializing_if` so `errors freeze` (the only writer of these,
-    // currently) doesn't clutter a frozen file with `"includeExceptionName": false`
-    // on every entry — the field is still readable/settable by hand either way.
-    #[serde(rename = "includeExceptionName", default, skip_serializing_if = "is_false")]
-    pub include_exception_name: bool,
-}
-
-fn is_false(b: &bool) -> bool {
-    !b
 }
 
 /// Two files in `config/errors/` define the same code with different
@@ -200,6 +190,22 @@ mod tests {
         let registry = ErrorRegistry::load(dir.path()).expect("fixture should load cleanly");
         assert!(registry.get(UNEXPECTED_ERROR_CODE).is_some());
         assert_eq!(registry.lookup("auth.invalid_credentials").http_status, 401);
+    }
+
+    /// `includeExceptionName` was removed (it never had any real effect) —
+    /// an existing project scaffolded before that removal may still have it
+    /// sitting in its `core.json`. It must still load cleanly, the unknown
+    /// key silently ignored, not a startup failure.
+    #[test]
+    fn a_leftover_include_exception_name_key_from_before_its_removal_is_ignored() {
+        let dir = tempdir();
+        write_json(
+            dir.path(),
+            "core.json",
+            r#"{ "unexpected.error": { "httpStatus": 500, "exposeDetail": false, "includeExceptionName": true } }"#,
+        );
+        let registry = ErrorRegistry::load(dir.path()).expect("a leftover includeExceptionName key must not fail to load");
+        assert_eq!(registry.lookup(UNEXPECTED_ERROR_CODE).http_status, 500);
     }
 
     #[test]

@@ -33,6 +33,7 @@ impl SourceErrorCause {
         match self {
             SourceErrorCause::Sql(SqlError::ConnectionFailed(_)) => "datasource.sql.connection_failed",
             SourceErrorCause::Sql(SqlError::QueryFailed(_)) => "datasource.sql.query_failed",
+            SourceErrorCause::Sql(SqlError::ConstraintViolation(_)) => "datasource.sql.constraint_violation",
             SourceErrorCause::NotFound => "datasource.sql.not_found",
             SourceErrorCause::Http(HttpError::Request(_)) => "datasource.http.timeout",
             SourceErrorCause::Http(HttpError::UpstreamStatus(404)) => "datasource.http.not_found",
@@ -67,6 +68,10 @@ mod tests {
             "datasource.sql.connection_failed"
         );
         assert_eq!(SourceErrorCause::Sql(SqlError::QueryFailed("x".into())).code(), "datasource.sql.query_failed");
+        assert_eq!(
+            SourceErrorCause::Sql(SqlError::ConstraintViolation("x".into())).code(),
+            "datasource.sql.constraint_violation"
+        );
     }
 
     #[test]

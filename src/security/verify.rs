@@ -75,7 +75,7 @@ pub async fn verify(
 
     let resolved = match &verifier.def {
         VerifierDef::Sql { connection, script, .. } => run_sql(drivers, sql_root, connection, script, &bound).await?,
-        VerifierDef::Http { request, .. } => run_http(http_root, http_client, request, &bound).await?,
+        VerifierDef::Http { request, .. } => run_http(http_root, http_client, request, &bound, headers).await?,
     };
 
     let valid = verifier.valid_if.evaluate(&resolved);
@@ -117,6 +117,10 @@ fn sql_value_cache_repr(value: &SqlValue) -> String {
         SqlValue::Float(f) => f.to_string(),
         SqlValue::Text(s) => s.clone(),
         SqlValue::Timestamp(ts) => ts.to_rfc3339(),
+        // Unreachable in practice — a verifier's parameters are always
+        // `header.*` scalars (see `bind_headers`), never array-typed — but
+        // still a real, unambiguous representation rather than a panic.
+        SqlValue::Array(_) => sql_value_to_json(value).to_string(),
     }
 }
 
@@ -147,7 +151,7 @@ async fn run_sql(
     Ok(Value::Object(row.iter().map(|(k, v)| (k.clone(), sql_value_to_json(v))).collect()))
 }
 
-async fn run_http(http_root: &Path, client: &reqwest::Client, request: &str, bound: &HashMap<String, SqlValue>) -> Result<Value, VerifyErrorCause> {
+async fn run_http(http_root: &Path, client: &reqwest::Client, request: &str, bound: &HashMap<String, SqlValue>, headers: &HeaderMap) -> Result<Value, VerifyErrorCause> {
     let request_path = http_root.join(request);
     let contents = std::fs::read_to_string(&request_path).map_err(|e| VerifyErrorCause::Unavailable(format!("failed to read {}: {e}", request_path.display())))?;
     let request_file: crate::http::HttpRequestFile =
@@ -161,7 +165,7 @@ async fn run_http(http_root: &Path, client: &reqwest::Client, request: &str, bou
     // A verifier's own parameters are always `header.*` scalars, never
     // array-typed (see the design doc's own examples), so no array names
     // are ever passed through here.
-    crate::http::execute(client, &request_file, bound, &std::collections::HashSet::new())
+    crate::http::execute(client, &request_file, bound, &std::collections::HashSet::new(), headers)
         .await
         .map_err(|e| VerifyErrorCause::Unavailable(e.to_string()))
 }

@@ -12,7 +12,12 @@ use serde_json::Value;
 use crate::config::ConnectionConfig;
 
 /// A driver-agnostic value, used both for bound query parameters and for
-/// fields decoded out of a returned row.
+/// fields decoded out of a returned row. `Array` is a *bound-parameter-only*
+/// concept — no driver ever decodes a returned column into it (array-typed
+/// columns aren't supported on read at all, see each driver's own
+/// `convert_row`); it exists so a JSON array from a request body can bind as
+/// a real native array parameter where the driver supports one, rather than
+/// always falling back to JSON-encoded text.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlValue {
     Null,
@@ -21,6 +26,7 @@ pub enum SqlValue {
     Float(f64),
     Text(String),
     Timestamp(DateTime<Utc>),
+    Array(Vec<SqlValue>),
 }
 
 /// One row of a query result, keyed by column name — matches how the
@@ -32,6 +38,12 @@ pub type SqlRow = HashMap<String, SqlValue>;
 pub enum SqlError {
     ConnectionFailed(String),
     QueryFailed(String),
+    /// A unique/foreign-key/not-null/check constraint violation —
+    /// classified separately from an ordinary `QueryFailed` via the
+    /// driver's own portable `sqlx::error::ErrorKind`, not by pattern-
+    /// matching a driver-specific SQLSTATE/result code (see each driver's
+    /// own `classify_query_error`).
+    ConstraintViolation(String),
 }
 
 impl fmt::Display for SqlError {
@@ -39,6 +51,7 @@ impl fmt::Display for SqlError {
         match self {
             SqlError::ConnectionFailed(msg) => write!(f, "connection failed: {msg}"),
             SqlError::QueryFailed(msg) => write!(f, "query failed: {msg}"),
+            SqlError::ConstraintViolation(msg) => write!(f, "constraint violation: {msg}"),
         }
     }
 }
@@ -57,15 +70,21 @@ pub fn sql_value_to_json(value: &SqlValue) -> Value {
         SqlValue::Float(f) => serde_json::Number::from_f64(*f).map(Value::Number).unwrap_or(Value::Null),
         SqlValue::Text(s) => Value::String(s.clone()),
         SqlValue::Timestamp(ts) => Value::String(ts.to_rfc3339()),
+        // Never actually produced by a driver decoding a real row (see this
+        // variant's own doc comment) — defined for completeness/symmetry,
+        // not a path any driver exercises today.
+        SqlValue::Array(items) => Value::Array(items.iter().map(sql_value_to_json).collect()),
     }
 }
 
 /// The inverse of `sql_value_to_json` — converts a JSON value pulled out of
-/// a request body into a bindable parameter. An array or object doesn't fit
-/// `SqlValue`'s flat scalar shape, so it's JSON-encoded as text rather than
-/// silently dropped to `Null`; native array-typed parameter binding (the
-/// design doc's own array-passthrough case) is a distinct, more deliberate
-/// feature, not this function's job.
+/// a request body into a bindable parameter. A JSON array becomes
+/// `SqlValue::Array`, which each driver then binds as a real native array
+/// parameter where it can (Postgres, when every element is the same
+/// scalar kind) and falls back to JSON-encoded text otherwise (always, for
+/// SQLite — it has no native array parameter type at all). An object
+/// doesn't fit `SqlValue`'s shape either way, so it's JSON-encoded as text
+/// rather than silently dropped to `Null`.
 pub fn json_value_to_sql_value(value: &Value) -> SqlValue {
     match value {
         Value::Null => SqlValue::Null,
@@ -80,7 +99,8 @@ pub fn json_value_to_sql_value(value: &Value) -> SqlValue {
             }
         }
         Value::String(s) => SqlValue::Text(s.clone()),
-        Value::Array(_) | Value::Object(_) => SqlValue::Text(value.to_string()),
+        Value::Array(items) => SqlValue::Array(items.iter().map(json_value_to_sql_value).collect()),
+        Value::Object(_) => SqlValue::Text(value.to_string()),
     }
 }
 
@@ -220,11 +240,35 @@ mod tests {
     }
 
     #[test]
-    fn a_json_array_or_object_is_encoded_as_text_rather_than_dropped() {
-        let array = serde_json::json!([1, 2, 3]);
-        assert_eq!(json_value_to_sql_value(&array), SqlValue::Text("[1,2,3]".to_string()));
-
+    fn a_json_object_is_encoded_as_text_rather_than_dropped() {
         let object = serde_json::json!({ "a": 1 });
         assert_eq!(json_value_to_sql_value(&object), SqlValue::Text(r#"{"a":1}"#.to_string()));
+    }
+
+    #[test]
+    fn a_json_array_becomes_a_native_sql_value_array_not_text() {
+        let array = serde_json::json!([1, 2, 3]);
+        assert_eq!(
+            json_value_to_sql_value(&array),
+            SqlValue::Array(vec![SqlValue::Int(1), SqlValue::Int(2), SqlValue::Int(3)])
+        );
+    }
+
+    #[test]
+    fn a_nested_array_converts_recursively() {
+        let array = serde_json::json!([[1, 2], ["a"]]);
+        assert_eq!(
+            json_value_to_sql_value(&array),
+            SqlValue::Array(vec![
+                SqlValue::Array(vec![SqlValue::Int(1), SqlValue::Int(2)]),
+                SqlValue::Array(vec![SqlValue::Text("a".to_string())]),
+            ])
+        );
+    }
+
+    #[test]
+    fn sql_value_array_round_trips_back_to_json() {
+        let value = SqlValue::Array(vec![SqlValue::Int(1), SqlValue::Text("x".to_string())]);
+        assert_eq!(sql_value_to_json(&value), serde_json::json!([1, "x"]));
     }
 }

@@ -1,5 +1,6 @@
 mod error;
 mod format;
+mod request_validation;
 mod resolve;
 mod schema;
 
@@ -14,10 +15,11 @@ use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 
 use crate::errors::{DiscoveredErrors, ErrorRegistry};
+use crate::openapi::Operation;
 use crate::security::{SecurityConfig, VerifierCache};
 use crate::server::RequestId;
 use crate::sql::SqlDriver;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Re-exported for `testing`, the only other module that needs to reach
 /// into `endpoint`'s internals — `EndpointFile` to load the file a test
@@ -27,6 +29,7 @@ use serde_json::Value;
 /// copy `testing` would otherwise have to convert).
 pub(crate) use resolve::MockOutcome;
 pub(crate) use schema::EndpointFile;
+use schema::ErrorOverride;
 
 /// The HTTP methods frogs actually routes — an `endpoint.<method>.json`
 /// file for anything else (or one of OpenAPI's non-request-body-shaped
@@ -59,6 +62,15 @@ struct RouteState {
     discovered_errors: Arc<Mutex<DiscoveredErrors>>,
     discovered_errors_path: PathBuf,
     debug_mode: bool,
+    /// This route's matching `openapi.yaml` operation, for request
+    /// validation — `None` when `features.requestValidation` is off, or
+    /// (a warn-and-skip, not a startup failure) no operation matching this
+    /// route's path+method was found.
+    operation: Option<Operation>,
+    /// Shared across every route (the same `openapi.yaml` document, not a
+    /// fresh copy per route) — only ever consulted when `operation` above
+    /// is `Some`, for resolving a request body schema's `$ref`s.
+    component_schemas: Arc<Map<String, Value>>,
 }
 
 /// Scans `datasources/endpoints/` for `endpoint.<method>.json` files (one
@@ -79,6 +91,11 @@ pub fn build_router(
     services: Arc<HashMap<String, String>>,
     discovered_errors: Arc<Mutex<DiscoveredErrors>>,
     debug_mode: bool,
+    // `None` when `features.requestValidation` is off, or `openapi.yaml`
+    // couldn't be loaded at all (`commands::run` already warns about that
+    // case — this function just degrades to "no route gets validation"
+    // rather than failing every route registration over it).
+    openapi_document: Option<&crate::openapi::OpenApiDocument>,
 ) -> Router {
     let sql_root = project_root.join("datasources/sql");
     let http_root = project_root.join("datasources/http");
@@ -88,6 +105,7 @@ pub fn build_router(
     // requests instead of paying a fresh-connection cost per call.
     let http_client = reqwest::Client::new();
     let verifier_cache = Arc::new(VerifierCache::new());
+    let component_schemas = Arc::new(openapi_document.map(|doc| doc.component_schemas.clone()).unwrap_or_default());
 
     let mut router = Router::new();
     for (url_path, method, file_path) in discover_endpoint_files(&endpoints_root) {
@@ -127,6 +145,12 @@ pub fn build_router(
             file_path.display(),
             endpoint.operation_id
         );
+
+        let operation = openapi_document.and_then(|doc| find_operation(doc, &url_path, &method));
+        if openapi_document.is_some() && operation.is_none() {
+            tracing::warn!("{}: no matching operation found in openapi.yaml — request validation skipped for this route", file_path.display());
+        }
+
         // Each route gets its own `RouteState` baked in via `with_state` —
         // this is what lets one shared `handle_request` function serve
         // every endpoint file: axum's `State` extractor pulls out whichever
@@ -144,13 +168,22 @@ pub fn build_router(
             discovered_errors: discovered_errors.clone(),
             discovered_errors_path: discovered_errors_path.clone(),
             debug_mode,
+            operation: operation.cloned(),
+            component_schemas: component_schemas.clone(),
         });
+        // Read back out before `state` moves into `.with_state` below —
+        // this endpoint's own `rateLimit`, if it declared one, gets its own
+        // dedicated bucket layered onto just this route (in addition to,
+        // not instead of, the global bucket `apply_rate_limit` applies to
+        // the whole router in `commands::run`).
+        let rate_limit_override = state.endpoint.rate_limit.clone();
+
         // `Router::route` merges method routers registered for the same
         // path across separate calls (a GET and a PUT on the same path
         // each get their own call here), so looping one method at a time
         // is enough — it doesn't overwrite a sibling method already
         // registered for this same `url_path`.
-        let method_router = match method.as_str() {
+        let mut method_router = match method.as_str() {
             "get" => get(handle_request).with_state(state),
             "post" => post(handle_request).with_state(state),
             "put" => put(handle_request).with_state(state),
@@ -158,6 +191,10 @@ pub fn build_router(
             "delete" => delete(handle_request).with_state(state),
             other => unreachable!("discover_endpoint_files only yields ROUTABLE_METHODS, got '{other}'"),
         };
+        if let Some(rate_limit) = rate_limit_override {
+            let limiter = Arc::new(crate::server::RateLimiter::new(rate_limit.requests_per_second, rate_limit.burst));
+            method_router = crate::server::apply_rate_limit_to_route(method_router, limiter);
+        }
         router = router.route(&url_path, method_router);
     }
     router
@@ -222,11 +259,10 @@ async fn handle_request(
     // on an empty body instead of treating "no body" as `Value::Null`.
     raw_body: axum::body::Bytes,
 ) -> Response {
-    // A missing or malformed body becomes `Value::Null`, the same
-    // "unresolvable input, not a crash" posture as an unresolvable
-    // `{{param}}` or missing header elsewhere — request validation (still
-    // not built, see the design doc) is where a genuinely malformed body
-    // would eventually be caught, not source resolution.
+    // A missing or malformed body becomes `Value::Null` — request
+    // validation (below, when `state.operation` is `Some`) is what catches
+    // a genuinely malformed/missing body against the OpenAPI schema; this
+    // is just "don't crash parsing it."
     let body: Value = if raw_body.is_empty() {
         Value::Null
     } else {
@@ -253,6 +289,8 @@ async fn handle_request(
         &body,
         &transaction_id,
         &HashMap::new(),
+        state.operation.as_ref(),
+        &state.component_schemas,
     )
     .await;
 
@@ -291,7 +329,39 @@ pub(crate) async fn resolve_for_test(
     body: &Value,
     transaction_id: &str,
     mocks: &HashMap<String, MockOutcome>,
+    // `None` either means `features.requestValidation` is off, or this
+    // endpoint's operation couldn't be matched in `openapi.yaml` at
+    // startup — both cases skip validation entirely rather than block the
+    // request, the same graceful-degradation posture an unmatched security
+    // scheme does *not* get (that one fails closed, since it's a security
+    // concern; this one isn't).
+    operation: Option<&Operation>,
+    component_schemas: &Map<String, Value>,
 ) -> (u16, Value) {
+    // A still-`_generated: true` stub is refused *before* anything else
+    // runs — including the security check below. It isn't really "this
+    // endpoint's own request handling" yet, so there's nothing to
+    // authorize a caller against; gating here first also means a stub
+    // that's still mid-edit (security scheme not wired up correctly yet,
+    // say) doesn't produce a confusing auth error while someone's actively
+    // filling it in. Always shows the todo message regardless of
+    // `exposeDetail`/`debugMode` — the whole point is telling whoever's
+    // looking exactly what to do next, not something to hide from a caller.
+    if endpoint.generated {
+        let body = serde_json::json!({
+            "code": 501,
+            "name": "endpoint.not_configured",
+            "detail": endpoint.todo.as_deref().unwrap_or("this endpoint is a generated stub and hasn't been filled in yet"),
+        });
+        return (501, body);
+    }
+
+    // This endpoint's own `debugMode`, if it set one, overrides the
+    // server-wide default for everything below — every use of `debug_mode`
+    // for the rest of this function (including inside `error_envelope`)
+    // sees this effective value, not the raw parameter.
+    let debug_mode = endpoint.debug_mode.unwrap_or(debug_mode);
+
     if let Some(scheme) = &endpoint.security {
         let Some(verifier) = security.verifiers.get(scheme) else {
             // In the real `build_router` path this can't happen — a route
@@ -308,6 +378,7 @@ pub(crate) async fn resolve_for_test(
                 "unexpected.error",
                 &format!("security scheme '{scheme}' has no matching entry in security/schemes.json"),
                 None,
+                &endpoint.error_overrides,
             );
         };
 
@@ -326,8 +397,19 @@ pub(crate) async fn resolve_for_test(
         };
 
         if let Err((code, message)) = verify_result {
-            return error_envelope(errors, discovered_errors, discovered_errors_path, debug_mode, &code, &message, None);
+            return error_envelope(errors, discovered_errors, discovered_errors_path, debug_mode, &code, &message, None, &endpoint.error_overrides);
         }
+    }
+
+    // Runs *after* the security check above, deliberately — a caller who
+    // fails authorization gets that failure regardless of whether their
+    // request body also happens to be malformed; a request never gets
+    // structurally validated before it's known the caller is even allowed
+    // to make it.
+    if let Some(operation) = operation
+        && let Err(problem) = request_validation::validate_request(operation, component_schemas, path_params, query_params, headers, body)
+    {
+        return error_envelope(errors, discovered_errors, discovered_errors_path, debug_mode, problem.code, &problem.message, None, &endpoint.error_overrides);
     }
 
     match resolve::resolve_sources(
@@ -342,6 +424,7 @@ pub(crate) async fn resolve_for_test(
         body,
         transaction_id,
         mocks,
+        headers,
     )
     .await
     {
@@ -370,6 +453,7 @@ pub(crate) async fn resolve_for_test(
                 failure.cause.code(),
                 &failure.cause.message(),
                 failure.on_error,
+                &endpoint.error_overrides,
             )
         }
     }
@@ -415,6 +499,11 @@ pub(crate) async fn record_sources(
         body,
         transaction_id,
         &HashMap::new(),
+        // Record mode has no caller headers to work with at all (see
+        // `docs/TODO.md`'s record-mode gap) — an ordinary source's
+        // `header.*` parameter resolves to null during recording, same as
+        // any other value that isn't available yet.
+        &HeaderMap::new(),
     )
     .await
     {
@@ -429,14 +518,20 @@ pub(crate) async fn record_sources(
 
 /// Builds the standard `{code, name, detail}` error envelope's status and
 /// body — shared by source-resolution failures and security-verifier
-/// failures, both real and mocked, since they all classify into the same
-/// registry-driven `httpStatus`/`exposeDetail` lookup. `resolve_for_test`
-/// is this function's only caller; `handle_request` gets the same envelope
-/// indirectly through it, converting the plain `(u16, Value)` into an axum
-/// `Response` itself. Also where the design doc's observe–react discovery
-/// happens: `code` reaching here with no entry in `errors` is exactly the
-/// "unclassified" case, recorded via `record_discovered_error` whenever
-/// `debugMode` is on.
+/// failures, both real and mocked. Resolves `httpStatus`/`exposeDetail`
+/// through the design doc's full 3-tier lookup: the canonical `errors`
+/// registry wins if `code` is classified there; otherwise a matching entry
+/// in `discovered_errors` (so hand-editing `errors.discovered.json` takes
+/// effect on the very next request, without waiting for `errors freeze` to
+/// promote it into `config/errors/`); otherwise `unexpected.error`.
+/// `resolve_for_test` is this function's only caller; `handle_request` gets
+/// the same envelope indirectly through it, converting the plain `(u16,
+/// Value)` into an axum `Response` itself. Also where the design doc's
+/// observe–react discovery happens: `code` reaching here with no entry in
+/// the *canonical* registry is the "unclassified" case, recorded via
+/// `record_discovered_error` whenever `debugMode` is on — regardless of
+/// whether a discovered entry for it already exists (`record` itself is
+/// the idempotent, occurrence-counting half of that).
 #[allow(clippy::too_many_arguments)]
 fn error_envelope(
     errors: &ErrorRegistry,
@@ -446,20 +541,42 @@ fn error_envelope(
     code: &str,
     message: &str,
     on_error: Option<u16>,
+    // This endpoint's own `errorOverrides` (`EndpointFile::error_overrides`)
+    // — the final, most-specific layer on top of the 3-tier lookup below.
+    // `on_error` (a *source's* own override, more specific still) wins over
+    // this for `httpStatus` when both apply to the same failure;
+    // `exposeDetail` has no source-level equivalent, so an override here is
+    // always the last word on it.
+    error_overrides: &HashMap<String, ErrorOverride>,
 ) -> (u16, Value) {
-    let definition = errors.lookup(code);
-    let http_status = on_error.unwrap_or(definition.http_status);
+    // Tier 3 fallback (`unexpected.error`) — also what seeds a *new*
+    // discovered entry's initial `httpStatus`/`exposeDetail` below, same as
+    // before this function grew tier 2.
+    let fallback_definition = errors.lookup(code);
+    let (tiered_http_status, tiered_expose_detail) = match errors.get(code) {
+        Some(definition) => (definition.http_status, definition.expose_detail),
+        None => match discovered_errors.lock().unwrap().lookup(code) {
+            Some(entry) => (entry.http_status, entry.expose_detail),
+            None => (fallback_definition.http_status, fallback_definition.expose_detail),
+        },
+    };
+
+    let override_for_code = error_overrides.get(code);
+    let http_status = on_error
+        .or_else(|| override_for_code.and_then(|o| o.http_status))
+        .unwrap_or(tiered_http_status);
+    let expose_detail = override_for_code.and_then(|o| o.expose_detail).unwrap_or(tiered_expose_detail);
     let status = StatusCode::from_u16(http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     if debug_mode && errors.get(code).is_none() {
-        record_discovered_error(discovered_errors, discovered_errors_path, code, definition, message);
+        record_discovered_error(discovered_errors, discovered_errors_path, code, fallback_definition, message);
     }
 
     let mut body = serde_json::json!({
         "code": status.as_u16(),
         "name": code,
     });
-    if definition.expose_detail || debug_mode {
+    if expose_detail || debug_mode {
         body["detail"] = serde_json::json!(message);
     }
 
@@ -517,6 +634,31 @@ fn routable_method(path: &Path) -> Option<&'static str> {
     let name = path.file_name()?.to_str()?;
     let method = name.strip_prefix("endpoint.")?.strip_suffix(".json")?;
     ROUTABLE_METHODS.iter().find(|&&m| m == method).copied()
+}
+
+/// Finds the `openapi.yaml` operation matching an already-registered
+/// route's axum-style path (`/cars/:vin`) and method — converts each
+/// candidate operation's own OpenAPI-style path (`/cars/{vin}`) the same
+/// way `url_path_for` converts a folder path, so the two naming
+/// conventions actually meet in the middle. `None` if nothing matches
+/// (a spec/filesystem drift this project otherwise tolerates — see
+/// `commands::generate`'s own orphaned-endpoint handling).
+fn find_operation<'a>(doc: &'a crate::openapi::OpenApiDocument, url_path: &str, method: &str) -> Option<&'a Operation> {
+    doc.operations.iter().find(|op| op.method == method && axum_style_path(&op.path) == url_path)
+}
+
+/// `{name}` -> `:name`, segment by segment — the same conversion
+/// `url_path_for` does for a filesystem path, applied directly to an
+/// OpenAPI path string instead.
+fn axum_style_path(openapi_path: &str) -> String {
+    openapi_path
+        .split('/')
+        .map(|segment| match segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+            Some(name) => format!(":{name}"),
+            None => segment.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Converts a folder path under `datasources/endpoints/` into an axum route,
@@ -708,6 +850,8 @@ mod tests {
             discovered_errors: Arc::new(Mutex::new(DiscoveredErrors::default())),
             discovered_errors_path: root.join("errors.discovered.json"),
             debug_mode: true,
+            operation: None,
+            component_schemas: Arc::new(Map::new()),
         });
 
         let router = Router::new().route("/secret", get(handle_request)).with_state(state);
@@ -763,6 +907,7 @@ mod tests {
             Arc::new(HashMap::new()),
             Arc::new(Mutex::new(DiscoveredErrors::default())),
             false,
+            None,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -778,6 +923,67 @@ mod tests {
 
         let post_resp = client.post(format!("http://{addr}/things")).send().await.unwrap();
         assert_eq!(post_resp.status(), 201, "POST's own successStatus must be applied to the real response");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An endpoint's own `rateLimit` applies to just that route, proven
+    /// through the real `build_router` with `features.rateLimiting` off
+    /// entirely (no global bucket in play at all) — the override alone is
+    /// what throttles `/limited`, and a sibling route with no override of
+    /// its own is completely unaffected by it.
+    #[tokio::test]
+    async fn a_per_endpoint_rate_limit_throttles_only_that_route() {
+        let root = std::env::temp_dir().join(format!(
+            "frogs-endpoint-rate-limit-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let limited_dir = root.join("datasources/endpoints/limited");
+        let unlimited_dir = root.join("datasources/endpoints/unlimited");
+        std::fs::create_dir_all(&limited_dir).unwrap();
+        std::fs::create_dir_all(&unlimited_dir).unwrap();
+        std::fs::write(
+            limited_dir.join("endpoint.get.json"),
+            r#"{ "operationId": "limited", "sources": {}, "response": {}, "rateLimit": { "requestsPerSecond": 1, "burst": 1 } }"#,
+        )
+        .unwrap();
+        std::fs::write(unlimited_dir.join("endpoint.get.json"), r#"{ "operationId": "unlimited", "sources": {}, "response": {} }"#).unwrap();
+
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        let errors = Arc::new(ErrorRegistry::load(&root.join("does-not-exist")).unwrap());
+        let security = Arc::new(SecurityConfig::default());
+        // No `apply_rate_limit` call at all here — this test's whole point
+        // is that the per-route override works independently of the global
+        // `features.rateLimiting` layer, which isn't part of `build_router`.
+        let router = build_router(
+            &root,
+            Arc::new(drivers),
+            errors,
+            security,
+            Arc::new(HashMap::new()),
+            Arc::new(Mutex::new(DiscoveredErrors::default())),
+            false,
+            None,
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+
+        let first = client.get(format!("http://{addr}/limited")).send().await.unwrap();
+        assert_eq!(first.status(), 200, "the first request should still consume the lone token and succeed");
+        let second = client.get(format!("http://{addr}/limited")).send().await.unwrap();
+        assert_eq!(second.status(), 429, "burst: 1 leaves no token for a second immediate request");
+
+        for _ in 0..5 {
+            let resp = client.get(format!("http://{addr}/unlimited")).send().await.unwrap();
+            assert_eq!(resp.status(), 200, "a route with no rateLimit override must be unaffected by /limited's own bucket");
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -846,6 +1052,7 @@ mod tests {
             Arc::new(HashMap::new()),
             Arc::new(Mutex::new(DiscoveredErrors::default())),
             false,
+            None,
         );
         let router = crate::server::apply_middleware(router);
 
@@ -889,7 +1096,7 @@ mod tests {
         let discovered = Mutex::new(DiscoveredErrors::default());
         let path = temp_discovered_errors_path();
 
-        error_envelope(&errors, &discovered, &path, true, "datasource.sql.not_found", "no rows", None);
+        error_envelope(&errors, &discovered, &path, true, "datasource.sql.not_found", "no rows", None, &HashMap::new());
 
         assert_eq!(discovered.lock().unwrap().len(), 1);
         assert!(
@@ -906,7 +1113,7 @@ mod tests {
         let discovered = Mutex::new(DiscoveredErrors::default());
         let path = temp_discovered_errors_path();
 
-        error_envelope(&errors, &discovered, &path, false, "datasource.sql.not_found", "no rows", None);
+        error_envelope(&errors, &discovered, &path, false, "datasource.sql.not_found", "no rows", None, &HashMap::new());
 
         assert!(discovered.lock().unwrap().is_empty(), "discovery is a debugMode-only aid, per the design doc");
         assert!(!path.is_file(), "nothing should have been written at all");
@@ -920,7 +1127,7 @@ mod tests {
 
         // "unexpected.error" is always present (`ErrorRegistry::load` force-
         // inserts it) — a genuinely classified code, not a gap to discover.
-        error_envelope(&errors, &discovered, &path, true, "unexpected.error", "boom", None);
+        error_envelope(&errors, &discovered, &path, true, "unexpected.error", "boom", None, &HashMap::new());
 
         assert!(discovered.lock().unwrap().is_empty());
     }
@@ -931,7 +1138,7 @@ mod tests {
         let discovered = Mutex::new(DiscoveredErrors::default());
         let path = temp_discovered_errors_path();
 
-        error_envelope(&errors, &discovered, &path, true, "datasource.sql.not_found", "no rows", None);
+        error_envelope(&errors, &discovered, &path, true, "datasource.sql.not_found", "no rows", None, &HashMap::new());
 
         let reloaded = DiscoveredErrors::load(&path).expect("the recorded entry must be saved to disk, not just in-memory");
         assert_eq!(reloaded.len(), 1);
@@ -945,8 +1152,8 @@ mod tests {
         let discovered = Mutex::new(DiscoveredErrors::default());
         let path = temp_discovered_errors_path();
 
-        error_envelope(&errors, &discovered, &path, true, "datasource.sql.not_found", "first", None);
-        error_envelope(&errors, &discovered, &path, true, "datasource.sql.not_found", "second", None);
+        error_envelope(&errors, &discovered, &path, true, "datasource.sql.not_found", "first", None, &HashMap::new());
+        error_envelope(&errors, &discovered, &path, true, "datasource.sql.not_found", "second", None, &HashMap::new());
 
         let locked = discovered.lock().unwrap();
         assert_eq!(locked.len(), 1, "the same code occurring twice must update one entry, not create two");
@@ -954,6 +1161,195 @@ mod tests {
 
         drop(locked);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The tier-2 gap this section closes: a discovered entry's own
+    /// `httpStatus`/`exposeDetail` — as if hand-edited in
+    /// `errors.discovered.json` before `errors freeze` ever ran — actually
+    /// changes what a live response looks like, instead of every
+    /// unclassified code always falling straight through to
+    /// `unexpected.error`'s status.
+    #[test]
+    fn error_envelope_uses_a_discovered_entrys_own_status_and_expose_detail() {
+        let errors = ErrorRegistry::load(Path::new("/does/not/exist")).unwrap();
+        let discovered = Mutex::new(DiscoveredErrors::default());
+        let path = temp_discovered_errors_path();
+
+        // Seeded directly, the same as a hand-edit to errors.discovered.json
+        // followed by a reload would look like — distinct from
+        // `unexpected.error`'s own defaults (500, exposeDetail: false) so a
+        // pass-through bug would be obvious.
+        discovered.lock().unwrap().record("plugin.hmac.unknown:BadSignature", 422, true, "signature mismatch");
+
+        let (status, body) = error_envelope(&errors, &discovered, &path, false, "plugin.hmac.unknown:BadSignature", "signature mismatch", None, &HashMap::new());
+
+        assert_eq!(status, 422, "the discovered entry's own httpStatus should win over unexpected.error's 500");
+        assert_eq!(body["code"], 422);
+        assert_eq!(body["name"], "plugin.hmac.unknown:BadSignature");
+        assert_eq!(body["detail"], "signature mismatch", "the discovered entry's own exposeDetail: true should show detail even with debugMode off");
+    }
+
+    /// Tier 1 still wins over tier 2 — a code genuinely classified in the
+    /// canonical registry is never shadowed by a stale/differing discovered
+    /// entry for the same code (e.g. one recorded before the code was
+    /// formally added to `config/errors/`).
+    #[test]
+    fn error_envelope_prefers_the_canonical_registry_over_a_discovered_entry() {
+        let dir = std::env::temp_dir().join(format!(
+            "frogs-error-envelope-tiers-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("core.json"), r#"{ "auth.invalid_credentials": { "httpStatus": 401, "exposeDetail": true } }"#).unwrap();
+        let errors = ErrorRegistry::load(&dir).unwrap();
+
+        let discovered = Mutex::new(DiscoveredErrors::default());
+        // A stale discovered entry for the same code, with a different
+        // status — must never win once the code is canonically classified.
+        discovered.lock().unwrap().record("auth.invalid_credentials", 418, false, "stale");
+        let path = temp_discovered_errors_path();
+
+        let (status, body) = error_envelope(&errors, &discovered, &path, false, "auth.invalid_credentials", "wrong key", None, &HashMap::new());
+
+        assert_eq!(status, 401, "the canonical registry's own status must win over a discovered entry for the same code");
+        assert_eq!(body["detail"], "wrong key");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An endpoint's own `errorOverrides` wins over the canonical registry's
+    /// `httpStatus`/`exposeDetail` for a matching code — the final, most
+    /// specific layer, scoped to just this one endpoint.
+    #[test]
+    fn error_envelope_applies_a_per_endpoint_error_override() {
+        let dir = std::env::temp_dir().join(format!(
+            "frogs-error-envelope-overrides-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("core.json"),
+            r#"{ "datasource.sql.connection_failed": { "httpStatus": 500, "exposeDetail": false } }"#,
+        )
+        .unwrap();
+        let errors = ErrorRegistry::load(&dir).unwrap();
+        let discovered = Mutex::new(DiscoveredErrors::default());
+        let path = temp_discovered_errors_path();
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "datasource.sql.connection_failed".to_string(),
+            ErrorOverride {
+                http_status: Some(503),
+                expose_detail: Some(true),
+            },
+        );
+
+        let (status, body) = error_envelope(&errors, &discovered, &path, false, "datasource.sql.connection_failed", "pool exhausted", None, &overrides);
+
+        assert_eq!(status, 503, "the endpoint's own override should win over the registry's 500");
+        assert_eq!(body["detail"], "pool exhausted", "exposeDetail: true in the override should show detail even though the registry says false");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Setting only one field in an override leaves the other at whatever
+    /// the registry (or a lower tier) already says — not reset to a default.
+    #[test]
+    fn error_envelope_override_can_set_just_one_field() {
+        let dir = std::env::temp_dir().join(format!(
+            "frogs-error-envelope-overrides-partial-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("core.json"),
+            r#"{ "datasource.sql.connection_failed": { "httpStatus": 500, "exposeDetail": true } }"#,
+        )
+        .unwrap();
+        let errors = ErrorRegistry::load(&dir).unwrap();
+        let discovered = Mutex::new(DiscoveredErrors::default());
+        let path = temp_discovered_errors_path();
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "datasource.sql.connection_failed".to_string(),
+            ErrorOverride {
+                http_status: Some(503),
+                expose_detail: None,
+            },
+        );
+
+        let (status, body) = error_envelope(&errors, &discovered, &path, false, "datasource.sql.connection_failed", "pool exhausted", None, &overrides);
+
+        assert_eq!(status, 503);
+        assert_eq!(body["detail"], "pool exhausted", "exposeDetail wasn't overridden, so the registry's own true should still apply");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A source's own `onError` is still more specific than an endpoint-wide
+    /// `errorOverrides` entry for `httpStatus` — the override exists for
+    /// codes without a source-level lever (or ones shared across sources),
+    /// not to override `onError` itself.
+    #[test]
+    fn error_envelope_source_level_on_error_wins_over_an_endpoint_level_override() {
+        let errors = ErrorRegistry::load(Path::new("/does/not/exist")).unwrap();
+        let discovered = Mutex::new(DiscoveredErrors::default());
+        let path = temp_discovered_errors_path();
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "datasource.sql.connection_failed".to_string(),
+            ErrorOverride {
+                http_status: Some(503),
+                expose_detail: None,
+            },
+        );
+
+        let (status, _) = error_envelope(
+            &errors,
+            &discovered,
+            &path,
+            false,
+            "datasource.sql.connection_failed",
+            "pool exhausted",
+            Some(502), // this source's own onError
+            &overrides,
+        );
+
+        assert_eq!(status, 502, "onError is more specific than an endpoint-wide errorOverrides entry and must win");
+    }
+
+    /// A code with no matching override entry falls straight through to the
+    /// existing 3-tier lookup, unaffected — `errorOverrides` on an endpoint
+    /// with unrelated codes doesn't change anything for codes it doesn't name.
+    #[test]
+    fn error_envelope_a_code_with_no_matching_override_is_unaffected() {
+        let errors = ErrorRegistry::load(Path::new("/does/not/exist")).unwrap();
+        let discovered = Mutex::new(DiscoveredErrors::default());
+        let path = temp_discovered_errors_path();
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "some.other.code".to_string(),
+            ErrorOverride {
+                http_status: Some(503),
+                expose_detail: Some(true),
+            },
+        );
+
+        let (status, _) = error_envelope(&errors, &discovered, &path, false, "datasource.sql.not_found", "no rows", None, &overrides);
+
+        // Empty registry (`/does/not/exist`) — "datasource.sql.not_found"
+        // isn't classified anywhere, so it falls through to
+        // `unexpected.error`'s own default (500), same as if `overrides`
+        // were empty entirely. The override for an unrelated code must not
+        // leak into this one.
+        assert_eq!(status, 500);
     }
 
     /// End-to-end proof through a real running server (not just the direct
@@ -1014,6 +1410,7 @@ mod tests {
             Arc::new(HashMap::new()),
             Arc::new(Mutex::new(DiscoveredErrors::default())),
             true,
+            None,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1038,5 +1435,775 @@ mod tests {
         assert_eq!(entry.sample_message, "query returned no rows");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `errorOverrides` end to end through `resolve_for_test` — parsed from
+    /// real endpoint-file JSON (not constructed via `ErrorOverride`
+    /// literals), through a genuine source failure, not just the direct
+    /// `error_envelope` unit tests above.
+    #[tokio::test]
+    async fn an_endpoint_files_error_overrides_change_a_real_response() {
+        #[derive(Debug)]
+        struct AlwaysFailsDriver;
+        #[async_trait::async_trait]
+        impl SqlDriver for AlwaysFailsDriver {
+            async fn query(&self, _script: &str, _params: &HashMap<String, crate::sql::SqlValue>) -> Result<Vec<crate::sql::SqlRow>, crate::sql::SqlError> {
+                Err(crate::sql::SqlError::ConnectionFailed("pool exhausted".to_string()))
+            }
+        }
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "car": { "type": "sql", "connection": "db", "script": "q.sql" }
+            },
+            "response": {},
+            "errorOverrides": {
+                "datasource.sql.connection_failed": { "httpStatus": 503, "exposeDetail": true }
+            }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        assert!(
+            endpoint.error_overrides.contains_key("datasource.sql.connection_failed"),
+            "errorOverrides should parse from real endpoint JSON"
+        );
+
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), Box::new(AlwaysFailsDriver));
+
+        let root = std::env::temp_dir().join(format!(
+            "frogs-error-overrides-e2e-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("db")).unwrap();
+        std::fs::write(root.join("db/q.sql"), "SELECT 1;").unwrap();
+        // Registry says 500/no-detail — the endpoint's own override should
+        // win over both.
+        let errors_dir = root.join("config-errors");
+        std::fs::create_dir_all(&errors_dir).unwrap();
+        std::fs::write(
+            errors_dir.join("core.json"),
+            r#"{ "datasource.sql.connection_failed": { "httpStatus": 500, "exposeDetail": false } }"#,
+        )
+        .unwrap();
+        let errors = ErrorRegistry::load(&errors_dir).unwrap();
+
+        let security = SecurityConfig {
+            schemes: HashMap::new(),
+            verifiers: HashMap::new(),
+        };
+        let discovered_errors = Mutex::new(DiscoveredErrors::default());
+
+        let (status, body) = resolve_for_test(
+            &endpoint,
+            &security,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root,
+            &reqwest::Client::new(),
+            &errors,
+            &discovered_errors,
+            &root.join("errors.discovered.json"),
+            false,
+            &crate::security::VerifierCache::new(),
+            &HeaderMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            None,
+            &Map::new(),
+        )
+        .await;
+
+        assert_eq!(status, 503, "the endpoint's own errorOverrides should win over the registry's 500");
+        assert_eq!(
+            body["detail"], "connection failed: pool exhausted",
+            "exposeDetail: true in the override should show detail despite the registry saying false"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `_generated: true` stub is refused with `501` and the real `_todo`
+    /// message, without ever touching sources, security, or validation —
+    /// proven by a `PanicsIfCalledDriver`-equivalent (a driver that would
+    /// panic if `resolve_sources` ever reached it) and a security scheme
+    /// with no matching verifier at all (which would otherwise itself be a
+    /// hard failure) still resolving to the *generated-stub* response, not
+    /// a security error.
+    #[tokio::test]
+    async fn a_generated_stub_is_refused_with_501_before_security_or_sources_run() {
+        #[derive(Debug)]
+        struct PanicsIfCalledDriver;
+        #[async_trait::async_trait]
+        impl SqlDriver for PanicsIfCalledDriver {
+            async fn query(&self, _script: &str, _params: &HashMap<String, crate::sql::SqlValue>) -> Result<Vec<crate::sql::SqlRow>, crate::sql::SqlError> {
+                panic!("a _generated: true stub must never reach a real source");
+            }
+        }
+
+        let json = r#"{
+            "operationId": "getCarInfo",
+            "_generated": true,
+            "_todo": "See getCarInfo.reference.json for available request/response fields.",
+            "security": "apiKeyAuth",
+            "sources": { "car": { "type": "sql", "connection": "db", "script": "q.sql" } },
+            "response": { "maker": null }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        assert!(endpoint.generated);
+
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), Box::new(PanicsIfCalledDriver));
+
+        // No "apiKeyAuth" scheme registered at all — if the security check
+        // ran before the generated-stub gate, this alone would already be a
+        // hard failure (see `a_missing_verifier_is_a_clear_config_failure`-
+        // style tests elsewhere), proving the gate really does run first.
+        let security = SecurityConfig::default();
+        let errors = ErrorRegistry::load(Path::new("/does/not/exist")).unwrap();
+        let discovered_errors = Mutex::new(DiscoveredErrors::default());
+        let root = std::env::temp_dir();
+
+        let (status, body) = resolve_for_test(
+            &endpoint,
+            &security,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root,
+            &reqwest::Client::new(),
+            &errors,
+            &discovered_errors,
+            &root.join("errors.discovered.json"),
+            false,
+            &crate::security::VerifierCache::new(),
+            &HeaderMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            None,
+            &Map::new(),
+        )
+        .await;
+
+        assert_eq!(status, 501);
+        assert_eq!(body["name"], "endpoint.not_configured");
+        assert_eq!(body["detail"], "See getCarInfo.reference.json for available request/response fields.");
+    }
+
+    #[tokio::test]
+    async fn a_generated_stub_with_no_todo_message_gets_a_sensible_default_detail() {
+        let json = r#"{ "operationId": "test", "_generated": true, "sources": {}, "response": {} }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        let security = SecurityConfig::default();
+        let errors = ErrorRegistry::load(Path::new("/does/not/exist")).unwrap();
+        let discovered_errors = Mutex::new(DiscoveredErrors::default());
+        let root = std::env::temp_dir();
+
+        let (status, body) = resolve_for_test(
+            &endpoint,
+            &security,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root,
+            &reqwest::Client::new(),
+            &errors,
+            &discovered_errors,
+            &root.join("errors.discovered.json"),
+            false,
+            &crate::security::VerifierCache::new(),
+            &HeaderMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            None,
+            &Map::new(),
+        )
+        .await;
+
+        assert_eq!(status, 501);
+        assert!(body["detail"].as_str().is_some_and(|d| !d.is_empty()));
+    }
+
+    /// A hand-edited, no-longer-generated endpoint (the common case —
+    /// `frogs generate` never overwrites a file once it exists, so this is
+    /// what a filled-in stub actually looks like) behaves exactly as before
+    /// this gate existed.
+    #[tokio::test]
+    async fn an_endpoint_with_generated_false_is_unaffected() {
+        let json = r#"{ "operationId": "test", "_generated": false, "sources": {}, "response": {} }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        let security = SecurityConfig::default();
+        let errors = ErrorRegistry::load(Path::new("/does/not/exist")).unwrap();
+        let discovered_errors = Mutex::new(DiscoveredErrors::default());
+        let root = std::env::temp_dir();
+
+        let (status, _) = resolve_for_test(
+            &endpoint,
+            &security,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root,
+            &reqwest::Client::new(),
+            &errors,
+            &discovered_errors,
+            &root.join("errors.discovered.json"),
+            false,
+            &crate::security::VerifierCache::new(),
+            &HeaderMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            None,
+            &Map::new(),
+        )
+        .await;
+
+        assert_eq!(status, 200, "an ordinary (non-generated) endpoint must resolve normally");
+    }
+
+    /// End to end through a real running server via `build_router` — not
+    /// just the direct `resolve_for_test` calls above.
+    #[tokio::test]
+    async fn a_generated_stub_returns_501_through_a_real_running_server() {
+        let root = std::env::temp_dir().join(format!(
+            "frogs-generated-stub-501-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let dir = root.join("datasources/endpoints/things");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("endpoint.get.json"),
+            r#"{ "operationId": "getThing", "_generated": true, "_todo": "fill me in", "sources": {}, "response": { "id": null } }"#,
+        )
+        .unwrap();
+
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        let errors = Arc::new(ErrorRegistry::load(&root.join("does-not-exist")).unwrap());
+        let security = Arc::new(SecurityConfig::default());
+        let router = build_router(
+            &root,
+            Arc::new(drivers),
+            errors,
+            security,
+            Arc::new(HashMap::new()),
+            Arc::new(Mutex::new(DiscoveredErrors::default())),
+            false,
+            None,
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let response = reqwest::get(format!("http://{addr}/things")).await.unwrap();
+        assert_eq!(response.status(), 501);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["detail"], "fill me in");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A helper shared by the per-endpoint `debugMode` tests below: one
+    /// non-optional SQL source that always fails, resolved through
+    /// `resolve_for_test` with a fresh, isolated `errors`/`discovered`/`root`
+    /// set each call, returning just the built response body.
+    async fn run_with_debug_mode(endpoint_json: &str, global_debug_mode: bool) -> Value {
+        #[derive(Debug)]
+        struct AlwaysFailsDriver;
+        #[async_trait::async_trait]
+        impl SqlDriver for AlwaysFailsDriver {
+            async fn query(&self, _script: &str, _params: &HashMap<String, crate::sql::SqlValue>) -> Result<Vec<crate::sql::SqlRow>, crate::sql::SqlError> {
+                Err(crate::sql::SqlError::ConnectionFailed("pool exhausted".to_string()))
+            }
+        }
+
+        let endpoint: EndpointFile = serde_json::from_str(endpoint_json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), Box::new(AlwaysFailsDriver));
+
+        let root = std::env::temp_dir().join(format!(
+            "frogs-per-endpoint-debug-mode-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("db")).unwrap();
+        std::fs::write(root.join("db/q.sql"), "SELECT 1;").unwrap();
+        // exposeDetail: false — so any `detail` that shows up must be
+        // because of debugMode, not the registry's own exposure setting.
+        let errors_dir = root.join("config-errors");
+        std::fs::create_dir_all(&errors_dir).unwrap();
+        std::fs::write(
+            errors_dir.join("core.json"),
+            r#"{ "datasource.sql.connection_failed": { "httpStatus": 500, "exposeDetail": false } }"#,
+        )
+        .unwrap();
+        let errors = ErrorRegistry::load(&errors_dir).unwrap();
+
+        let security = SecurityConfig {
+            schemes: HashMap::new(),
+            verifiers: HashMap::new(),
+        };
+        let discovered_errors = Mutex::new(DiscoveredErrors::default());
+
+        let (_, body) = resolve_for_test(
+            &endpoint,
+            &security,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root,
+            &reqwest::Client::new(),
+            &errors,
+            &discovered_errors,
+            &root.join("errors.discovered.json"),
+            global_debug_mode,
+            &crate::security::VerifierCache::new(),
+            &HeaderMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            None,
+            &Map::new(),
+        )
+        .await;
+
+        let _ = std::fs::remove_dir_all(&root);
+        body
+    }
+
+    #[tokio::test]
+    async fn an_endpoints_own_debug_mode_true_overrides_a_false_global_default() {
+        let json = r#"{
+            "operationId": "test",
+            "sources": { "car": { "type": "sql", "connection": "db", "script": "q.sql" } },
+            "response": {},
+            "debugMode": true
+        }"#;
+        let body = run_with_debug_mode(json, false).await;
+
+        assert!(
+            body.get("detail").is_some(),
+            "the endpoint's own debugMode: true should show detail even though the global default is off and exposeDetail is false: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_endpoints_own_debug_mode_false_overrides_a_true_global_default() {
+        let json = r#"{
+            "operationId": "test",
+            "sources": { "car": { "type": "sql", "connection": "db", "script": "q.sql" } },
+            "response": {},
+            "debugMode": false
+        }"#;
+        let body = run_with_debug_mode(json, true).await;
+
+        assert!(
+            body.get("detail").is_none(),
+            "the endpoint's own debugMode: false should suppress detail even though the global default is on: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_with_no_debug_mode_of_its_own_uses_the_global_default() {
+        let json = r#"{
+            "operationId": "test",
+            "sources": { "car": { "type": "sql", "connection": "db", "script": "q.sql" } },
+            "response": {}
+        }"#;
+        assert!(run_with_debug_mode(json, true).await.get("detail").is_some(), "global debugMode: true should still apply with no per-endpoint override");
+        assert!(run_with_debug_mode(json, false).await.get("detail").is_none(), "global debugMode: false should still apply with no per-endpoint override");
+    }
+
+    /// The discovery-recording side effect (not just detail exposure) also
+    /// follows the effective, per-endpoint `debugMode` — an unclassified
+    /// code gets recorded when *this endpoint's* debugMode is on, even
+    /// though the server-wide default is off.
+    #[tokio::test]
+    async fn per_endpoint_debug_mode_also_governs_discovered_error_recording() {
+        #[derive(Debug)]
+        struct EmptyResultDriver;
+        #[async_trait::async_trait]
+        impl SqlDriver for EmptyResultDriver {
+            async fn query(&self, _script: &str, _params: &HashMap<String, crate::sql::SqlValue>) -> Result<Vec<crate::sql::SqlRow>, crate::sql::SqlError> {
+                Ok(vec![])
+            }
+        }
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": { "car": { "type": "sql", "connection": "db", "script": "q.sql" } },
+            "response": {},
+            "debugMode": true
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), Box::new(EmptyResultDriver));
+
+        let root = std::env::temp_dir().join(format!(
+            "frogs-per-endpoint-debug-mode-discovery-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("db")).unwrap();
+        std::fs::write(root.join("db/q.sql"), "SELECT 1;").unwrap();
+        // Empty registry — "datasource.sql.not_found" is genuinely unclassified.
+        let errors = ErrorRegistry::load(&root.join("does-not-exist")).unwrap();
+        let security = SecurityConfig {
+            schemes: HashMap::new(),
+            verifiers: HashMap::new(),
+        };
+        let discovered_errors = Mutex::new(DiscoveredErrors::default());
+
+        resolve_for_test(
+            &endpoint,
+            &security,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root,
+            &reqwest::Client::new(),
+            &errors,
+            &discovered_errors,
+            &root.join("errors.discovered.json"),
+            false, // global default is off
+            &crate::security::VerifierCache::new(),
+            &HeaderMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            None,
+            &Map::new(),
+        )
+        .await;
+
+        assert_eq!(
+            discovered_errors.lock().unwrap().len(),
+            1,
+            "the endpoint's own debugMode: true should still trigger discovery recording despite the global default being off"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `resolve_for_test`'s own request-validation step, exercised directly
+    /// rather than through a real HTTP server — it's `pub(crate)` and
+    /// already the exact integration point both `handle_request` and
+    /// `frogs test`'s case runner call through.
+    mod request_validation_tests {
+        use super::*;
+        use crate::openapi::{Operation, ParameterInfo};
+        use crate::sql::{SqlError, SqlValue};
+
+        fn error_registry_with_validation_codes() -> ErrorRegistry {
+            let root = std::env::temp_dir().join(format!(
+                "frogs-endpoint-validation-errors-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join("core.json"),
+                r#"{
+                    "validation.missing_parameter": { "httpStatus": 400, "exposeDetail": true },
+                    "validation.invalid_type": { "httpStatus": 400, "exposeDetail": true },
+                    "auth.invalid_credentials": { "httpStatus": 401, "exposeDetail": true }
+                }"#,
+            )
+            .unwrap();
+            let registry = ErrorRegistry::load(&root).unwrap();
+            let _ = std::fs::remove_dir_all(&root);
+            registry
+        }
+
+        fn no_op_endpoint() -> EndpointFile {
+            serde_json::from_str(r#"{ "operationId": "test", "sources": {}, "response": {} }"#).unwrap()
+        }
+
+        fn temp_project_root() -> PathBuf {
+            let root = std::env::temp_dir().join(format!(
+                "frogs-endpoint-validation-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            root
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn run(
+            endpoint: &EndpointFile,
+            security: &SecurityConfig,
+            drivers: &HashMap<String, Box<dyn SqlDriver>>,
+            errors: &ErrorRegistry,
+            path_params: &HashMap<String, String>,
+            query_params: &HashMap<String, String>,
+            headers: &HeaderMap,
+            body: &Value,
+            operation: Option<&Operation>,
+        ) -> (u16, Value) {
+            let root = temp_project_root();
+            // A verifier's own sql script needs a real file on disk to read
+            // (its *contents* are never actually inspected — `SqlDriver` is
+            // faked — but `run_sql`/`security::verify` still `fs::read_to_string`
+            // it before ever reaching the fake driver).
+            std::fs::create_dir_all(root.join("db")).unwrap();
+            std::fs::write(root.join("db/verify_key.sql"), "SELECT active FROM api_keys WHERE key = :key;").unwrap();
+            let discovered_errors = Mutex::new(DiscoveredErrors::default());
+            let component_schemas = Map::new();
+            let result = resolve_for_test(
+                endpoint,
+                security,
+                &HashMap::new(),
+                drivers,
+                &root,
+                &root,
+                &reqwest::Client::new(),
+                errors,
+                &discovered_errors,
+                &root.join("errors.discovered.json"),
+                false,
+                &crate::security::VerifierCache::new(),
+                headers,
+                path_params,
+                query_params,
+                body,
+                "",
+                &HashMap::new(),
+                operation,
+                &component_schemas,
+            )
+            .await;
+            let _ = std::fs::remove_dir_all(&root);
+            result
+        }
+
+        fn operation_requiring_query_param(name: &str, schema_type: &str) -> Operation {
+            Operation {
+                path: "/test".to_string(),
+                method: "get".to_string(),
+                operation_id: "test".to_string(),
+                response_schema: None,
+                parameters: vec![ParameterInfo {
+                    name: name.to_string(),
+                    location: "query".to_string(),
+                    required: true,
+                    schema_type: Some(schema_type.to_string()),
+                }],
+                request_body: None,
+                response_status_codes: vec![200],
+                security: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn a_missing_required_query_parameter_is_rejected_with_400() {
+            let endpoint = no_op_endpoint();
+            let security = SecurityConfig {
+                schemes: HashMap::new(),
+                verifiers: HashMap::new(),
+            };
+            let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+            let errors = error_registry_with_validation_codes();
+            let operation = operation_requiring_query_param("maker", "string");
+
+            let (status, body) = run(
+                &endpoint,
+                &security,
+                &drivers,
+                &errors,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HeaderMap::new(),
+                &Value::Null,
+                Some(&operation),
+            )
+            .await;
+
+            assert_eq!(status, 400);
+            assert_eq!(body["name"], "validation.missing_parameter");
+        }
+
+        #[tokio::test]
+        async fn a_wrong_typed_query_parameter_is_rejected_with_400() {
+            let endpoint = no_op_endpoint();
+            let security = SecurityConfig {
+                schemes: HashMap::new(),
+                verifiers: HashMap::new(),
+            };
+            let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+            let errors = error_registry_with_validation_codes();
+            let operation = operation_requiring_query_param("limit", "integer");
+            let query_params = HashMap::from([("limit".to_string(), "not-a-number".to_string())]);
+
+            let (status, body) = run(
+                &endpoint,
+                &security,
+                &drivers,
+                &errors,
+                &HashMap::new(),
+                &query_params,
+                &HeaderMap::new(),
+                &Value::Null,
+                Some(&operation),
+            )
+            .await;
+
+            assert_eq!(status, 400);
+            assert_eq!(body["name"], "validation.invalid_type");
+        }
+
+        #[tokio::test]
+        async fn a_present_correctly_typed_parameter_passes_and_the_request_proceeds() {
+            let endpoint = no_op_endpoint();
+            let security = SecurityConfig {
+                schemes: HashMap::new(),
+                verifiers: HashMap::new(),
+            };
+            let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+            let errors = error_registry_with_validation_codes();
+            let operation = operation_requiring_query_param("limit", "integer");
+            let query_params = HashMap::from([("limit".to_string(), "10".to_string())]);
+
+            let (status, body) = run(
+                &endpoint,
+                &security,
+                &drivers,
+                &errors,
+                &HashMap::new(),
+                &query_params,
+                &HeaderMap::new(),
+                &Value::Null,
+                Some(&operation),
+            )
+            .await;
+
+            // The no-op endpoint has no sources at all, so a request that
+            // clears validation resolves to a plain empty 200 — proof
+            // resolution actually ran, not just that validation didn't
+            // reject it.
+            assert_eq!(status, 200);
+            assert_eq!(body, serde_json::json!({}));
+        }
+
+        #[tokio::test]
+        async fn operation_none_skips_validation_entirely_even_for_an_otherwise_invalid_request() {
+            let endpoint = no_op_endpoint();
+            let security = SecurityConfig {
+                schemes: HashMap::new(),
+                verifiers: HashMap::new(),
+            };
+            let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+            let errors = error_registry_with_validation_codes();
+
+            // No `operation` passed at all (the `features.requestValidation:
+            // false` equivalent) — a request that would fail the same
+            // operation's own validation if it were `Some` sails through.
+            let (status, body) = run(
+                &endpoint,
+                &security,
+                &drivers,
+                &errors,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HeaderMap::new(),
+                &Value::Null,
+                None,
+            )
+            .await;
+
+            assert_eq!(status, 200);
+            assert_eq!(body, serde_json::json!({}));
+        }
+
+        /// The explicit ordering decision: a request that fails *both* the
+        /// security check and request validation gets the security
+        /// failure, never validation's — a caller who isn't even allowed to
+        /// call this endpoint shouldn't learn anything about its request
+        /// shape.
+        #[tokio::test]
+        async fn a_security_failure_wins_over_a_request_validation_failure() {
+            use crate::security::{LoadedVerifier, ValidIf, VerifierDef};
+
+            #[derive(Debug)]
+            struct AlwaysDeniesDriver;
+            #[async_trait::async_trait]
+            impl SqlDriver for AlwaysDeniesDriver {
+                async fn query(&self, _script: &str, _params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
+                    Ok(vec![])
+                }
+            }
+
+            let def: VerifierDef = serde_json::from_str(
+                r#"{
+                    "type": "sql",
+                    "connection": "db",
+                    "script": "verify_key.sql",
+                    "parameters": [{ "name": "key", "from": "header.X-Api-Key" }],
+                    "validIf": "row.active = true"
+                }"#,
+            )
+            .unwrap();
+            let verifier = LoadedVerifier {
+                valid_if: ValidIf::parse(def.valid_if()).unwrap(),
+                def,
+            };
+            let mut verifiers = HashMap::new();
+            verifiers.insert("apiKeyAuth".to_string(), verifier);
+            let security = SecurityConfig {
+                schemes: HashMap::new(),
+                verifiers,
+            };
+
+            let endpoint: EndpointFile = serde_json::from_str(r#"{ "operationId": "test", "security": "apiKeyAuth", "sources": {}, "response": {} }"#).unwrap();
+            let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+            drivers.insert("db".to_string(), Box::new(AlwaysDeniesDriver));
+            let errors = error_registry_with_validation_codes();
+            // Would also fail request validation (missing required query
+            // param) if the security check didn't already stop the request.
+            let operation = operation_requiring_query_param("maker", "string");
+
+            // No `X-Api-Key` header sent at all, and no `maker` query
+            // parameter either — both checks would fail independently.
+            let (status, body) = run(
+                &endpoint,
+                &security,
+                &drivers,
+                &errors,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HeaderMap::new(),
+                &Value::Null,
+                Some(&operation),
+            )
+            .await;
+
+            assert_eq!(status, 401);
+            assert_eq!(body["name"], "auth.invalid_credentials");
+        }
     }
 }

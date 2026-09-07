@@ -22,6 +22,27 @@ const HTTP_METHODS: &[&str] = &["get", "put", "post", "delete", "options", "head
 pub struct ParameterInfo {
     pub name: String,
     pub location: String,
+    /// `required: true` in the spec — request validation's own concern
+    /// (`endpoint::request_validation`), unused by the reference-file/
+    /// generation machinery this struct originally existed for.
+    pub required: bool,
+    /// The raw OpenAPI `schema.type` string (`"string"`/`"integer"`/...),
+    /// if the parameter declares one at all. Only meaningful for request
+    /// validation's type check — a bare scalar, since path/query/header
+    /// values are always plain strings on the wire; array/object-typed
+    /// parameters (rare, and dependent on `style`/`explode` serialization
+    /// this project doesn't otherwise model) get presence-checked only,
+    /// never type-checked.
+    pub schema_type: Option<String>,
+}
+
+/// A `requestBody`'s `application/json` schema, if the operation declares
+/// one — `required` per the spec's own `requestBody.required` (default
+/// `false` when omitted, same as the spec itself).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestBodySchema {
+    pub required: bool,
+    pub schema: Value,
 }
 
 /// One operation from `openapi.yaml`'s `paths`. `response_schema` is the
@@ -38,6 +59,11 @@ pub struct Operation {
     pub operation_id: String,
     pub response_schema: Option<Value>,
     pub parameters: Vec<ParameterInfo>,
+    /// This operation's `requestBody`'s `application/json` schema, if it
+    /// declares one — request validation's own concern, resolved (`$ref`s
+    /// included) against `OpenApiDocument::component_schemas` at validation
+    /// time, not eagerly here.
+    pub request_body: Option<RequestBodySchema>,
     /// Every numeric response code this operation declares in `openapi.yaml`
     /// (`responses`' own keys — `default` and pattern keys like `4XX` are
     /// skipped, since `successStatus` is validated against literal codes
@@ -128,7 +154,8 @@ impl Operation {
     }
 }
 
-/// Extracts `name`/`in` from an operation's `parameters` array.
+/// Extracts `name`/`in`/`required`/`schema.type` from an operation's
+/// `parameters` array.
 fn extract_parameters(operation: &Map<String, Value>) -> Vec<ParameterInfo> {
     let Some(parameters) = operation.get("parameters").and_then(Value::as_array) else {
         return Vec::new();
@@ -138,12 +165,27 @@ fn extract_parameters(operation: &Map<String, Value>) -> Vec<ParameterInfo> {
         .filter_map(|param| {
             let name = param.get("name")?.as_str()?;
             let location = param.get("in")?.as_str()?;
+            let required = param.get("required").and_then(Value::as_bool).unwrap_or(false);
+            let schema_type = param.get("schema").and_then(|s| s.get("type")).and_then(Value::as_str).map(str::to_string);
             Some(ParameterInfo {
                 name: name.to_string(),
                 location: location.to_string(),
+                required,
+                schema_type,
             })
         })
         .collect()
+}
+
+/// This operation's `requestBody.content.application/json.schema`, if it
+/// declares one at all — `None` for an operation with no `requestBody`, or
+/// one that declares a body but not a JSON content type (nothing else is
+/// validated).
+fn extract_request_body(operation: &Map<String, Value>) -> Option<RequestBodySchema> {
+    let request_body = operation.get("requestBody")?.as_object()?;
+    let schema = request_body.get("content")?.get("application/json")?.get("schema")?.clone();
+    let required = request_body.get("required").and_then(Value::as_bool).unwrap_or(false);
+    Some(RequestBodySchema { required, schema })
 }
 
 /// Every numeric key of an operation's `responses` object — `default` and
@@ -279,6 +321,7 @@ pub fn load(path: &Path) -> Result<OpenApiDocument, OpenApiError> {
                     operation_id: operation_id.to_string(),
                     response_schema: success_response_schema(operation_obj),
                     parameters: extract_parameters(operation_obj),
+                    request_body: extract_request_body(operation_obj),
                     response_status_codes: declared_response_codes(operation_obj),
                     security: operation_security(operation_obj, document_security),
                 });
@@ -379,13 +422,18 @@ mod tests {
                     parameters: vec![
                         ParameterInfo {
                             name: "maker".to_string(),
-                            location: "query".to_string()
+                            location: "query".to_string(),
+                            required: true,
+                            schema_type: Some("string".to_string()),
                         },
                         ParameterInfo {
                             name: "model".to_string(),
-                            location: "query".to_string()
+                            location: "query".to_string(),
+                            required: true,
+                            schema_type: Some("string".to_string()),
                         },
                     ],
+                    request_body: None,
                     response_status_codes: vec![200],
                     security: None,
                 },
@@ -395,6 +443,7 @@ mod tests {
                     operation_id: "createCar".to_string(),
                     response_schema: car_with_price_ref.clone(),
                     parameters: vec![],
+                    request_body: None,
                     response_status_codes: vec![201],
                     security: None,
                 },
@@ -405,8 +454,11 @@ mod tests {
                     response_schema: car_with_price_ref,
                     parameters: vec![ParameterInfo {
                         name: "vin".to_string(),
-                        location: "path".to_string()
+                        location: "path".to_string(),
+                        required: true,
+                        schema_type: Some("string".to_string()),
                     }],
+                    request_body: None,
                     response_status_codes: vec![200, 404],
                     security: Some("apiKeyAuth".to_string()),
                 },
@@ -425,16 +477,23 @@ mod tests {
                 ParameterInfo {
                     name: "id".to_string(),
                     location: "path".to_string(),
+                    required: true,
+                    schema_type: Some("string".to_string()),
                 },
                 ParameterInfo {
                     name: "limit".to_string(),
                     location: "query".to_string(),
+                    required: false,
+                    schema_type: Some("integer".to_string()),
                 },
                 ParameterInfo {
                     name: "Authorization".to_string(),
                     location: "header".to_string(),
+                    required: true,
+                    schema_type: Some("string".to_string()),
                 },
             ],
+            request_body: None,
             response_status_codes: vec![200],
             security: None,
         };
@@ -444,6 +503,80 @@ mod tests {
             serde_json::json!({ "query": ["limit"], "path": ["id"], "header": ["Authorization"], "body": null })
         );
         assert_eq!(op.available_parameter_sources(), vec!["query.limit", "path.id", "header.Authorization"]);
+    }
+
+    /// `extract_parameters`/`extract_request_body` — the raw `required`/
+    /// `schema.type`/`requestBody` data request validation needs, which
+    /// used to be parsed and immediately discarded.
+    #[test]
+    fn extracts_required_and_schema_type_for_parameters() {
+        let operation = serde_json::json!({
+            "parameters": [
+                { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } },
+                { "name": "limit", "in": "query", "schema": { "type": "integer" } },
+                { "name": "note", "in": "query" }
+            ]
+        });
+        let params = extract_parameters(operation.as_object().unwrap());
+        assert_eq!(
+            params,
+            vec![
+                ParameterInfo {
+                    name: "id".to_string(),
+                    location: "path".to_string(),
+                    required: true,
+                    schema_type: Some("integer".to_string()),
+                },
+                ParameterInfo {
+                    name: "limit".to_string(),
+                    location: "query".to_string(),
+                    required: false,
+                    schema_type: Some("integer".to_string()),
+                },
+                ParameterInfo {
+                    name: "note".to_string(),
+                    location: "query".to_string(),
+                    required: false,
+                    schema_type: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_the_json_request_body_schema() {
+        let operation = serde_json::json!({
+            "requestBody": {
+                "required": true,
+                "content": { "application/json": { "schema": { "type": "object", "required": ["maker"] } } }
+            }
+        });
+        let body = extract_request_body(operation.as_object().unwrap()).expect("a declared JSON request body should be found");
+        assert!(body.required);
+        assert_eq!(body.schema, serde_json::json!({ "type": "object", "required": ["maker"] }));
+    }
+
+    #[test]
+    fn a_request_body_omitting_required_defaults_to_false() {
+        let operation = serde_json::json!({
+            "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }
+        });
+        let body = extract_request_body(operation.as_object().unwrap()).unwrap();
+        assert!(!body.required);
+    }
+
+    #[test]
+    fn no_request_body_at_all_is_none() {
+        let operation = serde_json::json!({ "operationId": "test" });
+        assert_eq!(extract_request_body(operation.as_object().unwrap()), None);
+    }
+
+    #[test]
+    fn a_request_body_with_no_json_content_is_none() {
+        let operation = serde_json::json!({
+            "requestBody": { "content": { "text/plain": { "schema": { "type": "string" } } } }
+        });
+        assert_eq!(extract_request_body(operation.as_object().unwrap()), None);
     }
 
     #[test]
@@ -491,6 +624,7 @@ mod tests {
             operation_id: "createCar".to_string(),
             response_schema: None,
             parameters: Vec::new(),
+            request_body: None,
             response_status_codes: codes,
             security: None,
         }

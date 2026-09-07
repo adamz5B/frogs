@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use axum::http::HeaderMap;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Deserialize;
 use serde_json::Value;
@@ -51,6 +52,13 @@ pub enum HttpError {
     InvalidJson(String),
     ResponsePathNotFound(String),
     Auth(String),
+    /// `cardinality: "many"` (`resolve::run_http_source`) expects the
+    /// (already `responsePath`-unwrapped) response body to be a JSON array
+    /// — this is what it gets instead, e.g. `"an object"`. A shape mismatch
+    /// between the endpoint's own declaration and what the upstream
+    /// actually sent, the same "upstream didn't hold up its end" category
+    /// as `ResponsePathNotFound`/`InvalidJson`, not a config typo.
+    NotAnArray(String),
 }
 
 impl std::fmt::Display for HttpError {
@@ -62,6 +70,7 @@ impl std::fmt::Display for HttpError {
             HttpError::InvalidJson(m) => write!(f, "invalid JSON response: {m}"),
             HttpError::ResponsePathNotFound(path) => write!(f, "responsePath '{path}' not found in response"),
             HttpError::Auth(m) => write!(f, "{m}"),
+            HttpError::NotAnArray(shape) => write!(f, "cardinality 'many' expects a JSON array response, got {shape}"),
         }
     }
 }
@@ -91,15 +100,10 @@ pub enum HttpAuth {
         password_env: String,
     },
     /// Passes the *caller's own* auth header through unchanged — the one
-    /// case a raw env-based secret can't cover. Parses so a datasource file
-    /// that declares one doesn't fail to load, but isn't executable yet:
-    /// it needs the incoming request's own headers threaded all the way
-    /// down to here, which nothing in the resolver does yet (the same gap
-    /// noted for `header.`/`body.`/`sources.` parameter prefixes).
-    Forward {
-        #[allow(dead_code)]
-        header: String,
-    },
+    /// case a raw env-based secret can't cover. `header` names the inbound
+    /// header to read (e.g. `"Authorization"`); it's sent to the upstream
+    /// under that exact same name.
+    Forward { header: String },
 }
 
 /// Executes one HTTP source: substitutes `{{param}}` templates into the
@@ -116,6 +120,7 @@ pub async fn execute(
     request: &HttpRequestFile,
     params: &HashMap<String, SqlValue>,
     array_params: &HashSet<String>,
+    caller_headers: &HeaderMap,
 ) -> Result<Value, HttpError> {
     let url = substitute_string(&request.url, params);
     let method = reqwest::Method::from_bytes(request.method.as_bytes()).map_err(|e| HttpError::InvalidMethod(format!("{}: {e}", request.method)))?;
@@ -128,7 +133,7 @@ pub async fn execute(
     }
 
     if let Some(auth) = &request.auth {
-        builder = apply_auth(builder, auth)?;
+        builder = apply_auth(builder, auth, caller_headers)?;
     }
 
     let response = builder.send().await.map_err(|e| HttpError::Request(e.to_string()))?;
@@ -145,7 +150,7 @@ pub async fn execute(
     }
 }
 
-fn apply_auth(builder: reqwest::RequestBuilder, auth: &HttpAuth) -> Result<reqwest::RequestBuilder, HttpError> {
+fn apply_auth(builder: reqwest::RequestBuilder, auth: &HttpAuth, caller_headers: &HeaderMap) -> Result<reqwest::RequestBuilder, HttpError> {
     match auth {
         HttpAuth::Bearer { token_env } => {
             let token = std::env::var(token_env).map_err(|_| HttpError::Auth(format!("env var '{token_env}' not set for bearer auth")))?;
@@ -160,11 +165,16 @@ fn apply_auth(builder: reqwest::RequestBuilder, auth: &HttpAuth) -> Result<reqwe
             let password = std::env::var(password_env).map_err(|_| HttpError::Auth(format!("env var '{password_env}' not set for basic auth")))?;
             Ok(builder.basic_auth(user, Some(password)))
         }
-        HttpAuth::Forward { .. } => Err(HttpError::Auth(
-            "auth type 'forward' isn't supported yet (needs the caller's own request headers threaded through, \
-             which the resolver doesn't do yet)"
-                .to_string(),
-        )),
+        // Same "fail the source clearly" posture a missing env var already
+        // gets for the other three auth types — a caller who didn't send
+        // the header being forwarded gets a clear auth error, not a request
+        // silently sent with no auth at all.
+        HttpAuth::Forward { header } => {
+            let value = caller_headers
+                .get(header.as_str())
+                .ok_or_else(|| HttpError::Auth(format!("caller sent no '{header}' header to forward")))?;
+            Ok(builder.header(header.as_str(), value.clone()))
+        }
     }
 }
 
@@ -176,6 +186,10 @@ fn sql_value_to_string(value: &SqlValue) -> String {
         SqlValue::Float(f) => f.to_string(),
         SqlValue::Text(s) => s.clone(),
         SqlValue::Timestamp(ts) => ts.to_rfc3339(),
+        // Ordinary (non-`"type": "array"`) templating always stringifies —
+        // `whole_value_passthrough` is the separate path that reconstitutes
+        // a real array/object shape for an array-typed parameter.
+        SqlValue::Array(_) => sql_value_to_json(value).to_string(),
     }
 }
 
@@ -308,7 +322,6 @@ fn navigate<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
 mod tests {
     use super::*;
     use axum::extract::State;
-    use axum::http::HeaderMap;
     use axum::routing::get;
     use axum::{Json, Router};
     use std::sync::Arc;
@@ -378,7 +391,7 @@ mod tests {
         params.insert("vin".to_string(), SqlValue::Text("1HGCM82633A004352".to_string()));
 
         let client = reqwest::Client::new();
-        let result = execute(&client, &request_file, &params, &HashSet::new()).await.expect("request should succeed");
+        let result = execute(&client, &request_file, &params, &HashSet::new(), &HeaderMap::new()).await.expect("request should succeed");
 
         assert_eq!(result, serde_json::json!({ "amount": 24500, "currency": "USD" }));
     }
@@ -404,7 +417,7 @@ mod tests {
         });
 
         let client = reqwest::Client::new();
-        let err = execute(&client, &request_file(format!("http://{addr}/broken")), &HashMap::new(), &HashSet::new())
+        let err = execute(&client, &request_file(format!("http://{addr}/broken")), &HashMap::new(), &HashSet::new(), &HeaderMap::new())
             .await
             .expect_err("a 404 upstream response must not be treated as success");
 
@@ -421,7 +434,7 @@ mod tests {
         });
 
         let client = reqwest::Client::new();
-        let err = execute(&client, &request_file(format!("http://{addr}/text")), &HashMap::new(), &HashSet::new())
+        let err = execute(&client, &request_file(format!("http://{addr}/text")), &HashMap::new(), &HashSet::new(), &HeaderMap::new())
             .await
             .expect_err("a non-JSON body must not parse as a JSON response");
 
@@ -441,7 +454,7 @@ mod tests {
         request.response_path = Some("data".to_string());
 
         let client = reqwest::Client::new();
-        let err = execute(&client, &request, &HashMap::new(), &HashSet::new())
+        let err = execute(&client, &request, &HashMap::new(), &HashSet::new(), &HeaderMap::new())
             .await
             .expect_err("a responsePath absent from the body must be an error, not null");
 
@@ -458,7 +471,7 @@ mod tests {
         drop(listener);
 
         let client = reqwest::Client::new();
-        let err = execute(&client, &request_file(format!("http://{addr}/anything")), &HashMap::new(), &HashSet::new())
+        let err = execute(&client, &request_file(format!("http://{addr}/anything")), &HashMap::new(), &HashSet::new(), &HeaderMap::new())
             .await
             .expect_err("nothing listening on this port must fail the request, not hang or panic");
 
@@ -470,7 +483,7 @@ mod tests {
         let mut request = request_file("http://127.0.0.1:1/unreachable".to_string());
         request.method = "IN VALID".to_string();
 
-        let err = execute(&reqwest::Client::new(), &request, &HashMap::new(), &HashSet::new())
+        let err = execute(&reqwest::Client::new(), &request, &HashMap::new(), &HashSet::new(), &HeaderMap::new())
             .await
             .expect_err("a method containing a space isn't a valid HTTP token");
 
@@ -484,7 +497,7 @@ mod tests {
             token_env: "FROGS_TEST_DEFINITELY_UNSET_TOKEN_VAR".to_string(),
         });
 
-        let err = execute(&reqwest::Client::new(), &request, &HashMap::new(), &HashSet::new())
+        let err = execute(&reqwest::Client::new(), &request, &HashMap::new(), &HashSet::new(), &HeaderMap::new())
             .await
             .expect_err("a missing env var for bearer auth must fail, not send an empty token");
 
@@ -492,15 +505,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_auth_is_not_executable_yet() {
+    async fn forward_auth_passes_the_callers_own_header_through_unchanged() {
+        async fn echo_auth(headers: HeaderMap) -> Json<Value> {
+            let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            Json(serde_json::json!({ "sawAuth": auth }))
+        }
+
+        let app = Router::new().route("/whoami", get(echo_auth));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut request = request_file(format!("http://{addr}/whoami"));
+        request.auth = Some(HttpAuth::Forward {
+            header: "Authorization".to_string(),
+        });
+
+        let mut caller_headers = HeaderMap::new();
+        caller_headers.insert("authorization", "Bearer caller-own-token".parse().unwrap());
+
+        let result = execute(&reqwest::Client::new(), &request, &HashMap::new(), &HashSet::new(), &caller_headers)
+            .await
+            .expect("forward auth should pass the caller's own header through to the upstream");
+
+        assert_eq!(result["sawAuth"], "Bearer caller-own-token");
+    }
+
+    #[tokio::test]
+    async fn forward_auth_fails_clearly_when_the_caller_never_sent_the_header() {
         let mut request = request_file("http://127.0.0.1:1/unreachable".to_string());
         request.auth = Some(HttpAuth::Forward {
             header: "Authorization".to_string(),
         });
 
-        let err = execute(&reqwest::Client::new(), &request, &HashMap::new(), &HashSet::new())
+        // No `Authorization` header on this HeaderMap at all — the caller
+        // simply didn't send one.
+        let err = execute(&reqwest::Client::new(), &request, &HashMap::new(), &HashSet::new(), &HeaderMap::new())
             .await
-            .expect_err("forward auth has no caller-header plumbing yet, so it must fail rather than silently skip auth");
+            .expect_err("forwarding a header the caller never sent must fail clearly, not send the request with no auth");
 
         assert!(matches!(err, HttpError::Auth(_)));
     }
@@ -602,7 +646,7 @@ mod tests {
         let array_params = HashSet::from(["items".to_string()]);
 
         let client = reqwest::Client::new();
-        let result = execute(&client, &request, &params, &array_params).await.expect("request should succeed");
+        let result = execute(&client, &request, &params, &array_params, &HeaderMap::new()).await.expect("request should succeed");
 
         assert_eq!(result, serde_json::json!([{ "maker": "Honda" }, { "maker": "Ford" }]));
     }

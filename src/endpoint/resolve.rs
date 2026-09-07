@@ -1,11 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 
+use axum::http::HeaderMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
 use super::error::SourceErrorCause;
-use super::schema::{ArrayResponse, Cardinality, EndpointFile, Parameter, ParameterType, ResponseField, ResponseShape, SourceDef};
+use super::schema::{ArrayResponse, Cardinality, DetailedField, EndpointFile, Parameter, ParameterType, ResponseField, ResponseShape, SourceDef};
 use crate::sql::{SqlDriver, SqlValue, json_value_to_sql_value, sql_value_to_json};
 
 /// One resolved source's result, as plain JSON — a `Value::Object` whether
@@ -89,11 +92,12 @@ impl Serialize for MockOutcome {
     }
 }
 
-/// Runs every source in `endpoint.sources` (in map-iteration order — fine
-/// while no source depends on another's output; real dependency ordering
-/// is future work once `sources.<name>.` chaining is wired up) and collects
-/// each result. Returns `Err` immediately if a non-optional source fails,
-/// since there's no point building a response the client can't use.
+/// Runs every source in `endpoint.sources` and collects each result. A
+/// source whose own `parameters` reference another source's output
+/// (`"from": "sources.<name>.<field>"`) has that dependency resolved first,
+/// recursively — see `resolve_one`. Returns `Err` immediately if a
+/// non-optional source fails, since there's no point building a response
+/// the client can't use.
 ///
 /// `mocks` is keyed by source name; a source with no entry runs for real.
 /// The real (non-test) request path always passes an empty map — same
@@ -111,16 +115,118 @@ pub async fn resolve_sources(
     body: &Value,
     transaction_id: &str,
     mocks: &HashMap<String, MockOutcome>,
+    headers: &HeaderMap,
 ) -> Result<ResolvedSources, SourceFailure> {
     let mut resolved: ResolvedSources = HashMap::new();
+    let mut in_progress: HashSet<String> = HashSet::new();
 
-    for (name, source) in &endpoint.sources {
-        let (on_error, optional) = match source {
-            SourceDef::Sql { on_error, optional, .. } => (*on_error, *optional),
-            SourceDef::Http { on_error, optional, .. } => (*on_error, *optional),
+    for name in endpoint.sources.keys() {
+        if !resolved.contains_key(name) {
+            resolve_one(
+                name,
+                endpoint,
+                services,
+                drivers,
+                sql_root,
+                http_root,
+                http_client,
+                headers,
+                path_params,
+                query_params,
+                body,
+                transaction_id,
+                mocks,
+                &mut resolved,
+                &mut in_progress,
+            )
+            .await?;
+        }
+    }
+
+    Ok(resolved)
+}
+
+/// Resolves one source, first recursively resolving any dependency its own
+/// `parameters` reference via `"sources.<name>..."` (skipped entirely for a
+/// mocked source, which needs no parameters bound at all). A plain `async
+/// fn` can't call itself directly — the compiler would need to know its own
+/// future's size to define it — so this returns an explicitly boxed,
+/// pinned future instead; the same problem `openapi::schema_walk`'s
+/// (synchronous, so it doesn't hit this) recursive walk doesn't have to
+/// work around. `in_progress` mirrors that module's own cycle-detection
+/// idiom: a name still in it when re-entered means a real dependency cycle,
+/// reported as a config error rather than hanging or silently picking an
+/// order.
+#[allow(clippy::too_many_arguments)]
+fn resolve_one<'a>(
+    name: &'a str,
+    endpoint: &'a EndpointFile,
+    services: &'a HashMap<String, String>,
+    drivers: &'a HashMap<String, Box<dyn SqlDriver>>,
+    sql_root: &'a Path,
+    http_root: &'a Path,
+    http_client: &'a reqwest::Client,
+    headers: &'a HeaderMap,
+    path_params: &'a HashMap<String, String>,
+    query_params: &'a HashMap<String, String>,
+    body: &'a Value,
+    transaction_id: &'a str,
+    mocks: &'a HashMap<String, MockOutcome>,
+    resolved: &'a mut ResolvedSources,
+    in_progress: &'a mut HashSet<String>,
+) -> Pin<Box<dyn Future<Output = Result<(), SourceFailure>> + Send + 'a>> {
+    Box::pin(async move {
+        if resolved.contains_key(name) {
+            return Ok(());
+        }
+        let Some(source) = endpoint.sources.get(name) else {
+            return Ok(());
         };
 
-        let outcome = match mocks.get(name) {
+        let (on_error, optional, parameters) = match source {
+            SourceDef::Sql { on_error, optional, parameters, .. } => (*on_error, *optional, parameters),
+            SourceDef::Http { on_error, optional, parameters, .. } => (*on_error, *optional, parameters),
+        };
+
+        let mock = mocks.get(name);
+
+        if mock.is_none() {
+            if !in_progress.insert(name.to_string()) {
+                return Err(SourceFailure {
+                    on_error,
+                    source_name: name.to_string(),
+                    cause: SourceErrorCause::Config(format!("circular source dependency involving '{name}'")),
+                });
+            }
+            for param in parameters {
+                if let Some(dep_name) = source_dependency(&param.from)
+                    && endpoint.sources.contains_key(dep_name)
+                    && !resolved.contains_key(dep_name)
+                {
+                    resolve_one(
+                        dep_name,
+                        endpoint,
+                        services,
+                        drivers,
+                        sql_root,
+                        http_root,
+                        http_client,
+                        headers,
+                        path_params,
+                        query_params,
+                        body,
+                        transaction_id,
+                        mocks,
+                        resolved,
+                        in_progress,
+                    )
+                    .await?;
+                }
+            }
+            in_progress.remove(name);
+        }
+
+        let outcome = match mock {
             Some(MockOutcome::Success(value)) => Ok(value.clone()),
             Some(MockOutcome::Fail(code)) => Err(SourceErrorCause::Mocked(code.clone())),
             None => match source {
@@ -128,7 +234,6 @@ pub async fn resolve_sources(
                     connection,
                     script,
                     cardinality,
-                    parameters,
                     ..
                 } => {
                     run_sql_source(
@@ -138,19 +243,16 @@ pub async fn resolve_sources(
                         script,
                         *cardinality,
                         parameters,
+                        headers,
                         path_params,
                         query_params,
                         body,
                         transaction_id,
+                        resolved,
                     )
                     .await
                 }
-                SourceDef::Http {
-                    request,
-                    cardinality,
-                    parameters,
-                    ..
-                } => {
+                SourceDef::Http { request, cardinality, .. } => {
                     run_http_source(
                         services,
                         http_root,
@@ -158,10 +260,12 @@ pub async fn resolve_sources(
                         request,
                         *cardinality,
                         parameters,
+                        headers,
                         path_params,
                         query_params,
                         body,
                         transaction_id,
+                        resolved,
                     )
                     .await
                 }
@@ -170,23 +274,30 @@ pub async fn resolve_sources(
 
         match outcome {
             Ok(value) => {
-                resolved.insert(name.clone(), Some(value));
+                resolved.insert(name.to_string(), Some(value));
+                Ok(())
             }
             Err(cause) => {
                 if optional {
-                    resolved.insert(name.clone(), None);
+                    resolved.insert(name.to_string(), None);
+                    Ok(())
                 } else {
-                    return Err(SourceFailure {
+                    Err(SourceFailure {
                         on_error,
-                        source_name: name.clone(),
+                        source_name: name.to_string(),
                         cause,
-                    });
+                    })
                 }
             }
         }
-    }
+    })
+}
 
-    Ok(resolved)
+/// The dependency name out of a `"sources.<name>"` or `"sources.<name>.<field>"`
+/// parameter `from` value, or `None` for anything else (including bare
+/// `"sources"` with nothing after it).
+fn source_dependency(from: &str) -> Option<&str> {
+    from.strip_prefix("sources.")?.split('.').next().filter(|s| !s.is_empty())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -197,10 +308,12 @@ async fn run_sql_source(
     script: &str,
     cardinality: Cardinality,
     parameters: &[Parameter],
+    headers: &HeaderMap,
     path_params: &HashMap<String, String>,
     query_params: &HashMap<String, String>,
     body: &Value,
     transaction_id: &str,
+    resolved: &ResolvedSources,
 ) -> Result<Value, SourceErrorCause> {
     let driver = drivers
         .get(connection)
@@ -211,7 +324,8 @@ async fn run_sql_source(
 
     let mut bound = HashMap::new();
     for param in parameters {
-        bound.insert(param.name.clone(), resolve_from(&param.from, path_params, query_params, body, transaction_id));
+        let value = resolve_from(&param.from, headers, path_params, query_params, body, transaction_id, resolved);
+        bound.insert(param.name.clone(), clamp_numeric(value, param.default, param.min, param.max));
     }
 
     let rows = driver.query(&script_contents, &bound).await.map_err(SourceErrorCause::Sql)?;
@@ -241,20 +355,13 @@ async fn run_http_source(
     request: &str,
     cardinality: Cardinality,
     parameters: &[Parameter],
+    headers: &HeaderMap,
     path_params: &HashMap<String, String>,
     query_params: &HashMap<String, String>,
     body: &Value,
     transaction_id: &str,
+    resolved: &ResolvedSources,
 ) -> Result<Value, SourceErrorCause> {
-    if cardinality == Cardinality::Many {
-        // SQL's `many` is wired into response assembly (see `run_sql_source`
-        // and `resolve::build_array`) — an HTTP source returning a list is a
-        // separate, not-yet-designed question (does the upstream paginate?
-        // is the array the whole body or nested in an envelope?), so this
-        // stays a clear, deliberate error rather than a guess.
-        return Err(SourceErrorCause::Config("cardinality 'many' isn't supported for http sources yet".to_string()));
-    }
-
     let request_path = http_root.join(request);
     let contents = std::fs::read_to_string(&request_path).map_err(|e| SourceErrorCause::Config(format!("failed to read {}: {e}", request_path.display())))?;
     let request_file: crate::http::HttpRequestFile =
@@ -274,15 +381,36 @@ async fn run_http_source(
     }
     let mut array_params = HashSet::new();
     for param in parameters {
-        bound.insert(param.name.clone(), resolve_from(&param.from, path_params, query_params, body, transaction_id));
+        let value = resolve_from(&param.from, headers, path_params, query_params, body, transaction_id, resolved);
+        bound.insert(param.name.clone(), clamp_numeric(value, param.default, param.min, param.max));
         if param.param_type == ParameterType::Array {
             array_params.insert(param.name.clone());
         }
     }
 
-    crate::http::execute(client, &request_file, &bound, &array_params)
-        .await
-        .map_err(SourceErrorCause::Http)
+    let value = crate::http::execute(client, &request_file, &bound, &array_params, headers).await.map_err(SourceErrorCause::Http)?;
+
+    // `responsePath` (if declared) has already been unwrapped by `execute`
+    // above — the array `cardinality: "many"` expects is exactly whatever
+    // that unwrapping produced, the same way `responsePath` already lets
+    // `cardinality: "one"` unwrap an envelope before the ordinary
+    // field-mapping case sees it. No separate config knob needed.
+    if cardinality == Cardinality::Many && !value.is_array() {
+        return Err(SourceErrorCause::Http(crate::http::HttpError::NotAnArray(json_shape_name(&value).to_string())));
+    }
+
+    Ok(value)
+}
+
+fn json_shape_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 /// `path.`/`query.` look up the URL; `body.<field>` walks the parsed
@@ -294,18 +422,38 @@ async fn run_http_source(
 /// for this request is already tagged with (see `server::RequestId`) — a
 /// shared identifier every source in a request can use for its own
 /// coordination, per the design doc's multi-source write atomicity section;
-/// the engine itself does no distributed-transaction/rollback logic. `header.`/
-/// `sources.` still aren't wired up (no caller-header passthrough, no
-/// source chaining yet). An unresolvable `from` becomes `SqlValue::Null`
-/// rather than an error: a script author who references a parameter that
-/// isn't available (or a body sent with a GET) gets a null bound value,
-/// not a crash.
-fn resolve_from(from: &str, path_params: &HashMap<String, String>, query_params: &HashMap<String, String>, body: &Value, transaction_id: &str) -> SqlValue {
+/// the engine itself does no distributed-transaction/rollback logic.
+/// `sources.<name>` / `sources.<name>.<field...>` reads another source's
+/// already-resolved value — `resolve_one` guarantees it's resolved before
+/// this ever runs, or the whole request already failed if it couldn't be.
+/// `header.<name>` reads the caller's own request header, case-insensitively
+/// (`HeaderMap::get` already is) — the exact same lookup
+/// `security::bind_headers` uses for a verifier's parameters, just now also
+/// available to an ordinary source. An unresolvable `from` becomes
+/// `SqlValue::Null` rather than an error: a script author who references a
+/// parameter that isn't available (or a body sent with a GET, or a header
+/// the caller didn't send) gets a null bound value, not a crash.
+fn resolve_from(
+    from: &str,
+    headers: &HeaderMap,
+    path_params: &HashMap<String, String>,
+    query_params: &HashMap<String, String>,
+    body: &Value,
+    transaction_id: &str,
+    resolved: &ResolvedSources,
+) -> SqlValue {
     if let Some(name) = from.strip_prefix("path.") {
         return path_params.get(name).map(|v| SqlValue::Text(v.clone())).unwrap_or(SqlValue::Null);
     }
     if let Some(name) = from.strip_prefix("query.") {
         return query_params.get(name).map(|v| SqlValue::Text(v.clone())).unwrap_or(SqlValue::Null);
+    }
+    if let Some(name) = from.strip_prefix("header.") {
+        return headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| SqlValue::Text(v.to_string()))
+            .unwrap_or(SqlValue::Null);
     }
     if from == "context.transactionId" {
         return SqlValue::Text(transaction_id.to_string());
@@ -314,16 +462,68 @@ fn resolve_from(from: &str, path_params: &HashMap<String, String>, query_params:
         return json_value_to_sql_value(body);
     }
     if let Some(path) = from.strip_prefix("body.") {
-        let mut current = body;
-        for segment in path.split('.') {
-            match current.get(segment) {
-                Some(next) => current = next,
-                None => return SqlValue::Null,
-            }
-        }
-        return json_value_to_sql_value(current);
+        return match walk_dot_path(body, path) {
+            Some(value) => json_value_to_sql_value(value),
+            None => SqlValue::Null,
+        };
+    }
+    if let Some(rest) = from.strip_prefix("sources.") {
+        let mut segments = rest.splitn(2, '.');
+        let Some(source_name) = segments.next().filter(|s| !s.is_empty()) else {
+            return SqlValue::Null;
+        };
+        let Some(Some(value)) = resolved.get(source_name) else {
+            return SqlValue::Null;
+        };
+        return match segments.next() {
+            Some(path) => match walk_dot_path(value, path) {
+                Some(v) => json_value_to_sql_value(v),
+                None => SqlValue::Null,
+            },
+            None => json_value_to_sql_value(value),
+        };
     }
     SqlValue::Null
+}
+
+/// Walks a dot-separated path (`"owner.name"`) into a JSON value, one
+/// segment at a time — shared by `body.*`/`sources.*` parameter binding and
+/// (via `lookup`) `response` field mapping, all three of which support
+/// arbitrary-depth nesting.
+fn walk_dot_path<'a>(mut current: &'a Value, path: &str) -> Option<&'a Value> {
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
+/// General-purpose numeric clamping (design doc: "useful anywhere a
+/// parameter is user-controlled, but the obvious safety net for `limit`
+/// specifically") — a no-op, returning `value` completely untouched, unless
+/// at least one of `default`/`min`/`max` is actually declared on this
+/// parameter. Once any of them is set, the resolved value is reinterpreted
+/// as a real integer (parsed from a path/query string, truncated from a
+/// float, or `default`/`0` if it's missing/unparseable/`Null`) and clamped
+/// into `[min, max]` — the clamped result always binds as `SqlValue::Int`,
+/// a real number, not text, even though path/query params otherwise always
+/// resolve as `SqlValue::Text` (see `resolve_from`).
+fn clamp_numeric(value: SqlValue, default: Option<i64>, min: Option<i64>, max: Option<i64>) -> SqlValue {
+    if default.is_none() && min.is_none() && max.is_none() {
+        return value;
+    }
+    let mut n = match &value {
+        SqlValue::Int(n) => *n,
+        SqlValue::Float(f) => *f as i64,
+        SqlValue::Text(s) => s.parse().unwrap_or(default.unwrap_or(0)),
+        _ => default.unwrap_or(0),
+    };
+    if let Some(min) = min {
+        n = n.max(min);
+    }
+    if let Some(max) = max {
+        n = n.min(max);
+    }
+    SqlValue::Int(n)
 }
 
 /// Builds the JSON response body from resolved sources, per the endpoint's
@@ -350,14 +550,63 @@ fn build_fields(fields: &HashMap<String, ResponseField>, resolved: &ResolvedSour
 fn build_field(mapping: &ResponseField, resolved: &ResolvedSources) -> Value {
     match mapping {
         ResponseField::Array(array) => build_array(array, resolved),
+        // An unmapped field (still `null`, as `frogs generate` leaves it in
+        // a fresh stub) — nothing to look up, no `from` to have one.
+        ResponseField::Null => Value::Null,
         ResponseField::Plain(_) | ResponseField::Detailed(_) => {
-            let value = lookup(mapping.dot_path(), resolved);
+            let path = mapping.dot_path();
+            // The original design doc's own bracket syntax
+            // (`"sources.cars[].vin"`) — an ordinary field whose value is
+            // an *array*, one entry per row of a `cardinality: "many"`
+            // source, each entry being just that one field (not a whole
+            // row object the way `array.source` + `items` builds). A
+            // distinct capability from `array.source`, not just alternate
+            // syntax for it — this is how you get a bare array of scalars
+            // as one field among others without writing a full `items` map.
+            if let Some((source_name, field_path)) = parse_bracket_array_path(path) {
+                return build_bracket_array(source_name, field_path, mapping.detail(), resolved);
+            }
+            let value = lookup(path, resolved);
             match mapping.detail() {
                 Some(detail) => super::format::apply(value, detail),
                 None => value,
             }
         }
     }
+}
+
+/// Splits `"sources.<name>[].<field...>"` into `(name, field...)` — `None`
+/// for anything else, including a bare `"sources.<name>"` (no brackets at
+/// all, that's `lookup`'s ordinary job) or `"sources.<name>[]"` with
+/// nothing after it (a bracket path always names a field to extract per
+/// row; if you want the whole row, use `array.source` + `items` instead).
+fn parse_bracket_array_path(from: &str) -> Option<(&str, &str)> {
+    let rest = from.strip_prefix("sources.")?;
+    let (name, field_path) = rest.split_once("[].")?;
+    (!name.is_empty() && !field_path.is_empty()).then_some((name, field_path))
+}
+
+/// Builds the array `parse_bracket_array_path` describes: `source_name`
+/// must resolve to a real array (same "not actually an array -> empty
+/// list, not an error" posture as `build_array`), and each row contributes
+/// exactly one value — `field_path` walked into that row (arbitrary depth,
+/// via `walk_dot_path`, same as any other nested field), formatted with
+/// `detail` if given, applied per-element rather than to the array as a whole.
+fn build_bracket_array(source_name: &str, field_path: &str, detail: Option<&DetailedField>, resolved: &ResolvedSources) -> Value {
+    let Some(Some(Value::Array(rows))) = resolved.get(source_name) else {
+        return Value::Array(Vec::new());
+    };
+    Value::Array(
+        rows.iter()
+            .map(|row| {
+                let value = walk_dot_path(row, field_path).cloned().unwrap_or(Value::Null);
+                match detail {
+                    Some(detail) => super::format::apply(value, detail),
+                    None => value,
+                }
+            })
+            .collect(),
+    )
 }
 
 /// `array.source` names a `cardinality: "many"` source's *whole* resolved
@@ -394,6 +643,7 @@ fn build_field_against_row(mapping: &ResponseField, row: &Value) -> Value {
         // Many-depends-on-many fan-out isn't supported yet — same scope
         // boundary as HTTP `cardinality: "many"` (see `run_http_source`).
         ResponseField::Array(_) => Value::Null,
+        ResponseField::Null => Value::Null,
         ResponseField::Plain(path) => lookup_in_row(path, row),
         ResponseField::Detailed(detail) => super::format::apply(lookup_in_row(&detail.from, row), detail),
     }
@@ -410,14 +660,27 @@ fn lookup_in_row(path: &str, row: &Value) -> Value {
     current.clone()
 }
 
+/// `"sources.<name>.<field>"` reads one field, and — unlike the original 3-
+/// segment-only implementation — `"sources.<name>.<field>.<nested>..."`
+/// walks arbitrarily deep into that field's own value too, the same way
+/// `resolve_from`'s `body.*`/`sources.*` parameter binding already does via
+/// `walk_dot_path`. A path with nothing after the source name (`"sources.car"`
+/// with no field at all) is null here — that's `lookup_source`'s job, not
+/// this function's.
 fn lookup(from: &str, resolved: &ResolvedSources) -> Value {
-    let mut parts = from.split('.');
-    let (Some("sources"), Some(source_name), Some(field_name)) = (parts.next(), parts.next(), parts.next()) else {
+    let Some(rest) = from.strip_prefix("sources.") else {
+        return Value::Null;
+    };
+    let mut parts = rest.splitn(2, '.');
+    let Some(source_name) = parts.next().filter(|s| !s.is_empty()) else {
+        return Value::Null;
+    };
+    let Some(field_path) = parts.next() else {
         return Value::Null;
     };
 
     match resolved.get(source_name) {
-        Some(Some(value)) => value.get(field_name).cloned().unwrap_or(Value::Null),
+        Some(Some(value)) => walk_dot_path(value, field_path).cloned().unwrap_or(Value::Null),
         _ => Value::Null,
     }
 }
@@ -487,8 +750,16 @@ mod tests {
     /// script's *contents* but still need the file to exist), `http/` is
     /// created for parity even though most tests here don't use it.
     fn temp_project_root() -> PathBuf {
+        // A nanosecond timestamp alone isn't a reliable uniqueness source on
+        // every platform's clock resolution, and this module's test count
+        // (several sharing the same relative "http/pricing.json" fixture
+        // filename) makes a same-instant collision between two parallel
+        // tokio test threads a real, if rare, flake risk — an atomic
+        // counter guarantees uniqueness regardless of clock granularity.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "frogs-resolve-test-{}-{}",
+            "frogs-resolve-test-{}-{}-{unique}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
@@ -546,12 +817,132 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect("non-optional source with a row should resolve");
 
         let body = build_response(&endpoint, &resolved);
         assert_eq!(body["vin"], "1HGCM82633A004352");
+    }
+
+    /// A bare `null` response field (`ResponseField::Null`) renders as
+    /// `null` in the built response — no `from` to look up, nothing to
+    /// format. Distinct from the `_generated: true` 501 gate (`endpoint::
+    /// tests`) — this is the ordinary response-building behavior for a
+    /// field that's still unmapped regardless of why.
+    #[tokio::test]
+    async fn a_null_response_field_renders_as_null() {
+        let json = r#"{
+            "operationId": "test",
+            "sources": {},
+            "response": { "maker": "sources.car.maker", "year": null }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+
+        let root = temp_project_root();
+        let client = reqwest::Client::new();
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("an endpoint with no sources at all should resolve trivially");
+
+        let body = build_response(&endpoint, &resolved);
+        assert_eq!(body["maker"], Value::Null, "an unresolvable dot-path is null too, for a different reason");
+        assert_eq!(body["year"], Value::Null, "a bare null field is null because there's nothing mapped at all");
+    }
+
+    #[test]
+    fn lookup_still_resolves_the_ordinary_3_segment_case() {
+        let mut resolved: ResolvedSources = HashMap::new();
+        resolved.insert("car".to_string(), Some(serde_json::json!({ "vin": "AAA" })));
+        assert_eq!(lookup("sources.car.vin", &resolved), Value::String("AAA".to_string()));
+    }
+
+    #[test]
+    fn lookup_now_walks_arbitrarily_deep_past_the_first_field() {
+        let mut resolved: ResolvedSources = HashMap::new();
+        resolved.insert("car".to_string(), Some(serde_json::json!({ "owner": { "name": "Alex" } })));
+        assert_eq!(
+            lookup("sources.car.owner.name", &resolved),
+            Value::String("Alex".to_string()),
+            "must resolve owner.name, not stop at the whole owner object"
+        );
+    }
+
+    #[test]
+    fn lookup_walks_even_deeper_than_two_levels() {
+        let mut resolved: ResolvedSources = HashMap::new();
+        resolved.insert("car".to_string(), Some(serde_json::json!({ "owner": { "address": { "city": "Springfield" } } })));
+        assert_eq!(lookup("sources.car.owner.address.city", &resolved), Value::String("Springfield".to_string()));
+    }
+
+    #[test]
+    fn lookup_a_missing_nested_field_is_null_not_a_crash() {
+        let mut resolved: ResolvedSources = HashMap::new();
+        resolved.insert("car".to_string(), Some(serde_json::json!({ "owner": { "name": "Alex" } })));
+        assert_eq!(lookup("sources.car.owner.doesNotExist", &resolved), Value::Null);
+    }
+
+    /// The gap end to end: a real HTTP source's genuinely nested JSON
+    /// response, mapped via a 4-segment `response` dot-path — not just the
+    /// `lookup` unit tests above, through the full `resolve_sources` +
+    /// `build_response` pipeline.
+    #[tokio::test]
+    async fn a_response_field_can_map_an_arbitrarily_nested_source_value() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let app = Router::new().route("/car", get(|| async { Json(serde_json::json!({ "owner": { "name": "Alex" } })) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(root.join("http/car.json"), format!(r#"{{ "method": "GET", "url": "http://{addr}/car" }}"#)).unwrap();
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": { "car": { "type": "http", "request": "car.json" } },
+            "response": { "ownerName": "sources.car.owner.name" }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("the http source should resolve");
+
+        let body = build_response(&endpoint, &resolved);
+        assert_eq!(body["ownerName"], "Alex", "a 4-segment dot-path should reach owner.name, not stop at the whole owner object");
     }
 
     #[tokio::test]
@@ -574,6 +965,7 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect("an optional source's failure must not fail the whole request");
@@ -602,6 +994,7 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect_err("a non-optional source's failure must fail the request");
@@ -644,6 +1037,7 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect_err("a non-optional source's failure must fail the request");
@@ -671,6 +1065,7 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect_err("zero rows for cardinality 'one' should be treated as not found");
@@ -725,6 +1120,7 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect("the real HTTP source should resolve");
@@ -785,6 +1181,7 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect("the registry-resolved URL should reach the real server");
@@ -852,6 +1249,7 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect("an empty-but-present placeholder should still resolve, not fail");
@@ -893,6 +1291,7 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect("a many-cardinality source with rows should resolve");
@@ -932,6 +1331,7 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect("zero rows is a valid result for a list, not a failure");
@@ -976,6 +1376,7 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .unwrap();
@@ -1024,6 +1425,7 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .unwrap();
@@ -1066,6 +1468,7 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .unwrap();
@@ -1074,19 +1477,330 @@ mod tests {
         assert_eq!(body, serde_json::json!([]));
     }
 
+    #[test]
+    fn parse_bracket_array_path_extracts_source_and_field() {
+        assert_eq!(parse_bracket_array_path("sources.cars[].vin"), Some(("cars", "vin")));
+        assert_eq!(parse_bracket_array_path("sources.cars[].owner.name"), Some(("cars", "owner.name")), "the field half can itself be nested");
+    }
+
+    #[test]
+    fn parse_bracket_array_path_rejects_non_bracket_forms() {
+        assert_eq!(parse_bracket_array_path("sources.cars.vin"), None, "no brackets at all — lookup's ordinary job");
+        assert_eq!(parse_bracket_array_path("sources.cars[]"), None, "brackets with nothing after them");
+        assert_eq!(parse_bracket_array_path("not.even.sources"), None);
+    }
+
+    /// The design doc's own literal example syntax: a plain array-of-
+    /// scalars field, distinct from `array.source` + `items` (which builds
+    /// an array of *objects*, one per row) — this builds an array of just
+    /// one field, as one field among others in an ordinary object response.
     #[tokio::test]
-    async fn http_cardinality_many_is_a_config_failure_not_wired_up_yet() {
+    async fn a_bracket_path_field_produces_an_array_of_one_field_per_row() {
         let json = r#"{
             "operationId": "test",
             "sources": {
-                "pricing": { "type": "http", "request": "pricing.json", "cardinality": "many" }
+                "cars": { "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "many" }
+            },
+            "response": { "vins": "sources.cars[].vin" }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert(
+            "db".to_string(),
+            Box::new(FakeDriver {
+                rows: vec![
+                    row(&[("vin", SqlValue::Text("AAA".to_string()))]),
+                    row(&[("vin", SqlValue::Text("BBB".to_string()))]),
+                ],
+                fail: false,
+            }),
+        );
+
+        let root = temp_project_root();
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let body = build_response(&endpoint, &resolved);
+        assert_eq!(body["vins"], serde_json::json!(["AAA", "BBB"]));
+    }
+
+    #[tokio::test]
+    async fn a_bracket_path_field_can_use_the_detailed_object_form_with_formatting() {
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "cars": { "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "many" }
+            },
+            "response": { "years": { "from": "sources.cars[].year", "format": "integer" } }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert(
+            "db".to_string(),
+            Box::new(FakeDriver {
+                rows: vec![row(&[("year", SqlValue::Float(2003.0))]), row(&[("year", SqlValue::Float(2010.0))])],
+                fail: false,
+            }),
+        );
+
+        let root = temp_project_root();
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let body = build_response(&endpoint, &resolved);
+        assert_eq!(body["years"], serde_json::json!([2003, 2010]), "format: integer should apply per-element, not to the array as a whole");
+    }
+
+    #[tokio::test]
+    async fn a_bracket_path_field_can_reach_a_nested_field_per_row() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let app = Router::new().route(
+            "/cars",
+            get(|| async { Json(serde_json::json!([{ "owner": { "name": "Alex" } }, { "owner": { "name": "Sam" } }])) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(root.join("http/cars.json"), format!(r#"{{ "method": "GET", "url": "http://{addr}/cars" }}"#)).unwrap();
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "cars": { "type": "http", "request": "cars.json", "cardinality": "many" }
+            },
+            "response": { "ownerNames": "sources.cars[].owner.name" }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let body = build_response(&endpoint, &resolved);
+        assert_eq!(body["ownerNames"], serde_json::json!(["Alex", "Sam"]), "the field half of a bracket path should walk arbitrarily deep too");
+    }
+
+    #[tokio::test]
+    async fn a_bracket_path_referencing_a_non_array_source_yields_an_empty_list() {
+        let endpoint = endpoint_with_one_sql_source("car", false);
+        let mut endpoint = endpoint;
+        endpoint.response = serde_json::from_str(r#"{ "vins": "sources.car[].vin" }"#).unwrap();
+
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert(
+            "db".to_string(),
+            Box::new(FakeDriver {
+                rows: vec![row(&[("vin", SqlValue::Text("AAA".to_string()))])],
+                fail: false,
+            }),
+        );
+
+        let root = temp_project_root();
+        let client = reqwest::Client::new();
+        let path_params = HashMap::from([("vin".to_string(), "AAA".to_string())]);
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &path_params,
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let body = build_response(&endpoint, &resolved);
+        assert_eq!(body["vins"], serde_json::json!([]), "sources.car is cardinality: one, not an array — must degrade to empty, not error or panic");
+    }
+
+    #[tokio::test]
+    async fn http_cardinality_many_resolves_a_real_json_array_response() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let app = Router::new().route(
+            "/cars",
+            get(|| async { Json(serde_json::json!([{ "vin": "AAA" }, { "vin": "BBB" }])) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(root.join("http/cars.json"), format!(r#"{{ "method": "GET", "url": "http://{addr}/cars" }}"#)).unwrap();
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "cars": { "type": "http", "request": "cars.json", "cardinality": "many" }
+            },
+            "response": { "type": "array", "source": "sources.cars", "items": { "vin": "vin" } }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("a real JSON array response should resolve for cardinality: many");
+
+        let body = build_response(&endpoint, &resolved);
+        assert_eq!(body, serde_json::json!([{ "vin": "AAA" }, { "vin": "BBB" }]));
+    }
+
+    /// `responsePath` unwraps an enveloped array the same way it already
+    /// unwraps a `cardinality: "one"` object — no separate config knob for
+    /// "where does the array live in the response."
+    #[tokio::test]
+    async fn http_cardinality_many_unwraps_an_array_nested_via_response_path() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let app = Router::new().route(
+            "/cars",
+            get(|| async { Json(serde_json::json!({ "data": { "items": [{ "vin": "AAA" }] }, "total": 1 })) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(
+            root.join("http/cars.json"),
+            format!(r#"{{ "method": "GET", "url": "http://{addr}/cars", "responsePath": "data.items" }}"#),
+        )
+        .unwrap();
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "cars": { "type": "http", "request": "cars.json", "cardinality": "many" }
+            },
+            "response": { "type": "array", "source": "sources.cars", "items": { "vin": "vin" } }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("responsePath should unwrap the envelope before the array check runs");
+
+        let body = build_response(&endpoint, &resolved);
+        assert_eq!(body, serde_json::json!([{ "vin": "AAA" }]));
+    }
+
+    #[tokio::test]
+    async fn http_cardinality_many_with_a_non_array_response_is_a_clear_failure() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let app = Router::new().route("/cars", get(|| async { Json(serde_json::json!({ "not": "an array" })) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(root.join("http/cars.json"), format!(r#"{{ "method": "GET", "url": "http://{addr}/cars" }}"#)).unwrap();
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "cars": { "type": "http", "request": "cars.json", "cardinality": "many", "onError": 502 }
             },
             "response": {}
         }"#;
         let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
         let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
 
-        let root = temp_project_root();
         let client = reqwest::Client::new();
         let failure = resolve_sources(
             &endpoint,
@@ -1100,11 +1814,13 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
-        .expect_err("cardinality 'many' has no response-assembly support yet, even before the request file is read");
+        .expect_err("a non-array response for cardinality: many must fail clearly, not silently coerce or empty out");
 
-        assert_eq!(failure.cause.code(), "unexpected.error");
+        assert_eq!(failure.cause.code(), "datasource.http.upstream_error");
+        assert_eq!(failure.on_error, Some(502));
     }
 
     #[tokio::test]
@@ -1128,6 +1844,7 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect_err("a source referencing a connection that isn't configured must fail clearly");
@@ -1163,6 +1880,7 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect_err("a script file that isn't on disk must fail before ever reaching the driver");
@@ -1212,6 +1930,7 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect_err("a non-optional http source returning a server error must fail the request");
@@ -1284,6 +2003,7 @@ mod tests {
             &Value::Null,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect("both sources should resolve independently");
@@ -1299,7 +2019,7 @@ mod tests {
     fn resolve_from_reads_a_top_level_body_field() {
         let body = serde_json::json!({ "maker": "Honda" });
         assert_eq!(
-            resolve_from("body.maker", &HashMap::new(), &HashMap::new(), &body, ""),
+            resolve_from("body.maker", &HeaderMap::new(), &HashMap::new(), &HashMap::new(), &body, "", &HashMap::new()),
             SqlValue::Text("Honda".to_string())
         );
     }
@@ -1308,7 +2028,7 @@ mod tests {
     fn resolve_from_reads_a_nested_body_field() {
         let body = serde_json::json!({ "car": { "maker": "Honda" } });
         assert_eq!(
-            resolve_from("body.car.maker", &HashMap::new(), &HashMap::new(), &body, ""),
+            resolve_from("body.car.maker", &HeaderMap::new(), &HashMap::new(), &HashMap::new(), &body, "", &HashMap::new()),
             SqlValue::Text("Honda".to_string())
         );
     }
@@ -1316,14 +2036,17 @@ mod tests {
     #[test]
     fn resolve_from_a_missing_body_field_is_null_not_an_error() {
         let body = serde_json::json!({ "maker": "Honda" });
-        assert_eq!(resolve_from("body.model", &HashMap::new(), &HashMap::new(), &body, ""), SqlValue::Null);
+        assert_eq!(
+            resolve_from("body.model", &HeaderMap::new(), &HashMap::new(), &HashMap::new(), &body, "", &HashMap::new()),
+            SqlValue::Null
+        );
     }
 
     #[test]
     fn resolve_from_bare_body_binds_the_whole_value_json_encoded() {
         let body = serde_json::json!({ "maker": "Honda" });
         assert_eq!(
-            resolve_from("body", &HashMap::new(), &HashMap::new(), &body, ""),
+            resolve_from("body", &HeaderMap::new(), &HashMap::new(), &HashMap::new(), &body, "", &HashMap::new()),
             SqlValue::Text(r#"{"maker":"Honda"}"#.to_string())
         );
     }
@@ -1331,19 +2054,131 @@ mod tests {
     #[test]
     fn resolve_from_bare_body_as_a_scalar_binds_the_scalar_directly() {
         let body = serde_json::json!(42);
-        assert_eq!(resolve_from("body", &HashMap::new(), &HashMap::new(), &body, ""), SqlValue::Int(42));
+        assert_eq!(
+            resolve_from("body", &HeaderMap::new(), &HashMap::new(), &HashMap::new(), &body, "", &HashMap::new()),
+            SqlValue::Int(42)
+        );
     }
 
     #[test]
     fn resolve_from_with_no_body_sent_is_null() {
-        assert_eq!(resolve_from("body.maker", &HashMap::new(), &HashMap::new(), &Value::Null, ""), SqlValue::Null);
+        assert_eq!(
+            resolve_from("body.maker", &HeaderMap::new(), &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new()),
+            SqlValue::Null
+        );
     }
 
     #[test]
     fn resolve_from_binds_the_transaction_id() {
         assert_eq!(
-            resolve_from("context.transactionId", &HashMap::new(), &HashMap::new(), &Value::Null, "txn-123"),
+            resolve_from(
+                "context.transactionId",
+                &HeaderMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &Value::Null,
+                "txn-123",
+                &HashMap::new()
+            ),
             SqlValue::Text("txn-123".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_from_reads_a_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "secret-123".parse().unwrap());
+        assert_eq!(
+            resolve_from("header.X-Api-Key", &headers, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new()),
+            SqlValue::Text("secret-123".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_from_a_missing_header_is_null_not_a_crash() {
+        assert_eq!(
+            resolve_from(
+                "header.X-Api-Key",
+                &HeaderMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &Value::Null,
+                "",
+                &HashMap::new()
+            ),
+            SqlValue::Null
+        );
+    }
+
+    #[test]
+    fn resolve_from_reads_another_sources_whole_resolved_value_json_encoded() {
+        let mut resolved: ResolvedSources = HashMap::new();
+        resolved.insert("car".to_string(), Some(serde_json::json!({ "vin": "AAA" })));
+        assert_eq!(
+            resolve_from("sources.car", &HeaderMap::new(), &HashMap::new(), &HashMap::new(), &Value::Null, "", &resolved),
+            SqlValue::Text(r#"{"vin":"AAA"}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_from_reads_a_field_out_of_another_sources_resolved_value() {
+        let mut resolved: ResolvedSources = HashMap::new();
+        resolved.insert("car".to_string(), Some(serde_json::json!({ "vin": "AAA" })));
+        assert_eq!(
+            resolve_from("sources.car.vin", &HeaderMap::new(), &HashMap::new(), &HashMap::new(), &Value::Null, "", &resolved),
+            SqlValue::Text("AAA".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_from_reads_an_arbitrarily_nested_field_out_of_another_source() {
+        let mut resolved: ResolvedSources = HashMap::new();
+        resolved.insert("car".to_string(), Some(serde_json::json!({ "owner": { "name": "Alex" } })));
+        assert_eq!(
+            resolve_from(
+                "sources.car.owner.name",
+                &HeaderMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &Value::Null,
+                "",
+                &resolved
+            ),
+            SqlValue::Text("Alex".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_from_a_source_that_failed_optionally_is_null_not_a_crash() {
+        let mut resolved: ResolvedSources = HashMap::new();
+        resolved.insert("pricing".to_string(), None);
+        assert_eq!(
+            resolve_from(
+                "sources.pricing.amount",
+                &HeaderMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &Value::Null,
+                "",
+                &resolved
+            ),
+            SqlValue::Null
+        );
+    }
+
+    #[test]
+    fn resolve_from_an_unknown_source_name_is_null_not_a_crash() {
+        assert_eq!(
+            resolve_from(
+                "sources.doesNotExist.field",
+                &HeaderMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &Value::Null,
+                "",
+                &HashMap::new()
+            ),
+            SqlValue::Null
         );
     }
 
@@ -1400,6 +2235,7 @@ mod tests {
             &Value::Null,
             "shared-txn-id",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect("both sources should resolve");
@@ -1472,6 +2308,7 @@ mod tests {
             &Value::Null,
             "shared-txn-id",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect("the http source should resolve");
@@ -1536,6 +2373,7 @@ mod tests {
             &body,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect("the sql source should resolve using the body-derived parameter");
@@ -1547,15 +2385,16 @@ mod tests {
         assert_eq!(received_params.get("maker"), Some(&SqlValue::Text("Honda".to_string())));
     }
 
-    /// Point 3's SQL-side behavior, per the design doc: "an array-typed
-    /// parameter is passed to the script as a single value ... JSON-encoded
-    /// text" where a native driver array type isn't wired up. No SQL-side
-    /// code change was actually needed for this — `json_value_to_sql_value`
-    /// already JSON-encodes arrays generically — so this test exists to
-    /// prove that fallback holds end to end for a real array-typed
-    /// `parameters[]` entry, not just as an isolated unit test.
+    /// An array of *objects* still can't be a native SQL array element (no
+    /// driver models a JSON-object array element) — each element falls back
+    /// to JSON-encoded text individually, wrapped in a real `SqlValue::Array`
+    /// rather than the whole thing collapsing to one JSON-encoded string
+    /// the way it did before per-driver native array binding existed. See
+    /// `sql::postgres::bind_array` for what Postgres actually does with a
+    /// homogeneous-scalar array at bind time — this level just proves the
+    /// `SqlValue` shape `resolve_sources` hands the driver is correct.
     #[tokio::test]
-    async fn a_sql_source_receives_an_array_typed_body_field_as_json_encoded_text() {
+    async fn a_sql_source_receives_an_array_typed_body_field_as_a_native_sql_value_array() {
         #[derive(Debug)]
         struct RecordingDriver {
             received: std::sync::Arc<std::sync::Mutex<Option<HashMap<String, SqlValue>>>>,
@@ -1600,6 +2439,7 @@ mod tests {
             &body,
             "",
             &HashMap::new(),
+            &HeaderMap::new(),
         )
         .await
         .expect("the sql source should resolve using the array-typed body parameter");
@@ -1607,8 +2447,179 @@ mod tests {
         let received_params = received.lock().unwrap().clone().unwrap();
         assert_eq!(
             received_params.get("items"),
-            Some(&SqlValue::Text(r#"[{"maker":"Honda"},{"maker":"Ford"}]"#.to_string()))
+            Some(&SqlValue::Array(vec![
+                SqlValue::Text(r#"{"maker":"Honda"}"#.to_string()),
+                SqlValue::Text(r#"{"maker":"Ford"}"#.to_string()),
+            ]))
         );
+    }
+
+    /// The common case in practice: a scalar array (not an array of
+    /// objects) round-trips as a `SqlValue::Array` of the matching scalar
+    /// variant, ready for a driver like Postgres to bind natively.
+    #[tokio::test]
+    async fn a_sql_source_receives_a_scalar_array_body_field_as_a_typed_array() {
+        #[derive(Debug)]
+        struct RecordingDriver {
+            received: std::sync::Arc<std::sync::Mutex<Option<HashMap<String, SqlValue>>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl SqlDriver for RecordingDriver {
+            async fn query(&self, _script: &str, params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
+                *self.received.lock().unwrap() = Some(params.clone());
+                Ok(vec![row(&[("count", SqlValue::Int(1))])])
+            }
+        }
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "batch": {
+                    "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "one",
+                    "parameters": [{ "name": "ids", "from": "body.ids", "type": "array" }]
+                }
+            },
+            "response": { "count": "sources.batch.count" }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+
+        let received = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), Box::new(RecordingDriver { received: received.clone() }));
+
+        let root = temp_project_root();
+        let client = reqwest::Client::new();
+        let body = serde_json::json!({ "ids": [1, 2, 3] });
+        resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &body,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("the sql source should resolve using the scalar array body parameter");
+
+        let received_params = received.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            received_params.get("ids"),
+            Some(&SqlValue::Array(vec![SqlValue::Int(1), SqlValue::Int(2), SqlValue::Int(3)]))
+        );
+    }
+
+    #[test]
+    fn clamp_numeric_is_a_no_op_when_nothing_is_declared() {
+        assert_eq!(clamp_numeric(SqlValue::Text("hello".to_string()), None, None, None), SqlValue::Text("hello".to_string()));
+        assert_eq!(clamp_numeric(SqlValue::Null, None, None, None), SqlValue::Null);
+    }
+
+    #[test]
+    fn clamp_numeric_clamps_an_over_max_value_down() {
+        assert_eq!(clamp_numeric(SqlValue::Text("999999999".to_string()), Some(20), None, Some(100)), SqlValue::Int(100));
+    }
+
+    #[test]
+    fn clamp_numeric_clamps_a_below_min_value_up() {
+        assert_eq!(clamp_numeric(SqlValue::Text("-5".to_string()), Some(0), Some(0), None), SqlValue::Int(0));
+    }
+
+    #[test]
+    fn clamp_numeric_uses_default_for_a_missing_value() {
+        assert_eq!(clamp_numeric(SqlValue::Null, Some(20), None, Some(100)), SqlValue::Int(20));
+    }
+
+    #[test]
+    fn clamp_numeric_uses_default_for_an_unparseable_value() {
+        assert_eq!(clamp_numeric(SqlValue::Text("not-a-number".to_string()), Some(20), None, Some(100)), SqlValue::Int(20));
+    }
+
+    #[test]
+    fn clamp_numeric_a_value_within_bounds_passes_through_unclamped() {
+        assert_eq!(clamp_numeric(SqlValue::Text("50".to_string()), Some(20), Some(0), Some(100)), SqlValue::Int(50));
+    }
+
+    #[test]
+    fn clamp_numeric_truncates_a_float() {
+        assert_eq!(clamp_numeric(SqlValue::Float(42.9), Some(0), None, None), SqlValue::Int(42));
+    }
+
+    #[test]
+    fn clamp_numeric_with_only_default_declared_still_activates_clamping() {
+        // Even with no min/max at all, declaring `default` alone still
+        // means "this is a numeric parameter" — a text value must convert.
+        assert_eq!(clamp_numeric(SqlValue::Text("7".to_string()), Some(0), None, None), SqlValue::Int(7));
+    }
+
+    /// The design doc's own worked example, proven end to end: an
+    /// unbounded caller-supplied `limit` gets clamped before it ever
+    /// reaches the driver, and an omitted one falls back to `default` —
+    /// both as a real `SqlValue::Int`, not the usual all-text query-param
+    /// binding.
+    #[tokio::test]
+    async fn a_query_parameter_with_default_min_max_is_clamped_end_to_end() {
+        #[derive(Debug)]
+        struct RecordingDriver {
+            received: std::sync::Arc<std::sync::Mutex<Option<HashMap<String, SqlValue>>>>,
+        }
+        #[async_trait::async_trait]
+        impl SqlDriver for RecordingDriver {
+            async fn query(&self, _script: &str, params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
+                *self.received.lock().unwrap() = Some(params.clone());
+                Ok(vec![row(&[("id", SqlValue::Int(1))])])
+            }
+        }
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "cars": {
+                    "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "one",
+                    "parameters": [
+                        { "name": "limit", "from": "query.limit", "default": 20, "min": 0, "max": 100 },
+                        { "name": "offset", "from": "query.offset", "default": 0, "min": 0 }
+                    ]
+                }
+            },
+            "response": {}
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+
+        let received = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), Box::new(RecordingDriver { received: received.clone() }));
+
+        let root = temp_project_root();
+        let client = reqwest::Client::new();
+        // Caller sends an absurdly high limit and no offset at all.
+        let query_params = HashMap::from([("limit".to_string(), "999999999".to_string())]);
+        resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &query_params,
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("the sql source should resolve using the clamped parameters");
+
+        let received_params = received.lock().unwrap().clone().unwrap();
+        assert_eq!(received_params.get("limit"), Some(&SqlValue::Int(100)), "limit=999999999 must be clamped down to max: 100");
+        assert_eq!(received_params.get("offset"), Some(&SqlValue::Int(0)), "an omitted offset must fall back to default: 0, as a real integer");
     }
 
     /// A driver that panics if it's ever actually queried — the strongest
@@ -1647,6 +2658,7 @@ mod tests {
             &Value::Null,
             "",
             &mocks,
+            &HeaderMap::new(),
         )
         .await
         .expect("a mocked source should resolve without touching the real driver");
@@ -1677,6 +2689,7 @@ mod tests {
             &Value::Null,
             "",
             &mocks,
+            &HeaderMap::new(),
         )
         .await
         .expect_err("a mocked failure on a non-optional source must fail the request");
@@ -1708,6 +2721,7 @@ mod tests {
             &Value::Null,
             "",
             &mocks,
+            &HeaderMap::new(),
         )
         .await
         .expect("an optional source's mocked failure must not fail the whole request");
@@ -1764,6 +2778,7 @@ mod tests {
             &Value::Null,
             "",
             &mocks,
+            &HeaderMap::new(),
         )
         .await
         .expect("the real sql source and the mocked http source should both resolve");
@@ -1804,11 +2819,527 @@ mod tests {
             &Value::Null,
             "",
             &mocks,
+            &HeaderMap::new(),
         )
         .await
         .expect("a mocked http source must resolve without ever reading its request file");
 
         let body = build_response(&endpoint, &resolved);
         assert_eq!(body["price"], 100);
+    }
+
+    /// The `cars-demo` example's real, previously-broken shape: `pricing`'s
+    /// own `vin` parameter reads `sources.car.vin` — proving the chain is
+    /// resolved in dependency order (car before pricing) even though it's
+    /// declared second in the JSON map, not just that both happen to
+    /// resolve independently.
+    #[tokio::test]
+    async fn a_source_can_chain_a_parameter_off_another_sources_resolved_output() {
+        use axum::extract::{RawQuery, State};
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::sync::{Arc, Mutex};
+
+        async fn record(State(received): State<Arc<Mutex<Option<String>>>>, RawQuery(query): RawQuery) -> Json<Value> {
+            *received.lock().unwrap() = query;
+            Json(serde_json::json!({ "amount": 24500 }))
+        }
+
+        let received_query: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let app = Router::new().route("/price", get(record)).with_state(received_query.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(
+            root.join("http/pricing.json"),
+            format!(r#"{{ "method": "GET", "url": "http://{addr}/price?vin={{{{vin}}}}" }}"#),
+        )
+        .unwrap();
+
+        let json = r#"{
+            "operationId": "getCarInfo",
+            "sources": {
+                "pricing": {
+                    "type": "http", "request": "pricing.json", "optional": true,
+                    "parameters": [{ "name": "vin", "from": "sources.car.vin" }]
+                },
+                "car": {
+                    "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "one",
+                    "parameters": [{ "name": "maker", "from": "query.maker" }]
+                }
+            },
+            "response": { "vin": "sources.car.vin", "price": "sources.pricing.amount" }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert(
+            "db".to_string(),
+            Box::new(FakeDriver {
+                rows: vec![row(&[("vin", SqlValue::Text("1HGCM82633A004352".to_string()))])],
+                fail: false,
+            }),
+        );
+
+        let root_http = root.join("http");
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root_http,
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("pricing's dependency on car should resolve car first, then chain into pricing");
+
+        let body = build_response(&endpoint, &resolved);
+        assert_eq!(body["vin"], "1HGCM82633A004352");
+        assert_eq!(body["price"], 24500);
+        assert_eq!(
+            received_query.lock().unwrap().as_deref(),
+            Some("vin=1HGCM82633A004352"),
+            "pricing's own outbound request must carry car's real resolved vin, not an empty/null placeholder"
+        );
+    }
+
+    /// SQL rows are flat, but an HTTP source's resolved body is genuine
+    /// nested JSON — proving a dependent source's parameter can chain a
+    /// field more than one level deep (`sources.pricing.seller.name`), not
+    /// just a single top-level field like the other chaining tests here.
+    #[tokio::test]
+    async fn a_dependent_source_can_chain_an_arbitrarily_nested_field() {
+        use axum::extract::{Query, State};
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::collections::HashMap as StdHashMap;
+        use std::sync::{Arc, Mutex};
+
+        async fn price() -> Json<Value> {
+            Json(serde_json::json!({ "seller": { "name": "Bob" } }))
+        }
+        async fn notify(State(received): State<Arc<Mutex<Option<String>>>>, Query(params): Query<StdHashMap<String, String>>) -> Json<Value> {
+            *received.lock().unwrap() = params.get("sellerName").cloned();
+            Json(serde_json::json!({ "ok": true }))
+        }
+
+        let received_seller_name: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route("/price", get(price))
+            .route("/notify", get(notify))
+            .with_state(received_seller_name.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(root.join("http/pricing.json"), format!(r#"{{ "method": "GET", "url": "http://{addr}/price" }}"#)).unwrap();
+        std::fs::write(
+            root.join("http/notify.json"),
+            format!(r#"{{ "method": "GET", "url": "http://{addr}/notify?sellerName={{{{sellerName}}}}" }}"#),
+        )
+        .unwrap();
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "notify": {
+                    "type": "http", "request": "notify.json",
+                    "parameters": [{ "name": "sellerName", "from": "sources.pricing.seller.name" }]
+                },
+                "pricing": { "type": "http", "request": "pricing.json" }
+            },
+            "response": {}
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        let client = reqwest::Client::new();
+        resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("notify's nested chained parameter should resolve against pricing's real nested response");
+
+        assert_eq!(
+            received_seller_name.lock().unwrap().as_deref(),
+            Some("Bob"),
+            "notify must receive pricing.seller.name two levels deep, not just pricing's top-level fields"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cycle_between_two_sources_is_a_clear_config_failure_not_a_hang() {
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "a": {
+                    "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "one",
+                    "parameters": [{ "name": "x", "from": "sources.b.x" }]
+                },
+                "b": {
+                    "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "one",
+                    "parameters": [{ "name": "x", "from": "sources.a.x" }]
+                }
+            },
+            "response": {}
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), Box::new(FakeDriver { rows: vec![], fail: false }));
+
+        let root = temp_project_root();
+        let client = reqwest::Client::new();
+        let failure = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect_err("two sources depending on each other must fail clearly, not hang or loop forever");
+
+        assert_eq!(failure.cause.code(), "unexpected.error");
+    }
+
+    /// A mocked dependency still counts as resolved for a source chaining
+    /// off it — the point of mocks + chaining together: swap what `car`
+    /// returns, and prove `pricing`'s own chained parameter picks up the
+    /// substituted value, not a real (unmocked) one.
+    #[tokio::test]
+    async fn a_source_can_chain_off_a_mocked_dependency() {
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "car": { "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "one" },
+                "pricing": {
+                    "type": "http", "request": "pricing.json",
+                    "parameters": [{ "name": "vin", "from": "sources.car.vin" }]
+                }
+            },
+            "response": { "vin": "sources.pricing.echoedVin" }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+
+        let root = temp_project_root();
+        // `pricing` is also mocked here — if the chain didn't resolve `car`
+        // first, this would still pass by accident. It's only a meaningful
+        // proof together with the unmocked-chain test above.
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        let client = reqwest::Client::new();
+        let mut mocks = HashMap::new();
+        mocks.insert("car".to_string(), MockOutcome::Success(serde_json::json!({ "vin": "MOCKED-VIN" })));
+        mocks.insert("pricing".to_string(), MockOutcome::Success(serde_json::json!({ "echoedVin": "MOCKED-VIN" })));
+
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &mocks,
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("both mocked sources should resolve without touching real drivers");
+
+        let body = build_response(&endpoint, &resolved);
+        assert_eq!(body["vin"], "MOCKED-VIN");
+    }
+
+    #[tokio::test]
+    async fn a_non_optional_sources_failure_propagates_through_a_dependent_source() {
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "car": { "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "one", "onError": 500 },
+                "pricing": {
+                    "type": "http", "request": "pricing.json",
+                    "parameters": [{ "name": "vin", "from": "sources.car.vin" }]
+                }
+            },
+            "response": {}
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), Box::new(FakeDriver { rows: vec![], fail: true }));
+
+        let root = temp_project_root();
+        let client = reqwest::Client::new();
+        let failure = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect_err("car's non-optional failure must fail the request before pricing ever runs");
+
+        assert_eq!(failure.source_name, "car");
+    }
+
+    #[tokio::test]
+    async fn an_optional_sources_failure_lets_a_dependent_source_chain_a_null() {
+        use axum::extract::{Query, State};
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::collections::HashMap as StdHashMap;
+        use std::sync::{Arc, Mutex};
+
+        async fn notify(State(received): State<Arc<Mutex<Option<String>>>>, Query(params): Query<StdHashMap<String, String>>) -> Json<Value> {
+            // A null `sources.car.vin` templates as an empty string, per
+            // the usual "unresolvable {{name}} -> empty string" rule — the
+            // key is still present (`?vin=`), just with an empty value.
+            *received.lock().unwrap() = Some(params.get("vin").cloned().unwrap_or_default());
+            Json(serde_json::json!({ "echoedVin": "resolved-despite-null-vin" }))
+        }
+
+        let received_vin: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let app = Router::new().route("/price", get(notify)).with_state(received_vin.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "car": { "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "one", "optional": true },
+                "pricing": {
+                    "type": "http", "request": "pricing.json",
+                    "parameters": [{ "name": "vin", "from": "sources.car.vin" }]
+                }
+            },
+            "response": { "vin": "sources.pricing.echoedVin" }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), Box::new(FakeDriver { rows: vec![], fail: true }));
+
+        let root = temp_project_root();
+        std::fs::write(
+            root.join("http/pricing.json"),
+            format!(r#"{{ "method": "GET", "url": "http://{addr}/price?vin={{{{vin}}}}" }}"#),
+        )
+        .unwrap();
+
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("car's optional failure must not stop pricing from resolving, chained parameter or not");
+
+        assert_eq!(
+            received_vin.lock().unwrap().as_deref(),
+            Some(""),
+            "car's optional failure means sources.car.vin resolves to null, which templates as an empty string, same as any other unresolvable {{name}}"
+        );
+        let body = build_response(&endpoint, &resolved);
+        assert_eq!(body["vin"], "resolved-despite-null-vin");
+    }
+
+    /// `header.*` end to end through `resolve_sources`, not just the
+    /// `resolve_from` unit tests above — a SQL source's own parameter reads
+    /// the caller's `X-Api-Key` header, the same way a security verifier's
+    /// parameters already could.
+    #[tokio::test]
+    async fn a_sql_source_reads_a_parameter_from_a_caller_header() {
+        #[derive(Debug)]
+        struct RecordingDriver {
+            received: std::sync::Arc<std::sync::Mutex<Option<HashMap<String, SqlValue>>>>,
+        }
+        #[async_trait::async_trait]
+        impl SqlDriver for RecordingDriver {
+            async fn query(&self, _script: &str, params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
+                *self.received.lock().unwrap() = Some(params.clone());
+                Ok(vec![row(&[("ok", SqlValue::Bool(true))])])
+            }
+        }
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "car": {
+                    "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "one",
+                    "parameters": [{ "name": "apiKey", "from": "header.X-Api-Key" }]
+                }
+            },
+            "response": {}
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+
+        let received = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), Box::new(RecordingDriver { received: received.clone() }));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "secret-123".parse().unwrap());
+
+        let root = temp_project_root();
+        let client = reqwest::Client::new();
+        resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &headers,
+        )
+        .await
+        .expect("the sql source should resolve using the header-derived parameter");
+
+        let received_params = received.lock().unwrap().clone().unwrap();
+        assert_eq!(received_params.get("apiKey"), Some(&SqlValue::Text("secret-123".to_string())));
+    }
+
+    /// Same proof for an HTTP source's own parameter, and for a header the
+    /// caller *didn't* send — templates as an empty string, same as any
+    /// other unresolvable `{{name}}`, not a request failure.
+    #[tokio::test]
+    async fn an_http_source_reads_a_parameter_from_a_caller_header_and_a_missing_one_is_empty() {
+        use axum::extract::{Query, State};
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::collections::HashMap as StdHashMap;
+        use std::sync::{Arc, Mutex};
+
+        async fn record(State(received): State<Arc<Mutex<Option<String>>>>, Query(params): Query<StdHashMap<String, String>>) -> Json<Value> {
+            *received.lock().unwrap() = Some(params.get("forwarded").cloned().unwrap_or_default());
+            Json(serde_json::json!({ "ok": true }))
+        }
+
+        let received_forwarded: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let app = Router::new().route("/ping", get(record)).with_state(received_forwarded.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(
+            root.join("http/ping.json"),
+            format!(r#"{{ "method": "GET", "url": "http://{addr}/ping?forwarded={{{{token}}}}" }}"#),
+        )
+        .unwrap();
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "ping": {
+                    "type": "http", "request": "ping.json",
+                    "parameters": [{ "name": "token", "from": "header.X-Forwarded-Token" }]
+                }
+            },
+            "response": {}
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        let client = reqwest::Client::new();
+
+        // First: the caller genuinely sends the header.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-token", "abc-123".parse().unwrap());
+        resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &headers,
+        )
+        .await
+        .expect("the http source should resolve using the header-derived parameter");
+        assert_eq!(received_forwarded.lock().unwrap().as_deref(), Some("abc-123"));
+
+        // Second: the caller doesn't send it at all — null, templated empty,
+        // not a failure.
+        resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("a missing header must not fail the request, just bind null");
+        assert_eq!(received_forwarded.lock().unwrap().as_deref(), Some(""));
     }
 }

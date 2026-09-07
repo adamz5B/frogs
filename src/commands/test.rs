@@ -41,6 +41,23 @@ pub async fn run(cwd: &Path) -> io::Result<()> {
     // `Arc<RouteState>`, nothing else needs to share ownership of this).
     let discovered_errors = Mutex::new(config.discovered_errors);
 
+    // Same "load once, gated by the feature flag, degrade gracefully on a
+    // load failure" posture as `commands::run` — a test run exercises the
+    // exact same validation a real request would (or wouldn't) go through,
+    // so a case can legitimately assert on a 400 from a malformed request.
+    let openapi_document = if config.server.features.request_validation {
+        match crate::openapi::load(&root.join(crate::project::MANIFEST_FILE)) {
+            Ok(doc) => Some(doc),
+            Err(e) => {
+                eprintln!("warning: failed to load {}: {e} — request validation is disabled for this run", crate::project::MANIFEST_FILE);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let empty_component_schemas = serde_json::Map::new();
+
     let test_files = discover_test_files(&endpoints_root);
     if test_files.is_empty() {
         println!("no *.test.json files found under datasources/endpoints/");
@@ -71,6 +88,11 @@ pub async fn run(cwd: &Path) -> io::Result<()> {
         };
 
         println!("{} {display_path}", method.to_uppercase());
+        // `display_path` keeps its OpenAPI-style `{name}` braces (unlike
+        // `build_router`'s axum-converted `:name` routes), so it matches
+        // `Operation::path` directly with no conversion needed.
+        let operation = openapi_document.as_ref().and_then(|doc| doc.operations.iter().find(|op| op.method == method && op.path == display_path));
+        let component_schemas = openapi_document.as_ref().map(|doc| &doc.component_schemas).unwrap_or(&empty_component_schemas);
         // Fresh per file, never shared across files or reused across runs —
         // this is what `{{memory.X}}` scoping to "this file's cases, run in
         // order" actually means in practice.
@@ -116,6 +138,8 @@ pub async fn run(cwd: &Path) -> io::Result<()> {
                 &body,
                 "frogs-test-run",
                 &mocks,
+                operation,
+                component_schemas,
             )
             .await;
 

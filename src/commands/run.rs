@@ -180,7 +180,24 @@ async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
     let security = std::sync::Arc::new(config.security);
     let services = std::sync::Arc::new(config.services);
     let discovered_errors = std::sync::Arc::new(std::sync::Mutex::new(config.discovered_errors));
-    let endpoint_router = crate::endpoint::build_router(&api_dir, drivers.clone(), errors, security, services, discovered_errors, debug_mode);
+
+    // Only loaded (and only consulted) when `features.requestValidation` is
+    // on — a load failure degrades to "no route gets validation" with a
+    // warning, the same graceful-degradation posture `build_router` itself
+    // uses for a route whose operation can't be matched, rather than
+    // refusing to start the server over a request-validation-only concern.
+    let openapi_document = if config.server.features.request_validation {
+        match crate::openapi::load(&root.join(crate::project::MANIFEST_FILE)) {
+            Ok(doc) => Some(doc),
+            Err(e) => {
+                tracing::warn!("failed to load {}: {e} — request validation is disabled for this run", crate::project::MANIFEST_FILE);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let endpoint_router = crate::endpoint::build_router(&api_dir, drivers.clone(), errors, security, services, discovered_errors, debug_mode, openapi_document.as_ref());
     let mut router = crate::server::router().merge(endpoint_router);
 
     // Each is a separate, independently-stated router merged in only when
@@ -200,7 +217,11 @@ async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
     // apiRoot included) — see `server::apply_middleware`'s doc comment for
     // why this ordering matters; `apply_metrics`/`apply_rate_limit` have the
     // same requirement, for the same reason.
-    let router = crate::server::apply_middleware(router);
+    let router = if config.server.features.request_correlation {
+        crate::server::apply_middleware(router)
+    } else {
+        router
+    };
     let router = match metrics {
         Some(metrics) => crate::server::apply_metrics(router, metrics),
         None => router,
@@ -610,5 +631,66 @@ mod tests {
             .expect("a real HTTPS request against run_web's own tls config should succeed");
         assert_eq!(response.status(), 200);
         assert_eq!(response.text().await.unwrap(), "hello from static content");
+    }
+
+    /// A minimal but complete API-role scratch project — every file
+    /// `Config::load_or_exit`/`connect_all` need present (even if empty),
+    /// so `build_api_router` runs its real assembly path end to end without
+    /// hitting either function's own `process::exit` on a genuine config
+    /// problem. `requestValidation` is off so this test isn't also
+    /// exercising that unrelated feature.
+    fn scratch_api_project(request_correlation: bool) -> std::path::PathBuf {
+        let root = temp_project();
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(api_dir.join("config/errors")).unwrap();
+        std::fs::create_dir_all(api_dir.join("security")).unwrap();
+        std::fs::create_dir_all(api_dir.join("datasources/endpoints")).unwrap();
+        std::fs::write(root.join("openapi.yaml"), "openapi: 3.0.3\ninfo: { title: t, version: '1' }\npaths: {}\n").unwrap();
+        std::fs::write(
+            api_dir.join("config/server.json"),
+            format!(r#"{{ "features": {{ "requestCorrelation": {request_correlation}, "requestValidation": false }} }}"#),
+        )
+        .unwrap();
+        std::fs::write(api_dir.join("config/errors/core.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("config/connections.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("security/schemes.json"), "{}").unwrap();
+        root
+    }
+
+    /// The gap this section closes: `features.requestCorrelation` used to
+    /// have zero effect (the middleware ran unconditionally regardless of
+    /// this setting) — proven both ways through the real `build_api_router`
+    /// assembly, not just `server::apply_middleware`'s own isolated tests.
+    #[tokio::test]
+    async fn request_correlation_true_adds_the_x_request_id_header() {
+        let root = scratch_api_project(true);
+        let (router, _) = build_api_router(&root).await.expect("a minimal but complete scratch project should build cleanly");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let response = reqwest::get(format!("http://{addr}/healthz")).await.unwrap();
+        assert!(response.headers().contains_key("x-request-id"), "requestCorrelation: true must add X-Request-Id");
+    }
+
+    #[tokio::test]
+    async fn request_correlation_false_omits_the_x_request_id_header() {
+        let root = scratch_api_project(false);
+        let (router, _) = build_api_router(&root).await.expect("a minimal but complete scratch project should build cleanly");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let response = reqwest::get(format!("http://{addr}/healthz")).await.unwrap();
+        assert!(
+            !response.headers().contains_key("x-request-id"),
+            "requestCorrelation: false must actually disable X-Request-Id, not just be a documented-but-inert toggle"
+        );
     }
 }

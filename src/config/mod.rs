@@ -2,7 +2,7 @@ mod connections;
 mod server;
 
 pub use connections::ConnectionConfig;
-pub use server::{ManualTlsConfig, ServerConfig, TlsConfig, TlsMode};
+pub use server::{ManualTlsConfig, RateLimitConfig, ServerConfig, TlsConfig, TlsMode};
 
 use std::collections::HashMap;
 use std::fmt;
