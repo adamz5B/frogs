@@ -316,14 +316,26 @@ mod tests {
 
     #[test]
     fn a_required_body_that_is_null_fails() {
-        let operation = op(vec![], Some(RequestBodySchema { required: true, schema: serde_json::json!({ "type": "object" }) }));
+        let operation = op(
+            vec![],
+            Some(RequestBodySchema {
+                required: true,
+                schema: serde_json::json!({ "type": "object" }),
+            }),
+        );
         let err = validate_request(&operation, &Map::new(), &HashMap::new(), &HashMap::new(), &HeaderMap::new(), &Value::Null).unwrap_err();
         assert_eq!(err.code, MISSING_PARAMETER);
     }
 
     #[test]
     fn an_optional_body_that_is_null_is_fine() {
-        let operation = op(vec![], Some(RequestBodySchema { required: false, schema: serde_json::json!({ "type": "object" }) }));
+        let operation = op(
+            vec![],
+            Some(RequestBodySchema {
+                required: false,
+                schema: serde_json::json!({ "type": "object" }),
+            }),
+        );
         assert!(validate_request(&operation, &Map::new(), &HashMap::new(), &HashMap::new(), &HeaderMap::new(), &Value::Null).is_ok());
     }
 
@@ -395,7 +407,11 @@ mod tests {
         let body = serde_json::json!({ "items": [{ "sku": "A1" }, {}] });
         let err = validate_request(&operation, &Map::new(), &HashMap::new(), &HashMap::new(), &HeaderMap::new(), &body).unwrap_err();
         assert_eq!(err.code, MISSING_PARAMETER);
-        assert!(err.message.contains("items[1].sku"), "path should identify which array element failed: {}", err.message);
+        assert!(
+            err.message.contains("items[1].sku"),
+            "path should identify which array element failed: {}",
+            err.message
+        );
     }
 
     /// `$ref` resolution against the component cache, through a nested
@@ -424,7 +440,10 @@ mod tests {
     #[test]
     fn a_circular_ref_does_not_hang_and_is_treated_as_valid() {
         let mut components = Map::new();
-        components.insert("Node".to_string(), serde_json::json!({ "type": "object", "properties": { "child": { "$ref": "#/components/schemas/Node" } } }));
+        components.insert(
+            "Node".to_string(),
+            serde_json::json!({ "type": "object", "properties": { "child": { "$ref": "#/components/schemas/Node" } } }),
+        );
         let schema = serde_json::json!({ "$ref": "#/components/schemas/Node" });
         let operation = op(vec![], Some(RequestBodySchema { required: true, schema }));
         let body = serde_json::json!({ "child": { "child": { "child": {} } } });

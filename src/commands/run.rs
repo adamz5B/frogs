@@ -197,7 +197,16 @@ async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
     } else {
         None
     };
-    let endpoint_router = crate::endpoint::build_router(&api_dir, drivers.clone(), errors, security, services, discovered_errors, debug_mode, openapi_document.as_ref());
+    let endpoint_router = crate::endpoint::build_router(
+        &api_dir,
+        drivers.clone(),
+        errors,
+        security,
+        services,
+        discovered_errors,
+        debug_mode,
+        openapi_document.as_ref(),
+    );
     let mut router = crate::server::router().merge(endpoint_router);
 
     // Each is a separate, independently-stated router merged in only when
@@ -232,6 +241,17 @@ async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
             config.server.rate_limit.burst,
         ));
         crate::server::apply_rate_limit(router, limiter)
+    } else {
+        router
+    };
+    // Outermost of all the optional middleware layers — see
+    // `server::apply_cors`'s doc comment for why it has to wrap the others,
+    // not just come after them in registration order.
+    let router = if config.server.features.cors {
+        if config.server.cors.allowed_origins.is_empty() {
+            tracing::warn!("features.cors is enabled but cors.allowedOrigins is empty — no origin will receive CORS headers");
+        }
+        crate::server::apply_cors(router, &config.server.cors.allowed_origins)
     } else {
         router
     };
@@ -692,5 +712,60 @@ mod tests {
             !response.headers().contains_key("x-request-id"),
             "requestCorrelation: false must actually disable X-Request-Id, not just be a documented-but-inert toggle"
         );
+    }
+
+    /// Same shape as `scratch_api_project`, but for `features.cors` — a
+    /// separate helper rather than growing that one's signature further,
+    /// since only these two tests need a configurable origin allowlist.
+    fn scratch_api_project_with_cors(allowed_origins: &str) -> std::path::PathBuf {
+        let root = temp_project();
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(api_dir.join("config/errors")).unwrap();
+        std::fs::create_dir_all(api_dir.join("security")).unwrap();
+        std::fs::create_dir_all(api_dir.join("datasources/endpoints")).unwrap();
+        std::fs::write(root.join("openapi.yaml"), "openapi: 3.0.3\ninfo: { title: t, version: '1' }\npaths: {}\n").unwrap();
+        std::fs::write(
+            api_dir.join("config/server.json"),
+            format!(r#"{{ "features": {{ "cors": true, "requestValidation": false }}, "cors": {{ "allowedOrigins": {allowed_origins} }} }}"#),
+        )
+        .unwrap();
+        std::fs::write(api_dir.join("config/errors/core.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("config/connections.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("security/schemes.json"), "{}").unwrap();
+        root
+    }
+
+    /// The same "prove the feature flag actually gates something, through
+    /// the real `build_api_router` assembly" discipline as the
+    /// `requestCorrelation` tests above — `server::apply_cors`'s own tests
+    /// already cover the middleware in isolation; this proves `frogs run`
+    /// actually wires `config/server.json`'s `cors` block into it.
+    #[tokio::test]
+    async fn cors_end_to_end_echoes_an_allowed_origin_and_omits_others() {
+        let root = scratch_api_project_with_cors(r#"["https://allowed.example"]"#);
+        let (router, _) = build_api_router(&root).await.expect("a minimal but complete scratch project should build cleanly");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let allowed = client
+            .get(format!("http://{addr}/healthz"))
+            .header("origin", "https://allowed.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allowed.headers().get("access-control-allow-origin").unwrap(), "https://allowed.example");
+
+        let other = client
+            .get(format!("http://{addr}/healthz"))
+            .header("origin", "https://other.example")
+            .send()
+            .await
+            .unwrap();
+        assert!(other.headers().get("access-control-allow-origin").is_none());
     }
 }

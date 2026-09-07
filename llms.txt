@@ -359,11 +359,13 @@ templating every other value uses.
     "requestCorrelation": true,
     "rateLimiting": false,
     "serviceRegistry": false,
-    "requestValidation": true
+    "requestValidation": true,
+    "cors": false
   },
   "autoMigrateEndpoints": true,
   "discoveredErrorsWarnThreshold": 20,
   "rateLimit": { "requestsPerSecond": 20, "burst": 40 },
+  "cors": { "allowedOrigins": [] },
   "tls": {
     "mode": "off",
     "manual": { "certPath": "config/cert.pem", "keyPath": "config/key.pem" }
@@ -397,6 +399,16 @@ with defaults on first run, so in practice it always exists.
   endpoint file can declare its own top-level `"rateLimit": {...}` too — an
   **additional** bucket layered on that one route, on top of (never instead
   of) the global one; a request must clear both.
+- `features.cors` (default `false`) + `cors.allowedOrigins`: adds
+  `Access-Control-*` response headers via `tower_http::cors::CorsLayer` and
+  answers `OPTIONS` preflight directly instead of routing it. `allowedOrigins`
+  is an exact-match allowlist (`[]` by default — on but inert, logs a startup
+  warning); a literal `"*"` entry means any origin. Methods/headers mirror
+  whatever the request itself asked for. Applied outermost of every optional
+  middleware layer, so even a 429/401/500 from an inner layer still carries
+  the CORS header a browser needs to expose that response to JS. No
+  credentialed-CORS support — frogs' auth types are all header-based, never
+  cookies.
 - `tls.mode`: `"off"` (default) or `"manual"` (serves HTTPS via
   `rustls` from a user-supplied PEM cert/key pair — `certPath`/`keyPath`
   resolve relative to `api/`). `"acme"` is designed but **not implemented** —

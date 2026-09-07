@@ -148,7 +148,10 @@ pub fn build_router(
 
         let operation = openapi_document.and_then(|doc| find_operation(doc, &url_path, &method));
         if openapi_document.is_some() && operation.is_none() {
-            tracing::warn!("{}: no matching operation found in openapi.yaml — request validation skipped for this route", file_path.display());
+            tracing::warn!(
+                "{}: no matching operation found in openapi.yaml — request validation skipped for this route",
+                file_path.display()
+            );
         }
 
         // Each route gets its own `RouteState` baked in via `with_state` —
@@ -397,7 +400,16 @@ pub(crate) async fn resolve_for_test(
         };
 
         if let Err((code, message)) = verify_result {
-            return error_envelope(errors, discovered_errors, discovered_errors_path, debug_mode, &code, &message, None, &endpoint.error_overrides);
+            return error_envelope(
+                errors,
+                discovered_errors,
+                discovered_errors_path,
+                debug_mode,
+                &code,
+                &message,
+                None,
+                &endpoint.error_overrides,
+            );
         }
     }
 
@@ -409,7 +421,16 @@ pub(crate) async fn resolve_for_test(
     if let Some(operation) = operation
         && let Err(problem) = request_validation::validate_request(operation, component_schemas, path_params, query_params, headers, body)
     {
-        return error_envelope(errors, discovered_errors, discovered_errors_path, debug_mode, problem.code, &problem.message, None, &endpoint.error_overrides);
+        return error_envelope(
+            errors,
+            discovered_errors,
+            discovered_errors_path,
+            debug_mode,
+            problem.code,
+            &problem.message,
+            None,
+            &endpoint.error_overrides,
+        );
     }
 
     match resolve::resolve_sources(
@@ -562,9 +583,7 @@ fn error_envelope(
     };
 
     let override_for_code = error_overrides.get(code);
-    let http_status = on_error
-        .or_else(|| override_for_code.and_then(|o| o.http_status))
-        .unwrap_or(tiered_http_status);
+    let http_status = on_error.or_else(|| override_for_code.and_then(|o| o.http_status)).unwrap_or(tiered_http_status);
     let expose_detail = override_for_code.and_then(|o| o.expose_detail).unwrap_or(tiered_expose_detail);
     let status = StatusCode::from_u16(http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
@@ -948,7 +967,11 @@ mod tests {
             r#"{ "operationId": "limited", "sources": {}, "response": {}, "rateLimit": { "requestsPerSecond": 1, "burst": 1 } }"#,
         )
         .unwrap();
-        std::fs::write(unlimited_dir.join("endpoint.get.json"), r#"{ "operationId": "unlimited", "sources": {}, "response": {} }"#).unwrap();
+        std::fs::write(
+            unlimited_dir.join("endpoint.get.json"),
+            r#"{ "operationId": "unlimited", "sources": {}, "response": {} }"#,
+        )
+        .unwrap();
 
         let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
         let errors = Arc::new(ErrorRegistry::load(&root.join("does-not-exist")).unwrap());
@@ -1181,12 +1204,24 @@ mod tests {
         // pass-through bug would be obvious.
         discovered.lock().unwrap().record("plugin.hmac.unknown:BadSignature", 422, true, "signature mismatch");
 
-        let (status, body) = error_envelope(&errors, &discovered, &path, false, "plugin.hmac.unknown:BadSignature", "signature mismatch", None, &HashMap::new());
+        let (status, body) = error_envelope(
+            &errors,
+            &discovered,
+            &path,
+            false,
+            "plugin.hmac.unknown:BadSignature",
+            "signature mismatch",
+            None,
+            &HashMap::new(),
+        );
 
         assert_eq!(status, 422, "the discovered entry's own httpStatus should win over unexpected.error's 500");
         assert_eq!(body["code"], 422);
         assert_eq!(body["name"], "plugin.hmac.unknown:BadSignature");
-        assert_eq!(body["detail"], "signature mismatch", "the discovered entry's own exposeDetail: true should show detail even with debugMode off");
+        assert_eq!(
+            body["detail"], "signature mismatch",
+            "the discovered entry's own exposeDetail: true should show detail even with debugMode off"
+        );
     }
 
     /// Tier 1 still wins over tier 2 — a code genuinely classified in the
@@ -1201,7 +1236,11 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("core.json"), r#"{ "auth.invalid_credentials": { "httpStatus": 401, "exposeDetail": true } }"#).unwrap();
+        std::fs::write(
+            dir.join("core.json"),
+            r#"{ "auth.invalid_credentials": { "httpStatus": 401, "exposeDetail": true } }"#,
+        )
+        .unwrap();
         let errors = ErrorRegistry::load(&dir).unwrap();
 
         let discovered = Mutex::new(DiscoveredErrors::default());
@@ -1247,10 +1286,22 @@ mod tests {
             },
         );
 
-        let (status, body) = error_envelope(&errors, &discovered, &path, false, "datasource.sql.connection_failed", "pool exhausted", None, &overrides);
+        let (status, body) = error_envelope(
+            &errors,
+            &discovered,
+            &path,
+            false,
+            "datasource.sql.connection_failed",
+            "pool exhausted",
+            None,
+            &overrides,
+        );
 
         assert_eq!(status, 503, "the endpoint's own override should win over the registry's 500");
-        assert_eq!(body["detail"], "pool exhausted", "exposeDetail: true in the override should show detail even though the registry says false");
+        assert_eq!(
+            body["detail"], "pool exhausted",
+            "exposeDetail: true in the override should show detail even though the registry says false"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1283,10 +1334,22 @@ mod tests {
             },
         );
 
-        let (status, body) = error_envelope(&errors, &discovered, &path, false, "datasource.sql.connection_failed", "pool exhausted", None, &overrides);
+        let (status, body) = error_envelope(
+            &errors,
+            &discovered,
+            &path,
+            false,
+            "datasource.sql.connection_failed",
+            "pool exhausted",
+            None,
+            &overrides,
+        );
 
         assert_eq!(status, 503);
-        assert_eq!(body["detail"], "pool exhausted", "exposeDetail wasn't overridden, so the registry's own true should still apply");
+        assert_eq!(
+            body["detail"], "pool exhausted",
+            "exposeDetail wasn't overridden, so the registry's own true should still apply"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1833,8 +1896,14 @@ mod tests {
             "sources": { "car": { "type": "sql", "connection": "db", "script": "q.sql" } },
             "response": {}
         }"#;
-        assert!(run_with_debug_mode(json, true).await.get("detail").is_some(), "global debugMode: true should still apply with no per-endpoint override");
-        assert!(run_with_debug_mode(json, false).await.get("detail").is_none(), "global debugMode: false should still apply with no per-endpoint override");
+        assert!(
+            run_with_debug_mode(json, true).await.get("detail").is_some(),
+            "global debugMode: true should still apply with no per-endpoint override"
+        );
+        assert!(
+            run_with_debug_mode(json, false).await.get("detail").is_none(),
+            "global debugMode: false should still apply with no per-endpoint override"
+        );
     }
 
     /// The discovery-recording side effect (not just detail exposure) also

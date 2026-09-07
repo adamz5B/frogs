@@ -184,8 +184,12 @@ fn resolve_one<'a>(
         };
 
         let (on_error, optional, parameters) = match source {
-            SourceDef::Sql { on_error, optional, parameters, .. } => (*on_error, *optional, parameters),
-            SourceDef::Http { on_error, optional, parameters, .. } => (*on_error, *optional, parameters),
+            SourceDef::Sql {
+                on_error, optional, parameters, ..
+            } => (*on_error, *optional, parameters),
+            SourceDef::Http {
+                on_error, optional, parameters, ..
+            } => (*on_error, *optional, parameters),
         };
 
         let mock = mocks.get(name);
@@ -231,10 +235,7 @@ fn resolve_one<'a>(
             Some(MockOutcome::Fail(code)) => Err(SourceErrorCause::Mocked(code.clone())),
             None => match source {
                 SourceDef::Sql {
-                    connection,
-                    script,
-                    cardinality,
-                    ..
+                    connection, script, cardinality, ..
                 } => {
                     run_sql_source(
                         drivers,
@@ -388,7 +389,9 @@ async fn run_http_source(
         }
     }
 
-    let value = crate::http::execute(client, &request_file, &bound, &array_params, headers).await.map_err(SourceErrorCause::Http)?;
+    let value = crate::http::execute(client, &request_file, &bound, &array_params, headers)
+        .await
+        .map_err(SourceErrorCause::Http)?;
 
     // `responsePath` (if declared) has already been unwrapped by `execute`
     // above — the array `cardinality: "many"` expects is exactly whatever
@@ -942,7 +945,10 @@ mod tests {
         .expect("the http source should resolve");
 
         let body = build_response(&endpoint, &resolved);
-        assert_eq!(body["ownerName"], "Alex", "a 4-segment dot-path should reach owner.name, not stop at the whole owner object");
+        assert_eq!(
+            body["ownerName"], "Alex",
+            "a 4-segment dot-path should reach owner.name, not stop at the whole owner object"
+        );
     }
 
     #[tokio::test]
@@ -1480,7 +1486,11 @@ mod tests {
     #[test]
     fn parse_bracket_array_path_extracts_source_and_field() {
         assert_eq!(parse_bracket_array_path("sources.cars[].vin"), Some(("cars", "vin")));
-        assert_eq!(parse_bracket_array_path("sources.cars[].owner.name"), Some(("cars", "owner.name")), "the field half can itself be nested");
+        assert_eq!(
+            parse_bracket_array_path("sources.cars[].owner.name"),
+            Some(("cars", "owner.name")),
+            "the field half can itself be nested"
+        );
     }
 
     #[test]
@@ -1508,10 +1518,7 @@ mod tests {
         drivers.insert(
             "db".to_string(),
             Box::new(FakeDriver {
-                rows: vec![
-                    row(&[("vin", SqlValue::Text("AAA".to_string()))]),
-                    row(&[("vin", SqlValue::Text("BBB".to_string()))]),
-                ],
+                rows: vec![row(&[("vin", SqlValue::Text("AAA".to_string()))]), row(&[("vin", SqlValue::Text("BBB".to_string()))])],
                 fail: false,
             }),
         );
@@ -1578,7 +1585,11 @@ mod tests {
         .unwrap();
 
         let body = build_response(&endpoint, &resolved);
-        assert_eq!(body["years"], serde_json::json!([2003, 2010]), "format: integer should apply per-element, not to the array as a whole");
+        assert_eq!(
+            body["years"],
+            serde_json::json!([2003, 2010]),
+            "format: integer should apply per-element, not to the array as a whole"
+        );
     }
 
     #[tokio::test]
@@ -1627,7 +1638,11 @@ mod tests {
         .unwrap();
 
         let body = build_response(&endpoint, &resolved);
-        assert_eq!(body["ownerNames"], serde_json::json!(["Alex", "Sam"]), "the field half of a bracket path should walk arbitrarily deep too");
+        assert_eq!(
+            body["ownerNames"],
+            serde_json::json!(["Alex", "Sam"]),
+            "the field half of a bracket path should walk arbitrarily deep too"
+        );
     }
 
     #[tokio::test]
@@ -1666,7 +1681,11 @@ mod tests {
         .unwrap();
 
         let body = build_response(&endpoint, &resolved);
-        assert_eq!(body["vins"], serde_json::json!([]), "sources.car is cardinality: one, not an array — must degrade to empty, not error or panic");
+        assert_eq!(
+            body["vins"],
+            serde_json::json!([]),
+            "sources.car is cardinality: one, not an array — must degrade to empty, not error or panic"
+        );
     }
 
     #[tokio::test]
@@ -1674,10 +1693,7 @@ mod tests {
         use axum::routing::get;
         use axum::{Json, Router};
 
-        let app = Router::new().route(
-            "/cars",
-            get(|| async { Json(serde_json::json!([{ "vin": "AAA" }, { "vin": "BBB" }])) }),
-        );
+        let app = Router::new().route("/cars", get(|| async { Json(serde_json::json!([{ "vin": "AAA" }, { "vin": "BBB" }])) }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2517,7 +2533,10 @@ mod tests {
 
     #[test]
     fn clamp_numeric_is_a_no_op_when_nothing_is_declared() {
-        assert_eq!(clamp_numeric(SqlValue::Text("hello".to_string()), None, None, None), SqlValue::Text("hello".to_string()));
+        assert_eq!(
+            clamp_numeric(SqlValue::Text("hello".to_string()), None, None, None),
+            SqlValue::Text("hello".to_string())
+        );
         assert_eq!(clamp_numeric(SqlValue::Null, None, None, None), SqlValue::Null);
     }
 
@@ -2538,7 +2557,10 @@ mod tests {
 
     #[test]
     fn clamp_numeric_uses_default_for_an_unparseable_value() {
-        assert_eq!(clamp_numeric(SqlValue::Text("not-a-number".to_string()), Some(20), None, Some(100)), SqlValue::Int(20));
+        assert_eq!(
+            clamp_numeric(SqlValue::Text("not-a-number".to_string()), Some(20), None, Some(100)),
+            SqlValue::Int(20)
+        );
     }
 
     #[test]
@@ -2618,8 +2640,16 @@ mod tests {
         .expect("the sql source should resolve using the clamped parameters");
 
         let received_params = received.lock().unwrap().clone().unwrap();
-        assert_eq!(received_params.get("limit"), Some(&SqlValue::Int(100)), "limit=999999999 must be clamped down to max: 100");
-        assert_eq!(received_params.get("offset"), Some(&SqlValue::Int(0)), "an omitted offset must fall back to default: 0, as a real integer");
+        assert_eq!(
+            received_params.get("limit"),
+            Some(&SqlValue::Int(100)),
+            "limit=999999999 must be clamped down to max: 100"
+        );
+        assert_eq!(
+            received_params.get("offset"),
+            Some(&SqlValue::Int(0)),
+            "an omitted offset must fall back to default: 0, as a real integer"
+        );
     }
 
     /// A driver that panics if it's ever actually queried — the strongest

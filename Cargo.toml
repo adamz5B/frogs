@@ -41,6 +41,11 @@ serde_yaml = "0.9"
 # into a URL, instead of hand-rolling encoding logic for something this
 # easy to get subtly wrong.
 percent-encoding = "2"
+# `default-features = false` + only the `cors` feature: `cors` itself pulls
+# in zero extra crates (see its Cargo.toml — `cors = []`), and "0.6" matches
+# the version `reqwest` already resolves this to transitively, so this stays
+# one compiled copy rather than two. See docs/frogs-quick-wins.md.
+tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 
 [dev-dependencies]
 # Generates a self-signed cert + key entirely in-memory at test time — no

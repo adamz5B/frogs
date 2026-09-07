@@ -264,7 +264,10 @@ mod tests {
 
         let mut params = HashMap::new();
         params.insert("vin".to_string(), SqlValue::Text("1HGCM82633A004352".to_string()));
-        driver.query("INSERT INTO cars (vin) VALUES (:vin)", &params).await.expect("the first insert should succeed");
+        driver
+            .query("INSERT INTO cars (vin) VALUES (:vin)", &params)
+            .await
+            .expect("the first insert should succeed");
 
         let err = driver
             .query("INSERT INTO cars (vin) VALUES (:vin)", &params)
@@ -285,7 +288,10 @@ mod tests {
             .await
             .expect_err("querying a nonexistent table must fail");
 
-        assert!(matches!(err, SqlError::QueryFailed(_)), "expected the ordinary QueryFailed classification, got {err:?}");
+        assert!(
+            matches!(err, SqlError::QueryFailed(_)),
+            "expected the ordinary QueryFailed classification, got {err:?}"
+        );
     }
 
     #[tokio::test]

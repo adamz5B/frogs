@@ -349,7 +349,10 @@ mod tests {
         let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
         let rate_limit = endpoint.rate_limit.unwrap();
         assert_eq!(rate_limit.burst, 5);
-        assert_eq!(rate_limit.requests_per_second, 20, "requestsPerSecond should fall back to RateLimitConfig's own default");
+        assert_eq!(
+            rate_limit.requests_per_second, 20,
+            "requestsPerSecond should fall back to RateLimitConfig's own default"
+        );
     }
 
     #[test]

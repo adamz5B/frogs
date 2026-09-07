@@ -44,6 +44,21 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// `config/server.json`'s `cors` block — only actually consulted when
+/// `features.cors` is on, same "the file can hold settings for a feature
+/// that's currently off" posture `rateLimit` already has. An empty
+/// `allowedOrigins` (the default) means the feature can be turned on without
+/// opening anything up by accident — `frogs run` logs a warning in that case
+/// rather than silently serving with no CORS headers at all. A literal `"*"`
+/// entry means "any origin", handled distinctly from an explicit list (see
+/// `server::apply_cors`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CorsConfig {
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+}
+
 /// TLS mode for `frogs run`'s listener — `off` (default, unchanged plain
 /// HTTP) or `manual` (a user-supplied cert+key PEM pair). `acme` (automatic
 /// Let's Encrypt provisioning, per `docs/frogs-https-development.md`) is a
@@ -90,7 +105,10 @@ pub struct TlsConfig {
 /// "mode"; a monolith and a split-out microservice both just pick whichever
 /// of these they need. `metrics`/`readyzCheck`/`requestCorrelation` and
 /// `requestValidation` are on by default because they cost nothing and help
-/// every shape; `rateLimiting`/`serviceRegistry` are opt-in.
+/// every shape; `rateLimiting`/`serviceRegistry`/`cors` are opt-in — `cors`
+/// specifically because it's a real cross-origin access decision an operator
+/// should make deliberately, not something that should start working the
+/// moment a project is generated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Features {
@@ -106,6 +124,8 @@ pub struct Features {
     pub service_registry: bool,
     #[serde(default = "default_true")]
     pub request_validation: bool,
+    #[serde(default)]
+    pub cors: bool,
 }
 
 impl Default for Features {
@@ -117,6 +137,7 @@ impl Default for Features {
             rate_limiting: false,
             service_registry: false,
             request_validation: true,
+            cors: false,
         }
     }
 }
@@ -143,6 +164,10 @@ pub struct ServerConfig {
     /// posture the rest of `server.json` already has.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+    /// Only actually consulted when `features.cors` is on — see
+    /// `CorsConfig`'s own doc comment.
+    #[serde(default)]
+    pub cors: CorsConfig,
     /// Off by default — see `TlsMode`'s doc comment. When `manual`, `frogs
     /// run` serves HTTPS via `axum-server`'s rustls acceptor instead of
     /// plain HTTP, using this same field's `manual.certPath`/`keyPath`.
@@ -170,6 +195,7 @@ impl Default for ServerConfig {
             auto_migrate_endpoints: true,
             discovered_errors_warn_threshold: 20,
             rate_limit: RateLimitConfig::default(),
+            cors: CorsConfig::default(),
             tls: TlsConfig::default(),
             port: 8080,
             api_root: String::new(),
@@ -211,6 +237,20 @@ mod tests {
         let config: ServerConfig = serde_json::from_str(r#"{ "rateLimit": { "requestsPerSecond": 5, "burst": 15 } }"#).unwrap();
         assert_eq!(config.rate_limit.requests_per_second, 5);
         assert_eq!(config.rate_limit.burst, 15);
+    }
+
+    #[test]
+    fn cors_defaults_to_off_with_no_allowed_origins_when_absent_from_the_file() {
+        let config: ServerConfig = serde_json::from_str("{}").unwrap();
+        assert!(!config.features.cors);
+        assert!(config.cors.allowed_origins.is_empty());
+    }
+
+    #[test]
+    fn cors_is_read_as_camel_case() {
+        let config: ServerConfig = serde_json::from_str(r#"{ "features": { "cors": true }, "cors": { "allowedOrigins": ["https://example.com"] } }"#).unwrap();
+        assert!(config.features.cors);
+        assert_eq!(config.cors.allowed_origins, vec!["https://example.com".to_string()]);
     }
 
     #[test]

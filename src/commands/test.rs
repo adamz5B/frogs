@@ -49,7 +49,10 @@ pub async fn run(cwd: &Path) -> io::Result<()> {
         match crate::openapi::load(&root.join(crate::project::MANIFEST_FILE)) {
             Ok(doc) => Some(doc),
             Err(e) => {
-                eprintln!("warning: failed to load {}: {e} — request validation is disabled for this run", crate::project::MANIFEST_FILE);
+                eprintln!(
+                    "warning: failed to load {}: {e} — request validation is disabled for this run",
+                    crate::project::MANIFEST_FILE
+                );
                 None
             }
         }
@@ -91,7 +94,9 @@ pub async fn run(cwd: &Path) -> io::Result<()> {
         // `display_path` keeps its OpenAPI-style `{name}` braces (unlike
         // `build_router`'s axum-converted `:name` routes), so it matches
         // `Operation::path` directly with no conversion needed.
-        let operation = openapi_document.as_ref().and_then(|doc| doc.operations.iter().find(|op| op.method == method && op.path == display_path));
+        let operation = openapi_document
+            .as_ref()
+            .and_then(|doc| doc.operations.iter().find(|op| op.method == method && op.path == display_path));
         let component_schemas = openapi_document.as_ref().map(|doc| &doc.component_schemas).unwrap_or(&empty_component_schemas);
         // Fresh per file, never shared across files or reused across runs —
         // this is what `{{memory.X}}` scoping to "this file's cases, run in

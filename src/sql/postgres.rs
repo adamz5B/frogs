@@ -335,10 +335,7 @@ mod tests {
         let driver = PostgresDriver { pool };
 
         let mut params = HashMap::new();
-        params.insert(
-            "ids".to_string(),
-            SqlValue::Array(vec![SqlValue::Int(1), SqlValue::Int(2), SqlValue::Int(3)]),
-        );
+        params.insert("ids".to_string(), SqlValue::Array(vec![SqlValue::Int(1), SqlValue::Int(2), SqlValue::Int(3)]));
         let rows = driver
             .query("SELECT unnest(:ids::int8[]) AS id ORDER BY id", &params)
             .await
@@ -362,10 +359,7 @@ mod tests {
         let driver = PostgresDriver { pool };
 
         let mut params = HashMap::new();
-        params.insert(
-            "mixed".to_string(),
-            SqlValue::Array(vec![SqlValue::Int(1), SqlValue::Text("two".to_string())]),
-        );
+        params.insert("mixed".to_string(), SqlValue::Array(vec![SqlValue::Int(1), SqlValue::Text("two".to_string())]));
         let rows = driver
             .query("SELECT jsonb_array_length(:mixed::jsonb) AS n", &params)
             .await
@@ -386,7 +380,10 @@ mod tests {
         let driver = PostgresDriver { pool };
 
         sqlx::query("DROP TABLE IF EXISTS frogs_constraint_test").execute(&driver.pool).await.unwrap();
-        sqlx::query("CREATE TABLE frogs_constraint_test (vin TEXT UNIQUE)").execute(&driver.pool).await.unwrap();
+        sqlx::query("CREATE TABLE frogs_constraint_test (vin TEXT UNIQUE)")
+            .execute(&driver.pool)
+            .await
+            .unwrap();
 
         let mut params = HashMap::new();
         params.insert("vin".to_string(), SqlValue::Text("1HGCM82633A004352".to_string()));

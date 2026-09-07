@@ -391,7 +391,9 @@ mod tests {
         params.insert("vin".to_string(), SqlValue::Text("1HGCM82633A004352".to_string()));
 
         let client = reqwest::Client::new();
-        let result = execute(&client, &request_file, &params, &HashSet::new(), &HeaderMap::new()).await.expect("request should succeed");
+        let result = execute(&client, &request_file, &params, &HashSet::new(), &HeaderMap::new())
+            .await
+            .expect("request should succeed");
 
         assert_eq!(result, serde_json::json!({ "amount": 24500, "currency": "USD" }));
     }
@@ -417,9 +419,15 @@ mod tests {
         });
 
         let client = reqwest::Client::new();
-        let err = execute(&client, &request_file(format!("http://{addr}/broken")), &HashMap::new(), &HashSet::new(), &HeaderMap::new())
-            .await
-            .expect_err("a 404 upstream response must not be treated as success");
+        let err = execute(
+            &client,
+            &request_file(format!("http://{addr}/broken")),
+            &HashMap::new(),
+            &HashSet::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect_err("a 404 upstream response must not be treated as success");
 
         assert!(matches!(err, HttpError::UpstreamStatus(404)));
     }
@@ -434,9 +442,15 @@ mod tests {
         });
 
         let client = reqwest::Client::new();
-        let err = execute(&client, &request_file(format!("http://{addr}/text")), &HashMap::new(), &HashSet::new(), &HeaderMap::new())
-            .await
-            .expect_err("a non-JSON body must not parse as a JSON response");
+        let err = execute(
+            &client,
+            &request_file(format!("http://{addr}/text")),
+            &HashMap::new(),
+            &HashSet::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect_err("a non-JSON body must not parse as a JSON response");
 
         assert!(matches!(err, HttpError::InvalidJson(_)));
     }
@@ -471,9 +485,15 @@ mod tests {
         drop(listener);
 
         let client = reqwest::Client::new();
-        let err = execute(&client, &request_file(format!("http://{addr}/anything")), &HashMap::new(), &HashSet::new(), &HeaderMap::new())
-            .await
-            .expect_err("nothing listening on this port must fail the request, not hang or panic");
+        let err = execute(
+            &client,
+            &request_file(format!("http://{addr}/anything")),
+            &HashMap::new(),
+            &HashSet::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect_err("nothing listening on this port must fail the request, not hang or panic");
 
         assert!(matches!(err, HttpError::Request(_)));
     }
@@ -646,7 +666,9 @@ mod tests {
         let array_params = HashSet::from(["items".to_string()]);
 
         let client = reqwest::Client::new();
-        let result = execute(&client, &request, &params, &array_params, &HeaderMap::new()).await.expect("request should succeed");
+        let result = execute(&client, &request, &params, &array_params, &HeaderMap::new())
+            .await
+            .expect("request should succeed");
 
         assert_eq!(result, serde_json::json!([{ "maker": "Honda" }, { "maker": "Ford" }]));
     }
