@@ -71,6 +71,9 @@ fn operational_routes_display(server_config: &ServerConfig) -> Vec<String> {
     if server_config.features.metrics {
         routes.push(format!("{api_root_display}/metrics"));
     }
+    if server_config.docs_ui.mode != crate::config::DocsUiMode::Off {
+        routes.push(format!("{api_root_display}/{}", crate::server::normalize_docs_ui_path(&server_config.docs_ui.path)));
+    }
     routes
 }
 
@@ -181,31 +184,39 @@ async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
     let services = std::sync::Arc::new(config.services);
     let discovered_errors = std::sync::Arc::new(std::sync::Mutex::new(config.discovered_errors));
 
-    // Only loaded (and only consulted) when `features.requestValidation` is
-    // on — a load failure degrades to "no route gets validation" with a
+    // Loaded whenever either `features.requestValidation` or `docsUi.mode`
+    // needs it — both are read-only consumers of the same parsed document,
+    // so one load serves both rather than each maintaining its own copy.
+    // `Arc`-wrapped so `docs_ui_router` can hold its own cheap clone
+    // alongside `build_router`'s borrow. A load failure degrades to "no
+    // route gets validation, docs UI's operation list is empty" with a
     // warning, the same graceful-degradation posture `build_router` itself
     // uses for a route whose operation can't be matched, rather than
-    // refusing to start the server over a request-validation-only concern.
-    let openapi_document = if config.server.features.request_validation {
-        match crate::openapi::load(&root.join(crate::project::MANIFEST_FILE)) {
-            Ok(doc) => Some(doc),
-            Err(e) => {
-                tracing::warn!("failed to load {}: {e} — request validation is disabled for this run", crate::project::MANIFEST_FILE);
-                None
+    // refusing to start the server over either concern.
+    let openapi_document: Option<std::sync::Arc<crate::openapi::OpenApiDocument>> =
+        if config.server.features.request_validation || config.server.docs_ui.mode != crate::config::DocsUiMode::Off {
+            match crate::openapi::load(&root.join(crate::project::MANIFEST_FILE)) {
+                Ok(doc) => Some(std::sync::Arc::new(doc)),
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to load {}: {e} — request validation is disabled and docs UI's operation list is empty for this run",
+                        crate::project::MANIFEST_FILE
+                    );
+                    None
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     let endpoint_router = crate::endpoint::build_router(
         &api_dir,
         drivers.clone(),
         errors,
-        security,
+        security.clone(),
         services,
         discovered_errors,
         debug_mode,
-        openapi_document.as_ref(),
+        openapi_document.as_deref(),
     );
     let mut router = crate::server::router().merge(endpoint_router);
 
@@ -219,6 +230,16 @@ async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
     let metrics = config.server.features.metrics.then(|| std::sync::Arc::new(crate::server::Metrics::new()));
     if let Some(metrics) = &metrics {
         router = router.merge(crate::server::metrics_router(metrics.clone()));
+    }
+    if config.server.docs_ui.mode != crate::config::DocsUiMode::Off {
+        let endpoint_summaries = crate::endpoint::endpoint_summaries(&api_dir.join("datasources/endpoints"));
+        router = router.merge(crate::server::docs_ui_router(
+            config.server.docs_ui.mode,
+            &config.server.docs_ui.path,
+            openapi_document.clone(),
+            security,
+            endpoint_summaries,
+        ));
     }
 
     let router = crate::server::mount_under(router, &config.server.api_root);
@@ -327,8 +348,12 @@ async fn serve_http(root: &Path, router: Router, port: u16) -> io::Result<()> {
 
     println!("listening on http://{addr} (Ctrl+C to stop, or `frogs stop` from another terminal)");
 
+    // `with_connect_info` (not the plain `into_make_service`) so
+    // `docs_ui_localhost_gate` can see the real TCP peer when `docsUi.mode`
+    // is `localhost` — harmless overhead for every other route, which
+    // simply never looks at `ConnectInfo`.
     let result = tokio::select! {
-        result = axum::serve(listener, router) => result,
+        result = axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()) => result,
         _ = tokio::signal::ctrl_c() => {
             println!("received Ctrl+C, shutting down");
             Ok(())
@@ -384,8 +409,10 @@ async fn serve_https(root: &Path, router: Router, port: u16, manual: &ManualTlsC
 
     println!("listening on https://{addr_str} (Ctrl+C to stop, or `frogs stop` from another terminal)");
 
+    // Same `with_connect_info` reasoning as `serve_http` — axum-server's
+    // TLS acceptor supports the identical `MakeService` shape.
     let result = tokio::select! {
-        result = server.serve(router.into_make_service()) => result,
+        result = server.serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>()) => result,
         _ = tokio::signal::ctrl_c() => {
             println!("received Ctrl+C, shutting down");
             Ok(())
@@ -767,5 +794,141 @@ mod tests {
             .await
             .unwrap();
         assert!(other.headers().get("access-control-allow-origin").is_none());
+    }
+
+    /// Same shape as `scratch_api_project`, for `docsUi.mode`.
+    fn scratch_api_project_with_docs_ui(mode: &str) -> std::path::PathBuf {
+        let root = temp_project();
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(api_dir.join("config/errors")).unwrap();
+        std::fs::create_dir_all(api_dir.join("security")).unwrap();
+        std::fs::create_dir_all(api_dir.join("datasources/endpoints")).unwrap();
+        std::fs::write(root.join("openapi.yaml"), "openapi: 3.0.3\ninfo: { title: t, version: '1' }\npaths: {}\n").unwrap();
+        std::fs::write(
+            api_dir.join("config/server.json"),
+            format!(r#"{{ "features": {{ "requestValidation": false }}, "docsUi": {{ "mode": "{mode}" }} }}"#),
+        )
+        .unwrap();
+        std::fs::write(api_dir.join("config/errors/core.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("config/connections.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("security/schemes.json"), "{}").unwrap();
+        root
+    }
+
+    /// Proves `docsUi.mode: "off"` behaves like `readyzCheck`/`metrics` off
+    /// — the route isn't merely hidden, it's never registered at all.
+    #[tokio::test]
+    async fn docs_ui_off_never_registers_the_route() {
+        let root = scratch_api_project_with_docs_ui("off");
+        let (router, _) = build_api_router(&root).await.expect("a minimal but complete scratch project should build cleanly");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let response = reqwest::get(format!("http://{addr}/docs")).await.unwrap();
+        assert_eq!(response.status(), 404);
+    }
+
+    /// End-to-end through the real `serve_http` wiring, connect-info
+    /// included — `server::docs_ui_localhost_gate`'s own tests already cover
+    /// the gate logic in isolation; this proves `frogs run` actually gets a
+    /// real peer address to it, not just that the gate function works when
+    /// handed one directly.
+    #[tokio::test]
+    async fn docs_ui_localhost_mode_is_reachable_through_the_real_serve_http_connect_info_wiring() {
+        let root = scratch_api_project_with_docs_ui("localhost");
+        let (router, _) = build_api_router(&root).await.expect("a minimal but complete scratch project should build cleanly");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                .await
+                .unwrap();
+        });
+
+        let response = reqwest::get(format!("http://{addr}/docs")).await.unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "a real loopback request through serve_http's own connect-info wiring must be admitted"
+        );
+    }
+
+    /// Proves `docsUi.path` is actually wired end-to-end — the default
+    /// `"docs"` path is what every other docs-UI test in this module
+    /// exercises implicitly; this is the one that proves a custom value
+    /// actually changes the mounted route, through the real
+    /// `build_api_router` assembly.
+    #[tokio::test]
+    async fn docs_ui_custom_path_is_wired_through_build_api_router() {
+        let root = temp_project();
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(api_dir.join("config/errors")).unwrap();
+        std::fs::create_dir_all(api_dir.join("security")).unwrap();
+        std::fs::create_dir_all(api_dir.join("datasources/endpoints")).unwrap();
+        std::fs::write(root.join("openapi.yaml"), "openapi: 3.0.3\ninfo: { title: t, version: '1' }\npaths: {}\n").unwrap();
+        std::fs::write(
+            api_dir.join("config/server.json"),
+            r#"{ "features": { "requestValidation": false }, "docsUi": { "mode": "public", "path": "internal-docs" } }"#,
+        )
+        .unwrap();
+        std::fs::write(api_dir.join("config/errors/core.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("config/connections.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("security/schemes.json"), "{}").unwrap();
+
+        let (router, _) = build_api_router(&root).await.expect("a minimal but complete scratch project should build cleanly");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let custom = reqwest::get(format!("http://{addr}/internal-docs")).await.unwrap();
+        assert_eq!(custom.status(), 200);
+        let default = reqwest::get(format!("http://{addr}/docs")).await.unwrap();
+        assert_eq!(default.status(), 404, "the default 'docs' path must not also be live once a custom one is configured");
+    }
+
+    /// Proves a real endpoint file on disk actually reaches
+    /// `/docs/endpoints.json` through `build_api_router`'s own wiring —
+    /// `endpoint::docs_summary`'s own tests already cover the sanitization
+    /// logic in isolation; this is the "does `frogs run` actually call it"
+    /// check.
+    #[tokio::test]
+    async fn docs_ui_endpoints_json_reflects_a_real_endpoint_file_on_disk() {
+        let root = temp_project();
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(api_dir.join("config/errors")).unwrap();
+        std::fs::create_dir_all(api_dir.join("security")).unwrap();
+        std::fs::create_dir_all(api_dir.join("datasources/endpoints/ping")).unwrap();
+        std::fs::write(root.join("openapi.yaml"), "openapi: 3.0.3\ninfo: { title: t, version: '1' }\npaths: {}\n").unwrap();
+        std::fs::write(
+            api_dir.join("config/server.json"),
+            r#"{ "features": { "requestValidation": false }, "docsUi": { "mode": "public" } }"#,
+        )
+        .unwrap();
+        std::fs::write(api_dir.join("config/errors/core.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("config/connections.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("security/schemes.json"), "{}").unwrap();
+        std::fs::write(
+            api_dir.join("datasources/endpoints/ping/endpoint.get.json"),
+            r#"{ "operationId": "ping", "sources": {}, "response": {} }"#,
+        )
+        .unwrap();
+
+        let (router, _) = build_api_router(&root).await.expect("a minimal but complete scratch project should build cleanly");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let body: serde_json::Value = reqwest::get(format!("http://{addr}/docs/endpoints.json")).await.unwrap().json().await.unwrap();
+        assert_eq!(body["endpoints"][0]["operationId"], "ping");
+        assert_eq!(body["endpoints"][0]["path"], "/ping");
     }
 }

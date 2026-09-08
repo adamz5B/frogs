@@ -80,6 +80,185 @@ async fn metrics_handler(State(metrics): State<Arc<Metrics>>) -> Response {
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], metrics.render()).into_response()
 }
 
+/// Shared read-only state for every docs-UI route — an `Arc`-cheap clone of
+/// the same `OpenApiDocument`/`SecurityConfig` `commands::run` already
+/// built for `endpoint::build_router`, not a second copy of either, plus
+/// the sanitized per-endpoint summaries `endpoint::endpoint_summaries`
+/// computed once at startup (see `docs_ui_endpoints_handler`).
+#[derive(Clone)]
+struct DocsUiState {
+    openapi_document: Option<Arc<crate::openapi::OpenApiDocument>>,
+    security: Arc<crate::security::SecurityConfig>,
+    endpoint_summaries: Arc<Vec<serde_json::Value>>,
+}
+
+/// Normalizes `docsUi.path` the same lenient way `normalize_api_root`
+/// normalizes `apiRoot`: `"docs"`, `"/docs"`, and `"/docs/"` all mean the
+/// same thing, and a blank/all-slashes value falls back to `"docs"` rather
+/// than mounting the console at the API root itself. Unlike
+/// `normalize_api_root`, the result never starts with `/` — callers here
+/// build `format!("/{path}")` themselves, since every one of them needs the
+/// bare segment for a nested sub-path too (`/docs/operations.json`).
+pub(crate) fn normalize_docs_ui_path(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.is_empty() { "docs".to_string() } else { trimmed.to_string() }
+}
+
+/// The console page (a single embedded HTML/CSS/vanilla-JS file, no
+/// framework, no CDN, see `docs_ui.html`), `/<path>/operations.json`
+/// (Point 2: `openapi.yaml`'s own structural data), and
+/// `/<path>/endpoints.json` (Point 4: each endpoint file's own sanitized
+/// `sources`/response config) — all three mounted under `path`
+/// (`config/server.json`'s `docsUi.path`, `"docs"` by default, normalized
+/// via `normalize_docs_ui_path`). Same "separate router, merged in only
+/// when the feature is on" shape as `readyz_router`/`metrics_router`; the
+/// caller checks `mode != DocsUiMode::Off` before merging this in at all,
+/// so `Off` never reaches this function. `Localhost` wraps every route in
+/// `docs_ui_localhost_gate`; `Public` serves them ungated; `Off` is the
+/// caller's problem, not this function's.
+pub fn docs_ui_router(
+    mode: crate::config::DocsUiMode,
+    path: &str,
+    openapi_document: Option<Arc<crate::openapi::OpenApiDocument>>,
+    security: Arc<crate::security::SecurityConfig>,
+    endpoint_summaries: Vec<serde_json::Value>,
+) -> Router {
+    let path = normalize_docs_ui_path(path);
+    let state = DocsUiState {
+        openapi_document,
+        security,
+        endpoint_summaries: Arc::new(endpoint_summaries),
+    };
+    let router = Router::new()
+        .route(&format!("/{path}"), get(docs_ui_page))
+        .route(&format!("/{path}/operations.json"), get(docs_ui_operations_handler))
+        .route(&format!("/{path}/endpoints.json"), get(docs_ui_endpoints_handler))
+        .with_state(state);
+    match mode {
+        crate::config::DocsUiMode::Localhost => router.layer(middleware::from_fn(docs_ui_localhost_gate)),
+        crate::config::DocsUiMode::Public | crate::config::DocsUiMode::Off => router,
+    }
+}
+
+/// `include_str!`, not a file read at request time — the whole point of
+/// embedding is that the console works with nothing on disk beyond the
+/// compiled binary itself. `docs_ui.html` derives both the API's own
+/// `apiRoot` prefix *and* its own mount path from `window.location.pathname`
+/// client-side (strip the page's own last path segment for the former, use
+/// the page's own full path for the latter) rather than needing this
+/// handler to template anything in — so this stays a byte-for-byte
+/// constant no matter what `docsUi.path`/`apiRoot` are configured to.
+const DOCS_UI_HTML: &str = include_str!("docs_ui.html");
+
+async fn docs_ui_page() -> Response {
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], DOCS_UI_HTML).into_response()
+}
+
+/// Every discovered endpoint file's own sanitized `sources`/response
+/// mapping — see `endpoint::endpoint_summaries`'s doc comment for the full
+/// allowlist and why it's safe to expose. Feeds the console's per-operation
+/// configuration panel; an empty list (rather than a route failure) is the
+/// honest answer for a project with no endpoint files at all yet.
+async fn docs_ui_endpoints_handler(State(state): State<DocsUiState>) -> Response {
+    axum::Json(serde_json::json!({ "endpoints": state.endpoint_summaries.as_ref() })).into_response()
+}
+
+/// A structural summary of `openapi.yaml`'s own operations (paths, methods,
+/// parameters, request body schema, declared success codes) plus which
+/// security scheme guards each one and, when derivable, which *header
+/// name* a caller needs to set — see `docs_ui_operation_json`'s doc comment
+/// for why this is safe to expose (never a header/credential *value*).
+/// Feeds the console's operation browser and "Try it out"; `operations`/
+/// `componentSchemas` are both empty when `openapi.yaml` failed to load
+/// (same graceful-degradation posture `commands::run`'s own load-failure
+/// warning already established) rather than this route failing outright.
+async fn docs_ui_operations_handler(State(state): State<DocsUiState>) -> Response {
+    let operations: Vec<serde_json::Value> = state
+        .openapi_document
+        .as_ref()
+        .map(|doc| doc.operations.iter().map(|op| docs_ui_operation_json(op, &state.security)).collect())
+        .unwrap_or_default();
+    let component_schemas = state
+        .openapi_document
+        .as_ref()
+        .map(|doc| serde_json::Value::Object(doc.component_schemas.clone()))
+        .unwrap_or_default();
+
+    axum::Json(serde_json::json!({
+        "operations": operations,
+        "componentSchemas": component_schemas,
+    }))
+    .into_response()
+}
+
+/// One operation's entry in `/docs/operations.json`. `security.header`, when
+/// present, names the header a caller must set to authenticate — read from
+/// the guarding verifier's own `parameters` (whichever one reads
+/// `header.<name>`, the only prefix a header-based verifier ever uses — see
+/// `security::verifier::Parameter`). This is always just a header *name*
+/// (`"X-Api-Key"`), never a value: `HttpAuth`/`VerifierDef` never store a
+/// real secret anywhere in project config, only env-var *names* the process
+/// looks up at request time, so there is nothing sensitive here to redact.
+/// `None` when the scheme isn't found (a startup misconfiguration
+/// elsewhere would already have failed loudly) or its verifier reads its
+/// check from somewhere other than a header (e.g. a body field, or
+/// `context.transactionId`) — the console then just shows "protected
+/// (scheme name)" with no specific input to render.
+fn docs_ui_operation_json(op: &crate::openapi::Operation, security: &crate::security::SecurityConfig) -> serde_json::Value {
+    let parameters: Vec<serde_json::Value> = op
+        .parameters
+        .iter()
+        .map(|p| serde_json::json!({ "name": p.name, "in": p.location, "required": p.required, "type": p.schema_type }))
+        .collect();
+
+    let request_body = op.request_body.as_ref().map(|b| serde_json::json!({ "required": b.required, "schema": b.schema }));
+
+    let security_info = op.security.as_ref().map(|scheme_name| {
+        let header = security
+            .verifiers
+            .get(scheme_name)
+            .and_then(|v| v.def.parameters().iter().find(|p| p.from.starts_with("header.")))
+            .map(|p| p.from.trim_start_matches("header.").to_string());
+        serde_json::json!({ "scheme": scheme_name, "header": header })
+    });
+
+    serde_json::json!({
+        "method": op.method.to_uppercase(),
+        "path": op.path,
+        "operationId": op.operation_id,
+        "parameters": parameters,
+        "requestBody": request_body,
+        "successStatusCodes": op.response_status_codes,
+        "security": security_info,
+    })
+}
+
+/// Restricts `/docs` to the real TCP peer being loopback, for
+/// `DocsUiMode::Localhost`. Needs `ConnectInfo<SocketAddr>` in request
+/// extensions, which only exists when the listener was bound via
+/// `into_make_service_with_connect_info` (see `commands::run`'s
+/// `serve_http`/`serve_https`) — when it's missing entirely (a test router
+/// spawned the plain way, or in principle some future listener setup that
+/// forgets it), this fails **closed**: no `ConnectInfo` is treated the same
+/// as "not loopback," not "trust it." Same limitation `RateLimitConfig`'s
+/// own doc comment already accepts for per-client throttling: this looks at
+/// the raw connecting socket, not `X-Forwarded-For` — behind a reverse
+/// proxy, every request's peer is the proxy itself, so `localhost` mode
+/// would only actually admit the proxy, not the real remote client. There's
+/// no proxy-aware version of this today.
+async fn docs_ui_localhost_gate(req: Request, next: Next) -> Response {
+    let is_loopback = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .is_some_and(|axum::extract::ConnectInfo(addr)| addr.ip().is_loopback());
+
+    if is_loopback {
+        next.run(req).await
+    } else {
+        (StatusCode::FORBIDDEN, "the docs UI is restricted to localhost (config/server.json's docsUi.mode)").into_response()
+    }
+}
+
 /// Fixed histogram bucket upper bounds, in seconds — Prometheus' own
 /// default set, since there's no principled reason to pick different ones
 /// for a general-purpose server like this.
@@ -395,6 +574,22 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
+        });
+        addr
+    }
+
+    /// Same as `spawn`, but wired the way `commands::run::serve_http` really
+    /// wires it — with `ConnectInfo<SocketAddr>` available to extractors —
+    /// since a plain `spawn`'d router never populates it at all, which would
+    /// make `docs_ui_localhost_gate` fail closed for every request
+    /// regardless of the real (loopback) peer.
+    async fn spawn_with_connect_info(router: Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                .await
+                .unwrap();
         });
         addr
     }
@@ -737,5 +932,202 @@ mod tests {
 
         assert_eq!(response.status(), 200, "the route itself must still work with cors on but unconfigured");
         assert!(response.headers().get("access-control-allow-origin").is_none());
+    }
+
+    /// No security config, no openapi doc, no endpoint summaries — the
+    /// common empty case for the gating tests, which don't care about any
+    /// route's body.
+    fn no_docs_ui_state() -> (Option<Arc<crate::openapi::OpenApiDocument>>, Arc<crate::security::SecurityConfig>) {
+        (None, Arc::new(crate::security::SecurityConfig::default()))
+    }
+
+    #[tokio::test]
+    async fn docs_ui_public_mode_serves_the_route_with_no_gating() {
+        let (doc, security) = no_docs_ui_state();
+        let addr = spawn(docs_ui_router(crate::config::DocsUiMode::Public, "docs", doc, security, vec![])).await;
+        let response = reqwest::get(format!("http://{addr}/docs")).await.unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn docs_ui_page_serves_the_real_console_as_html() {
+        let (doc, security) = no_docs_ui_state();
+        let addr = spawn(docs_ui_router(crate::config::DocsUiMode::Public, "docs", doc, security, vec![])).await;
+        let response = reqwest::get(format!("http://{addr}/docs")).await.unwrap();
+        assert_eq!(response.headers().get("content-type").unwrap(), "text/html; charset=utf-8");
+        let body = response.text().await.unwrap();
+        assert!(body.contains("<!doctype html>"), "must be the real console, not the old placeholder text");
+        assert!(body.contains("operations.json"), "the page must actually fetch the operations endpoint");
+        assert!(body.contains("endpoints.json"), "the page must actually fetch the sanitized endpoint-config endpoint");
+    }
+
+    #[tokio::test]
+    async fn docs_ui_localhost_mode_admits_a_real_loopback_peer() {
+        let (doc, security) = no_docs_ui_state();
+        let addr = spawn_with_connect_info(docs_ui_router(crate::config::DocsUiMode::Localhost, "docs", doc, security, vec![])).await;
+        let response = reqwest::get(format!("http://{addr}/docs")).await.unwrap();
+        assert_eq!(response.status(), 200, "a real request from 127.0.0.1 must be recognized as loopback and admitted");
+    }
+
+    #[tokio::test]
+    async fn docs_ui_localhost_mode_fails_closed_when_connect_info_is_unavailable() {
+        // The plain `spawn` helper — no `ConnectInfo` in extensions at all,
+        // the same gap a misconfigured or forgotten `into_make_service`
+        // call site would produce. Must not be treated as "trust it."
+        let (doc, security) = no_docs_ui_state();
+        let addr = spawn(docs_ui_router(crate::config::DocsUiMode::Localhost, "docs", doc, security, vec![])).await;
+        let response = reqwest::get(format!("http://{addr}/docs")).await.unwrap();
+        assert_eq!(response.status(), 403);
+    }
+
+    #[tokio::test]
+    async fn docs_ui_path_is_configurable_and_normalizes_leading_and_trailing_slashes() {
+        let (doc, security) = no_docs_ui_state();
+        let addr = spawn(docs_ui_router(crate::config::DocsUiMode::Public, "/internal-docs/", doc, security, vec![])).await;
+
+        let page = reqwest::get(format!("http://{addr}/internal-docs")).await.unwrap();
+        assert_eq!(page.status(), 200);
+        let ops = reqwest::get(format!("http://{addr}/internal-docs/operations.json")).await.unwrap();
+        assert_eq!(ops.status(), 200);
+
+        let old_path = reqwest::get(format!("http://{addr}/docs")).await.unwrap();
+        assert_eq!(old_path.status(), 404, "the default path must not also be registered once a custom one is configured");
+    }
+
+    #[tokio::test]
+    async fn docs_ui_path_falls_back_to_docs_when_blank() {
+        let (doc, security) = no_docs_ui_state();
+        let addr = spawn(docs_ui_router(crate::config::DocsUiMode::Public, "   ", doc, security, vec![])).await;
+        let response = reqwest::get(format!("http://{addr}/docs")).await.unwrap();
+        assert_eq!(response.status(), 200);
+    }
+
+    fn temp_security_dir() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-docs-ui-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("verifiers")).unwrap();
+        root
+    }
+
+    /// A real `SecurityConfig::load` (not a hand-built struct — `verifier`
+    /// is a private module, and this exercises the actual parse path a
+    /// project's own `security/` directory goes through) with one
+    /// header-based scheme, `apiKeyAuth`, reading `header.X-Api-Key`.
+    fn security_config_with_one_header_scheme() -> crate::security::SecurityConfig {
+        let dir = temp_security_dir();
+        std::fs::write(dir.join("schemes.json"), r#"{ "apiKeyAuth": { "verifier": "api_key.json" } }"#).unwrap();
+        std::fs::write(
+            dir.join("verifiers/api_key.json"),
+            r#"{
+                "type": "sql",
+                "connection": "anydb",
+                "script": "SELECT 1",
+                "parameters": [{ "name": "key", "from": "header.X-Api-Key" }],
+                "validIf": "row.active = true"
+            }"#,
+        )
+        .unwrap();
+        crate::security::SecurityConfig::load(&dir).expect("a well-formed security dir should load")
+    }
+
+    fn sample_openapi_doc() -> crate::openapi::OpenApiDocument {
+        crate::openapi::OpenApiDocument {
+            operations: vec![crate::openapi::Operation {
+                path: "/cars/{id}".to_string(),
+                method: "get".to_string(),
+                operation_id: "getCar".to_string(),
+                response_schema: None,
+                parameters: vec![crate::openapi::ParameterInfo {
+                    name: "id".to_string(),
+                    location: "path".to_string(),
+                    required: true,
+                    schema_type: Some("string".to_string()),
+                }],
+                request_body: None,
+                response_status_codes: vec![200],
+                security: Some("apiKeyAuth".to_string()),
+            }],
+            component_schemas: serde_json::Map::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn operations_json_is_empty_when_no_openapi_document_was_loaded() {
+        let addr = spawn(docs_ui_router(
+            crate::config::DocsUiMode::Public,
+            "docs",
+            None,
+            Arc::new(crate::security::SecurityConfig::default()),
+            vec![],
+        ))
+        .await;
+        let body: serde_json::Value = reqwest::get(format!("http://{addr}/docs/operations.json")).await.unwrap().json().await.unwrap();
+        assert_eq!(body["operations"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn operations_json_describes_an_operation_and_resolves_its_security_header() {
+        let doc = Arc::new(sample_openapi_doc());
+        let security = Arc::new(security_config_with_one_header_scheme());
+        let addr = spawn(docs_ui_router(crate::config::DocsUiMode::Public, "docs", Some(doc), security, vec![])).await;
+
+        let body: serde_json::Value = reqwest::get(format!("http://{addr}/docs/operations.json")).await.unwrap().json().await.unwrap();
+        let op = &body["operations"][0];
+        assert_eq!(op["method"], "GET");
+        assert_eq!(op["path"], "/cars/{id}");
+        assert_eq!(op["operationId"], "getCar");
+        assert_eq!(op["parameters"][0]["name"], "id");
+        assert_eq!(op["parameters"][0]["in"], "path");
+        assert_eq!(op["parameters"][0]["required"], true);
+        assert_eq!(op["security"]["scheme"], "apiKeyAuth");
+        assert_eq!(
+            op["security"]["header"], "X-Api-Key",
+            "the header name must be resolved from the verifier's own parameters"
+        );
+    }
+
+    #[tokio::test]
+    async fn operations_json_never_exposes_a_verifiers_own_datasource_details() {
+        // The whole point of building this by hand (scheme name + header
+        // name only) rather than passing the verifier's `def` through
+        // wholesale: a SQL verifier's `connection`/`script` fields must
+        // never appear in this payload, security-relevant structure or not.
+        let doc = Arc::new(sample_openapi_doc());
+        let security = Arc::new(security_config_with_one_header_scheme());
+        let addr = spawn(docs_ui_router(crate::config::DocsUiMode::Public, "docs", Some(doc), security, vec![])).await;
+
+        let raw = reqwest::get(format!("http://{addr}/docs/operations.json")).await.unwrap().text().await.unwrap();
+        assert!(!raw.contains("anydb"), "the verifier's own connection name must never appear in the docs UI payload");
+        assert!(!raw.contains("SELECT 1"), "the verifier's own script must never appear in the docs UI payload");
+    }
+
+    #[tokio::test]
+    async fn endpoints_json_is_empty_when_no_summaries_were_computed() {
+        let (doc, security) = no_docs_ui_state();
+        let addr = spawn(docs_ui_router(crate::config::DocsUiMode::Public, "docs", doc, security, vec![])).await;
+        let body: serde_json::Value = reqwest::get(format!("http://{addr}/docs/endpoints.json")).await.unwrap().json().await.unwrap();
+        assert_eq!(body["endpoints"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn endpoints_json_serves_whatever_summaries_it_was_given() {
+        let (doc, security) = no_docs_ui_state();
+        let summary = serde_json::json!({ "method": "GET", "path": "/cars/{id}", "operationId": "getCar" });
+        let addr = spawn(docs_ui_router(crate::config::DocsUiMode::Public, "docs", doc, security, vec![summary.clone()])).await;
+        let body: serde_json::Value = reqwest::get(format!("http://{addr}/docs/endpoints.json")).await.unwrap().json().await.unwrap();
+        assert_eq!(body["endpoints"], serde_json::json!([summary]));
+    }
+
+    #[tokio::test]
+    async fn endpoints_json_is_gated_by_the_same_localhost_mode_as_the_page() {
+        let (doc, security) = no_docs_ui_state();
+        let addr = spawn(docs_ui_router(crate::config::DocsUiMode::Localhost, "docs", doc, security, vec![])).await;
+        let response = reqwest::get(format!("http://{addr}/docs/endpoints.json")).await.unwrap();
+        assert_eq!(response.status(), 403, "endpoints.json must be behind the same gate as the console page itself");
     }
 }

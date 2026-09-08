@@ -13,12 +13,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Full package only (both drivers, `--features sqlite` on top of the
-  # postgres default) — per-driver-combination legs were dropped since
-  # every driver's own logic is already covered by `sql::postgres`/
-  # `sql::sqlite`'s own unit tests regardless of which combination of
-  # features a given binary is built with; what's worth CI's time is
-  # proving the full package builds and passes on each OS.
+  # Default features only — sqlite is always compiled in regardless (a base
+  # feature, not optional; see Cargo.toml's `[features]` block), and
+  # postgres is on by default, so a plain `cargo build`/`cargo test` here
+  # already exercises the full package (both drivers) on each OS.
+  # Per-driver-combination legs were dropped since every driver's own logic
+  # is already covered by `sql::postgres`/`sql::sqlite`'s own unit tests
+  # regardless of which combination of features a given binary is built
+  # with; what's worth CI's time is proving the full package builds and
+  # passes on each OS.
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -35,10 +38,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --locked --features sqlite
+        run: cargo build --locked
 
       - name: Test
-        run: cargo test --locked --features sqlite
+        run: cargo test --locked
 
   # A real Postgres instance, exercised via the one `#[ignore]`d live-DB
   # test in src/sql/postgres.rs — Postgres service containers are a

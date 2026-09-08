@@ -4,7 +4,8 @@
 # never something a project should commit. Matters here because
 # examples/cars-demo is a sample *project* living inside this repo.
 .frogs/
-
+CLAUDE.md
+.claude/
 # Auto-generated migration snapshots from `frogs generate`'s backup-and-
 # migrate flow — a regenerable byproduct, not hand-authored example content.
 _backups/

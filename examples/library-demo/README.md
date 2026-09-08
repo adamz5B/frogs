@@ -14,7 +14,7 @@ once" feature end to end, not just side by side:
 ## Running it
 
 ```sh
-cargo build --features sqlite
+cargo build   # sqlite is always compiled in — no --features flag needed
 cd examples/library-demo
 ../../target/debug/frogs run
 ```

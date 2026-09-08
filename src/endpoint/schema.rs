@@ -90,6 +90,18 @@ pub struct ErrorOverride {
 pub enum ResponseShape {
     Array(ArrayResponse),
     Fields(HashMap<String, ResponseField>),
+    /// A bare JSON `null` for the *whole* `response` key — what
+    /// `frogs generate` writes for an operation with no declared response
+    /// schema at all (`stub_from_descriptor(Value::Null)`, e.g. a `200`
+    /// with no `content`), as opposed to a schema whose individual fields
+    /// are each null (that case is `Fields` with `ResponseField::Null`
+    /// entries, already handled). Without this variant, exactly that class
+    /// of fresh, unedited stub fails to parse at all — the route is never
+    /// registered, not even reachable to hit the `_generated: true` → `501`
+    /// gate, silently 404ing instead. Treated identically to an empty
+    /// `Fields` map everywhere this is matched (`resolve::build_response`,
+    /// `docs_summary::response_shape_json`).
+    Null,
 }
 
 /// `cardinality: "many"`'s response counterpart: `source` names the
@@ -384,6 +396,28 @@ mod tests {
         };
         assert!(matches!(response["maker"], ResponseField::Null));
         assert!(matches!(response["year"], ResponseField::Null));
+    }
+
+    /// The other half of the same class of bug: an operation with *no
+    /// declared response schema at all* (e.g. a `200` with no `content`)
+    /// makes `frogs generate` write a bare top-level `"response": null` —
+    /// distinct from the per-field-null case above, and previously unfixed:
+    /// `ResponseShape`'s untagged enum had no variant a bare `null` could
+    /// match at all, so this exact class of fresh stub failed to parse,
+    /// silently 404ing instead of even reaching the `_generated` → `501`
+    /// gate. Found live while building the docs UI's endpoint-config
+    /// summary (`endpoint::docs_summary`), which hit exactly this shape.
+    #[test]
+    fn a_bare_null_top_level_response_parses_as_a_generated_stub_with_no_response_schema_would_write_it() {
+        let json = r#"{
+            "operationId": "ping",
+            "_generated": true,
+            "_todo": "fill me in",
+            "sources": {},
+            "response": null
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).expect("a fresh frogs-generate stub for a no-response-schema operation must parse");
+        assert!(matches!(endpoint.response, ResponseShape::Null));
     }
 
     #[test]

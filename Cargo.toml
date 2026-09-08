@@ -15,9 +15,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
-sqlx = { version = "0.8", optional = true, default-features = false, features = [
+# `sqlite` is a base feature, not optional/toggleable — every build always
+# carries the SQLite driver (see `[features]` below for why). `postgres`
+# remains the only opt-in sub-feature, added on top by that feature.
+sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "chrono",
+    "sqlite",
 ] }
 # rustls (not native-tls/openssl) to stay consistent with the sqlx driver
 # choice and avoid pulling in a second TLS stack — matters for binary size.
@@ -55,13 +59,15 @@ rcgen = "0.13"
 
 [features]
 default = ["postgres"]
-# Compile-time driver selection, per the design doc's "fast and lightweight"
-# priority: a binary only carries the SQL drivers it was actually built with.
-# Each feature pulls in `sqlx` plus only the sub-feature it actually needs —
-# enabling both just unifies into one binary carrying both drivers, same as
-# the doc's "server-full" build; enabling neither drops `sqlx` entirely.
-postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/tls-rustls"]
-sqlite = ["dep:sqlx", "sqlx/sqlite"]
+# SQLite is always compiled in (see `sqlx`'s own dependency entry above) —
+# no build of this binary lacks it, `--no-default-features` included. The
+# only remaining compile-time choice is whether Postgres support is *also*
+# built in; a future pass is expected to drop this distinction entirely and
+# always build every driver (see docs/frogs-quick-wins.md's history for
+# context), but for now `postgres` stays an explicit opt-in on top of the
+# SQLite baseline, same as the design doc's "server-full" build already
+# meant "both."
+postgres = ["sqlx/postgres", "sqlx/tls-rustls"]
 
 [profile.release]
 opt-level = "z"     # optimize for size over speed

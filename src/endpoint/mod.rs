@@ -1,3 +1,4 @@
+mod docs_summary;
 mod error;
 mod format;
 mod request_validation;
@@ -27,6 +28,7 @@ use serde_json::{Map, Value};
 /// `resolve_sources` consumes (test-file `mocks` deserialize directly into
 /// it, see `endpoint::resolve::MockOutcome`, rather than a separate parsed
 /// copy `testing` would otherwise have to convert).
+pub(crate) use docs_summary::endpoint_summaries;
 pub(crate) use resolve::MockOutcome;
 pub(crate) use schema::EndpointFile;
 use schema::ErrorOverride;

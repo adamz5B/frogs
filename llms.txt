@@ -168,7 +168,10 @@ real traffic for this endpoint — every request gets `501` with `_todo`'s
 own text as `detail`, before security, request validation, or any source
 runs. Delete both fields (or set `_generated: false`) once the file is
 actually filled in — nothing does this for you automatically once you've
-hand-edited the file.
+hand-edited the file. A fresh stub's `response` is either an object of
+per-field `null`s (a response schema exists, nothing's mapped yet) or a
+bare top-level `null` (no response schema at all, e.g. a `200` with no
+`content`) — both parse cleanly and both reach the `501` gate above.
 
 **`sources`**: a map of arbitrary source names to either:
 - `"type": "sql"` — `connection` (a key in `connections.json`), `script`
@@ -366,6 +369,7 @@ templating every other value uses.
   "discoveredErrorsWarnThreshold": 20,
   "rateLimit": { "requestsPerSecond": 20, "burst": 40 },
   "cors": { "allowedOrigins": [] },
+  "docsUi": { "mode": "off" },
   "tls": {
     "mode": "off",
     "manual": { "certPath": "config/cert.pem", "keyPath": "config/key.pem" }
@@ -409,6 +413,41 @@ with defaults on first run, so in practice it always exists.
   the CORS header a browser needs to expose that response to JS. No
   credentialed-CORS support — frogs' auth types are all header-based, never
   cookies.
+- `docsUi.mode` (default `"off"`) + `docsUi.path` (default `"docs"`): not a
+  `features` bool — its own mode, same shape as `tls.mode`. `"off"`: the
+  console's routes aren't registered at all. `"localhost"`: registered, but
+  gated to the real TCP peer being loopback (checks the actual connecting
+  socket, not `X-Forwarded-For`/`Host` — un-spoofable by a client, but also
+  not proxy-aware: behind a reverse proxy it only ever sees the proxy's own
+  address). `"public"`: no gating. `path` is the mount segment (renameable,
+  e.g. `"internal-docs"`) — leading/trailing slashes and blank tolerated the
+  same lenient way `apiRoot` is, normalized at mount time
+  (`server::normalize_docs_ui_path`), falling back to `"docs"` if blank.
+  `/<path>` serves the real console: a single embedded HTML/CSS/vanilla-JS
+  page (`src/server/docs_ui.html`, `include_str!`'d in — no framework, no
+  CDN, no file read at request time), an operation sidebar, a detail pane
+  with parameter/body inputs and a "Try it out" button that fires a real
+  request at the running server, and a Configuration panel (when a matching
+  endpoint file exists) showing that endpoint's own sanitized `sources`/
+  response mapping. It derives *both* the API's own `apiRoot` prefix and its
+  own `path` purely from `window.location.pathname` client-side (strip its
+  own last segment for the former, use its own full path for the latter),
+  so the file is a byte-for-byte constant regardless of either setting.
+  `/<path>/operations.json` (gated the same): a structural summary of every
+  openapi.yaml operation (method, path, operationId, parameters, request
+  body schema, success codes) plus, for a protected operation, its security
+  scheme name and — when the guarding verifier reads from a header — that
+  header's *name* (never a value: `HttpAuth`/`VerifierDef` never store real
+  secrets, only env-var names). Also returns `componentSchemas` (raw
+  `components/schemas`, `$ref`s unresolved). `/<path>/endpoints.json`
+  (gated the same): every discovered endpoint file's own sanitized
+  `sources`/response mapping, built via `endpoint::docs_summary` through an
+  explicit allowlist — a SQL source's `connection`/`script` are shown in
+  full (query text, not a credential); an HTTP source shows only its
+  `request` filename, never its referenced file's `url`/`body`/`auth`
+  (deliberately not resolved/inlined). `generated: true` flags an unedited
+  `frogs generate` stub. A file that fails to parse is silently skipped
+  from this list.
 - `tls.mode`: `"off"` (default) or `"manual"` (serves HTTPS via
   `rustls` from a user-supplied PEM cert/key pair — `certPath`/`keyPath`
   resolve relative to `api/`). `"acme"` is designed but **not implemented** —

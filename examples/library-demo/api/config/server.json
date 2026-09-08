@@ -11,5 +11,6 @@
   "autoMigrateEndpoints": true,
   "discoveredErrorsWarnThreshold": 20,
   "port": 8080,
-  "apiRoot": "/api"
+  "apiRoot": "/api",
+  "docsUi": { "mode": "public" }
 }

@@ -536,6 +536,11 @@ pub fn build_response(endpoint: &EndpointFile, resolved: &ResolvedSources) -> Va
     match &endpoint.response {
         ResponseShape::Fields(fields) => build_fields(fields, resolved),
         ResponseShape::Array(array) => build_array(array, resolved),
+        // A bare top-level `null` — an unmapped, no-response-schema stub.
+        // In practice `_generated: true` already gates this at `501`
+        // before response-building ever runs, but the empty object is the
+        // honest answer if this were ever reached some other way.
+        ResponseShape::Null => Value::Object(Map::new()),
     }
 }
 
@@ -866,6 +871,41 @@ mod tests {
         let body = build_response(&endpoint, &resolved);
         assert_eq!(body["maker"], Value::Null, "an unresolvable dot-path is null too, for a different reason");
         assert_eq!(body["year"], Value::Null, "a bare null field is null because there's nothing mapped at all");
+    }
+
+    /// The other half of the same class of stub: `ResponseShape::Null`
+    /// (the whole `response` key is a bare JSON `null`, not an object of
+    /// null fields) — `_generated: true` already gates this at `501`
+    /// before response-building ever runs in practice, but this is the
+    /// honest fallback if it were ever reached, and proves the new variant
+    /// doesn't panic `build_response`'s match.
+    #[tokio::test]
+    async fn a_bare_null_top_level_response_renders_as_an_empty_object() {
+        let json = r#"{ "operationId": "ping", "sources": {}, "response": null }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+
+        let root = temp_project_root();
+        let client = reqwest::Client::new();
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("an endpoint with no sources at all should resolve trivially");
+
+        let body = build_response(&endpoint, &resolved);
+        assert_eq!(body, serde_json::json!({}));
     }
 
     #[test]

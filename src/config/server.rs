@@ -101,6 +101,55 @@ pub struct TlsConfig {
     pub manual: Option<ManualTlsConfig>,
 }
 
+/// Visibility for the docs UI console (`/docs`) — modeled as its own mode
+/// enum, the same shape as `TlsMode`, rather than a `features.docsUi` bool
+/// plus a separate visibility setting, since "off" is already one of the
+/// modes: `off` (default — the routes aren't even registered, not just
+/// hidden behind a check, same posture `readyz`/`metrics` have when their
+/// own feature is off), `localhost` (registered, but gated to the real TCP
+/// peer being loopback — see `server::docs_ui_localhost_gate`'s doc comment
+/// for what that does and doesn't cover), or `public` (no gating at all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DocsUiMode {
+    #[default]
+    Off,
+    Localhost,
+    Public,
+}
+
+fn default_docs_ui_path() -> String {
+    "docs".to_string()
+}
+
+/// `config/server.json`'s `docsUi` block — a wrapper struct (matching
+/// `CorsConfig`/`TlsConfig`'s shape even though they started single-field
+/// too) rather than putting `DocsUiMode` directly on `ServerConfig`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocsUiConfig {
+    #[serde(default)]
+    pub mode: DocsUiMode,
+    /// The path segment `/docs` mounts under — `"docs"` by default (and
+    /// when the field is absent entirely), but a project can rename it
+    /// (e.g. `"internal-docs"`) for its own reasons. Stored raw, exactly as
+    /// written in the file — leading/trailing slashes and blank values are
+    /// tolerated the same lenient way `apiRoot` is, but only normalized at
+    /// mount time (`server::normalize_docs_ui_path`), not here, matching
+    /// `apiRoot`'s own "store raw, normalize at the point of use" split.
+    #[serde(default = "default_docs_ui_path")]
+    pub path: String,
+}
+
+impl Default for DocsUiConfig {
+    fn default() -> Self {
+        DocsUiConfig {
+            mode: DocsUiMode::default(),
+            path: default_docs_ui_path(),
+        }
+    }
+}
+
 /// Independently toggleable capabilities — none of them imply a deployment
 /// "mode"; a monolith and a split-out microservice both just pick whichever
 /// of these they need. `metrics`/`readyzCheck`/`requestCorrelation` and
@@ -168,6 +217,9 @@ pub struct ServerConfig {
     /// `CorsConfig`'s own doc comment.
     #[serde(default)]
     pub cors: CorsConfig,
+    /// `off` by default — see `DocsUiMode`'s own doc comment.
+    #[serde(default)]
+    pub docs_ui: DocsUiConfig,
     /// Off by default — see `TlsMode`'s doc comment. When `manual`, `frogs
     /// run` serves HTTPS via `axum-server`'s rustls acceptor instead of
     /// plain HTTP, using this same field's `manual.certPath`/`keyPath`.
@@ -196,6 +248,7 @@ impl Default for ServerConfig {
             discovered_errors_warn_threshold: 20,
             rate_limit: RateLimitConfig::default(),
             cors: CorsConfig::default(),
+            docs_ui: DocsUiConfig::default(),
             tls: TlsConfig::default(),
             port: 8080,
             api_root: String::new(),
@@ -251,6 +304,43 @@ mod tests {
         let config: ServerConfig = serde_json::from_str(r#"{ "features": { "cors": true }, "cors": { "allowedOrigins": ["https://example.com"] } }"#).unwrap();
         assert!(config.features.cors);
         assert_eq!(config.cors.allowed_origins, vec!["https://example.com".to_string()]);
+    }
+
+    #[test]
+    fn docs_ui_defaults_to_off_when_absent_from_the_file() {
+        let config: ServerConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.docs_ui.mode, DocsUiMode::Off);
+    }
+
+    #[test]
+    fn docs_ui_mode_is_read_as_camel_case() {
+        let config: ServerConfig = serde_json::from_str(r#"{ "docsUi": { "mode": "localhost" } }"#).unwrap();
+        assert_eq!(config.docs_ui.mode, DocsUiMode::Localhost);
+    }
+
+    #[test]
+    fn docs_ui_mode_public_parses() {
+        let config: ServerConfig = serde_json::from_str(r#"{ "docsUi": { "mode": "public" } }"#).unwrap();
+        assert_eq!(config.docs_ui.mode, DocsUiMode::Public);
+    }
+
+    #[test]
+    fn docs_ui_mode_rejects_an_unknown_value_rather_than_falling_back_to_off() {
+        let err = serde_json::from_str::<ServerConfig>(r#"{ "docsUi": { "mode": "everyone" } }"#)
+            .expect_err("an unrecognized docsUi.mode must fail to parse, not silently disable the feature");
+        assert!(err.to_string().to_lowercase().contains("unknown variant"));
+    }
+
+    #[test]
+    fn docs_ui_path_defaults_to_docs_when_absent_from_the_file() {
+        let config: ServerConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.docs_ui.path, "docs");
+    }
+
+    #[test]
+    fn docs_ui_path_is_read_as_written_with_no_normalization_at_parse_time() {
+        let config: ServerConfig = serde_json::from_str(r#"{ "docsUi": { "path": "/internal-docs/" } }"#).unwrap();
+        assert_eq!(config.docs_ui.path, "/internal-docs/", "normalization happens at mount time, not here");
     }
 
     #[test]

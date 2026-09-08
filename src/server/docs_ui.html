@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>frogs docs</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f8;
+    --panel: #ffffff;
+    --border: #e2e2e6;
+    --text: #1b1b1f;
+    --muted: #6b6b74;
+    --accent: #2f6fed;
+    --code-bg: #f2f2f5;
+    --get: #2f6fed;
+    --post: #1a9e6b;
+    --put: #d98d1a;
+    --patch: #8a4fd6;
+    --delete: #d0393e;
+    --ok: #1a9e6b;
+    --err: #d0393e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181c;
+      --panel: #1f2025;
+      --border: #2c2d33;
+      --text: #e8e8ea;
+      --muted: #9a9aa2;
+      --code-bg: #26272d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    height: 100vh;
+  }
+  aside {
+    width: 300px;
+    flex-shrink: 0;
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+    background: var(--panel);
+  }
+  aside h1 {
+    font-size: 15px;
+    margin: 0;
+    padding: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .op-item {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    padding: 10px 16px;
+    cursor: pointer;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    border-left: 3px solid transparent;
+  }
+  .op-item:hover { background: var(--code-bg); }
+  .op-item.active { background: var(--code-bg); border-left-color: var(--accent); }
+  .method-badge {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: white;
+    min-width: 46px;
+    text-align: center;
+    flex-shrink: 0;
+  }
+  .method-get { background: var(--get); }
+  .method-post { background: var(--post); }
+  .method-put { background: var(--put); }
+  .method-patch { background: var(--patch); }
+  .method-delete { background: var(--delete); }
+  .op-path {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  main {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px 32px;
+  }
+  .empty, .hint { color: var(--muted); }
+  .empty { padding: 16px; font-size: 13px; }
+  h2 {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    margin-bottom: 2px;
+  }
+  .op-id { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  section { margin-top: 24px; }
+  section h3 {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }
+  .field-row { display: grid; grid-template-columns: 180px 1fr; gap: 10px; align-items: center; margin-bottom: 8px; }
+  .field-row label {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+    overflow-wrap: anywhere;
+  }
+  .field-row input, textarea {
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--panel);
+    color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+  }
+  .required { color: var(--err); }
+  textarea {
+    width: 100%;
+    min-height: 140px;
+    padding: 10px;
+    background: var(--code-bg);
+    resize: vertical;
+  }
+  button {
+    margin-top: 18px;
+    padding: 8px 18px;
+    border: none;
+    border-radius: 6px;
+    background: var(--accent);
+    color: white;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover { opacity: .9; }
+  pre {
+    background: var(--code-bg);
+    padding: 12px;
+    border-radius: 6px;
+    overflow-x: auto;
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .status-pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; color: white; }
+  .status-ok { background: var(--ok); }
+  .status-err { background: var(--err); }
+  .generated-pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+    color: white;
+    background: var(--put);
+    margin-left: 10px;
+    vertical-align: middle;
+  }
+  .source-card {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+    background: var(--panel);
+  }
+  .source-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .source-name { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 600; }
+  .source-type {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .03em;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 6px;
+  }
+  .source-detail { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  .source-card pre { margin: 0 0 8px; }
+  table.mapping-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.mapping-table td {
+    padding: 5px 8px;
+    border-bottom: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  table.mapping-table td.arrow { color: var(--muted); font-family: inherit; width: 1%; white-space: nowrap; }
+</style>
+</head>
+<body>
+<aside>
+  <h1>frogs — API docs</h1>
+  <div id="op-list"><p class="empty">Loading…</p></div>
+</aside>
+<main id="main"><p class="empty">Select an operation on the left.</p></main>
+<script>
+(function () {
+  "use strict";
+
+  // This console's own mount path (`docsUi.path`, "docs" by default, but
+  // configurable) and the API's `apiRoot` prefix are both derived from the
+  // page's own URL, purely structurally — no hardcoded "docs" string, no
+  // templating needed at serve time, so this file stays a byte-for-byte
+  // constant no matter what either setting is configured to. `docsRoot` is
+  // this page's own full path (e.g. "/api/internal-docs"); `apiBase` is
+  // everything before its last segment (e.g. "/api") — the prefix the real
+  // API routes (and this page's own operations.json/endpoints.json) live
+  // under.
+  var docsRoot = window.location.pathname.replace(/\/$/, "");
+  var apiBase = docsRoot.substring(0, docsRoot.lastIndexOf("/"));
+
+  var state = { operations: [], componentSchemas: {}, endpointsByKey: {} };
+
+  Promise.all([
+    fetch(docsRoot + "/operations.json").then(function (r) { return r.json(); }),
+    fetch(docsRoot + "/endpoints.json").then(function (r) { return r.json(); }),
+  ])
+    .then(function (results) {
+      var operationsData = results[0];
+      var endpointsData = results[1];
+      state.operations = operationsData.operations || [];
+      state.componentSchemas = operationsData.componentSchemas || {};
+      (endpointsData.endpoints || []).forEach(function (e) {
+        state.endpointsByKey[e.method + " " + e.path] = e;
+      });
+      renderList();
+      if (state.operations.length) selectOp(0);
+    })
+    .catch(function (e) {
+      document.getElementById("op-list").innerHTML =
+        '<p class="empty">failed to load: ' + escapeHtml(String(e)) + "</p>";
+    });
+
+  function renderList() {
+    var list = document.getElementById("op-list");
+    if (!state.operations.length) {
+      list.innerHTML = '<p class="empty">No operations found in openapi.yaml.</p>';
+      return;
+    }
+    list.innerHTML = "";
+    state.operations.forEach(function (op, i) {
+      var item = document.createElement("div");
+      item.className = "op-item";
+      item.innerHTML =
+        '<span class="method-badge method-' + op.method.toLowerCase() + '">' + escapeHtml(op.method) + "</span>" +
+        '<span class="op-path">' + escapeHtml(op.path) + "</span>";
+      item.addEventListener("click", function () { selectOp(i); });
+      list.appendChild(item);
+    });
+  }
+
+  function selectOp(i) {
+    document.querySelectorAll(".op-item").forEach(function (el, idx) {
+      el.classList.toggle("active", idx === i);
+    });
+    renderDetail(state.operations[i]);
+  }
+
+  function renderDetail(op) {
+    var main = document.getElementById("main");
+    main.innerHTML = "";
+    var summary = state.endpointsByKey[op.method + " " + op.path];
+
+    var h2 = document.createElement("h2");
+    h2.innerHTML = '<span class="method-badge method-' + op.method.toLowerCase() + '">' + escapeHtml(op.method) + "</span>" + escapeHtml(op.path) +
+      (summary && summary.generated ? '<span class="generated-pill">stub — not yet implemented</span>' : "");
+    main.appendChild(h2);
+
+    var opId = document.createElement("div");
+    opId.className = "op-id";
+    opId.textContent = op.operationId;
+    main.appendChild(opId);
+
+    if (summary) main.appendChild(renderConfigSection(summary));
+
+    if (op.security) {
+      var secSection = document.createElement("section");
+      secSection.innerHTML = "<h3>Security — " + escapeHtml(op.security.scheme) + "</h3>";
+      if (op.security.header) {
+        secSection.appendChild(fieldRow("security:header", op.security.header, false));
+        var secHint = document.createElement("p");
+        secHint.className = "hint";
+        secHint.textContent = "Paste your own credential here to test — nothing here is stored or sent anywhere except this one request.";
+        secSection.appendChild(secHint);
+      } else {
+        var p = document.createElement("p");
+        p.className = "hint";
+        p.textContent = "This operation is protected, but its verifier doesn't read from a request header — there's no field to fill in here.";
+        secSection.appendChild(p);
+      }
+      main.appendChild(secSection);
+    }
+
+    var byLocation = { path: [], query: [], header: [] };
+    (op.parameters || []).forEach(function (p) {
+      if (!byLocation[p.in]) byLocation[p.in] = [];
+      byLocation[p.in].push(p);
+    });
+
+    ["path", "query", "header"].forEach(function (loc) {
+      if (!byLocation[loc] || !byLocation[loc].length) return;
+      var section = document.createElement("section");
+      section.innerHTML = "<h3>" + loc + " parameters</h3>";
+      byLocation[loc].forEach(function (p) {
+        section.appendChild(fieldRow("param:" + loc + ":" + p.name, p.name, p.required));
+      });
+      main.appendChild(section);
+    });
+
+    if (op.requestBody) {
+      var bodySection = document.createElement("section");
+      bodySection.innerHTML = "<h3>Request body" + (op.requestBody.required ? ' <span class="required">*</span>' : "") + "</h3>";
+      var textarea = document.createElement("textarea");
+      textarea.id = "field-body";
+      textarea.value = JSON.stringify(exampleFromSchema(op.requestBody.schema, 0), null, 2);
+      bodySection.appendChild(textarea);
+      main.appendChild(bodySection);
+    }
+
+    var tryButton = document.createElement("button");
+    tryButton.textContent = "Try it out";
+    tryButton.addEventListener("click", function () { runTryItOut(op, byLocation); });
+    main.appendChild(tryButton);
+
+    var responseSection = document.createElement("section");
+    responseSection.id = "response-section";
+    main.appendChild(responseSection);
+  }
+
+  // This endpoint's own internal `sources`/response mapping — frogs-
+  // specific detail no generic OpenAPI viewer could show, sourced from
+  // `/docs/endpoints.json` (see `endpoint::docs_summary` server-side for
+  // exactly what's allowlisted into that payload and why it's safe).
+  function renderConfigSection(summary) {
+    var section = document.createElement("section");
+    section.innerHTML = "<h3>Configuration</h3>";
+
+    var sourceNames = Object.keys(summary.sources || {});
+    if (sourceNames.length) {
+      var sourcesLabel = document.createElement("div");
+      sourcesLabel.className = "hint";
+      sourcesLabel.style.marginBottom = "8px";
+      sourcesLabel.textContent = "Sources";
+      section.appendChild(sourcesLabel);
+      sourceNames.forEach(function (name) {
+        section.appendChild(renderSourceCard(name, summary.sources[name]));
+      });
+    }
+
+    var responseLabel = document.createElement("div");
+    responseLabel.className = "hint";
+    responseLabel.style.marginTop = "14px";
+    responseLabel.style.marginBottom = "8px";
+    responseLabel.textContent = "Response mapping";
+    section.appendChild(responseLabel);
+    section.appendChild(renderResponseMapping(summary.response));
+
+    return section;
+  }
+
+  function renderSourceCard(name, source) {
+    var card = document.createElement("div");
+    card.className = "source-card";
+
+    var head = document.createElement("div");
+    head.className = "source-head";
+    head.innerHTML = '<span class="source-name">' + escapeHtml(name) + '</span><span class="source-type">' + escapeHtml(source.type) + "</span>";
+    card.appendChild(head);
+
+    var detailParts = [];
+    if (source.type === "sql") detailParts.push("connection: " + source.connection);
+    if (source.type === "http") detailParts.push("request: " + source.request);
+    detailParts.push("cardinality: " + source.cardinality);
+    if (source.optional) detailParts.push("optional");
+    if (source.onError !== null && source.onError !== undefined) detailParts.push("onError: " + source.onError);
+    var detail = document.createElement("div");
+    detail.className = "source-detail";
+    detail.textContent = detailParts.join(" · ");
+    card.appendChild(detail);
+
+    if (source.type === "sql" && source.script) {
+      var pre = document.createElement("pre");
+      pre.textContent = source.script;
+      card.appendChild(pre);
+    }
+
+    if (source.parameters && source.parameters.length) {
+      var params = document.createElement("div");
+      params.className = "hint";
+      params.textContent = "parameters: " + source.parameters.map(function (p) { return p.name + " ← " + p.from; }).join(", ");
+      card.appendChild(params);
+    }
+
+    return card;
+  }
+
+  function renderResponseMapping(response) {
+    if (!response) {
+      var none = document.createElement("p");
+      none.className = "hint";
+      none.textContent = "no response mapping";
+      return none;
+    }
+
+    var table = document.createElement("table");
+    table.className = "mapping-table";
+
+    if (response.kind === "array") {
+      table.appendChild(mappingRow("(array)", "← " + response.source));
+      Object.keys(response.items || {}).forEach(function (name) {
+        table.appendChild(mappingRow(name, fieldMappingText(response.items[name])));
+      });
+    } else {
+      var fields = response.fields || {};
+      if (!Object.keys(fields).length) {
+        var emptyRow = document.createElement("p");
+        emptyRow.className = "hint";
+        emptyRow.textContent = "no fields mapped yet";
+        return emptyRow;
+      }
+      Object.keys(fields).forEach(function (name) {
+        table.appendChild(mappingRow(name, fieldMappingText(fields[name])));
+      });
+    }
+
+    return table;
+  }
+
+  function fieldMappingText(field) {
+    if (!field) return "(unmapped)";
+    if (field.kind === "array") return "← " + field.source + " (array)";
+    if (field.from === null || field.from === undefined) return "(unmapped)";
+    var text = "← " + field.from;
+    if (field.format) text += " (" + field.format + ")";
+    return text;
+  }
+
+  function mappingRow(name, text) {
+    var row = document.createElement("tr");
+    var nameCell = document.createElement("td");
+    nameCell.textContent = name;
+    var arrowCell = document.createElement("td");
+    arrowCell.className = "arrow";
+    arrowCell.textContent = text;
+    row.appendChild(nameCell);
+    row.appendChild(arrowCell);
+    return row;
+  }
+
+  function fieldRow(id, label, required) {
+    var row = document.createElement("div");
+    row.className = "field-row";
+    row.innerHTML = "<label>" + escapeHtml(label) + (required ? ' <span class="required">*</span>' : "") + "</label>";
+    var input = document.createElement("input");
+    input.type = "text";
+    input.id = "field-" + id;
+    row.appendChild(input);
+    return row;
+  }
+
+  function fieldValue(id) {
+    var el = document.getElementById("field-" + id);
+    return el ? el.value : "";
+  }
+
+  function resolveSchema(schema) {
+    if (schema && schema["$ref"]) {
+      var name = String(schema["$ref"]).split("/").pop();
+      return state.componentSchemas[name] || {};
+    }
+    return schema || {};
+  }
+
+  // Not a real JSON Schema example generator — just enough to hand "Try it
+  // out" a plausible starting shape to edit, not a faithfully valid
+  // instance. Depth-capped rather than cycle-tracked: good enough for a
+  // client-side convenience prefill, and simpler than proper cycle
+  // detection for something the user is expected to edit anyway.
+  function exampleFromSchema(schema, depth) {
+    if (depth > 6) return null;
+    schema = resolveSchema(schema);
+    if (schema.example !== undefined) return schema.example;
+    if (schema.default !== undefined) return schema.default;
+    if (schema.enum && schema.enum.length) return schema.enum[0];
+    switch (schema.type) {
+      case "object": {
+        var obj = {};
+        var props = schema.properties || {};
+        Object.keys(props).forEach(function (key) {
+          obj[key] = exampleFromSchema(props[key], depth + 1);
+        });
+        return obj;
+      }
+      case "array":
+        return [exampleFromSchema(schema.items || {}, depth + 1)];
+      case "string":
+        return "";
+      case "integer":
+      case "number":
+        return 0;
+      case "boolean":
+        return false;
+      default:
+        return schema.properties ? exampleFromSchema(Object.assign({ type: "object" }, schema), depth + 1) : null;
+    }
+  }
+
+  function runTryItOut(op, byLocation) {
+    var path = op.path;
+    byLocation.path.forEach(function (p) {
+      path = path.replace("{" + p.name + "}", encodeURIComponent(fieldValue("param:path:" + p.name)));
+    });
+
+    var query = [];
+    byLocation.query.forEach(function (p) {
+      var v = fieldValue("param:query:" + p.name);
+      if (v !== "") query.push(encodeURIComponent(p.name) + "=" + encodeURIComponent(v));
+    });
+
+    var headers = {};
+    byLocation.header.forEach(function (p) {
+      var v = fieldValue("param:header:" + p.name);
+      if (v !== "") headers[p.name] = v;
+    });
+    if (op.security && op.security.header) {
+      var secVal = fieldValue("security:header");
+      if (secVal !== "") headers[op.security.header] = secVal;
+    }
+
+    var init = { method: op.method, headers: headers };
+
+    if (op.requestBody) {
+      var raw = document.getElementById("field-body").value;
+      try {
+        JSON.parse(raw);
+      } catch (e) {
+        renderResponseError("request body is not valid JSON: " + e.message);
+        return;
+      }
+      headers["Content-Type"] = "application/json";
+      init.body = raw;
+    }
+
+    var url = apiBase + path + (query.length ? "?" + query.join("&") : "");
+    var started = performance.now();
+    fetch(url, init)
+      .then(function (res) {
+        var elapsed = Math.round(performance.now() - started);
+        return res.text().then(function (text) { return { res: res, text: text, elapsed: elapsed }; });
+      })
+      .then(function (result) { renderResponse(result.res, result.text, result.elapsed); })
+      .catch(function (e) { renderResponseError("request failed: " + e.message); });
+  }
+
+  function renderResponse(res, text, elapsed) {
+    var section = document.getElementById("response-section");
+    var pretty = text;
+    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch (e) { /* not JSON — show raw text */ }
+    section.innerHTML =
+      "<h3>Response</h3>" +
+      '<p><span class="status-pill ' + (res.ok ? "status-ok" : "status-err") + '">' + res.status + " " + escapeHtml(res.statusText) + "</span>" +
+      ' <span class="hint">' + elapsed + "ms</span></p>" +
+      "<pre>" + escapeHtml(pretty) + "</pre>";
+  }
+
+  function renderResponseError(message) {
+    var section = document.getElementById("response-section");
+    section.innerHTML = '<h3>Response</h3><p><span class="status-pill status-err">error</span></p><pre>' + escapeHtml(message) + "</pre>";
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+})();
+</script>
+</body>
+</html>

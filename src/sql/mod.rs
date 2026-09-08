@@ -1,6 +1,7 @@
 #[cfg(feature = "postgres")]
 pub mod postgres;
-#[cfg(feature = "sqlite")]
+// Always compiled in — SQLite is a base feature, not optional. See
+// Cargo.toml's `[features]` block.
 pub mod sqlite;
 
 use std::collections::HashMap;
@@ -128,7 +129,6 @@ async fn connect_one(name: &str, conn: &ConnectionConfig) -> Result<Box<dyn SqlD
     match conn.driver.as_str() {
         #[cfg(feature = "postgres")]
         "postgres" => Ok(Box::new(postgres::PostgresDriver::connect(conn).await?)),
-        #[cfg(feature = "sqlite")]
         "sqlite" => Ok(Box::new(sqlite::SqliteDriver::connect(conn).await?)),
         other => Err(SqlError::ConnectionFailed(format!(
             "connection '{name}' uses driver '{other}', which isn't compiled into this binary \
