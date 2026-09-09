@@ -105,6 +105,34 @@ pub fn json_value_to_sql_value(value: &Value) -> SqlValue {
     }
 }
 
+/// The pool size both drivers actually configure (see `postgres.rs`/
+/// `sqlite.rs`'s own `.max_connections(...)` calls) — pulled out to one
+/// named constant so `pool_capacity`'s ceiling reasoning below can't
+/// silently drift out of sync with what a real connection really gets.
+pub const DEFAULT_POOL_MAX_CONNECTIONS: u32 = 5;
+
+/// The real pool capacity `connect_one` would give this connection,
+/// without actually connecting — used by `endpoint::validate_nested_many`'s
+/// `maxConcurrency` ceiling so a nested-many source can't be configured to
+/// claim more concurrent connections than its own connection's pool could
+/// ever satisfy. `None` for a driver this binary doesn't recognize at all;
+/// callers skip that specific check in that case (see `validate_nested_many`'s
+/// own doc comment — the same "unknown connection" gap already exists
+/// elsewhere and isn't newly invented here).
+pub fn pool_capacity(conn: &ConnectionConfig) -> Option<u32> {
+    match conn.driver.as_str() {
+        "sqlite" => {
+            // Mirrors `sqlite::SqliteDriver::connect`'s own in-memory
+            // special case exactly — a `:memory:` database is pinned to
+            // exactly one real connection, regardless of this constant.
+            let is_memory = conn.settings.get("database").and_then(|v| v.as_str()) == Some(":memory:");
+            Some(if is_memory { 1 } else { DEFAULT_POOL_MAX_CONNECTIONS })
+        }
+        "postgres" => Some(DEFAULT_POOL_MAX_CONNECTIONS),
+        _ => None,
+    }
+}
+
 /// The internal abstraction boundary every compiled-in driver adapts to.
 /// `connections.json`'s `"driver"` field selects which implementation runs
 /// at startup — same mechanism regardless of whether it resolves to

@@ -16,7 +16,7 @@ impl PostgresDriver {
     pub async fn connect(config: &ConnectionConfig) -> Result<Self, SqlError> {
         let url = build_connection_url(config)?;
         let pool = PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(super::DEFAULT_POOL_MAX_CONNECTIONS)
             .connect(&url)
             .await
             .map_err(|e| SqlError::ConnectionFailed(e.to_string()))?;

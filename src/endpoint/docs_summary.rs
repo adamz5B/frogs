@@ -73,6 +73,7 @@ fn source_def_json(def: &SourceDef) -> Value {
             on_error,
             optional,
             parameters,
+            ..
         } => json!({
             "type": "sql",
             "connection": connection,
@@ -88,6 +89,7 @@ fn source_def_json(def: &SourceDef) -> Value {
             on_error,
             optional,
             parameters,
+            ..
         } => json!({
             "type": "http",
             "request": request,

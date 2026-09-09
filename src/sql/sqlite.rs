@@ -35,7 +35,7 @@ impl SqliteDriver {
         // otherwise-empty database, so pooling would silently scatter
         // queries across unrelated in-memory databases.
         let pool = SqlitePoolOptions::new()
-            .max_connections(if is_memory { 1 } else { 5 })
+            .max_connections(if is_memory { 1 } else { super::DEFAULT_POOL_MAX_CONNECTIONS })
             .connect_with(options)
             .await
             .map_err(|e| SqlError::ConnectionFailed(e.to_string()))?;

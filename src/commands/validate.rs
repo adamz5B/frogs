@@ -82,7 +82,7 @@ async fn validate_api(root: &Path) -> usize {
     }
 
     let endpoints_root = api_dir.join("datasources/endpoints");
-    let (count, endpoint_problems) = crate::endpoint::validate_endpoint_files(&endpoints_root, &config.security);
+    let (count, endpoint_problems) = crate::endpoint::validate_endpoint_files(&endpoints_root, &config.security, &config.connections);
     println!("  endpoint files: {count} discovered, {} problem(s)", endpoint_problems.len());
     for problem in &endpoint_problems {
         println!("    - {problem}");

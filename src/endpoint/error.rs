@@ -21,6 +21,19 @@ pub enum SourceErrorCause {
     /// error-handling logic instead of a re-implementation of it in the
     /// test runner.
     Mocked(String),
+    /// A nested-many source's fan-out parent resolved more rows than its own
+    /// `maxRows` allows — checked before any per-row future is built (see
+    /// `resolve::resolve_nested_many`), never a truncate-and-continue.
+    NestedManyRowLimitExceeded {
+        resolved: usize,
+        max: usize,
+    },
+    /// One row of a nested-many fan-out didn't complete within its own
+    /// `rowTimeoutMs` — goes through the same per-row `optional`/`onError`
+    /// handling any other per-row failure gets.
+    NestedManyRowTimedOut {
+        after_ms: u64,
+    },
 }
 
 impl SourceErrorCause {
@@ -40,6 +53,8 @@ impl SourceErrorCause {
             SourceErrorCause::Http(_) => "datasource.http.upstream_error",
             SourceErrorCause::Config(_) => "unexpected.error",
             SourceErrorCause::Mocked(code) => code,
+            SourceErrorCause::NestedManyRowLimitExceeded { .. } => "datasource.nested_many.row_limit_exceeded",
+            SourceErrorCause::NestedManyRowTimedOut { .. } => "datasource.nested_many.row_timed_out",
         }
     }
 
@@ -53,6 +68,12 @@ impl SourceErrorCause {
             SourceErrorCause::NotFound => "query returned no rows".to_string(),
             SourceErrorCause::Config(m) => m.clone(),
             SourceErrorCause::Mocked(code) => format!("mocked failure: {code}"),
+            SourceErrorCause::NestedManyRowLimitExceeded { resolved, max } => {
+                format!("nested fan-out parent resolved {resolved} rows, exceeding maxRows {max}")
+            }
+            SourceErrorCause::NestedManyRowTimedOut { after_ms } => {
+                format!("nested fan-out row call did not complete within {after_ms}ms")
+            }
         }
     }
 }
@@ -105,5 +126,22 @@ mod tests {
         let cause = SourceErrorCause::Mocked("datasource.http.timeout".to_string());
         assert_eq!(cause.code(), "datasource.http.timeout");
         assert!(cause.message().contains("datasource.http.timeout"));
+    }
+
+    #[test]
+    fn classifies_a_nested_many_row_limit_exceeded_failure() {
+        let cause = SourceErrorCause::NestedManyRowLimitExceeded { resolved: 42, max: 10 };
+        assert_eq!(cause.code(), "datasource.nested_many.row_limit_exceeded");
+        let message = cause.message();
+        assert!(message.contains("42"), "message should mention the resolved row count: {message}");
+        assert!(message.contains("10"), "message should mention the configured maxRows: {message}");
+    }
+
+    #[test]
+    fn classifies_a_nested_many_row_timed_out_failure() {
+        let cause = SourceErrorCause::NestedManyRowTimedOut { after_ms: 5000 };
+        assert_eq!(cause.code(), "datasource.nested_many.row_timed_out");
+        let message = cause.message();
+        assert!(message.contains("5000"), "message should mention the configured rowTimeoutMs: {message}");
     }
 }

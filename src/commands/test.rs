@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::endpoint::{EndpointFile, MockOutcome, resolve_for_test};
+use crate::endpoint::{EndpointFile, MockOutcome, SourceDef, nested_many_parent, resolve_for_test};
 use crate::project::require_project_root;
 use crate::security::VerifierCache;
 
@@ -261,6 +261,34 @@ pub async fn record(cwd: &Path, path: &str, method: &str) -> io::Result<()> {
                      \"<code>\"}}) if this case should exercise that path"
                 );
             }
+        }
+    }
+
+    // A nested-many source never gets a top-level `resolved` entry of its
+    // own (see `endpoint::resolve::resolve_nested_many`), so the loop above
+    // never produces a mock for one — its recorded value instead lives
+    // embedded in its bracket parent's own first row, already merged there
+    // by the real, unmocked recording run just above.
+    for (name, source) in &endpoint.sources {
+        let (allow_nested_many, parameters) = match source {
+            SourceDef::Sql {
+                allow_nested_many, parameters, ..
+            } => (*allow_nested_many, parameters),
+            SourceDef::Http {
+                allow_nested_many, parameters, ..
+            } => (*allow_nested_many, parameters),
+        };
+        if !allow_nested_many {
+            continue;
+        }
+        let Ok(parent_name) = nested_many_parent(parameters) else {
+            continue;
+        };
+        let Some(Some(Value::Array(rows))) = resolved.get(parent_name) else {
+            continue;
+        };
+        if let Some(value) = rows.first().and_then(|row| row.get(name)) {
+            mocks.insert(name.clone(), MockOutcome::Success(value.clone()));
         }
     }
 
@@ -571,5 +599,127 @@ mod tests {
         let fixture = sample_endpoints_root();
         // The fixture has no DELETE endpoint at all.
         assert!(find_endpoint_file(fixture.path(), "/cars/1HGCM82633A004352", "delete").is_none());
+    }
+
+    /// A minimal but complete scratch project (`frogs run`'s own
+    /// `scratch_api_project` precedent, `src/commands/run.rs`) — everything
+    /// `Config::load_or_exit`/`connect_all`/`record` need present, so
+    /// `record` runs its real assembly path end to end rather than hitting
+    /// `process::exit` on a config problem this test doesn't care about.
+    struct RecordFixture {
+        root: PathBuf,
+    }
+
+    impl Drop for RecordFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// `cars` is a `cardinality: "many"` HTTP source with two rows
+    /// (`vin: "AAA"`/`"BBB"`), and `pricing` is its nested-many dependent —
+    /// each row's own `vin` becomes the `?vin=` query the fake pricing
+    /// server distinguishes on, so row 0 (`AAA`) and row 1 (`BBB`) get
+    /// distinguishably different recorded amounts.
+    async fn record_fixture() -> RecordFixture {
+        use axum::extract::Query;
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let app = Router::new()
+            .route("/cars", get(|| async { Json(serde_json::json!([{ "vin": "AAA" }, { "vin": "BBB" }])) }))
+            .route(
+                "/pricing",
+                get(|Query(params): Query<HashMap<String, String>>| async move {
+                    let amount = if params.get("vin").map(String::as_str) == Some("AAA") { 111 } else { 222 };
+                    Json(serde_json::json!({ "amount": amount }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = std::env::temp_dir().join(format!(
+            "frogs-commands-test-record-nested-many-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(api_dir.join("config/errors")).unwrap();
+        std::fs::create_dir_all(api_dir.join("security")).unwrap();
+        std::fs::create_dir_all(api_dir.join("datasources/http")).unwrap();
+        std::fs::create_dir_all(api_dir.join("datasources/endpoints/cars")).unwrap();
+        std::fs::write(root.join("openapi.yaml"), "openapi: 3.0.3\ninfo: { title: t, version: '1' }\npaths: {}\n").unwrap();
+        std::fs::write(api_dir.join("config/server.json"), r#"{ "features": { "requestValidation": false } }"#).unwrap();
+        std::fs::write(api_dir.join("config/errors/core.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("config/connections.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("security/schemes.json"), "{}").unwrap();
+        std::fs::write(
+            api_dir.join("datasources/http/cars.json"),
+            format!(r#"{{ "method": "GET", "url": "http://{addr}/cars" }}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            api_dir.join("datasources/http/pricing.json"),
+            format!(r#"{{ "method": "GET", "url": "http://{addr}/pricing?vin={{{{vin}}}}" }}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            api_dir.join("datasources/endpoints/cars/endpoint.get.json"),
+            r#"{
+                "operationId": "listCars",
+                "sources": {
+                    "cars": { "type": "http", "request": "cars.json", "cardinality": "many" },
+                    "pricing": {
+                        "type": "http", "request": "pricing.json",
+                        "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10,
+                        "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                    }
+                },
+                "response": { "type": "array", "source": "sources.cars", "items": { "vin": "vin" } }
+            }"#,
+        )
+        .unwrap();
+
+        RecordFixture { root }
+    }
+
+    /// `frogs test record`'s new post-loop pass (Point 6's nested-many
+    /// extension): a nested-many source never gets its own top-level
+    /// `resolved` entry (see `endpoint::resolve::resolve_nested_many`), so
+    /// without this pass its recorded mocks would simply never mention it.
+    /// This proves the captured mock is exactly the *first* row's own
+    /// merged value, not the whole array or some other row's.
+    #[tokio::test]
+    async fn record_captures_a_nested_many_sources_own_first_row_result_as_its_mock() {
+        let fixture = record_fixture().await;
+
+        record(&fixture.root, "/cars", "get")
+            .await
+            .expect("record should succeed against the real fake infrastructure");
+
+        let test_file_path = fixture.root.join("api/datasources/endpoints/cars/endpoint.get.test.json");
+        let test_file = crate::testing::load(&test_file_path).expect("record should have written a loadable test file");
+        assert_eq!(test_file.cases.len(), 1);
+        let case = &test_file.cases[0];
+
+        assert_eq!(
+            case.mocks.get("pricing"),
+            Some(&MockOutcome::Success(serde_json::json!({ "amount": 111 }))),
+            "the recorded mock for the nested-many source must be exactly row 0's (vin AAA's) own merged result, not row 1's or the whole array"
+        );
+
+        // Sanity check: `cars` itself *did* get an ordinary top-level mock
+        // (it's a real, resolved source, just not a nested-many one), and
+        // its own recorded array still has the merge embedded per row —
+        // proving this is reading the same real resolution the nested-many
+        // pass also reads from, not a separately mocked value.
+        let Some(MockOutcome::Success(cars_mock)) = case.mocks.get("cars") else {
+            panic!("expected an ordinary Success mock for 'cars'");
+        };
+        assert_eq!(cars_mock[0]["pricing"]["amount"], 111);
+        assert_eq!(cars_mock[1]["pricing"]["amount"], 222);
     }
 }

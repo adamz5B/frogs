@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 
+use crate::config::ConnectionConfig;
 use crate::errors::{DiscoveredErrors, ErrorRegistry};
 use crate::openapi::Operation;
 use crate::security::{SecurityConfig, VerifierCache};
@@ -27,11 +28,14 @@ use serde_json::{Map, Value};
 /// case runs against, `MockOutcome` because it's the exact type
 /// `resolve_sources` consumes (test-file `mocks` deserialize directly into
 /// it, see `endpoint::resolve::MockOutcome`, rather than a separate parsed
-/// copy `testing` would otherwise have to convert).
+/// copy `testing` would otherwise have to convert), `nested_many_parent` and
+/// `SourceDef` because `commands::test::record`'s own nested-many mock-
+/// capture pass needs to find each `allowNestedMany` source's bracket
+/// parent the same way `resolve_nested_many`/`validate_nested_many` do.
 pub(crate) use docs_summary::endpoint_summaries;
-pub(crate) use resolve::MockOutcome;
-pub(crate) use schema::EndpointFile;
-use schema::ErrorOverride;
+pub(crate) use resolve::{MockOutcome, nested_many_parent};
+use schema::{Cardinality, ErrorOverride};
+pub(crate) use schema::{EndpointFile, SourceDef};
 
 /// The HTTP methods frogs actually routes — an `endpoint.<method>.json`
 /// file for anything else (or one of OpenAPI's non-request-body-shaped
@@ -88,6 +92,7 @@ struct RouteState {
 pub fn build_router(
     project_root: &Path,
     drivers: Arc<HashMap<String, Box<dyn SqlDriver>>>,
+    connections: &HashMap<String, ConnectionConfig>,
     errors: Arc<ErrorRegistry>,
     security: Arc<SecurityConfig>,
     services: Arc<HashMap<String, String>>,
@@ -138,6 +143,14 @@ pub fn build_router(
                 "skipping {}: security scheme '{scheme}' has no matching entry in security/schemes.json",
                 file_path.display()
             );
+            continue;
+        }
+
+        let nested_many_problems = validate_nested_many(&endpoint, connections);
+        if !nested_many_problems.is_empty() {
+            for problem in &nested_many_problems {
+                tracing::warn!("skipping {}: {problem}", file_path.display());
+            }
             continue;
         }
 
@@ -213,7 +226,7 @@ pub fn build_router(
 /// check logic (parse JSON, confirm a declared security scheme resolves)
 /// is small enough that duplicating it here stays cheaper than
 /// restructuring `build_router` to serve both callers.
-pub(crate) fn validate_endpoint_files(endpoints_root: &Path, security: &SecurityConfig) -> (usize, Vec<String>) {
+pub(crate) fn validate_endpoint_files(endpoints_root: &Path, security: &SecurityConfig, connections: &HashMap<String, ConnectionConfig>) -> (usize, Vec<String>) {
     let discovered = discover_endpoint_files(endpoints_root);
     let count = discovered.len();
     let mut problems = Vec::new();
@@ -241,9 +254,157 @@ pub(crate) fn validate_endpoint_files(endpoints_root: &Path, security: &Security
                 file_path.display()
             ));
         }
+        for problem in validate_nested_many(&endpoint, connections) {
+            problems.push(format!("{}: {problem}", file_path.display()));
+        }
     }
 
     (count, problems)
+}
+
+/// The fraction of a SQL connection's real pool capacity
+/// (`sql::pool_capacity`) a single nested-many source's own `maxConcurrency`
+/// may claim — so this feature's own concurrency surface can't alone
+/// exhaust a shared pool other requests/sources also depend on. Evaluates to
+/// 3 at today's real `DEFAULT_POOL_MAX_CONNECTIONS` (5) default.
+/// Validation-time-only, so it lives here rather than alongside
+/// `resolve.rs`'s other nested-many constants.
+const NESTED_MANY_POOL_CONCURRENCY_FRACTION: f64 = 0.6;
+
+/// Rejects a per-endpoint nested-many misconfiguration before it can ever
+/// run — see the design doc's "Many-Depends-on-Many Array Fan-Out" plan,
+/// point 7. Called from both `build_router` (fail-closed: skip the route,
+/// same posture as an unmatched security scheme) and
+/// `validate_endpoint_files` (`frogs validate`'s read-only report). Skips
+/// the pool-derived `maxConcurrency` ceiling check entirely when `connections`
+/// doesn't name the source's own SQL connection at all — a pre-existing,
+/// more general "unknown connection" gap, not newly invented here; it
+/// already fails every request for that source at runtime regardless.
+fn validate_nested_many(endpoint: &EndpointFile, connections: &HashMap<String, ConnectionConfig>) -> Vec<String> {
+    let mut problems = Vec::new();
+
+    for (name, source) in &endpoint.sources {
+        let (allow_nested_many, max_concurrency, max_rows, row_timeout_ms, parameters, sql_connection) = match source {
+            SourceDef::Sql {
+                allow_nested_many,
+                max_concurrency,
+                max_rows,
+                row_timeout_ms,
+                parameters,
+                connection,
+                ..
+            } => (
+                *allow_nested_many,
+                *max_concurrency,
+                *max_rows,
+                *row_timeout_ms,
+                parameters,
+                Some(connection.as_str()),
+            ),
+            SourceDef::Http {
+                allow_nested_many,
+                max_concurrency,
+                max_rows,
+                row_timeout_ms,
+                parameters,
+                ..
+            } => (*allow_nested_many, *max_concurrency, *max_rows, *row_timeout_ms, parameters, None),
+        };
+
+        if !allow_nested_many {
+            // A bracket-form parameter on a source that isn't itself
+            // `allowNestedMany` is a config mistake regardless of whether
+            // this source has any of the other nested-many fields set.
+            for param in parameters {
+                if resolve::parse_bracket_array_path(&param.from).is_some() {
+                    problems.push(format!(
+                        "source '{name}': parameter '{}' uses bracket fan-out syntax (\"sources.<parent>[].<field>\") \
+                         but this source doesn't declare \"allowNestedMany\": true",
+                        param.from
+                    ));
+                }
+            }
+            continue;
+        }
+
+        let Some(max_concurrency) = max_concurrency else {
+            problems.push(format!("source '{name}': \"allowNestedMany\": true requires \"maxConcurrency\" to be set"));
+            continue;
+        };
+        let Some(max_rows) = max_rows else {
+            problems.push(format!("source '{name}': \"allowNestedMany\": true requires \"maxRows\" to be set"));
+            continue;
+        };
+
+        if max_concurrency.get() > resolve::MAX_NESTED_MANY_CONCURRENCY {
+            problems.push(format!(
+                "source '{name}': maxConcurrency {} exceeds the hard ceiling of {}",
+                max_concurrency.get(),
+                resolve::MAX_NESTED_MANY_CONCURRENCY
+            ));
+        }
+        if max_rows.get() > resolve::MAX_NESTED_MANY_ROWS {
+            problems.push(format!(
+                "source '{name}': maxRows {} exceeds the hard ceiling of {}",
+                max_rows.get(),
+                resolve::MAX_NESTED_MANY_ROWS
+            ));
+        }
+        if let Some(row_timeout_ms) = row_timeout_ms
+            && row_timeout_ms.get() > resolve::MAX_NESTED_MANY_ROW_TIMEOUT_MS
+        {
+            problems.push(format!(
+                "source '{name}': rowTimeoutMs {} exceeds the hard ceiling of {}",
+                row_timeout_ms.get(),
+                resolve::MAX_NESTED_MANY_ROW_TIMEOUT_MS
+            ));
+        }
+
+        if let Some(connection_name) = sql_connection
+            && let Some(conn) = connections.get(connection_name)
+            && let Some(capacity) = crate::sql::pool_capacity(conn)
+        {
+            let pool_ceiling = ((capacity as f64 * NESTED_MANY_POOL_CONCURRENCY_FRACTION).floor() as usize).max(1);
+            let ceiling = resolve::MAX_NESTED_MANY_CONCURRENCY.min(pool_ceiling);
+            if max_concurrency.get() > ceiling {
+                problems.push(format!(
+                    "source '{name}': maxConcurrency {} exceeds the pool-derived ceiling of {ceiling} for connection \
+                     '{connection_name}' (pool capacity {capacity}) — a single nested-many source may claim at most \
+                     {}% of a connection's pool",
+                    max_concurrency.get(),
+                    (NESTED_MANY_POOL_CONCURRENCY_FRACTION * 100.0) as u32
+                ));
+            }
+        }
+
+        match resolve::nested_many_parent(parameters) {
+            Ok(parent_name) => match endpoint.sources.get(parent_name) {
+                Some(SourceDef::Sql {
+                    cardinality,
+                    allow_nested_many: parent_nested,
+                    ..
+                })
+                | Some(SourceDef::Http {
+                    cardinality,
+                    allow_nested_many: parent_nested,
+                    ..
+                }) => {
+                    if *cardinality != Cardinality::Many {
+                        problems.push(format!("source '{name}': bracket-parent '{parent_name}' must declare \"cardinality\": \"many\""));
+                    }
+                    if *parent_nested {
+                        problems.push(format!(
+                            "source '{name}': bracket-parent '{parent_name}' is itself allowNestedMany — multi-level fan-out isn't supported"
+                        ));
+                    }
+                }
+                None => problems.push(format!("source '{name}': bracket-parent '{parent_name}' isn't declared in this endpoint's sources")),
+            },
+            Err(message) => problems.push(format!("source '{name}': {message}")),
+        }
+    }
+
+    problems
 }
 
 async fn handle_request(
@@ -923,6 +1084,7 @@ mod tests {
         let router = build_router(
             &root,
             Arc::new(drivers),
+            &HashMap::new(),
             errors,
             security,
             Arc::new(HashMap::new()),
@@ -984,6 +1146,7 @@ mod tests {
         let router = build_router(
             &root,
             Arc::new(drivers),
+            &HashMap::new(),
             errors,
             security,
             Arc::new(HashMap::new()),
@@ -1072,6 +1235,7 @@ mod tests {
         let router = build_router(
             &root,
             Arc::new(drivers),
+            &HashMap::new(),
             errors,
             security,
             Arc::new(HashMap::new()),
@@ -1470,6 +1634,7 @@ mod tests {
         let router = build_router(
             &root,
             Arc::new(drivers),
+            &HashMap::new(),
             errors,
             security,
             Arc::new(HashMap::new()),
@@ -1767,6 +1932,7 @@ mod tests {
         let router = build_router(
             &root,
             Arc::new(drivers),
+            &HashMap::new(),
             errors,
             security,
             Arc::new(HashMap::new()),
@@ -2276,5 +2442,384 @@ mod tests {
             assert_eq!(status, 401);
             assert_eq!(body["name"], "auth.invalid_credentials");
         }
+    }
+
+    // ---- `validate_nested_many` ----
+
+    mod validate_nested_many_tests {
+        use super::*;
+
+        fn endpoint_with(source_json: &str) -> EndpointFile {
+            let json = format!(
+                r#"{{
+                    "operationId": "test",
+                    "sources": {{
+                        "cars": {{ "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "many" }},
+                        "pricing": {source_json}
+                    }},
+                    "response": {{}}
+                }}"#
+            );
+            serde_json::from_str(&json).unwrap()
+        }
+
+        fn sqlite_connection(in_memory: bool) -> ConnectionConfig {
+            let mut settings = HashMap::new();
+            if in_memory {
+                settings.insert("database".to_string(), Value::String(":memory:".to_string()));
+            }
+            ConnectionConfig {
+                driver: "sqlite".to_string(),
+                settings,
+            }
+        }
+
+        #[test]
+        fn rejects_allow_nested_many_with_max_concurrency_omitted() {
+            let endpoint = endpoint_with(
+                r#"{
+                    "type": "sql", "connection": "db", "script": "q.sql",
+                    "allowNestedMany": true, "maxRows": 10,
+                    "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                }"#,
+            );
+            let problems = validate_nested_many(&endpoint, &HashMap::new());
+            assert!(
+                problems.iter().any(|p| p.contains("maxConcurrency")),
+                "expected a maxConcurrency problem, got: {problems:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_allow_nested_many_with_max_rows_omitted() {
+            let endpoint = endpoint_with(
+                r#"{
+                    "type": "sql", "connection": "db", "script": "q.sql",
+                    "allowNestedMany": true, "maxConcurrency": 2,
+                    "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                }"#,
+            );
+            let problems = validate_nested_many(&endpoint, &HashMap::new());
+            assert!(problems.iter().any(|p| p.contains("maxRows")), "expected a maxRows problem, got: {problems:?}");
+        }
+
+        #[test]
+        fn rejects_max_concurrency_exceeding_the_hard_ceiling() {
+            let endpoint = endpoint_with(
+                r#"{
+                    "type": "http", "request": "pricing.json",
+                    "allowNestedMany": true, "maxConcurrency": 51, "maxRows": 10,
+                    "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                }"#,
+            );
+            let problems = validate_nested_many(&endpoint, &HashMap::new());
+            assert!(
+                problems.iter().any(|p| p.contains("maxConcurrency") && p.contains("hard ceiling")),
+                "expected a hard-ceiling maxConcurrency problem, got: {problems:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_max_rows_exceeding_the_hard_ceiling() {
+            let endpoint = endpoint_with(
+                r#"{
+                    "type": "http", "request": "pricing.json",
+                    "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 1001,
+                    "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                }"#,
+            );
+            let problems = validate_nested_many(&endpoint, &HashMap::new());
+            assert!(
+                problems.iter().any(|p| p.contains("maxRows") && p.contains("hard ceiling")),
+                "expected a hard-ceiling maxRows problem, got: {problems:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_row_timeout_ms_exceeding_the_hard_ceiling() {
+            let endpoint = endpoint_with(
+                r#"{
+                    "type": "http", "request": "pricing.json",
+                    "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10, "rowTimeoutMs": 300001,
+                    "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                }"#,
+            );
+            let problems = validate_nested_many(&endpoint, &HashMap::new());
+            assert!(
+                problems.iter().any(|p| p.contains("rowTimeoutMs") && p.contains("hard ceiling")),
+                "expected a hard-ceiling rowTimeoutMs problem, got: {problems:?}"
+            );
+        }
+
+        /// A normal (non-in-memory) SQL connection has the default pool
+        /// capacity of 5 (`sql::DEFAULT_POOL_MAX_CONNECTIONS`) — 0.6 of that,
+        /// floored, is 3, so `maxConcurrency: 4` must be rejected and
+        /// `maxConcurrency: 3` must not be.
+        #[test]
+        fn rejects_sql_backed_max_concurrency_exceeding_the_pool_derived_ceiling_for_a_normal_connection() {
+            let mut connections = HashMap::new();
+            connections.insert("db".to_string(), sqlite_connection(false));
+
+            let over = endpoint_with(
+                r#"{
+                    "type": "sql", "connection": "db", "script": "q.sql",
+                    "allowNestedMany": true, "maxConcurrency": 4, "maxRows": 10,
+                    "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                }"#,
+            );
+            let problems = validate_nested_many(&over, &connections);
+            assert!(
+                problems.iter().any(|p| p.contains("pool-derived ceiling")),
+                "maxConcurrency: 4 should exceed the pool-derived ceiling of 3, got: {problems:?}"
+            );
+
+            let at_ceiling = endpoint_with(
+                r#"{
+                    "type": "sql", "connection": "db", "script": "q.sql",
+                    "allowNestedMany": true, "maxConcurrency": 3, "maxRows": 10,
+                    "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                }"#,
+            );
+            let problems = validate_nested_many(&at_ceiling, &connections);
+            assert!(
+                !problems.iter().any(|p| p.contains("pool-derived ceiling")),
+                "maxConcurrency: 3 should be exactly at the pool-derived ceiling, got: {problems:?}"
+            );
+        }
+
+        /// An in-memory sqlite connection is pinned to exactly 1 real
+        /// connection (`sql::pool_capacity`) — 0.6 of that, floored and
+        /// clamped to a minimum of 1, is still 1, so `maxConcurrency: 2` must
+        /// be rejected and `maxConcurrency: 1` must not be.
+        #[test]
+        fn rejects_sql_backed_max_concurrency_exceeding_the_pool_derived_ceiling_for_an_in_memory_sqlite_connection() {
+            let mut connections = HashMap::new();
+            connections.insert("db".to_string(), sqlite_connection(true));
+
+            let over = endpoint_with(
+                r#"{
+                    "type": "sql", "connection": "db", "script": "q.sql",
+                    "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10,
+                    "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                }"#,
+            );
+            let problems = validate_nested_many(&over, &connections);
+            assert!(
+                problems.iter().any(|p| p.contains("pool-derived ceiling")),
+                "maxConcurrency: 2 should exceed the in-memory-sqlite pool-derived ceiling of 1, got: {problems:?}"
+            );
+
+            let at_ceiling = endpoint_with(
+                r#"{
+                    "type": "sql", "connection": "db", "script": "q.sql",
+                    "allowNestedMany": true, "maxConcurrency": 1, "maxRows": 10,
+                    "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                }"#,
+            );
+            let problems = validate_nested_many(&at_ceiling, &connections);
+            assert!(
+                !problems.iter().any(|p| p.contains("pool-derived ceiling")),
+                "maxConcurrency: 1 should be exactly at the in-memory-sqlite pool-derived ceiling, got: {problems:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_a_bracket_parent_that_isnt_cardinality_many() {
+            let json = r#"{
+                "operationId": "test",
+                "sources": {
+                    "car": { "type": "sql", "connection": "db", "script": "q.sql" },
+                    "pricing": {
+                        "type": "http", "request": "pricing.json",
+                        "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10,
+                        "parameters": [{ "name": "vin", "from": "sources.car[].vin" }]
+                    }
+                },
+                "response": {}
+            }"#;
+            let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+            let problems = validate_nested_many(&endpoint, &HashMap::new());
+            assert!(
+                problems.iter().any(|p| p.contains("cardinality")),
+                "a bracket-parent that isn't cardinality: many must be rejected, got: {problems:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_a_bracket_parent_that_is_itself_allow_nested_many() {
+            let json = r#"{
+                "operationId": "test",
+                "sources": {
+                    "trucks": { "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "many" },
+                    "specs": {
+                        "type": "http", "request": "specs.json",
+                        "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10,
+                        "parameters": [{ "name": "plate", "from": "sources.trucks[].plate" }]
+                    },
+                    "pricing": {
+                        "type": "http", "request": "pricing.json",
+                        "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10,
+                        "parameters": [{ "name": "plate", "from": "sources.specs[].plate" }]
+                    }
+                },
+                "response": {}
+            }"#;
+            let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+            let problems = validate_nested_many(&endpoint, &HashMap::new());
+            assert!(
+                problems.iter().any(|p| p.contains("pricing") && p.contains("itself allowNestedMany")),
+                "'pricing' depending on the already-nested-many 'specs' must be rejected (multi-level fan-out isn't supported), got: {problems:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_zero_bracket_form_parents() {
+            let endpoint = endpoint_with(
+                r#"{
+                    "type": "http", "request": "pricing.json",
+                    "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10,
+                    "parameters": [{ "name": "vin", "from": "path.vin" }]
+                }"#,
+            );
+            let problems = validate_nested_many(&endpoint, &HashMap::new());
+            assert!(
+                problems.iter().any(|p| p.contains("no bracket-form parameter")),
+                "a nested-many source with no bracket-form parameter at all must be rejected, got: {problems:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_multiple_distinct_bracket_form_parents() {
+            let json = r#"{
+                "operationId": "test",
+                "sources": {
+                    "cars": { "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "many" },
+                    "trucks": { "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "many" },
+                    "pricing": {
+                        "type": "http", "request": "pricing.json",
+                        "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10,
+                        "parameters": [
+                            { "name": "vin", "from": "sources.cars[].vin" },
+                            { "name": "plate", "from": "sources.trucks[].plate" }
+                        ]
+                    }
+                },
+                "response": {}
+            }"#;
+            let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+            let problems = validate_nested_many(&endpoint, &HashMap::new());
+            assert!(
+                problems.iter().any(|p| p.contains("distinct bracket-form parents")),
+                "a nested-many source referencing two different bracket parents must be rejected, got: {problems:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_bracket_form_syntax_on_a_source_that_isnt_itself_allow_nested_many() {
+            let json = r#"{
+                "operationId": "test",
+                "sources": {
+                    "cars": { "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "many" },
+                    "pricing": {
+                        "type": "http", "request": "pricing.json",
+                        "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                    }
+                },
+                "response": {}
+            }"#;
+            let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+            let problems = validate_nested_many(&endpoint, &HashMap::new());
+            assert!(
+                problems.iter().any(|p| p.contains("doesn't declare") && p.contains("allowNestedMany")),
+                "bracket syntax on a non-allowNestedMany source must be rejected, got: {problems:?}"
+            );
+        }
+
+        /// The nested-many source's own result cardinality (`"one"`, the
+        /// default — one merged object per row) is a completely separate
+        /// concept from its *bracket-parent's* cardinality (which must be
+        /// `"many"`) — a correctly configured `cardinality: "one"`
+        /// nested-many source must not be rejected.
+        #[test]
+        fn does_not_reject_a_correctly_configured_cardinality_one_nested_many_source() {
+            let endpoint = endpoint_with(
+                r#"{
+                    "type": "http", "request": "pricing.json", "cardinality": "one",
+                    "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10,
+                    "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                }"#,
+            );
+            let problems = validate_nested_many(&endpoint, &HashMap::new());
+            assert!(
+                problems.is_empty(),
+                "a correctly configured cardinality: one nested-many source must not be rejected, got: {problems:?}"
+            );
+        }
+    }
+
+    /// Mirrors the existing unmatched-security-scheme precedent: an endpoint
+    /// file with an invalid nested-many configuration is skipped at
+    /// `build_router` time (the route is simply never registered, a plain
+    /// 404 rather than a startup crash) and `validate_endpoint_files`
+    /// reports the exact same problem as a string, for `frogs validate`.
+    #[tokio::test]
+    async fn an_endpoint_with_an_invalid_nested_many_config_is_skipped_by_build_router_and_reported_by_validate_endpoint_files() {
+        let root = std::env::temp_dir().join(format!(
+            "frogs-endpoint-nested-many-invalid-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let dir = root.join("datasources/endpoints/pricing");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("endpoint.get.json"),
+            r#"{
+                "operationId": "getPricing",
+                "sources": {
+                    "cars": { "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "many" },
+                    "pricing": {
+                        "type": "http", "request": "pricing.json",
+                        "allowNestedMany": true, "maxRows": 10,
+                        "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                    }
+                },
+                "response": {}
+            }"#,
+        )
+        .unwrap();
+
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        let errors = Arc::new(ErrorRegistry::load(&root.join("does-not-exist")).unwrap());
+        let security = Arc::new(SecurityConfig::default());
+        let router = build_router(
+            &root,
+            Arc::new(drivers),
+            &HashMap::new(),
+            errors,
+            security,
+            Arc::new(HashMap::new()),
+            Arc::new(Mutex::new(DiscoveredErrors::default())),
+            false,
+            None,
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let resp = client.get(format!("http://{addr}/pricing")).send().await.unwrap();
+        assert_eq!(resp.status(), 404, "an invalid nested-many config must mean the route was never registered at all");
+
+        let (count, problems) = validate_endpoint_files(&root.join("datasources/endpoints"), &SecurityConfig::default(), &HashMap::new());
+        assert_eq!(count, 1, "the file was still discovered — just invalid");
+        assert!(
+            problems.iter().any(|p| p.contains("maxConcurrency")),
+            "validate_endpoint_files should report the same missing-maxConcurrency problem as a string: {problems:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

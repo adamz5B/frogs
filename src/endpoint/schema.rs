@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 use serde::Deserialize;
 
@@ -143,6 +144,30 @@ pub enum SourceDef {
         optional: bool,
         #[serde(default)]
         parameters: Vec<Parameter>,
+        /// Many-depends-on-many array fan-out (design doc: "Many-Depends-
+        /// on-Many Array Fan-Out") — `false` (the overwhelming common case)
+        /// means this source resolves exactly like any other. See
+        /// `resolve::resolve_nested_many` for how these four fields are
+        /// used, and `validate_nested_many` for how they're enforced.
+        #[serde(rename = "allowNestedMany", default)]
+        allow_nested_many: bool,
+        /// Required (`Some`) whenever `allow_nested_many` is true —
+        /// enforced by `validate_nested_many` at startup/`frogs validate`
+        /// time, not serde, since a config mistake here needs a clear
+        /// message naming the source and file, not a generic serde
+        /// "missing field."
+        #[serde(rename = "maxConcurrency")]
+        max_concurrency: Option<NonZeroUsize>,
+        /// Hard ceiling on the fan-out parent's row count — same "required
+        /// alongside `allowNestedMany`, enforced by validation, not serde"
+        /// posture as `max_concurrency`.
+        #[serde(rename = "maxRows")]
+        max_rows: Option<NonZeroUsize>,
+        /// `None` (the common case) defaults to
+        /// `resolve::DEFAULT_NESTED_MANY_ROW_TIMEOUT_MS` (30s) at resolve
+        /// time. Only meaningful alongside `allow_nested_many: true`.
+        #[serde(rename = "rowTimeoutMs")]
+        row_timeout_ms: Option<NonZeroU64>,
     },
     Http {
         /// The `datasources/http/<request>.json` file this source executes.
@@ -155,6 +180,14 @@ pub enum SourceDef {
         optional: bool,
         #[serde(default)]
         parameters: Vec<Parameter>,
+        #[serde(rename = "allowNestedMany", default)]
+        allow_nested_many: bool,
+        #[serde(rename = "maxConcurrency")]
+        max_concurrency: Option<NonZeroUsize>,
+        #[serde(rename = "maxRows")]
+        max_rows: Option<NonZeroUsize>,
+        #[serde(rename = "rowTimeoutMs")]
+        row_timeout_ms: Option<NonZeroU64>,
     },
 }
 
@@ -532,6 +565,98 @@ mod tests {
         };
         assert!(matches!(&fields["items"], ResponseField::Array(array) if array.source == "sources.cars"));
         assert_eq!(fields["total"].dot_path(), "sources.count.total");
+    }
+
+    #[test]
+    fn allow_nested_many_and_its_three_companion_fields_parse_on_a_sql_source() {
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "pricing": {
+                    "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "many",
+                    "allowNestedMany": true, "maxConcurrency": 3, "maxRows": 100, "rowTimeoutMs": 5000,
+                    "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                }
+            },
+            "response": {}
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let SourceDef::Sql {
+            allow_nested_many,
+            max_concurrency,
+            max_rows,
+            row_timeout_ms,
+            ..
+        } = &endpoint.sources["pricing"]
+        else {
+            panic!("expected a Sql source");
+        };
+        assert!(*allow_nested_many);
+        assert_eq!(max_concurrency.map(|n| n.get()), Some(3));
+        assert_eq!(max_rows.map(|n| n.get()), Some(100));
+        assert_eq!(row_timeout_ms.map(|n| n.get()), Some(5000));
+    }
+
+    #[test]
+    fn allow_nested_many_and_its_three_companion_fields_parse_on_an_http_source() {
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "pricing": {
+                    "type": "http", "request": "pricing.json",
+                    "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 50, "rowTimeoutMs": 15000,
+                    "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                }
+            },
+            "response": {}
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let SourceDef::Http {
+            allow_nested_many,
+            max_concurrency,
+            max_rows,
+            row_timeout_ms,
+            ..
+        } = &endpoint.sources["pricing"]
+        else {
+            panic!("expected an Http source");
+        };
+        assert!(*allow_nested_many);
+        assert_eq!(max_concurrency.map(|n| n.get()), Some(2));
+        assert_eq!(max_rows.map(|n| n.get()), Some(50));
+        assert_eq!(row_timeout_ms.map(|n| n.get()), Some(15000));
+    }
+
+    #[test]
+    fn allow_nested_many_defaults_to_false_and_its_companion_fields_to_none_when_omitted() {
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "car": { "type": "sql", "connection": "db", "script": "q.sql" }
+            },
+            "response": {}
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let SourceDef::Sql {
+            allow_nested_many,
+            max_concurrency,
+            max_rows,
+            row_timeout_ms,
+            ..
+        } = &endpoint.sources["car"]
+        else {
+            panic!("expected a Sql source");
+        };
+        assert!(
+            !*allow_nested_many,
+            "allowNestedMany omitted must default to false, matching the overwhelming common case"
+        );
+        assert_eq!(*max_concurrency, None);
+        assert_eq!(*max_rows, None);
+        assert_eq!(
+            *row_timeout_ms, None,
+            "rowTimeoutMs omitted must parse as None — resolve::resolve_nested_many is what applies the 30s default downstream, not serde"
+        );
     }
 
     #[test]

@@ -211,6 +211,7 @@ async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
     let endpoint_router = crate::endpoint::build_router(
         &api_dir,
         drivers.clone(),
+        &config.connections,
         errors,
         security.clone(),
         services,

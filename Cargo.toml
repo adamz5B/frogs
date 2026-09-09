@@ -9,7 +9,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 chrono = { version = "0.4", features = ["serde"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 axum = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -50,6 +50,13 @@ percent-encoding = "2"
 # the version `reqwest` already resolves this to transitively, so this stays
 # one compiled copy rather than two. See docs/frogs-quick-wins.md.
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
+# Already present transitively (via axum/sqlx) at this same version — added
+# directly so `endpoint::resolve`'s nested-many fan-out can name
+# `stream::iter`/`StreamExt::buffer_unordered` explicitly rather than
+# depending on another crate's feature unification to keep pulling it in.
+# `std` (which also brings in `alloc`) is the only feature actually used;
+# every other feature stays off deliberately, for binary size.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # Generates a self-signed cert + key entirely in-memory at test time — no

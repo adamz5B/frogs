@@ -1,15 +1,31 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::pin::Pin;
+use std::time::Duration;
 
 use axum::http::HeaderMap;
+use futures_util::StreamExt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
 use super::error::SourceErrorCause;
 use super::schema::{ArrayResponse, Cardinality, DetailedField, EndpointFile, Parameter, ParameterType, ResponseField, ResponseShape, SourceDef};
 use crate::sql::{SqlDriver, SqlValue, json_value_to_sql_value, sql_value_to_json};
+
+/// Default per-row call timeout for a nested-many source's fan-out
+/// (`rowTimeoutMs` omitted) — see the design doc's "Many-Depends-on-Many
+/// Array Fan-Out" plan, point 1.
+pub(crate) const DEFAULT_NESTED_MANY_ROW_TIMEOUT_MS: u64 = 30_000;
+/// Sanity cap on a declared `rowTimeoutMs` — enforced by `validate_nested_many`.
+pub(crate) const MAX_NESTED_MANY_ROW_TIMEOUT_MS: u64 = 300_000;
+/// Hard ceiling on a declared `maxConcurrency` — enforced by
+/// `validate_nested_many`, independent of (and in addition to) the SQL
+/// pool-derived ceiling that function also applies.
+pub(crate) const MAX_NESTED_MANY_CONCURRENCY: usize = 50;
+/// Hard ceiling on a declared `maxRows` — enforced by `validate_nested_many`.
+pub(crate) const MAX_NESTED_MANY_ROWS: usize = 1000;
 
 /// One resolved source's result, as plain JSON — a `Value::Object` whether
 /// it came from a SQL row (converted once here) or an HTTP response body
@@ -19,6 +35,39 @@ use crate::sql::{SqlDriver, SqlValue, json_value_to_sql_value, sql_value_to_json
 /// map at all: it short-circuits the whole request via `Err(SourceFailure)`
 /// below.
 type ResolvedSources = HashMap<String, Option<Value>>;
+
+/// A read-only view over already-resolved sources, handed to `resolve_from`/
+/// `run_sql_source`/`run_http_source` instead of `&ResolvedSources` directly
+/// — the abstraction that lets a nested-many fan-out's per-row future see
+/// its own row substituted in for the bracket parent's *whole* array,
+/// without cloning every other already-resolved source's payload once per
+/// row (see `resolve_nested_many`). `Map` is the ordinary case every
+/// call site outside nested-many resolution uses; `RowOverride` only ever
+/// exists for the lifetime of one fan-out row's own future.
+#[derive(Clone, Copy)]
+enum ResolvedView<'a> {
+    Map(&'a ResolvedSources),
+    RowOverride {
+        base: &'a ResolvedSources,
+        parent_name: &'a str,
+        row: &'a Value,
+    },
+}
+
+impl<'a> ResolvedView<'a> {
+    fn get_source(&self, name: &str) -> Option<&'a Value> {
+        match self {
+            ResolvedView::Map(m) => m.get(name).and_then(|v| v.as_ref()),
+            ResolvedView::RowOverride { base, parent_name, row } => {
+                if name == *parent_name {
+                    Some(row)
+                } else {
+                    base.get(name).and_then(|v| v.as_ref())
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct SourceFailure {
@@ -183,14 +232,56 @@ fn resolve_one<'a>(
             return Ok(());
         };
 
-        let (on_error, optional, parameters) = match source {
+        let (on_error, optional, parameters, allow_nested_many, max_concurrency, max_rows, row_timeout_ms) = match source {
             SourceDef::Sql {
-                on_error, optional, parameters, ..
-            } => (*on_error, *optional, parameters),
+                on_error,
+                optional,
+                parameters,
+                allow_nested_many,
+                max_concurrency,
+                max_rows,
+                row_timeout_ms,
+                ..
+            } => (*on_error, *optional, parameters, *allow_nested_many, *max_concurrency, *max_rows, *row_timeout_ms),
             SourceDef::Http {
-                on_error, optional, parameters, ..
-            } => (*on_error, *optional, parameters),
+                on_error,
+                optional,
+                parameters,
+                allow_nested_many,
+                max_concurrency,
+                max_rows,
+                row_timeout_ms,
+                ..
+            } => (*on_error, *optional, parameters, *allow_nested_many, *max_concurrency, *max_rows, *row_timeout_ms),
         };
+
+        if allow_nested_many {
+            return resolve_nested_many(
+                name,
+                on_error,
+                optional,
+                parameters,
+                max_concurrency,
+                max_rows,
+                row_timeout_ms,
+                source,
+                endpoint,
+                services,
+                drivers,
+                sql_root,
+                http_root,
+                http_client,
+                headers,
+                path_params,
+                query_params,
+                body,
+                transaction_id,
+                mocks,
+                resolved,
+                in_progress,
+            )
+            .await;
+        }
 
         let mock = mocks.get(name);
 
@@ -233,44 +324,24 @@ fn resolve_one<'a>(
         let outcome = match mock {
             Some(MockOutcome::Success(value)) => Ok(value.clone()),
             Some(MockOutcome::Fail(code)) => Err(SourceErrorCause::Mocked(code.clone())),
-            None => match source {
-                SourceDef::Sql {
-                    connection, script, cardinality, ..
-                } => {
-                    run_sql_source(
-                        drivers,
-                        sql_root,
-                        connection,
-                        script,
-                        *cardinality,
-                        parameters,
-                        headers,
-                        path_params,
-                        query_params,
-                        body,
-                        transaction_id,
-                        resolved,
-                    )
-                    .await
-                }
-                SourceDef::Http { request, cardinality, .. } => {
-                    run_http_source(
-                        services,
-                        http_root,
-                        http_client,
-                        request,
-                        *cardinality,
-                        parameters,
-                        headers,
-                        path_params,
-                        query_params,
-                        body,
-                        transaction_id,
-                        resolved,
-                    )
-                    .await
-                }
-            },
+            None => {
+                run_source_row(
+                    source,
+                    parameters,
+                    drivers,
+                    sql_root,
+                    http_root,
+                    http_client,
+                    services,
+                    headers,
+                    path_params,
+                    query_params,
+                    body,
+                    transaction_id,
+                    ResolvedView::Map(resolved),
+                )
+                .await
+            }
         };
 
         match outcome {
@@ -294,11 +365,324 @@ fn resolve_one<'a>(
     })
 }
 
-/// The dependency name out of a `"sources.<name>"` or `"sources.<name>.<field>"`
-/// parameter `from` value, or `None` for anything else (including bare
-/// `"sources"` with nothing after it).
+/// The dependency name out of a `"sources.<name>"`, `"sources.<name>.<field>"`,
+/// or nested-many bracket-form `"sources.<name>[].<field>"` parameter `from`
+/// value, or `None` for anything else (including bare `"sources"` with
+/// nothing after it). The `"[]"` strip is what lets a nested-many source's
+/// own bracket-parent parameter be recognized as a dependency to resolve
+/// first, the same as any other `sources.*` parameter.
 fn source_dependency(from: &str) -> Option<&str> {
-    from.strip_prefix("sources.")?.split('.').next().filter(|s| !s.is_empty())
+    let name = from.strip_prefix("sources.")?.split('.').next().filter(|s| !s.is_empty())?;
+    Some(name.strip_suffix("[]").unwrap_or(name))
+}
+
+/// Dispatches one source's real (non-mocked) execution to its own driver —
+/// shared by `resolve_one`'s ordinary path (`ResolvedView::Map`) and
+/// `resolve_nested_many`'s per-row fan-out (`ResolvedView::RowOverride`), so
+/// the SQL-vs-HTTP dispatch logic isn't duplicated between the two.
+#[allow(clippy::too_many_arguments)]
+async fn run_source_row(
+    source: &SourceDef,
+    parameters: &[Parameter],
+    drivers: &HashMap<String, Box<dyn SqlDriver>>,
+    sql_root: &Path,
+    http_root: &Path,
+    http_client: &reqwest::Client,
+    services: &HashMap<String, String>,
+    headers: &HeaderMap,
+    path_params: &HashMap<String, String>,
+    query_params: &HashMap<String, String>,
+    body: &Value,
+    transaction_id: &str,
+    resolved: ResolvedView<'_>,
+) -> Result<Value, SourceErrorCause> {
+    match source {
+        SourceDef::Sql {
+            connection, script, cardinality, ..
+        } => {
+            run_sql_source(
+                drivers,
+                sql_root,
+                connection,
+                script,
+                *cardinality,
+                parameters,
+                headers,
+                path_params,
+                query_params,
+                body,
+                transaction_id,
+                resolved,
+            )
+            .await
+        }
+        SourceDef::Http { request, cardinality, .. } => {
+            run_http_source(
+                services,
+                http_root,
+                http_client,
+                request,
+                *cardinality,
+                parameters,
+                headers,
+                path_params,
+                query_params,
+                body,
+                transaction_id,
+                resolved,
+            )
+            .await
+        }
+    }
+}
+
+/// Fan-out resolution for a source declaring `allowNestedMany: true` — see
+/// the design doc's "Many-Depends-on-Many Array Fan-Out" plan, points 4–5.
+/// Diverges from `resolve_one`'s ordinary dependency handling in one
+/// deliberate way: every dependency this source's own `parameters`
+/// reference (the bracket-form parent included) is always resolved first,
+/// even when this source itself is mocked — the row-count gate and merge
+/// target both need the parent's real resolved array regardless of whether
+/// the per-row calls themselves are mocked.
+///
+/// `max_concurrency`/`max_rows` being `None` here only happens via a caller
+/// that skipped `validate_nested_many` (`resolve_for_test`'s test-runner
+/// path, or `record_sources`) — classified as a config error, same
+/// precedent as an unmatched security scheme.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_nested_many<'a>(
+    name: &'a str,
+    on_error: Option<u16>,
+    optional: bool,
+    parameters: &'a [Parameter],
+    max_concurrency: Option<NonZeroUsize>,
+    max_rows: Option<NonZeroUsize>,
+    row_timeout_ms: Option<NonZeroU64>,
+    source: &'a SourceDef,
+    endpoint: &'a EndpointFile,
+    services: &'a HashMap<String, String>,
+    drivers: &'a HashMap<String, Box<dyn SqlDriver>>,
+    sql_root: &'a Path,
+    http_root: &'a Path,
+    http_client: &'a reqwest::Client,
+    headers: &'a HeaderMap,
+    path_params: &'a HashMap<String, String>,
+    query_params: &'a HashMap<String, String>,
+    body: &'a Value,
+    transaction_id: &'a str,
+    mocks: &'a HashMap<String, MockOutcome>,
+    resolved: &'a mut ResolvedSources,
+    in_progress: &'a mut HashSet<String>,
+) -> Result<(), SourceFailure> {
+    let (Some(max_concurrency), Some(max_rows)) = (max_concurrency, max_rows) else {
+        return Err(SourceFailure {
+            on_error,
+            source_name: name.to_string(),
+            cause: SourceErrorCause::Config(format!(
+                "source '{name}' declares allowNestedMany but maxConcurrency/maxRows is missing — validate_nested_many should have caught this at startup"
+            )),
+        });
+    };
+    let row_timeout_ms = row_timeout_ms.map(NonZeroU64::get).unwrap_or(DEFAULT_NESTED_MANY_ROW_TIMEOUT_MS);
+    let row_timeout = Duration::from_millis(row_timeout_ms);
+
+    let parent_name = match nested_many_parent(parameters) {
+        Ok(parent_name) => parent_name.to_string(),
+        Err(message) => {
+            return Err(SourceFailure {
+                on_error,
+                source_name: name.to_string(),
+                cause: SourceErrorCause::Config(format!("source '{name}': {message}")),
+            });
+        }
+    };
+
+    // Every referenced dependency — the bracket parent included — is
+    // resolved first, regardless of whether this source itself is mocked
+    // (see this function's own doc comment).
+    if !in_progress.insert(name.to_string()) {
+        return Err(SourceFailure {
+            on_error,
+            source_name: name.to_string(),
+            cause: SourceErrorCause::Config(format!("circular source dependency involving '{name}'")),
+        });
+    }
+    for param in parameters {
+        if let Some(dep_name) = source_dependency(&param.from)
+            && endpoint.sources.contains_key(dep_name)
+            && !resolved.contains_key(dep_name)
+        {
+            resolve_one(
+                dep_name,
+                endpoint,
+                services,
+                drivers,
+                sql_root,
+                http_root,
+                http_client,
+                headers,
+                path_params,
+                query_params,
+                body,
+                transaction_id,
+                mocks,
+                resolved,
+                in_progress,
+            )
+            .await?;
+        }
+    }
+    in_progress.remove(name);
+
+    // The one necessary, bounded clone — of just the parent's own array,
+    // taken once, not once per row. `None`/`Some(None)`/non-array parent
+    // all fall into the same zero-rows arm, and `resolved[parent_name]` is
+    // left completely untouched below in that case — never rewritten into a
+    // fabricated empty array, which would misrepresent a failed-optional
+    // parent as a successful empty list to anything else in the endpoint
+    // reading `sources.<parent>` directly.
+    let parent_rows: Vec<Value> = match resolved.get(parent_name.as_str()) {
+        Some(Some(Value::Array(rows))) => rows.clone(),
+        _ => Vec::new(),
+    };
+
+    if parent_rows.len() > max_rows.get() {
+        let cause = SourceErrorCause::NestedManyRowLimitExceeded {
+            resolved: parent_rows.len(),
+            max: max_rows.get(),
+        };
+        return if optional {
+            // Zero calls; every row's merged field simply stays absent —
+            // no top-level `resolved[name]` entry, and the parent's own
+            // array is untouched (no merge ever happened).
+            Ok(())
+        } else {
+            Err(SourceFailure {
+                on_error,
+                source_name: name.to_string(),
+                cause,
+            })
+        };
+    }
+    if parent_rows.is_empty() {
+        return Ok(());
+    }
+
+    let mock = mocks.get(name);
+    let mut row_values: HashMap<usize, Value> = match mock {
+        Some(MockOutcome::Success(value)) => parent_rows.iter().enumerate().map(|(i, _)| (i, value.clone())).collect(),
+        Some(MockOutcome::Fail(code)) => {
+            if optional {
+                HashMap::new()
+            } else {
+                return Err(SourceFailure {
+                    on_error,
+                    source_name: name.to_string(),
+                    cause: SourceErrorCause::Mocked(code.clone()),
+                });
+            }
+        }
+        None => {
+            // A shared, read-only reborrow of `resolved` — every concurrent
+            // per-row future reads through this same borrow rather than
+            // each cloning the whole map (see `ResolvedView`'s own doc
+            // comment). Its last use is this `while let` loop below; NLL
+            // lets `resolved` become mutably available again once this
+            // whole match arm's block ends, well before the final
+            // `resolved.insert(...)` further down.
+            let base: &ResolvedSources = resolved;
+            let parent_name_ref = parent_name.as_str();
+            // A plain loop building an owned `Vec` of futures, not
+            // `.iter().map(...)` — an iterator-adaptor closure here runs
+            // into spurious higher-ranked-lifetime inference errors against
+            // `base`'s already-fixed lifetime (each `async move` block
+            // needs to be built with a concrete, not higher-ranked, `row`
+            // lifetime).
+            let mut futures = Vec::with_capacity(parent_rows.len());
+            for (i, row) in parent_rows.iter().enumerate() {
+                let view = ResolvedView::RowOverride {
+                    base,
+                    parent_name: parent_name_ref,
+                    row,
+                };
+                futures.push(async move {
+                    let outcome = tokio::time::timeout(
+                        row_timeout,
+                        run_source_row(
+                            source,
+                            parameters,
+                            drivers,
+                            sql_root,
+                            http_root,
+                            http_client,
+                            services,
+                            headers,
+                            path_params,
+                            query_params,
+                            body,
+                            transaction_id,
+                            view,
+                        ),
+                    )
+                    .await;
+                    let outcome = outcome.unwrap_or(Err(SourceErrorCause::NestedManyRowTimedOut { after_ms: row_timeout_ms }));
+                    (i, outcome)
+                });
+            }
+
+            let mut stream = futures_util::stream::iter(futures).buffer_unordered(max_concurrency.get());
+            let mut values = HashMap::new();
+            let mut fatal = None;
+            // First-detected non-optional per-row failure (including a
+            // timeout) short-circuits immediately — dropping `stream` below
+            // cancels every not-yet-completed row's future.
+            while let Some((i, outcome)) = stream.next().await {
+                match outcome {
+                    Ok(value) => {
+                        values.insert(i, value);
+                    }
+                    Err(cause) => {
+                        if !optional {
+                            fatal = Some(cause);
+                            break;
+                        }
+                    }
+                }
+            }
+            drop(stream);
+
+            if let Some(cause) = fatal {
+                return Err(SourceFailure {
+                    on_error,
+                    source_name: name.to_string(),
+                    cause,
+                });
+            }
+            values
+        }
+    };
+
+    // Reordered by original row index (`buffer_unordered` completes rows in
+    // whatever order they finish), each merged into a *clone of that one
+    // row* under a new key equal to this source's own name — read by
+    // unmodified `items`/`lookup_in_row`. A row with no entry (optional
+    // per-row failure, or a mocked failure with `optional: true`) simply
+    // doesn't get the key, rendering `null` wherever it's looked up.
+    let merged: Vec<Value> = parent_rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut row)| {
+            if let Some(value) = row_values.remove(&i)
+                && let Value::Object(map) = &mut row
+            {
+                map.insert(name.to_string(), value);
+            }
+            row
+        })
+        .collect();
+
+    resolved.insert(parent_name, Some(Value::Array(merged)));
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -314,7 +698,7 @@ async fn run_sql_source(
     query_params: &HashMap<String, String>,
     body: &Value,
     transaction_id: &str,
-    resolved: &ResolvedSources,
+    resolved: ResolvedView<'_>,
 ) -> Result<Value, SourceErrorCause> {
     let driver = drivers
         .get(connection)
@@ -361,7 +745,7 @@ async fn run_http_source(
     query_params: &HashMap<String, String>,
     body: &Value,
     transaction_id: &str,
-    resolved: &ResolvedSources,
+    resolved: ResolvedView<'_>,
 ) -> Result<Value, SourceErrorCause> {
     let request_path = http_root.join(request);
     let contents = std::fs::read_to_string(&request_path).map_err(|e| SourceErrorCause::Config(format!("failed to read {}: {e}", request_path.display())))?;
@@ -443,7 +827,7 @@ fn resolve_from(
     query_params: &HashMap<String, String>,
     body: &Value,
     transaction_id: &str,
-    resolved: &ResolvedSources,
+    resolved: ResolvedView<'_>,
 ) -> SqlValue {
     if let Some(name) = from.strip_prefix("path.") {
         return path_params.get(name).map(|v| SqlValue::Text(v.clone())).unwrap_or(SqlValue::Null);
@@ -475,7 +859,14 @@ fn resolve_from(
         let Some(source_name) = segments.next().filter(|s| !s.is_empty()) else {
             return SqlValue::Null;
         };
-        let Some(Some(value)) = resolved.get(source_name) else {
+        // The nested-many bracket form (`"sources.<parent>[].<field>"`) — a
+        // trailing `"[]"` on the source name is a per-row substitution
+        // marker, not part of the real source name, so it's stripped before
+        // lookup. `get_source` then resolves it against whichever row this
+        // particular future is bound to (`ResolvedView::RowOverride`), or
+        // the parent's whole array otherwise.
+        let source_name = source_name.strip_suffix("[]").unwrap_or(source_name);
+        let Some(value) = resolved.get_source(source_name) else {
             return SqlValue::Null;
         };
         return match segments.next() {
@@ -588,10 +979,39 @@ fn build_field(mapping: &ResponseField, resolved: &ResolvedSources) -> Value {
 /// all, that's `lookup`'s ordinary job) or `"sources.<name>[]"` with
 /// nothing after it (a bracket path always names a field to extract per
 /// row; if you want the whole row, use `array.source` + `items` instead).
-fn parse_bracket_array_path(from: &str) -> Option<(&str, &str)> {
+/// `pub(crate)`, not private — also the parsing `validate_nested_many`
+/// (`endpoint::mod`) and `nested_many_parent` below use to find a nested-many
+/// source's own bracket-form parameters, not just `response` field mapping.
+pub(crate) fn parse_bracket_array_path(from: &str) -> Option<(&str, &str)> {
     let rest = from.strip_prefix("sources.")?;
     let (name, field_path) = rest.split_once("[].")?;
     (!name.is_empty() && !field_path.is_empty()).then_some((name, field_path))
+}
+
+/// The exactly-one bracket-form parent a nested-many source's own
+/// `parameters` must reference (`"sources.<parent>[].<field>"`) — shared by
+/// `validate_nested_many` (startup-time), `resolve_nested_many` (request-
+/// time), and `commands::test::record`'s post-loop mock-capture pass, so
+/// "find the one bracket-parent" isn't reimplemented three times. `Err`
+/// describes zero or more-than-one distinct parent referenced.
+pub(crate) fn nested_many_parent(parameters: &[Parameter]) -> Result<&str, String> {
+    let mut parents: Vec<&str> = Vec::new();
+    for param in parameters {
+        if let Some((parent, _field)) = parse_bracket_array_path(&param.from)
+            && !parents.contains(&parent)
+        {
+            parents.push(parent);
+        }
+    }
+    match parents.as_slice() {
+        [] => Err("no bracket-form parameter (\"sources.<parent>[].<field>\") found — allowNestedMany requires exactly one".to_string()),
+        [only] => Ok(*only),
+        many => Err(format!(
+            "references {} distinct bracket-form parents ({}) — a nested-many source may depend on exactly one",
+            many.len(),
+            many.join(", ")
+        )),
+    }
 }
 
 /// Builds the array `parse_bracket_array_path` describes: `source_name`
@@ -2075,7 +2495,15 @@ mod tests {
     fn resolve_from_reads_a_top_level_body_field() {
         let body = serde_json::json!({ "maker": "Honda" });
         assert_eq!(
-            resolve_from("body.maker", &HeaderMap::new(), &HashMap::new(), &HashMap::new(), &body, "", &HashMap::new()),
+            resolve_from(
+                "body.maker",
+                &HeaderMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &body,
+                "",
+                ResolvedView::Map(&HashMap::new())
+            ),
             SqlValue::Text("Honda".to_string())
         );
     }
@@ -2084,7 +2512,15 @@ mod tests {
     fn resolve_from_reads_a_nested_body_field() {
         let body = serde_json::json!({ "car": { "maker": "Honda" } });
         assert_eq!(
-            resolve_from("body.car.maker", &HeaderMap::new(), &HashMap::new(), &HashMap::new(), &body, "", &HashMap::new()),
+            resolve_from(
+                "body.car.maker",
+                &HeaderMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &body,
+                "",
+                ResolvedView::Map(&HashMap::new())
+            ),
             SqlValue::Text("Honda".to_string())
         );
     }
@@ -2093,7 +2529,15 @@ mod tests {
     fn resolve_from_a_missing_body_field_is_null_not_an_error() {
         let body = serde_json::json!({ "maker": "Honda" });
         assert_eq!(
-            resolve_from("body.model", &HeaderMap::new(), &HashMap::new(), &HashMap::new(), &body, "", &HashMap::new()),
+            resolve_from(
+                "body.model",
+                &HeaderMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &body,
+                "",
+                ResolvedView::Map(&HashMap::new())
+            ),
             SqlValue::Null
         );
     }
@@ -2102,7 +2546,15 @@ mod tests {
     fn resolve_from_bare_body_binds_the_whole_value_json_encoded() {
         let body = serde_json::json!({ "maker": "Honda" });
         assert_eq!(
-            resolve_from("body", &HeaderMap::new(), &HashMap::new(), &HashMap::new(), &body, "", &HashMap::new()),
+            resolve_from(
+                "body",
+                &HeaderMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &body,
+                "",
+                ResolvedView::Map(&HashMap::new())
+            ),
             SqlValue::Text(r#"{"maker":"Honda"}"#.to_string())
         );
     }
@@ -2111,7 +2563,15 @@ mod tests {
     fn resolve_from_bare_body_as_a_scalar_binds_the_scalar_directly() {
         let body = serde_json::json!(42);
         assert_eq!(
-            resolve_from("body", &HeaderMap::new(), &HashMap::new(), &HashMap::new(), &body, "", &HashMap::new()),
+            resolve_from(
+                "body",
+                &HeaderMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &body,
+                "",
+                ResolvedView::Map(&HashMap::new())
+            ),
             SqlValue::Int(42)
         );
     }
@@ -2119,7 +2579,15 @@ mod tests {
     #[test]
     fn resolve_from_with_no_body_sent_is_null() {
         assert_eq!(
-            resolve_from("body.maker", &HeaderMap::new(), &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new()),
+            resolve_from(
+                "body.maker",
+                &HeaderMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &Value::Null,
+                "",
+                ResolvedView::Map(&HashMap::new())
+            ),
             SqlValue::Null
         );
     }
@@ -2134,7 +2602,7 @@ mod tests {
                 &HashMap::new(),
                 &Value::Null,
                 "txn-123",
-                &HashMap::new()
+                ResolvedView::Map(&HashMap::new())
             ),
             SqlValue::Text("txn-123".to_string())
         );
@@ -2145,7 +2613,15 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", "secret-123".parse().unwrap());
         assert_eq!(
-            resolve_from("header.X-Api-Key", &headers, &HashMap::new(), &HashMap::new(), &Value::Null, "", &HashMap::new()),
+            resolve_from(
+                "header.X-Api-Key",
+                &headers,
+                &HashMap::new(),
+                &HashMap::new(),
+                &Value::Null,
+                "",
+                ResolvedView::Map(&HashMap::new())
+            ),
             SqlValue::Text("secret-123".to_string())
         );
     }
@@ -2160,7 +2636,7 @@ mod tests {
                 &HashMap::new(),
                 &Value::Null,
                 "",
-                &HashMap::new()
+                ResolvedView::Map(&HashMap::new())
             ),
             SqlValue::Null
         );
@@ -2171,7 +2647,15 @@ mod tests {
         let mut resolved: ResolvedSources = HashMap::new();
         resolved.insert("car".to_string(), Some(serde_json::json!({ "vin": "AAA" })));
         assert_eq!(
-            resolve_from("sources.car", &HeaderMap::new(), &HashMap::new(), &HashMap::new(), &Value::Null, "", &resolved),
+            resolve_from(
+                "sources.car",
+                &HeaderMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &Value::Null,
+                "",
+                ResolvedView::Map(&resolved)
+            ),
             SqlValue::Text(r#"{"vin":"AAA"}"#.to_string())
         );
     }
@@ -2181,7 +2665,15 @@ mod tests {
         let mut resolved: ResolvedSources = HashMap::new();
         resolved.insert("car".to_string(), Some(serde_json::json!({ "vin": "AAA" })));
         assert_eq!(
-            resolve_from("sources.car.vin", &HeaderMap::new(), &HashMap::new(), &HashMap::new(), &Value::Null, "", &resolved),
+            resolve_from(
+                "sources.car.vin",
+                &HeaderMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &Value::Null,
+                "",
+                ResolvedView::Map(&resolved)
+            ),
             SqlValue::Text("AAA".to_string())
         );
     }
@@ -2198,7 +2690,7 @@ mod tests {
                 &HashMap::new(),
                 &Value::Null,
                 "",
-                &resolved
+                ResolvedView::Map(&resolved)
             ),
             SqlValue::Text("Alex".to_string())
         );
@@ -2216,7 +2708,7 @@ mod tests {
                 &HashMap::new(),
                 &Value::Null,
                 "",
-                &resolved
+                ResolvedView::Map(&resolved)
             ),
             SqlValue::Null
         );
@@ -2232,7 +2724,7 @@ mod tests {
                 &HashMap::new(),
                 &Value::Null,
                 "",
-                &HashMap::new()
+                ResolvedView::Map(&HashMap::new())
             ),
             SqlValue::Null
         );
@@ -3411,5 +3903,871 @@ mod tests {
         .await
         .expect("a missing header must not fail the request, just bind null");
         assert_eq!(received_forwarded.lock().unwrap().as_deref(), Some(""));
+    }
+
+    // ---- Many-Depends-on-Many Array Fan-Out (`resolve_nested_many`) ----
+
+    /// Shared by every nested-many test below: a `cardinality: "many"`
+    /// parent's own rows, executed against `FakeDriver` so no real
+    /// connection is needed — the fan-out's own child source is what each
+    /// test actually cares about exercising for real.
+    fn cars_endpoint_json(nested_many_source_json: &str) -> String {
+        format!(
+            r#"{{
+                "operationId": "test",
+                "sources": {{
+                    "cars": {{ "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "many" }},
+                    "pricing": {nested_many_source_json}
+                }},
+                "response": {{}}
+            }}"#
+        )
+    }
+
+    fn cars_driver(vins: &[&str]) -> Box<dyn SqlDriver> {
+        Box::new(FakeDriver {
+            rows: vins.iter().map(|vin| row(&[("vin", SqlValue::Text(vin.to_string()))])).collect(),
+            fail: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn row_count_exceeding_max_rows_with_optional_false_fails_the_whole_request_and_issues_zero_real_calls() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter_for_route = call_count.clone();
+        let app = Router::new().route(
+            "/price",
+            get(move || {
+                let counter = counter_for_route.clone();
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Json(serde_json::json!({ "amount": 100 }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(root.join("http/pricing.json"), format!(r#"{{ "method": "GET", "url": "http://{addr}/price" }}"#)).unwrap();
+
+        let json = cars_endpoint_json(
+            r#"{
+                "type": "http", "request": "pricing.json",
+                "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 2, "optional": false,
+                "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+            }"#,
+        );
+        let endpoint: EndpointFile = serde_json::from_str(&json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), cars_driver(&["AAA", "BBB", "CCC"]));
+
+        let client = reqwest::Client::new();
+        let failure = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect_err("3 rows exceeds maxRows: 2 with optional: false, the whole request must fail");
+
+        assert_eq!(failure.cause.code(), "datasource.nested_many.row_limit_exceeded");
+        let message = failure.cause.message();
+        assert!(message.contains('3') && message.contains('2'), "message should name resolved/max: {message}");
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the row-count gate must fire before any per-row future is ever built"
+        );
+    }
+
+    /// The same maxRows-exceeded gate, but driven by a `.test.json`-style
+    /// parent-only mock (`MockOutcome::Success` on `cars`, exactly what a
+    /// test case's own `mocks` block deserializes into — see `MockOutcome`'s
+    /// own doc comment) rather than a real driver's row count. The
+    /// nested-many source itself has no mock at all, proving the row-count
+    /// gate is checked against the *mocked* parent's array length before any
+    /// real per-row call, not skipped just because the parent came from a mock.
+    #[tokio::test]
+    async fn a_mocked_parent_row_count_exceeding_max_rows_fails_before_any_real_per_row_call() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter_for_route = call_count.clone();
+        let app = Router::new().route(
+            "/price",
+            get(move || {
+                let counter = counter_for_route.clone();
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Json(serde_json::json!({ "amount": 100 }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(root.join("http/pricing.json"), format!(r#"{{ "method": "GET", "url": "http://{addr}/price" }}"#)).unwrap();
+
+        let json = cars_endpoint_json(
+            r#"{
+                "type": "http", "request": "pricing.json",
+                "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 2, "optional": false,
+                "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+            }"#,
+        );
+        let endpoint: EndpointFile = serde_json::from_str(&json).unwrap();
+        // Never queried at all — `cars` is fully mocked below, this exists
+        // purely so `drivers` has an entry for `connection: "db"`.
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+
+        let mut mocks = HashMap::new();
+        mocks.insert(
+            "cars".to_string(),
+            MockOutcome::Success(serde_json::json!([{ "vin": "AAA" }, { "vin": "BBB" }, { "vin": "CCC" }])),
+        );
+
+        let client = reqwest::Client::new();
+        let failure = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &mocks,
+            &HeaderMap::new(),
+        )
+        .await
+        .expect_err("a mocked parent with 3 rows still exceeds maxRows: 2");
+
+        assert_eq!(failure.cause.code(), "datasource.nested_many.row_limit_exceeded");
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the row-count gate must fire against the mocked parent's array before any real per-row call"
+        );
+    }
+
+    #[tokio::test]
+    async fn row_count_exceeding_max_rows_with_optional_true_nulls_every_merged_field_and_issues_zero_calls() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter_for_route = call_count.clone();
+        let app = Router::new().route(
+            "/price",
+            get(move || {
+                let counter = counter_for_route.clone();
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Json(serde_json::json!({ "amount": 100 }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(root.join("http/pricing.json"), format!(r#"{{ "method": "GET", "url": "http://{addr}/price" }}"#)).unwrap();
+
+        let json = cars_endpoint_json(
+            r#"{
+                "type": "http", "request": "pricing.json",
+                "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 2, "optional": true,
+                "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+            }"#,
+        );
+        let endpoint: EndpointFile = serde_json::from_str(&json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), cars_driver(&["AAA", "BBB", "CCC"]));
+
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("optional: true must degrade gracefully rather than fail the whole request");
+
+        assert!(!resolved.contains_key("pricing"), "a nested-many source never gets its own top-level resolved entry");
+        let Some(Some(Value::Array(rows))) = resolved.get("cars") else {
+            panic!("expected sources.cars to still resolve to an array");
+        };
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert!(
+                row.get("pricing").is_none(),
+                "no merge should have happened once the row-count gate rejected the fan-out"
+            );
+        }
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the row-count gate must fire before any per-row future is ever built, even when optional"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_many_happy_path_merges_each_rows_own_field_under_the_sources_own_name() {
+        use axum::extract::Query;
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let app = Router::new().route(
+            "/price",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                let amount = if params.get("vin").map(String::as_str) == Some("AAA") { 100 } else { 200 };
+                Json(serde_json::json!({ "amount": amount }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(
+            root.join("http/pricing.json"),
+            format!(r#"{{ "method": "GET", "url": "http://{addr}/price?vin={{{{vin}}}}" }}"#),
+        )
+        .unwrap();
+
+        let json = cars_endpoint_json(
+            r#"{
+                "type": "http", "request": "pricing.json",
+                "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10, "optional": false,
+                "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+            }"#,
+        );
+        let endpoint: EndpointFile = serde_json::from_str(&json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), cars_driver(&["AAA", "BBB"]));
+
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("the happy path should resolve cleanly");
+
+        assert!(!resolved.contains_key("pricing"), "a nested-many source never gets its own top-level resolved entry");
+        let Some(Some(Value::Array(rows))) = resolved.get("cars") else {
+            panic!("expected sources.cars to resolve to an array");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["vin"], "AAA");
+        assert_eq!(rows[0]["pricing"]["amount"], 100, "each row should get its own merged field");
+        assert_eq!(rows[1]["vin"], "BBB");
+        assert_eq!(rows[1]["pricing"]["amount"], 200);
+    }
+
+    /// Proves the coder's own noted deviation (a plain `for` loop building
+    /// the per-row futures instead of `.iter().enumerate().map()`) still
+    /// produces real concurrent execution through `buffer_unordered`, not an
+    /// accidentally-serialized fan-out — a peak in-flight count of 1 would
+    /// mean every row waited for the previous one to finish.
+    #[tokio::test]
+    async fn max_concurrency_actually_bounds_and_achieves_real_in_flight_concurrency() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let current = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let current_for_route = current.clone();
+        let peak_for_route = peak.clone();
+        let app = Router::new().route(
+            "/price",
+            get(move || {
+                let current = current_for_route.clone();
+                let peak = peak_for_route.clone();
+                async move {
+                    let now = current.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    current.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    Json(serde_json::json!({ "amount": 1 }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(root.join("http/pricing.json"), format!(r#"{{ "method": "GET", "url": "http://{addr}/price" }}"#)).unwrap();
+
+        let json = cars_endpoint_json(
+            r#"{
+                "type": "http", "request": "pricing.json",
+                "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10, "optional": false,
+                "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+            }"#,
+        );
+        let endpoint: EndpointFile = serde_json::from_str(&json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), cars_driver(&["A", "B", "C", "D", "E", "F"]));
+
+        let client = reqwest::Client::new();
+        resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("6 rows within maxRows should resolve cleanly");
+
+        let observed_peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(observed_peak <= 2, "maxConcurrency: 2 must never be exceeded, observed peak {observed_peak}");
+        assert!(
+            observed_peak >= 2,
+            "buffer_unordered must actually run rows concurrently, not serialize them one at a time (observed peak {observed_peak})"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_per_row_call_exceeding_row_timeout_ms_is_classified_as_a_row_timeout() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let app = Router::new().route(
+            "/price",
+            get(|| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                Json(serde_json::json!({ "amount": 1 }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(root.join("http/pricing.json"), format!(r#"{{ "method": "GET", "url": "http://{addr}/price" }}"#)).unwrap();
+
+        let json = cars_endpoint_json(
+            r#"{
+                "type": "http", "request": "pricing.json",
+                "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10, "optional": false, "rowTimeoutMs": 50,
+                "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+            }"#,
+        );
+        let endpoint: EndpointFile = serde_json::from_str(&json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), cars_driver(&["AAA"]));
+
+        let client = reqwest::Client::new();
+        let failure = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect_err("a per-row call slower than rowTimeoutMs must fail a non-optional nested-many source");
+
+        assert_eq!(failure.cause.code(), "datasource.nested_many.row_timed_out");
+        assert!(
+            failure.cause.message().contains("50"),
+            "message should mention the configured timeout: {}",
+            failure.cause.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_parent_rows_means_the_nested_many_source_never_runs() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter_for_route = call_count.clone();
+        let app = Router::new().route(
+            "/price",
+            get(move || {
+                let counter = counter_for_route.clone();
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Json(serde_json::json!({ "amount": 1 }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(root.join("http/pricing.json"), format!(r#"{{ "method": "GET", "url": "http://{addr}/price" }}"#)).unwrap();
+
+        let json = cars_endpoint_json(
+            r#"{
+                "type": "http", "request": "pricing.json",
+                "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10, "optional": false,
+                "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+            }"#,
+        );
+        let endpoint: EndpointFile = serde_json::from_str(&json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), cars_driver(&[]));
+
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("zero parent rows must resolve cleanly, not error");
+
+        assert_eq!(resolved.get("cars").cloned().flatten(), Some(Value::Array(Vec::new())));
+        assert!(!resolved.contains_key("pricing"));
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 0, "zero rows means zero per-row calls");
+    }
+
+    #[tokio::test]
+    async fn a_failed_optional_parent_is_treated_as_zero_rows_but_its_own_resolved_entry_stays_exactly_some_none() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter_for_route = call_count.clone();
+        let app = Router::new().route(
+            "/price",
+            get(move || {
+                let counter = counter_for_route.clone();
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Json(serde_json::json!({ "amount": 1 }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(root.join("http/pricing.json"), format!(r#"{{ "method": "GET", "url": "http://{addr}/price" }}"#)).unwrap();
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "cars": { "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "many", "optional": true },
+                "pricing": {
+                    "type": "http", "request": "pricing.json",
+                    "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10, "optional": false,
+                    "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                }
+            },
+            "response": {}
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        // The parent's own query fails outright — since `cars` is optional,
+        // that failure becomes `resolved["cars"] = None`, not a request
+        // failure.
+        drivers.insert("db".to_string(), Box::new(FakeDriver { rows: vec![], fail: true }));
+
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("a failed-optional parent must not fail the whole request, even with a non-optional nested-many child");
+
+        assert_eq!(
+            resolved.get("cars"),
+            Some(&None),
+            "the parent's own failed-optional entry must stay exactly Some(None), never rewritten into a fabricated empty array"
+        );
+        assert!(!resolved.contains_key("pricing"));
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a failed-optional parent means zero rows, so zero per-row calls, regardless of the child's own optional flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_independent_nested_many_sources_sharing_one_parent_both_merge_without_clobbering_each_other() {
+        use axum::extract::Query;
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let app = Router::new()
+            .route(
+                "/pricing",
+                get(|Query(params): Query<HashMap<String, String>>| async move {
+                    Json(serde_json::json!({ "amount": if params.get("vin").map(String::as_str) == Some("AAA") { 100 } else { 200 } }))
+                }),
+            )
+            .route(
+                "/specs",
+                get(|Query(params): Query<HashMap<String, String>>| async move {
+                    Json(serde_json::json!({ "engine": if params.get("vin").map(String::as_str) == Some("AAA") { "V6" } else { "V8" } }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(
+            root.join("http/pricing.json"),
+            format!(r#"{{ "method": "GET", "url": "http://{addr}/pricing?vin={{{{vin}}}}" }}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("http/specs.json"),
+            format!(r#"{{ "method": "GET", "url": "http://{addr}/specs?vin={{{{vin}}}}" }}"#),
+        )
+        .unwrap();
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": {
+                "cars": { "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "many" },
+                "pricing": {
+                    "type": "http", "request": "pricing.json",
+                    "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10, "optional": false,
+                    "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                },
+                "specs": {
+                    "type": "http", "request": "specs.json",
+                    "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10, "optional": false,
+                    "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+                }
+            },
+            "response": {}
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), cars_driver(&["AAA", "BBB"]));
+
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("both nested-many sources should resolve cleanly");
+
+        let Some(Some(Value::Array(rows))) = resolved.get("cars") else {
+            panic!("expected sources.cars to resolve to an array");
+        };
+        assert_eq!(rows.len(), 2);
+        let by_vin: HashMap<&str, &Value> = rows.iter().map(|r| (r["vin"].as_str().unwrap(), r)).collect();
+        assert_eq!(by_vin["AAA"]["pricing"]["amount"], 100, "pricing's own merge must survive specs' later merge");
+        assert_eq!(by_vin["AAA"]["specs"]["engine"], "V6", "specs' merge must not clobber pricing's");
+        assert_eq!(by_vin["BBB"]["pricing"]["amount"], 200);
+        assert_eq!(by_vin["BBB"]["specs"]["engine"], "V8");
+    }
+
+    #[tokio::test]
+    async fn per_row_optional_true_nulls_only_the_failing_rows_field_and_lets_others_proceed() {
+        use axum::extract::Query;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let app = Router::new().route(
+            "/price",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                if params.get("vin").map(String::as_str) == Some("BBB") {
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({}))).into_response()
+                } else {
+                    Json(serde_json::json!({ "amount": 100 })).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(
+            root.join("http/pricing.json"),
+            format!(r#"{{ "method": "GET", "url": "http://{addr}/price?vin={{{{vin}}}}" }}"#),
+        )
+        .unwrap();
+
+        let json = cars_endpoint_json(
+            r#"{
+                "type": "http", "request": "pricing.json",
+                "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10, "optional": true,
+                "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+            }"#,
+        );
+        let endpoint: EndpointFile = serde_json::from_str(&json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), cars_driver(&["AAA", "BBB"]));
+
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("a per-row optional: true failure must not fail the whole request");
+
+        let Some(Some(Value::Array(rows))) = resolved.get("cars") else {
+            panic!("expected sources.cars to resolve to an array");
+        };
+        let by_vin: HashMap<&str, &Value> = rows.iter().map(|r| (r["vin"].as_str().unwrap(), r)).collect();
+        assert_eq!(by_vin["AAA"]["pricing"]["amount"], 100, "the succeeding row must still get its merged field");
+        assert!(by_vin["BBB"].get("pricing").is_none(), "the failing row's field must be absent, not present-but-null");
+    }
+
+    #[tokio::test]
+    async fn per_row_optional_false_fails_the_whole_request_on_the_first_detected_row_failure() {
+        use axum::extract::Query;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let app = Router::new().route(
+            "/price",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                if params.get("vin").map(String::as_str) == Some("BBB") {
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({}))).into_response()
+                } else {
+                    Json(serde_json::json!({ "amount": 100 })).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(
+            root.join("http/pricing.json"),
+            format!(r#"{{ "method": "GET", "url": "http://{addr}/price?vin={{{{vin}}}}" }}"#),
+        )
+        .unwrap();
+
+        let json = cars_endpoint_json(
+            r#"{
+                "type": "http", "request": "pricing.json",
+                "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10, "optional": false,
+                "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+            }"#,
+        );
+        let endpoint: EndpointFile = serde_json::from_str(&json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), cars_driver(&["AAA", "BBB"]));
+
+        let client = reqwest::Client::new();
+        let failure = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect_err("a per-row optional: false failure must fail the whole request");
+
+        assert_eq!(failure.source_name, "pricing");
+        assert_eq!(failure.cause.code(), "datasource.http.upstream_error");
+    }
+
+    #[tokio::test]
+    async fn a_nested_many_sources_own_mock_applies_uniformly_to_every_row_without_a_real_call() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter_for_route = call_count.clone();
+        let app = Router::new().route(
+            "/price",
+            get(move || {
+                let counter = counter_for_route.clone();
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Json(serde_json::json!({ "amount": 999 }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(root.join("http/pricing.json"), format!(r#"{{ "method": "GET", "url": "http://{addr}/price" }}"#)).unwrap();
+
+        let json = cars_endpoint_json(
+            r#"{
+                "type": "http", "request": "pricing.json",
+                "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10, "optional": false,
+                "parameters": [{ "name": "vin", "from": "sources.cars[].vin" }]
+            }"#,
+        );
+        let endpoint: EndpointFile = serde_json::from_str(&json).unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), cars_driver(&["AAA", "BBB", "CCC"]));
+
+        let mut mocks = HashMap::new();
+        mocks.insert("pricing".to_string(), MockOutcome::Success(serde_json::json!({ "amount": 42 })));
+
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &mocks,
+            &HeaderMap::new(),
+        )
+        .await
+        .expect("a mocked nested-many source should resolve cleanly");
+
+        let Some(Some(Value::Array(rows))) = resolved.get("cars") else {
+            panic!("expected sources.cars to resolve to an array");
+        };
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert_eq!(row["pricing"]["amount"], 42, "every row must get the exact same mocked value");
+        }
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a mocked nested-many source must never make a real call"
+        );
     }
 }
