@@ -167,10 +167,14 @@ mod tests {
         let root = temp_project();
         write_minimal_openapi(&root);
         fs::create_dir_all(root.join("api/config")).unwrap();
-        // "mssql" has no match arm in `sql::connect_one` regardless of which
-        // `--features` this test binary happens to be built with — the same
-        // deterministic choice `sql::mod`'s own tests make.
-        fs::write(root.join("api/config/connections.json"), r#"{ "db": { "driver": "mssql" } }"#).unwrap();
+        // "nosuchdriver" has no match arm in `sql::connect_one` regardless of
+        // which `--features` this test binary happens to be built with —
+        // the same deterministic choice `sql::mod`'s own tests make.
+        // Deliberately not "mssql" (which now has a real match arm, gated on
+        // the `mssql` feature — see `mssql.rs`): "nosuchdriver" is guaranteed
+        // to never become a real driver, so this stays deterministic no
+        // matter which optional features this test binary is built with.
+        fs::write(root.join("api/config/connections.json"), r#"{ "db": { "driver": "nosuchdriver" } }"#).unwrap();
 
         assert_eq!(validate_api(&root).await, 1);
     }

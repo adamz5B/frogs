@@ -1,3 +1,7 @@
+#[cfg(feature = "mssql")]
+pub mod mssql;
+#[cfg(feature = "mysql")]
+pub mod mysql;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 // Always compiled in — SQLite is a base feature, not optional. See
@@ -129,6 +133,8 @@ pub fn pool_capacity(conn: &ConnectionConfig) -> Option<u32> {
             Some(if is_memory { 1 } else { DEFAULT_POOL_MAX_CONNECTIONS })
         }
         "postgres" => Some(DEFAULT_POOL_MAX_CONNECTIONS),
+        "mysql" => Some(DEFAULT_POOL_MAX_CONNECTIONS),
+        "mssql" => Some(DEFAULT_POOL_MAX_CONNECTIONS),
         _ => None,
     }
 }
@@ -157,6 +163,10 @@ async fn connect_one(name: &str, conn: &ConnectionConfig) -> Result<Box<dyn SqlD
     match conn.driver.as_str() {
         #[cfg(feature = "postgres")]
         "postgres" => Ok(Box::new(postgres::PostgresDriver::connect(conn).await?)),
+        #[cfg(feature = "mysql")]
+        "mysql" => Ok(Box::new(mysql::MySqlDriver::connect(conn).await?)),
+        #[cfg(feature = "mssql")]
+        "mssql" => Ok(Box::new(mssql::MssqlDriver::connect(conn).await?)),
         "sqlite" => Ok(Box::new(sqlite::SqliteDriver::connect(conn).await?)),
         other => Err(SqlError::ConnectionFailed(format!(
             "connection '{name}' uses driver '{other}', which isn't compiled into this binary \
@@ -194,17 +204,18 @@ mod tests {
     use super::*;
     use crate::config::ConnectionConfig;
 
-    /// "mssql" has no match arm at all in `connect_all` regardless of which
-    /// `--features` this test binary happens to be built with, so this
-    /// exercises the fallback branch deterministically rather than depending
-    /// on which drivers are compiled in.
+    /// "nosuchdriver" has no match arm at all in `connect_all` regardless of
+    /// which `--features` this test binary happens to be built with (unlike
+    /// "mssql", which now does — see `mssql.rs`), so this exercises the
+    /// fallback branch deterministically rather than depending on which
+    /// drivers are compiled in.
     #[tokio::test]
     async fn a_driver_not_compiled_into_this_binary_fails_startup_with_a_clear_message() {
         let mut connections = HashMap::new();
         connections.insert(
             "primary".to_string(),
             ConnectionConfig {
-                driver: "mssql".to_string(),
+                driver: "nosuchdriver".to_string(),
                 settings: HashMap::new(),
             },
         );
@@ -215,8 +226,8 @@ mod tests {
 
         let message = err.to_string();
         assert!(message.contains("primary"), "message should name the failing connection: {message}");
-        assert!(message.contains("mssql"), "message should name the unsupported driver: {message}");
-        assert!(message.contains("--features mssql"), "message should say how to fix it: {message}");
+        assert!(message.contains("nosuchdriver"), "message should name the unsupported driver: {message}");
+        assert!(message.contains("--features nosuchdriver"), "message should say how to fix it: {message}");
     }
 
     #[tokio::test]
@@ -232,7 +243,7 @@ mod tests {
         connections.insert(
             "primary".to_string(),
             ConnectionConfig {
-                driver: "mssql".to_string(),
+                driver: "nosuchdriver".to_string(),
                 settings: HashMap::new(),
             },
         );

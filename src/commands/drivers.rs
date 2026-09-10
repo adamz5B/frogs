@@ -8,11 +8,15 @@ use std::io;
 /// can be unit-tested directly against whatever features the test binary
 /// itself happens to be built with, rather than only exercised indirectly
 /// through `list`'s printed output.
-#[allow(unused_mut)] // only mutated when the `postgres` feature adds a second push below
+#[allow(unused_mut)] // only mutated when the `postgres`/`mysql`/`mssql` features add another push below
 fn compiled_drivers() -> Vec<&'static str> {
     let mut drivers = vec!["sqlite"];
     #[cfg(feature = "postgres")]
     drivers.push("postgres");
+    #[cfg(feature = "mysql")]
+    drivers.push("mysql");
+    #[cfg(feature = "mssql")]
+    drivers.push("mssql");
     drivers
 }
 
@@ -50,6 +54,18 @@ mod tests {
     #[cfg(not(feature = "postgres"))]
     fn postgres_is_absent_when_its_feature_is_not_compiled_in() {
         assert!(!compiled_drivers().contains(&"postgres"));
+    }
+
+    #[test]
+    #[cfg(feature = "mssql")]
+    fn mssql_is_listed_when_its_feature_is_compiled_in() {
+        assert!(compiled_drivers().contains(&"mssql"));
+    }
+
+    #[test]
+    #[cfg(not(feature = "mssql"))]
+    fn mssql_is_absent_when_its_feature_is_not_compiled_in() {
+        assert!(!compiled_drivers().contains(&"mssql"));
     }
 
     #[test]

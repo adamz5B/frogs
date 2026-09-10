@@ -7,7 +7,6 @@
       "connection": "vehicles_db",
       "script": "get_car_by_vin.sql",
       "cardinality": "one",
-      "onError": 500,
       "parameters": [
         {
           "name": "vin",

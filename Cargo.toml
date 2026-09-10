@@ -57,6 +57,20 @@ tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 # `std` (which also brings in `alloc`) is the only feature actually used;
 # every other feature stays off deliberately, for binary size.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# MSSQL support (`mssql` feature, see `[features]` below) is architecturally
+# different from every other driver: no sqlx adapter exists for SQL Server,
+# so this is the one driver built on `tiberius` (the pure-Rust TDS protocol
+# implementation) directly, pooled via `deadpool-tiberius`. `tds73` selects
+# the modern TDS protocol revision (SQL Server 2008+, which is the only
+# range worth supporting); `rustls` keeps the same all-rustls TLS posture as
+# every other driver in this project (see `rustls`'s own dependency comment
+# above) instead of pulling in native-tls/OpenSSL. `tiberius`'s own `tokio`
+# feature is deliberately *not* enabled — confirmed against its Cargo.toml
+# that it only gates SQL Browser named-instance discovery
+# (`sql-browser-tokio`), which `deadpool-tiberius` doesn't use; it manages
+# its own `tokio::net::TcpStream` directly instead.
+tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "rustls", "chrono"], optional = true }
+deadpool-tiberius = { version = "0.1.9", default-features = false, features = ["rustls", "chrono", "tds73"], optional = true }
 
 [dev-dependencies]
 # Generates a self-signed cert + key entirely in-memory at test time — no
@@ -75,6 +89,11 @@ default = ["postgres"]
 # SQLite baseline, same as the design doc's "server-full" build already
 # meant "both."
 postgres = ["sqlx/postgres", "sqlx/tls-rustls"]
+# Opt-in, same all-rustls TLS posture as `postgres` above.
+mysql = ["sqlx/mysql", "sqlx/tls-rustls"]
+# Opt-in, not in `default` — pulls in `tiberius`/`deadpool-tiberius` instead
+# of an sqlx adapter (see those dependencies' own comment above for why).
+mssql = ["dep:tiberius", "dep:deadpool-tiberius"]
 
 [profile.release]
 opt-level = "z"     # optimize for size over speed

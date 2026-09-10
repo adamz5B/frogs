@@ -61,6 +61,26 @@ paths:
                 $ref: '#/components/schemas/CarWithPrice'
         '404':
           description: No car with this VIN
+  /cars/by-maker:
+    get:
+      operationId: listCarsByMaker
+      description: >-
+        Lists every car from the given maker, with pricing looked up per row
+        (one HTTP call per car) via opt-in nested many-depends-on-many fan-out.
+      parameters:
+        - name: maker
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Every car from this maker, with pricing where available
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CarWithPrice'
 components:
   securitySchemes:
     apiKeyAuth:

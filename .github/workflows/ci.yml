@@ -77,6 +77,82 @@ jobs:
           DATABASE_URL_TEST: postgres://postgres:postgres@localhost:5432/postgres
         run: cargo test --locked --features postgres -- --ignored
 
+  # A real MySQL instance, exercised via the `#[ignore]`d live-DB tests in
+  # src/sql/mysql.rs — same Linux-runner-only service-container reasoning as
+  # `postgres-integration` above. MySQL and MariaDB speak the same wire
+  # protocol as far as sqlx's MySQL driver is concerned, so this one job is
+  # meant to cover both; a dedicated MariaDB job is deferred unless a real
+  # compatibility gap between the two ever surfaces.
+  mysql-integration:
+    name: mysql integration test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: mysql
+          MYSQL_DATABASE: frogs
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -pmysql"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the live-MySQL test
+        env:
+          DATABASE_URL_TEST_MYSQL: mysql://root:mysql@localhost:3306/frogs
+        run: cargo test --locked --features mysql -- --ignored
+
+  # A real SQL Server instance, exercised via the `#[ignore]`d live-DB tests
+  # in src/sql/mssql.rs — deliberately a Windows runner, unlike
+  # `postgres-integration`/`mysql-integration` above: GitHub Actions service
+  # containers (the `services:` key those two jobs use) are a Linux-runner-
+  # only feature, and windows-latest has no SQL Server preinstalled either,
+  # so there's no service-container equivalent available here at all. Uses
+  # the `mssqlsuite` action instead (an established, actively maintained
+  # community action specifically for this — installs a real SQL Server
+  # engine via Chocolatey and waits for it to accept connections itself,
+  # rather than this job hand-rolling a health-check loop) to get a real
+  # instance running directly on the runner. This also doubles as the one
+  # place this driver's build gets exercised on a non-Linux OS at all, since
+  # the base `test` matrix above only builds with default features (no
+  # `mssql`) on every OS.
+  mssql-integration:
+    name: mssql integration test
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install SQL Server
+        uses: potatoqualitee/mssqlsuite@v1.12
+        with:
+          install: sqlengine
+          version: 2022
+          sa-password: FrogsTestPassw0rd123
+
+      - name: Run the live-MSSQL test
+        env:
+          MSSQL_TEST_HOST: localhost
+          MSSQL_TEST_PORT: 1433
+          MSSQL_TEST_DATABASE: master
+          MSSQL_TEST_USER: sa
+          MSSQL_TEST_PASSWORD: FrogsTestPassw0rd123
+        run: cargo test --locked --features mssql -- --ignored
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest

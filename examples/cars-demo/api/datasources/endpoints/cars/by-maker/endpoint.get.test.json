@@ -1,0 +1,48 @@
+{
+  "cases": [
+    {
+      "name": "happy path — one pricing call fanned out per row, merged into each car",
+      "request": { "query": { "maker": "Honda" } },
+      "mocks": {
+        "cars": [
+          { "vin": "1HGCM82633A004352", "maker": "Honda", "model": "Accord", "year": 2003, "listed_at": 1055635200 },
+          { "vin": "2HGCM82633A004353", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000 }
+        ],
+        "pricing": { "amount": 24500, "currency": "USD" }
+      },
+      "expect": {
+        "status": 200,
+        "body": [
+          {
+            "vin": "1HGCM82633A004352",
+            "maker": "Honda",
+            "model": "Accord",
+            "year": 2003,
+            "price": 24500.0,
+            "currency": "USD",
+            "listedAt": "2003-06-15T00:00:00+00:00"
+          },
+          {
+            "vin": "2HGCM82633A004353",
+            "maker": "Honda",
+            "model": "Civic",
+            "year": 2020,
+            "price": 24500.0,
+            "currency": "USD",
+            "listedAt": "2023-11-14T22:13:20+00:00"
+          }
+        ]
+      }
+    },
+    {
+      "name": "maxRows exceeded — nested fan-out rejected, pricing (optional) degrades every row to null instead of failing the request",
+      "request": { "query": { "maker": "Honda" } },
+      "mocks": {
+        "cars": [{"vin": "ROW0000", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0001", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0002", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0003", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0004", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0005", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0006", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0007", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0008", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0009", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0010", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0011", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0012", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0013", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0014", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0015", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0016", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0017", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0018", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0019", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0020", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0021", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0022", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0023", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0024", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0025", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0026", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0027", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0028", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0029", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0030", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0031", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0032", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0033", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0034", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0035", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0036", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0037", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0038", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0039", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0040", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0041", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0042", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0043", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0044", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0045", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0046", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0047", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0048", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0049", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}, {"vin": "ROW0050", "maker": "Honda", "model": "Civic", "year": 2020, "listed_at": 1700000000}]
+      },
+      "expect": {
+        "status": 200
+      }
+    }
+  ]
+}
