@@ -83,6 +83,13 @@ jobs:
   # protocol as far as sqlx's MySQL driver is concerned, so this one job is
   # meant to cover both; a dedicated MariaDB job is deferred unless a real
   # compatibility gap between the two ever surfaces.
+  #
+  # `--no-default-features` matters here: `postgres` is a *default* feature,
+  # so a plain `--features mysql` would compile the Postgres driver (and its
+  # own `#[ignore]`d tests) into this same binary too — and `-- --ignored`
+  # runs every ignored test it finds, not just this job's own, so Postgres's
+  # live tests would fail here with no `DATABASE_URL_TEST` set/no Postgres
+  # container running (exactly what happened before this was added).
   mysql-integration:
     name: mysql integration test
     runs-on: ubuntu-latest
@@ -110,7 +117,7 @@ jobs:
       - name: Run the live-MySQL test
         env:
           DATABASE_URL_TEST_MYSQL: mysql://root:mysql@localhost:3306/frogs
-        run: cargo test --locked --features mysql -- --ignored
+        run: cargo test --locked --no-default-features --features mysql -- --ignored
 
   # A real SQL Server instance, exercised via the `#[ignore]`d live-DB tests
   # in src/sql/mssql.rs — deliberately a Windows runner, unlike
@@ -126,6 +133,12 @@ jobs:
   # place this driver's build gets exercised on a non-Linux OS at all, since
   # the base `test` matrix above only builds with default features (no
   # `mssql`) on every OS.
+  #
+  # `--no-default-features` for the same reason `mysql-integration` above
+  # needs it: without it, `--features mssql` would also compile the default
+  # `postgres` feature into this binary, and `-- --ignored` would then also
+  # run Postgres's own live-DB tests here, which have no Postgres instance
+  # to reach on this runner.
   mssql-integration:
     name: mssql integration test
     runs-on: windows-latest
@@ -151,7 +164,7 @@ jobs:
           MSSQL_TEST_DATABASE: master
           MSSQL_TEST_USER: sa
           MSSQL_TEST_PASSWORD: FrogsTestPassw0rd123
-        run: cargo test --locked --features mssql -- --ignored
+        run: cargo test --locked --no-default-features --features mssql -- --ignored
 
   clippy:
     name: clippy
