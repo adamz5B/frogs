@@ -120,19 +120,21 @@ jobs:
         run: cargo test --locked --no-default-features --features mysql -- --ignored
 
   # A real SQL Server instance, exercised via the `#[ignore]`d live-DB tests
-  # in src/sql/mssql.rs — deliberately a Windows runner, unlike
-  # `postgres-integration`/`mysql-integration` above: GitHub Actions service
-  # containers (the `services:` key those two jobs use) are a Linux-runner-
-  # only feature, and windows-latest has no SQL Server preinstalled either,
-  # so there's no service-container equivalent available here at all. Uses
-  # the `mssqlsuite` action instead (an established, actively maintained
-  # community action specifically for this — installs a real SQL Server
-  # engine via Chocolatey and waits for it to accept connections itself,
-  # rather than this job hand-rolling a health-check loop) to get a real
-  # instance running directly on the runner. This also doubles as the one
-  # place this driver's build gets exercised on a non-Linux OS at all, since
-  # the base `test` matrix above only builds with default features (no
-  # `mssql`) on every OS.
+  # in src/sql/mssql.rs. Runs on ubuntu-latest against Microsoft's official
+  # Linux SQL Server image as a `services:` container — same pattern as
+  # `postgres-integration`/`mysql-integration` above. This used to run on
+  # windows-latest via the `mssqlsuite` action (Chocolatey-installing a full
+  # SQL Server engine directly on the runner), but that install alone took
+  # ~13 wall-clock minutes, and Windows runners are billed at a 2x minute
+  # multiplier on top of that — the driver's own test code just opens a TCP
+  # connection via `MSSQL_TEST_*` env vars, nothing Windows-specific, so
+  # there's no reason to pay for a Windows runner here at all. Note this
+  # means `mssql` no longer gets its build exercised on a non-Linux OS by
+  # any CI job (the base `test` matrix builds default features only).
+  #
+  # `-C` on the sqlcmd health check trusts the container's self-signed dev
+  # cert, since mssql-tools18 (bundled from the 2022 image onward) refuses
+  # an untrusted server cert by default.
   #
   # `--no-default-features` for the same reason `mysql-integration` above
   # needs it: without it, `--features mssql` would also compile the default
@@ -141,21 +143,27 @@ jobs:
   # to reach on this runner.
   mssql-integration:
     name: mssql integration test
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: Y
+          MSSQL_SA_PASSWORD: FrogsTestPassw0rd123
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P $MSSQL_SA_PASSWORD -C -Q 'SELECT 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install SQL Server
-        uses: potatoqualitee/mssqlsuite@v1.12
-        with:
-          install: sqlengine
-          version: 2022
-          sa-password: FrogsTestPassw0rd123
 
       - name: Run the live-MSSQL test
         env:
