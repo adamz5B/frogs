@@ -2,6 +2,8 @@
 pub mod mssql;
 #[cfg(feature = "mysql")]
 pub mod mysql;
+#[cfg(feature = "oracle")]
+pub mod oracle;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 // Always compiled in — SQLite is a base feature, not optional. See
@@ -135,6 +137,7 @@ pub fn pool_capacity(conn: &ConnectionConfig) -> Option<u32> {
         "postgres" => Some(DEFAULT_POOL_MAX_CONNECTIONS),
         "mysql" => Some(DEFAULT_POOL_MAX_CONNECTIONS),
         "mssql" => Some(DEFAULT_POOL_MAX_CONNECTIONS),
+        "oracle" => Some(DEFAULT_POOL_MAX_CONNECTIONS),
         _ => None,
     }
 }
@@ -167,6 +170,8 @@ async fn connect_one(name: &str, conn: &ConnectionConfig) -> Result<Box<dyn SqlD
         "mysql" => Ok(Box::new(mysql::MySqlDriver::connect(conn).await?)),
         #[cfg(feature = "mssql")]
         "mssql" => Ok(Box::new(mssql::MssqlDriver::connect(conn).await?)),
+        #[cfg(feature = "oracle")]
+        "oracle" => Ok(Box::new(oracle::OracleDriver::connect(conn).await?)),
         "sqlite" => Ok(Box::new(sqlite::SqliteDriver::connect(conn).await?)),
         other => Err(SqlError::ConnectionFailed(format!(
             "connection '{name}' uses driver '{other}', which isn't compiled into this binary \
@@ -206,9 +211,9 @@ mod tests {
 
     /// "nosuchdriver" has no match arm at all in `connect_all` regardless of
     /// which `--features` this test binary happens to be built with (unlike
-    /// "mssql", which now does — see `mssql.rs`), so this exercises the
-    /// fallback branch deterministically rather than depending on which
-    /// drivers are compiled in.
+    /// "mssql"/"oracle", which now do — see `mssql.rs`/`oracle.rs`), so this
+    /// exercises the fallback branch deterministically rather than depending
+    /// on which drivers are compiled in.
     #[tokio::test]
     async fn a_driver_not_compiled_into_this_binary_fails_startup_with_a_clear_message() {
         let mut connections = HashMap::new();
@@ -247,10 +252,14 @@ mod tests {
                 settings: HashMap::new(),
             },
         );
+        // A second, distinct guaranteed-uncompiled-driver placeholder (not
+        // "oracle" — that's a real, compilable driver now, see `oracle.rs`)
+        // so this genuinely proves two independently-failing connections are
+        // both reported, rather than the same string's failure counted twice.
         connections.insert(
             "secondary".to_string(),
             ConnectionConfig {
-                driver: "oracle".to_string(),
+                driver: "nosuchdriver2".to_string(),
                 settings: HashMap::new(),
             },
         );

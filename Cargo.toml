@@ -71,6 +71,26 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # its own `tokio::net::TcpStream` directly instead.
 tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "rustls", "chrono"], optional = true }
 deadpool-tiberius = { version = "0.1.9", default-features = false, features = ["rustls", "chrono", "tds73"], optional = true }
+# Oracle support (`oracle` feature, see `[features]` below) is architecturally
+# the same shape as MSSQL above: no sqlx adapter exists for Oracle either, so
+# this is built on `oracle-rs` (a pure-Rust implementation of Oracle's TNS
+# wire protocol — no OCI/Instant Client install required), pooled via
+# `deadpool-oracle`. Oracle's own official `oracledb` crate was deliberately
+# *not* used instead — confirmed via crates.io that as of this writing it has
+# published only beta/yanked versions (latest `26.0.0-beta.3`,
+# `max_stable_version: null`), too API-unstable for a first pass.
+# `oracle-rs` pulls in its own `rustls` at "0.23" (`default-features = false`,
+# features `["std", "tls12"]` — no bundled crypto-provider feature of its
+# own), the *same* major version this project's own top-level `rustls`
+# dependency above already pins — unlike `tiberius`'s `rustls 0.21` (which
+# needed to coexist as a second copy alongside the process-wide `ring`
+# install), Cargo unifies this into one shared `rustls` 0.23.x build, so
+# `oracle-rs`'s own TLS code path (unused by default — see `oracle::OracleDriver::connect`'s
+# own doc comment for why this driver connects in plaintext by default) rides
+# on the same single `ring` `CryptoProvider` `main`'s first line already
+# installs, with no second provider to conflict.
+oracle-rs = { version = "0.1.7", optional = true }
+deadpool-oracle = { version = "0.1.1", optional = true }
 
 [dev-dependencies]
 # Generates a self-signed cert + key entirely in-memory at test time — no
@@ -94,6 +114,9 @@ mysql = ["sqlx/mysql", "sqlx/tls-rustls"]
 # Opt-in, not in `default` — pulls in `tiberius`/`deadpool-tiberius` instead
 # of an sqlx adapter (see those dependencies' own comment above for why).
 mssql = ["dep:tiberius", "dep:deadpool-tiberius"]
+# Opt-in, not in `default` — pulls in `oracle-rs`/`deadpool-oracle` instead of
+# an sqlx adapter (see those dependencies' own comment above for why).
+oracle = ["dep:oracle-rs", "dep:deadpool-oracle"]
 
 [profile.release]
 opt-level = "z"     # optimize for size over speed
