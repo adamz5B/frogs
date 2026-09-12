@@ -180,6 +180,62 @@ jobs:
           MSSQL_TEST_PASSWORD: FrogsTestPassw0rd123
         run: cargo test --locked --no-default-features --features mssql -- --ignored
 
+  # A real Oracle instance, exercised via the `#[ignore]`d live-DB tests in
+  # src/sql/oracle.rs — same Linux-runner-only service-container reasoning as
+  # `postgres-integration`/`mysql-integration`/`mssql-integration` above.
+  # Oracle's own official images have no lightweight, freely-redistributable
+  # tag suited to a public CI runner, but `gvenzl/oracle-free` (community-
+  # maintained, no Oracle account/login needed to pull) does — it's the same
+  # image this driver's live tests were originally verified against locally,
+  # and it ships a real `healthcheck.sh` specifically designed for exactly
+  # this "wait until genuinely ready to accept connections" use in CI/compose
+  # setups (not just "is the port open"). The `slim-faststart` tag trims
+  # first-boot time specifically for throwaway CI containers like this one.
+  #
+  # `ORACLE_PASSWORD` sets both the `sys` and `system` accounts' password;
+  # this driver's own default test user is `system` (see `oracle.rs`'s
+  # `ORACLE_TEST_USER` default), and `FREEPDB1` is this image's own default
+  # pluggable-database service name — matches what the local Multipass-VM
+  # live verification already used, so no `ORACLE_TEST_SERVICE_NAME`/`_USER`
+  # override is needed here.
+  #
+  # `--no-default-features` for the same reason `mysql-integration`/
+  # `mssql-integration` above need it: without it, `--features oracle` would
+  # also compile the default `postgres` feature into this binary, and
+  # `-- --ignored` would then also run Postgres's own live-DB tests here,
+  # which have no Postgres instance to reach on this runner.
+  oracle-integration:
+    name: oracle integration test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      oracle:
+        image: gvenzl/oracle-free:23-slim-faststart
+        env:
+          ORACLE_PASSWORD: FrogsTestPassw0rd123
+        ports:
+          - 1521:1521
+        options: >-
+          --health-cmd healthcheck.sh
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the live-Oracle test
+        env:
+          ORACLE_TEST_HOST: localhost
+          ORACLE_TEST_PORT: 1521
+          ORACLE_TEST_SERVICE_NAME: FREEPDB1
+          ORACLE_TEST_USER: system
+          ORACLE_TEST_PASSWORD: FrogsTestPassw0rd123
+        run: cargo test --locked --no-default-features --features oracle -- --ignored
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest
