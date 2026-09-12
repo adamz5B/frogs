@@ -1,0 +1,143 @@
+name: Release
+
+# Tag-triggered CD: pushing a `vX.Y.Z` tag builds an --all-features release
+# binary for Linux/Windows/macOS and publishes them as a GitHub Release.
+# This is the "official CI-published binary release matrix" item from
+# CLAUDE.md's roadmap note.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write  # required to create the GitHub Release and upload assets
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false  # never cancel a release build mid-upload
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fails fast if the pushed tag and Cargo.toml's [package] version have
+  # drifted, instead of publishing a release whose asset contents disagree
+  # with `frogs --version`/Cargo.toml. Every other job depends on this one.
+  check-version:
+    name: check tag matches Cargo.toml version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compare tag to Cargo.toml
+        id: check
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF#refs/tags/v}"
+          cargo_version=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "Tag v$tag_version does not match Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+
+  # One --all-features release binary per OS, packaged into an
+  # OS-appropriate archive (tar.gz + sha256 for Unix, zip + sha256 for
+  # Windows) named after the actual `rustc` host target triple rather than
+  # a hardcoded guess, since GitHub's `macos-latest` label has changed
+  # underlying architecture before (Intel -> Apple Silicon).
+  build:
+    name: build (${{ matrix.os }})
+    needs: check-version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (all features)
+        run: cargo build --release --locked --all-features
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          target=$(rustc -vV | sed -n 's/^host: //p')
+          stage="frogs-v${{ needs.check-version.outputs.version }}-$target"
+          mkdir "$stage"
+          cp target/release/frogs "$stage"/
+          cp README.md LICENSE-MIT LICENSE-APACHE "$stage"/
+          tar -czf "$stage.tar.gz" "$stage"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$stage.tar.gz" > "$stage.tar.gz.sha256"
+          else
+            shasum -a 256 "$stage.tar.gz" > "$stage.tar.gz.sha256"
+          fi
+          {
+            echo "ASSET_PATHS<<EOF"
+            echo "$stage.tar.gz"
+            echo "$stage.tar.gz.sha256"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $target = ((rustc -vV | Select-String '^host:').ToString() -split ' ')[1]
+          $stage = "frogs-v${{ needs.check-version.outputs.version }}-$target"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item target/release/frogs.exe $stage/
+          Copy-Item README.md,LICENSE-MIT,LICENSE-APACHE $stage/
+          Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip"
+          $hash = (Get-FileHash "$stage.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $stage.zip" | Out-File "$stage.zip.sha256" -Encoding ascii
+          # -Encoding ascii: GITHUB_ENV is a plain-text file other steps also
+          # append to (bash writes UTF-8 without BOM) — every value here is
+          # ASCII-safe (target triple, filenames), so ASCII keeps this
+          # append free of a stray mid-file BOM that would corrupt parsing.
+          Add-Content -Path $env:GITHUB_ENV -Value "ASSET_PATHS<<EOF" -Encoding ascii
+          Add-Content -Path $env:GITHUB_ENV -Value "$stage.zip" -Encoding ascii
+          Add-Content -Path $env:GITHUB_ENV -Value "$stage.zip.sha256" -Encoding ascii
+          Add-Content -Path $env:GITHUB_ENV -Value "EOF" -Encoding ascii
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frogs-${{ matrix.os }}
+          path: ${{ env.ASSET_PATHS }}
+          if-no-files-found: error
+
+  # Gathers all three per-OS archives and publishes one GitHub Release.
+  # Uses the `gh` CLI (preinstalled on every GitHub-hosted runner) rather
+  # than a third-party release action, consistent with this repo's existing
+  # workflow only depending on actions/checkout, dtolnay/rust-toolchain and
+  # Swatinem/rust-cache.
+  release:
+    name: publish release
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
