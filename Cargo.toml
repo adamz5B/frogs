@@ -3,6 +3,11 @@ name = "frogs"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+description = "Free Rust OpenAPI Generated Server — a config-driven API server: give it an openapi.yaml plus per-endpoint SQL/HTTP mapping files and it serves real traffic with no hand-written handler code."
+repository = "https://github.com/adamz5B/frogs"
+readme = "README.md"
+keywords = ["openapi", "api-server", "codegen", "sql", "rest"]
+categories = ["web-programming::http-server", "command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

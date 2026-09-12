@@ -18,6 +18,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Declared here (empty) only so editor tooling recognizes the name — the
+  # real value is set per-OS at runtime via GITHUB_ENV in the build job's
+  # "Package (Unix)"/"Package (Windows)" steps.
+  ASSET_PATHS: ''
 
 jobs:
   # Fails fast if the pushed tag and Cargo.toml's [package] version have
