@@ -71,8 +71,23 @@ frogs generate [--role api|web]   # openapi.yaml/webserve.json -> stub files. Ne
                                    # a hand-edited stub; --role forces one side when both markers
                                    # exist. Also scaffolds api/config/server.json,
                                    # api/config/errors/core.json with working defaults on first run.
-frogs run                          # start the server (blocks; Ctrl+C or `frogs stop` to end)
-frogs stop                         # stop the running server for this project
+frogs run                          # start the server (blocks; Ctrl+C or `frogs stop` to end).
+                                   # On a registered project (see below), reports/restarts the
+                                   # OS-managed service instead of binding a port itself.
+frogs stop                         # stop the running server for this project (or the OS-managed
+                                   # service, on a registered project)
+frogs register [--name <NAME>] [--user | --system] [--account <NAME>]
+                                   # install this project as a platform-native service (systemd /
+                                   # launchd / a real Windows Service), started now and at boot/login
+                                   # going forward. Default scope: --user. Default name: the project
+                                   # folder name, sanitized; registered as `frogs-<name>` either way.
+                                   # --account is Windows-only (which account the service runs as;
+                                   # default NT AUTHORITY\LocalService); on Windows, registering
+                                   # always requires an elevated (Administrator) terminal, and
+                                   # --user/--system stop mattering there.
+frogs unregister [--user | --system]
+                                   # stop and remove this project's service registration. Safe to
+                                   # run when nothing is registered (reports so, exits 0).
 frogs validate                     # read-only dry run: config, every SQL connection, every
                                    # endpoint file, openapi.yaml/webserve.json parsing.
                                    # Never binds a port. Exit code non-zero if anything's wrong.

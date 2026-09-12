@@ -3,9 +3,22 @@ use std::path::Path;
 
 use crate::project::require_project_root;
 use crate::server::pidfile;
+use crate::server::service;
 
 pub fn run(cwd: &Path) -> io::Result<()> {
     let root = require_project_root(cwd);
+
+    if let Some(record) = service::read_record(&root)? {
+        if let Err(e) = service::revalidate(&record, &root) {
+            eprintln!("error: refusing to stop {} — {e}", record.name);
+            std::process::exit(1);
+        }
+        println!("stopping {} (registered service, via {})...", record.name, service::backend_label(record.backend));
+        service::stop_registered(&record, &root)?;
+        pidfile::remove(&root)?;
+        println!("stopped.");
+        return Ok(());
+    }
 
     let Some(info) = pidfile::read(&root)? else {
         println!("no running server found for this project ({} doesn't exist)", pidfile::path(&root).display());

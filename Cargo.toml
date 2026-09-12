@@ -97,6 +97,20 @@ deadpool-tiberius = { version = "0.1.9", default-features = false, features = ["
 oracle-rs = { version = "0.1.7", optional = true }
 deadpool-oracle = { version = "0.1.1", optional = true }
 
+[target.'cfg(windows)'.dependencies]
+# Windows-only, and a deliberate reversal of this feature's original
+# "zero new dependencies" goal (see the hand-rolled `schtasks`/XML rendering
+# this replaces in `server::service`): registering/managing a real Windows
+# Service (SCM install, start/stop, status queries, the `ffi_service_main`
+# entry point) needs real Win32 Service Control Manager calls that
+# `std::process::Command` alone can't reach — there is no CLI tool
+# equivalent to `systemctl`/`launchctl` that can install a service account +
+# `ServiceMain` binary the way `sc.exe` half-can but `CreateServiceW` fully
+# can. Pinned to the last published 0.7.x release (0.7.0) rather than
+# 0.8.x's newer `windows-sys` bump, to keep this dependency's own transitive
+# footprint as small as reasonably possible.
+windows-service = "0.7.0"
+
 [dev-dependencies]
 # Generates a self-signed cert + key entirely in-memory at test time — no
 # committed cert fixtures, no external tool (mkcert) needed in CI. See

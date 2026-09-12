@@ -1,4 +1,7 @@
 pub mod pidfile;
+pub mod service;
+#[cfg(windows)]
+pub mod service_host;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

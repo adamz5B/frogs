@@ -14,6 +14,7 @@ mod webserve;
 use clap::{Parser, Subcommand};
 
 use commands::generate::Role;
+use server::service::ServiceScope;
 
 #[derive(Parser)]
 #[command(name = "frogs", version, about = "Free Rust OpenAPI Generated Server", disable_help_subcommand = true)]
@@ -34,9 +35,59 @@ enum Command {
         role: Option<Role>,
     },
     /// Start the server for the current project
-    Run,
+    Run {
+        /// Set automatically on the command line baked into a service
+        /// definition by `frogs register` — internal-only, not meant to be
+        /// passed by hand
+        #[arg(long = "service-managed", hide = true)]
+        service_managed: bool,
+        /// Restart the service if it's already running (only meaningful
+        /// for a project registered via `frogs register`)
+        #[arg(long)]
+        restart: bool,
+    },
     /// Stop the running server for the current project
     Stop,
+    /// Register this project to run as an OS-managed service (systemd on
+    /// Linux, launchd on macOS, a real Windows Service on Windows) —
+    /// started immediately and set to start automatically going forward
+    Register {
+        /// Identifier to use in place of the project folder name — the
+        /// final registered name is always frogs-<NAME>
+        #[arg(long)]
+        name: Option<String>,
+        /// Register for the current user only (default) — on Windows this
+        /// has no effect (see --account below); a Windows Service always
+        /// requires an elevated (Administrator) terminal to register or
+        /// unregister, regardless of --user/--system
+        #[arg(long, conflicts_with = "system")]
+        user: bool,
+        /// Register system-wide (requires appropriate OS privileges — no
+        /// self-elevation is attempted) — on Windows this has no effect
+        /// (see --account below)
+        #[arg(long, conflicts_with = "user")]
+        system: bool,
+        /// Windows only: the account the service runs as — a well-known
+        /// name (LocalService, NetworkService, LocalSystem, matched
+        /// case-insensitively) or a custom account name. Defaults to NT
+        /// AUTHORITY\LocalService when omitted (never LocalSystem, to avoid
+        /// granting more privilege than a service needs by default). A
+        /// custom account (other than a group-managed service account,
+        /// whose name ends in '$') needs its password supplied via the
+        /// FROGS_SERVICE_ACCOUNT_PASSWORD environment variable. Ignored on
+        /// non-Windows platforms.
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Remove this project's OS-managed service registration
+    Unregister {
+        /// The project was registered for the current user only (default)
+        #[arg(long, conflicts_with = "system")]
+        user: bool,
+        /// The project was registered system-wide
+        #[arg(long, conflicts_with = "user")]
+        system: bool,
+    },
     /// Run every *.test.json file's cases against the mock-substitution
     /// framework
     Test {
@@ -86,15 +137,50 @@ enum TestCommand {
     },
 }
 
-#[tokio::main]
-async fn main() {
-    // Must happen before any TLS operation (an HTTPS `frogs run`, or any
-    // outbound `reqwest`/`sqlx` TLS connection) — see the doc comment on
-    // this dependency in Cargo.toml for why rustls needs this told to it
-    // explicitly rather than picking a default on its own.
+/// `--system` wins if both were somehow passed (clap's own `conflicts_with`
+/// already rejects that combination before this ever runs); with neither
+/// flag given, `--user` is the documented default.
+fn resolve_scope(user: bool, system: bool) -> ServiceScope {
+    let _ = user;
+    if system { ServiceScope::System } else { ServiceScope::User }
+}
+
+/// Installs the process-wide rustls crypto provider — must happen before
+/// any TLS operation (an HTTPS `frogs run`, or any outbound `reqwest`/
+/// `sqlx` TLS connection) — see the doc comment on this dependency in
+/// Cargo.toml for why rustls needs this told to it explicitly rather than
+/// picking a default on its own. Shared by both `main`'s own normal
+/// startup path and the Windows `--windows-service-host` sentinel branch
+/// below, since exactly one of the two ever runs per process.
+fn install_rustls_crypto_provider() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("installing the process-wide rustls crypto provider should only ever be attempted once");
+}
+
+/// A plain, non-`#[tokio::main]` `fn main()` — a mechanical de-sugaring,
+/// not a behavior change — specifically so the Windows-only
+/// `--windows-service-host` sentinel check below can run, and exit,
+/// *before* a tokio runtime, `Cli::parse()`, or anything else in the
+/// normal startup path is ever touched. That sentinel is how a process the
+/// SCM itself launches (per a registered service's own baked-in command
+/// line — see `server::service_host`) ends up hosting the real Windows
+/// Service machinery instead of being parsed as an ordinary `frogs`
+/// subcommand invocation.
+fn main() {
+    #[cfg(windows)]
+    if std::env::args().nth(1).as_deref() == Some("--windows-service-host") {
+        install_rustls_crypto_provider();
+        std::process::exit(match crate::server::service_host::run_as_service() {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("error: {e}");
+                1
+            }
+        });
+    }
+
+    install_rustls_crypto_provider();
 
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
@@ -103,19 +189,28 @@ async fn main() {
     let cli = Cli::parse();
     let cwd = std::env::current_dir().expect("failed to read current directory");
 
-    let result = match cli.command {
-        Command::Generate { role } => commands::generate::run(&cwd, role),
-        Command::Run => commands::run::run(&cwd).await,
-        Command::Stop => commands::stop::run(&cwd),
-        Command::Test { action: None } => commands::test::run(&cwd).await,
-        Command::Test {
-            action: Some(TestCommand::Record { path, method }),
-        } => commands::test::record(&cwd, &path, &method).await,
-        Command::Errors { action: ErrorsCommand::Freeze } => commands::errors::freeze(&cwd),
-        Command::Drivers { action: DriversCommand::List } => commands::drivers::list(),
-        Command::Validate => commands::validate::run(&cwd).await,
-        Command::Help => commands::help::run(&cwd),
-    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build the tokio runtime");
+
+    let result = runtime.block_on(async {
+        match cli.command {
+            Command::Generate { role } => commands::generate::run(&cwd, role),
+            Command::Run { service_managed, restart } => commands::run::run(&cwd, service_managed, restart).await,
+            Command::Stop => commands::stop::run(&cwd),
+            Command::Register { name, user, system, account } => commands::register::run(&cwd, name.as_deref(), resolve_scope(user, system), account.as_deref()),
+            Command::Unregister { user, system } => commands::unregister::run(&cwd, resolve_scope(user, system)),
+            Command::Test { action: None } => commands::test::run(&cwd).await,
+            Command::Test {
+                action: Some(TestCommand::Record { path, method }),
+            } => commands::test::record(&cwd, &path, &method).await,
+            Command::Errors { action: ErrorsCommand::Freeze } => commands::errors::freeze(&cwd),
+            Command::Drivers { action: DriversCommand::List } => commands::drivers::list(),
+            Command::Validate => commands::validate::run(&cwd).await,
+            Command::Help => commands::help::run(&cwd),
+        }
+    });
 
     if let Err(err) = result {
         eprintln!("error: {err}");
@@ -156,12 +251,120 @@ mod tests {
 
     #[test]
     fn parses_run() {
-        assert!(matches!(parse(&["run"]), Command::Run));
+        assert!(matches!(
+            parse(&["run"]),
+            Command::Run {
+                service_managed: false,
+                restart: false
+            }
+        ));
     }
 
     #[test]
     fn parses_stop() {
         assert!(matches!(parse(&["stop"]), Command::Stop));
+    }
+
+    #[test]
+    fn parses_run_with_restart() {
+        assert!(matches!(
+            parse(&["run", "--restart"]),
+            Command::Run {
+                service_managed: false,
+                restart: true
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_run_with_service_managed_even_though_the_flag_is_hidden() {
+        // `hide = true` only affects `--help` output — the flag must still
+        // actually parse, since every registered service's own command
+        // line bakes it in.
+        assert!(matches!(
+            parse(&["run", "--service-managed"]),
+            Command::Run {
+                service_managed: true,
+                restart: false
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_register_with_no_flags() {
+        match parse(&["register"]) {
+            Command::Register { name, user, system, account } => {
+                assert_eq!(name, None);
+                assert!(!user);
+                assert!(!system);
+                assert_eq!(account, None);
+            }
+            _ => panic!("expected Command::Register"),
+        }
+    }
+
+    #[test]
+    fn parses_register_with_a_name() {
+        match parse(&["register", "--name", "foo"]) {
+            Command::Register { name, .. } => assert_eq!(name, Some("foo".to_string())),
+            _ => panic!("expected Command::Register"),
+        }
+    }
+
+    #[test]
+    fn parses_register_with_system() {
+        match parse(&["register", "--system"]) {
+            Command::Register { user, system, .. } => {
+                assert!(!user);
+                assert!(system);
+            }
+            _ => panic!("expected Command::Register"),
+        }
+    }
+
+    #[test]
+    fn parses_register_with_user() {
+        match parse(&["register", "--user"]) {
+            Command::Register { user, system, .. } => {
+                assert!(user);
+                assert!(!system);
+            }
+            _ => panic!("expected Command::Register"),
+        }
+    }
+
+    #[test]
+    fn parses_register_with_an_account() {
+        match parse(&["register", "--account", "NetworkService"]) {
+            Command::Register { account, .. } => assert_eq!(account, Some("NetworkService".to_string())),
+            _ => panic!("expected Command::Register"),
+        }
+    }
+
+    #[test]
+    fn register_user_and_system_together_is_a_parse_error() {
+        assert!(
+            Cli::try_parse_from(["frogs", "register", "--user", "--system"]).is_err(),
+            "--user and --system are mutually exclusive via conflicts_with"
+        );
+    }
+
+    #[test]
+    fn parses_unregister_with_no_flags() {
+        assert!(matches!(parse(&["unregister"]), Command::Unregister { user: false, system: false }));
+    }
+
+    #[test]
+    fn parses_unregister_with_system() {
+        assert!(matches!(parse(&["unregister", "--system"]), Command::Unregister { user: false, system: true }));
+    }
+
+    #[test]
+    fn unregister_user_and_system_together_is_a_parse_error() {
+        assert!(
+            Cli::try_parse_from(["frogs", "unregister", "--user", "--system"]).is_err(),
+            "--user and --system are mutually exclusive via conflicts_with"
+        );
     }
 
     #[test]
@@ -222,5 +425,20 @@ mod tests {
         // Unlike `Test`, `Errors`'s `action` isn't `Option` — `frogs errors`
         // alone isn't a complete command, it needs `freeze`.
         assert!(Cli::try_parse_from(["frogs", "errors"]).is_err());
+    }
+
+    #[test]
+    fn resolve_scope_defaults_to_user_when_neither_flag_is_set() {
+        assert_eq!(resolve_scope(false, false), ServiceScope::User);
+    }
+
+    #[test]
+    fn resolve_scope_is_user_when_user_is_explicitly_set() {
+        assert_eq!(resolve_scope(true, false), ServiceScope::User);
+    }
+
+    #[test]
+    fn resolve_scope_is_system_when_system_is_set() {
+        assert_eq!(resolve_scope(false, true), ServiceScope::System);
     }
 }
