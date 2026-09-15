@@ -2,14 +2,15 @@ use std::io;
 use std::path::Path;
 
 use crate::project::require_project_root;
-use crate::server::service::{self, ServiceScope};
+use crate::server::service::{self, ServiceScope, StartType};
 
 /// Registers the current project as an OS-managed service (systemd on
 /// Linux, launchd on macOS, a real Windows Service on Windows), started
-/// immediately and set to start automatically going forward. `account` is
-/// Windows-only (which account the service runs as) — ignored on every
-/// other platform.
-pub fn run(cwd: &Path, name: Option<&str>, scope: ServiceScope, account: Option<&str>) -> io::Result<()> {
+/// immediately regardless of `start_type` (see `StartType`'s own doc
+/// comment) — `start_type` only decides whether it also starts
+/// automatically on every *future* boot/login. `account` is Windows-only
+/// (which account the service runs as) — ignored on every other platform.
+pub fn run(cwd: &Path, name: Option<&str>, scope: ServiceScope, account: Option<&str>, start_type: StartType) -> io::Result<()> {
     let root = require_project_root(cwd);
 
     #[cfg(windows)]
@@ -63,13 +64,14 @@ pub fn run(cwd: &Path, name: Option<&str>, scope: ServiceScope, account: Option<
         }
     }
 
-    let record = service::install(&service_name, scope, &root, account)?;
+    let record = service::install(&service_name, scope, &root, account, start_type)?;
     service::write_record(&root, &record)?;
 
-    println!(
-        "registered and started {service_name} via {} — it will now start automatically per the OS's own scheduling",
-        service::backend_label(record.backend)
-    );
+    let boot_note = match start_type {
+        StartType::Automatic => "it will now start automatically at boot/login going forward",
+        StartType::Manual => "it will NOT start automatically at boot/login — start it explicitly with `frogs run` or the platform's own tool when needed",
+    };
+    println!("registered and started {service_name} via {} — {boot_note}", service::backend_label(record.backend));
     Ok(())
 }
 

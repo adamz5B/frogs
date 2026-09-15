@@ -14,7 +14,7 @@ mod webserve;
 use clap::{Parser, Subcommand};
 
 use commands::generate::Role;
-use server::service::ServiceScope;
+use server::service::{ServiceScope, StartType};
 
 #[derive(Parser)]
 #[command(name = "frogs", version, about = "Free Rust OpenAPI Generated Server", disable_help_subcommand = true)]
@@ -78,6 +78,12 @@ enum Command {
         /// non-Windows platforms.
         #[arg(long)]
         account: Option<String>,
+        /// Whether the service starts automatically at boot/login going
+        /// forward (default) or only when started explicitly (`frogs run`,
+        /// or the platform's own tool) — either way, `register` still
+        /// starts it once immediately regardless of this choice
+        #[arg(long, value_enum, default_value = "automatic")]
+        start_type: StartType,
     },
     /// Remove this project's OS-managed service registration
     Unregister {
@@ -199,7 +205,13 @@ fn main() {
             Command::Generate { role } => commands::generate::run(&cwd, role),
             Command::Run { service_managed, restart } => commands::run::run(&cwd, service_managed, restart).await,
             Command::Stop => commands::stop::run(&cwd),
-            Command::Register { name, user, system, account } => commands::register::run(&cwd, name.as_deref(), resolve_scope(user, system), account.as_deref()),
+            Command::Register {
+                name,
+                user,
+                system,
+                account,
+                start_type,
+            } => commands::register::run(&cwd, name.as_deref(), resolve_scope(user, system), account.as_deref(), start_type),
             Command::Unregister { user, system } => commands::unregister::run(&cwd, resolve_scope(user, system)),
             Command::Test { action: None } => commands::test::run(&cwd).await,
             Command::Test {
@@ -293,12 +305,35 @@ mod tests {
     #[test]
     fn parses_register_with_no_flags() {
         match parse(&["register"]) {
-            Command::Register { name, user, system, account } => {
+            Command::Register {
+                name,
+                user,
+                system,
+                account,
+                start_type,
+            } => {
                 assert_eq!(name, None);
                 assert!(!user);
                 assert!(!system);
                 assert_eq!(account, None);
+                assert_eq!(start_type, StartType::Automatic, "the default start type must be Automatic");
             }
+            _ => panic!("expected Command::Register"),
+        }
+    }
+
+    #[test]
+    fn parses_register_with_start_type_manual() {
+        match parse(&["register", "--start-type", "manual"]) {
+            Command::Register { start_type, .. } => assert_eq!(start_type, StartType::Manual),
+            _ => panic!("expected Command::Register"),
+        }
+    }
+
+    #[test]
+    fn parses_register_with_start_type_automatic_explicitly() {
+        match parse(&["register", "--start-type", "automatic"]) {
+            Command::Register { start_type, .. } => assert_eq!(start_type, StartType::Automatic),
             _ => panic!("expected Command::Register"),
         }
     }

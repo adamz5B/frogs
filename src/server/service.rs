@@ -42,6 +42,20 @@ pub fn scope_label(scope: ServiceScope) -> &'static str {
     }
 }
 
+/// Whether a registered service should start automatically at boot/login
+/// going forward (the OS's own `systemctl enable`/launchd `RunAtLoad`/
+/// Windows `ServiceStartType::AutoStart` concept) or only when started
+/// explicitly (`OnDemand`/not-enabled/`RunAtLoad=false`) — chosen once at
+/// `frogs register` time. Either way, `frogs register` still starts the
+/// service once immediately (per this project's existing "register implies
+/// start" decision); `Manual` only changes what happens on the *next* boot
+/// or login, not whether it starts right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum StartType {
+    Automatic,
+    Manual,
+}
+
 /// Which platform-native supervisor a `ServiceRecord` was registered
 /// against — decided once, at `frogs register` time, by the OS the binary
 /// is actually running on; never user-selectable.
@@ -546,24 +560,34 @@ pub fn probe_existing(name: &str, scope: ServiceScope) -> Option<ExistingDefinit
 /// `account` is Windows-only (which Windows account the service runs
 /// as) — Linux/macOS simply ignore it, so this dispatch signature stays
 /// uniform across all three platforms rather than growing a
-/// platform-conditional parameter list.
-pub fn install(name: &str, scope: ServiceScope, root: &Path, account: Option<&str>) -> io::Result<ServiceRecord> {
+/// platform-conditional parameter list. `start_type` applies on every
+/// platform (see its own doc comment) — `frogs register` still starts the
+/// service once regardless of which is chosen.
+pub fn install(name: &str, scope: ServiceScope, root: &Path, account: Option<&str>, start_type: StartType) -> io::Result<ServiceRecord> {
     reject_unsafe_path(root)?;
 
     #[cfg(target_os = "linux")]
     let (backend, definition_path, resolved_account) = {
         let _ = account;
-        (Backend::Systemd, systemd::install(name, scope, root)?.to_string_lossy().into_owned(), None)
+        (
+            Backend::Systemd,
+            systemd::install(name, scope, root, start_type)?.to_string_lossy().into_owned(),
+            None,
+        )
     };
     #[cfg(target_os = "macos")]
     let (backend, definition_path, resolved_account) = {
         let _ = account;
-        (Backend::Launchd, launchd::install(name, scope, root)?.to_string_lossy().into_owned(), None)
+        (
+            Backend::Launchd,
+            launchd::install(name, scope, root, start_type)?.to_string_lossy().into_owned(),
+            None,
+        )
     };
     #[cfg(windows)]
     let (backend, definition_path, resolved_account) = {
         let _ = scope;
-        windows_svc::install(name, root, account)?;
+        windows_svc::install(name, root, account, start_type)?;
         (
             Backend::WindowsService,
             name.to_string(),
@@ -572,7 +596,7 @@ pub fn install(name: &str, scope: ServiceScope, root: &Path, account: Option<&st
     };
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     let (backend, definition_path, resolved_account): (Backend, String, Option<String>) = {
-        let _ = (name, scope, account);
+        let _ = (name, scope, account, start_type);
         return Err(io::Error::new(io::ErrorKind::Unsupported, "frogs register is not supported on this platform"));
     };
 
@@ -772,7 +796,7 @@ mod systemd {
         }
     }
 
-    pub fn install(name: &str, scope: ServiceScope, root: &Path) -> io::Result<PathBuf> {
+    pub fn install(name: &str, scope: ServiceScope, root: &Path, start_type: StartType) -> io::Result<PathBuf> {
         let exe = std::env::current_exe()?;
         reject_unsafe_path(&exe)?;
 
@@ -783,7 +807,16 @@ mod systemd {
         fs::write(&path, render_unit(name, &exe, root, scope))?;
 
         run_systemctl(scope, &["daemon-reload"])?;
-        run_systemctl(scope, &["enable", "--now", name])?;
+        match start_type {
+            // `enable --now` both symlinks the unit into its target (so it
+            // starts on every future boot/login) and starts it right now.
+            StartType::Automatic => run_systemctl(scope, &["enable", "--now", name])?,
+            // A plain `start`, with no `enable`, starts it right now without
+            // creating that boot-time symlink — the unit stays present and
+            // start-able (`frogs run`/`systemctl start`), just not
+            // auto-started on the next boot/login.
+            StartType::Manual => run_systemctl(scope, &["start", name])?,
+        }
         Ok(path)
     }
 
@@ -875,10 +908,21 @@ mod launchd {
         }
     }
 
-    pub fn render_plist(name: &str, exe: &Path, root: &Path, scope: ServiceScope) -> String {
-        let _ = scope; // RunAtLoad/KeepAlive are identical for both scopes — only the install path differs.
+    pub fn render_plist(name: &str, exe: &Path, root: &Path, scope: ServiceScope, start_type: StartType) -> String {
+        let _ = scope; // KeepAlive is identical for both scopes — only the install path differs.
         let exe_esc = escape_xml(&exe.to_string_lossy());
         let root_esc = escape_xml(&root.to_string_lossy());
+        // `RunAtLoad=true` is what makes `load -w` (see `install`, below)
+        // start the job immediately as a side effect of loading it — with
+        // `false`, loading only registers the definition (and, via `-w`,
+        // marks it enabled for a *future* `load`, e.g. after a reboot) but
+        // does not itself start anything; `install` issues an explicit
+        // `launchctl start` afterward for the `Manual` case so "register
+        // still starts it once now" holds regardless of this flag.
+        let run_at_load = match start_type {
+            StartType::Automatic => "true",
+            StartType::Manual => "false",
+        };
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
              <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -897,7 +941,7 @@ mod launchd {
              \t<key>WorkingDirectory</key>\n\
              \t<string>{root_esc}</string>\n\
              \t<key>RunAtLoad</key>\n\
-             \t<true/>\n\
+             \t<{run_at_load}/>\n\
              \t<key>KeepAlive</key>\n\
              \t<dict>\n\
              \t\t<key>SuccessfulExit</key>\n\
@@ -953,7 +997,7 @@ mod launchd {
         }
     }
 
-    pub fn install(name: &str, scope: ServiceScope, root: &Path) -> io::Result<PathBuf> {
+    pub fn install(name: &str, scope: ServiceScope, root: &Path, start_type: StartType) -> io::Result<PathBuf> {
         let exe = std::env::current_exe()?;
         reject_unsafe_path(&exe)?;
 
@@ -961,9 +1005,17 @@ mod launchd {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, render_plist(name, &exe, root, scope))?;
+        fs::write(&path, render_plist(name, &exe, root, scope, start_type))?;
 
+        // `restart` (unload-ignore-fail + `load -w`) loads the definition;
+        // with `RunAtLoad=true` (Automatic) that alone starts it. With
+        // `RunAtLoad=false` (Manual) loading does not start it, so an
+        // explicit `launchctl start` follows — "register still starts it
+        // once now" holds either way.
         restart(name, scope)?;
+        if start_type == StartType::Manual {
+            run_launchctl(&["start", name])?;
+        }
         Ok(path)
     }
 
@@ -1009,7 +1061,7 @@ mod launchd {
         #[test]
         fn render_plist_carries_the_frogs_marker_and_escapes_hostile_xml_characters_in_the_working_directory() {
             let root = Path::new("/Users/x/100%<Weird>&\"Folder\"");
-            let plist = render_plist("frogs-test", Path::new("/usr/local/bin/frogs"), root, ServiceScope::User);
+            let plist = render_plist("frogs-test", Path::new("/usr/local/bin/frogs"), root, ServiceScope::User, StartType::Automatic);
 
             assert!(plist.contains(&format!("<string>{FROGS_MARKER}</string>")));
             assert!(
@@ -1019,6 +1071,18 @@ mod launchd {
             assert!(plist.contains("&lt;Weird&gt;"));
             assert!(plist.contains("&amp;"));
             assert!(plist.contains("&quot;Folder&quot;"));
+        }
+
+        #[test]
+        fn render_plist_sets_run_at_load_true_for_automatic_and_false_for_manual() {
+            let root = Path::new("/Users/x/project");
+            let exe = Path::new("/usr/local/bin/frogs");
+
+            let automatic = render_plist("frogs-test", exe, root, ServiceScope::User, StartType::Automatic);
+            assert!(automatic.contains("<key>RunAtLoad</key>\n\t<true/>"));
+
+            let manual = render_plist("frogs-test", exe, root, ServiceScope::User, StartType::Manual);
+            assert!(manual.contains("<key>RunAtLoad</key>\n\t<false/>"));
         }
 
         #[test]
@@ -1239,7 +1303,19 @@ pub mod windows_svc {
         args
     }
 
-    pub fn install(name: &str, root: &Path, account: Option<&str>) -> io::Result<()> {
+    /// `StartType::Automatic` → `ServiceStartType::AutoStart` (starts at
+    /// boot); `StartType::Manual` → `ServiceStartType::OnDemand` (installed
+    /// and start-able, but not started automatically) — either way,
+    /// `install` still calls `service.start(..)` once at the end, so
+    /// "register still starts it once now" holds regardless.
+    fn map_start_type(start_type: StartType) -> ServiceStartType {
+        match start_type {
+            StartType::Automatic => ServiceStartType::AutoStart,
+            StartType::Manual => ServiceStartType::OnDemand,
+        }
+    }
+
+    pub fn install(name: &str, root: &Path, account: Option<&str>, start_type: StartType) -> io::Result<()> {
         let resolved = resolve_account(account);
         let (account_name, account_password) = account_credentials(&resolved)?;
         let exe = std::env::current_exe()?;
@@ -1253,7 +1329,7 @@ pub mod windows_svc {
                     name: OsString::from(name),
                     display_name: OsString::from(name),
                     service_type: ServiceType::OWN_PROCESS,
-                    start_type: ServiceStartType::AutoStart,
+                    start_type: map_start_type(start_type),
                     error_control: ServiceErrorControl::Normal,
                     executable_path: exe,
                     launch_arguments: launch_arguments(name, root),

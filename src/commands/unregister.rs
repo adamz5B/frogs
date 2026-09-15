@@ -34,11 +34,25 @@ pub fn run(cwd: &Path, scope: ServiceScope) -> io::Result<()> {
         std::process::exit(1);
     }
 
+    println!(
+        "unregistering {} (registered service, via {})...",
+        record.name,
+        service::backend_label(record.backend)
+    );
+
     service::stop_registered(&record, &root)?;
+    // `stop_registered` only *requests* the stop (e.g. Win32's
+    // `ControlService(STOP)` is asynchronous — a request, not a synchronous
+    // stop); `uninstall` is what actually waits for the service to reach a
+    // stopped state (via `wait_until_stopped` on Windows) before deleting
+    // it, which can take a few seconds — worth its own status line so the
+    // terminal doesn't look hung for the duration.
+    println!("stop requested — waiting for it to fully stop before removing the registration...");
+
     service::uninstall(&record, &root)?;
     service::remove_record(&root)?;
     pidfile::remove(&root)?;
 
-    println!("unregistered {}", record.name);
+    println!("unregistered {}.", record.name);
     Ok(())
 }
