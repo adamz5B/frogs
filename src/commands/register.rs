@@ -2,15 +2,26 @@ use std::io;
 use std::path::Path;
 
 use crate::project::require_project_root;
-use crate::server::service::{self, ServiceScope, StartType};
+use crate::server::service::{self, RestartPolicy, ServiceScope, StartType};
 
 /// Registers the current project as an OS-managed service (systemd on
 /// Linux, launchd on macOS, a real Windows Service on Windows), started
-/// immediately regardless of `start_type` (see `StartType`'s own doc
-/// comment) — `start_type` only decides whether it also starts
-/// automatically on every *future* boot/login. `account` is Windows-only
-/// (which account the service runs as) — ignored on every other platform.
-pub fn run(cwd: &Path, name: Option<&str>, scope: ServiceScope, account: Option<&str>, start_type: StartType) -> io::Result<()> {
+/// immediately regardless of `start_type`/`restart_policy` (see their own
+/// doc comments) — `start_type` only decides whether it also starts
+/// automatically on every *future* boot/login, and `restart_policy` only
+/// decides what happens if the running process later exits with a failure.
+/// `account`/`description` are both Windows-only (which account the service
+/// runs as, and its `services.msc`/`sc qdescription` description text) —
+/// ignored on every other platform.
+pub fn run(
+    cwd: &Path,
+    name: Option<&str>,
+    scope: ServiceScope,
+    account: Option<&str>,
+    description: Option<&str>,
+    start_type: StartType,
+    restart_policy: RestartPolicy,
+) -> io::Result<()> {
     let root = require_project_root(cwd);
 
     #[cfg(windows)]
@@ -27,6 +38,9 @@ pub fn run(cwd: &Path, name: Option<&str>, scope: ServiceScope, account: Option<
         // user actually supplied gets a one-line note, not silence.
         if account.is_some() {
             println!("note: --account has no effect on this platform");
+        }
+        if description.is_some() {
+            println!("note: --description has no effect on this platform");
         }
     }
 
@@ -64,14 +78,19 @@ pub fn run(cwd: &Path, name: Option<&str>, scope: ServiceScope, account: Option<
         }
     }
 
-    let record = service::install(&service_name, scope, &root, account, start_type)?;
+    let record = service::install(&service_name, scope, &root, account, description, start_type, restart_policy)?;
     service::write_record(&root, &record)?;
 
     let boot_note = match start_type {
         StartType::Automatic => "it will now start automatically at boot/login going forward",
         StartType::Manual => "it will NOT start automatically at boot/login — start it explicitly with `frogs run` or the platform's own tool when needed",
     };
+    let restart_note = match restart_policy {
+        RestartPolicy::OnFailure => "crash recovery: it will restart automatically if it exits with a failure",
+        RestartPolicy::Never => "crash recovery: disabled — it will NOT restart automatically if it exits with a failure",
+    };
     println!("registered and started {service_name} via {} — {boot_note}", service::backend_label(record.backend));
+    println!("{restart_note}");
     Ok(())
 }
 

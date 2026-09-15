@@ -56,6 +56,24 @@ pub enum StartType {
     Manual,
 }
 
+/// Whether a registered service should be automatically restarted by the OS
+/// after it exits with a failure — chosen once at `frogs register` time,
+/// applied consistently across all three backends (systemd `Restart=`,
+/// launchd `KeepAlive`, Windows `SERVICE_CONFIG_FAILURE_ACTIONS`). A
+/// *deliberate* stop (`frogs stop`/`frogs unregister`, or the platform's own
+/// stop command) never triggers a restart on any backend regardless of this
+/// setting — only an unrequested/failure exit does. Defaults to
+/// `OnFailure`: crash recovery is standard practice for a production service
+/// manager (this is what every one of systemd/launchd/a real Windows Service
+/// supports natively, and what a comparable production server like Tomcat/
+/// WildFly is normally configured with), so opting out is the exceptional
+/// case, not the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum RestartPolicy {
+    OnFailure,
+    Never,
+}
+
 /// Which platform-native supervisor a `ServiceRecord` was registered
 /// against — decided once, at `frogs register` time, by the OS the binary
 /// is actually running on; never user-selectable.
@@ -92,6 +110,10 @@ pub struct ServiceRecord {
     /// AUTHORITY\LocalService`, or a custom account name) — `None` for
     /// `Systemd`/`Launchd` records, which have no equivalent concept.
     pub account: Option<String>,
+    /// The Windows service description actually applied (`services.msc`'s
+    /// "Description" column / `sc qdescription`) — `None` for
+    /// `Systemd`/`Launchd` records, which have no equivalent field.
+    pub description: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -560,43 +582,58 @@ pub fn probe_existing(name: &str, scope: ServiceScope) -> Option<ExistingDefinit
 /// `account` is Windows-only (which Windows account the service runs
 /// as) — Linux/macOS simply ignore it, so this dispatch signature stays
 /// uniform across all three platforms rather than growing a
-/// platform-conditional parameter list. `start_type` applies on every
-/// platform (see its own doc comment) — `frogs register` still starts the
-/// service once regardless of which is chosen.
-pub fn install(name: &str, scope: ServiceScope, root: &Path, account: Option<&str>, start_type: StartType) -> io::Result<ServiceRecord> {
+/// platform-conditional parameter list. `description` is likewise
+/// Windows-only (the service description shown in `services.msc`/`sc
+/// qdescription`; systemd's `Description=` is always set unconditionally
+/// from the project name, and launchd has no equivalent field at all).
+/// `start_type` and `restart_policy` both apply on every platform (see
+/// their own doc comments) — `frogs register` still starts the service once
+/// regardless of either choice.
+pub fn install(
+    name: &str,
+    scope: ServiceScope,
+    root: &Path,
+    account: Option<&str>,
+    description: Option<&str>,
+    start_type: StartType,
+    restart_policy: RestartPolicy,
+) -> io::Result<ServiceRecord> {
     reject_unsafe_path(root)?;
 
     #[cfg(target_os = "linux")]
-    let (backend, definition_path, resolved_account) = {
-        let _ = account;
+    let (backend, definition_path, resolved_account, resolved_description) = {
+        let _ = (account, description);
         (
             Backend::Systemd,
-            systemd::install(name, scope, root, start_type)?.to_string_lossy().into_owned(),
+            systemd::install(name, scope, root, start_type, restart_policy)?.to_string_lossy().into_owned(),
+            None,
             None,
         )
     };
     #[cfg(target_os = "macos")]
-    let (backend, definition_path, resolved_account) = {
-        let _ = account;
+    let (backend, definition_path, resolved_account, resolved_description) = {
+        let _ = (account, description);
         (
             Backend::Launchd,
-            launchd::install(name, scope, root, start_type)?.to_string_lossy().into_owned(),
+            launchd::install(name, scope, root, start_type, restart_policy)?.to_string_lossy().into_owned(),
+            None,
             None,
         )
     };
     #[cfg(windows)]
-    let (backend, definition_path, resolved_account) = {
+    let (backend, definition_path, resolved_account, resolved_description) = {
         let _ = scope;
-        windows_svc::install(name, root, account, start_type)?;
+        windows_svc::install(name, root, account, description, start_type, restart_policy)?;
         (
             Backend::WindowsService,
             name.to_string(),
             Some(windows_svc::account_display(&windows_svc::resolve_account(account))),
+            Some(windows_svc::resolve_description(description, root)),
         )
     };
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    let (backend, definition_path, resolved_account): (Backend, String, Option<String>) = {
-        let _ = (name, scope, account, start_type);
+    let (backend, definition_path, resolved_account, resolved_description): (Backend, String, Option<String>, Option<String>) = {
+        let _ = (name, scope, account, description, start_type, restart_policy);
         return Err(io::Error::new(io::ErrorKind::Unsupported, "frogs register is not supported on this platform"));
     };
 
@@ -606,6 +643,7 @@ pub fn install(name: &str, scope: ServiceScope, root: &Path, account: Option<&st
         backend,
         definition_path,
         account: resolved_account,
+        description: resolved_description,
         created_at: Utc::now(),
     })
 }
@@ -745,7 +783,7 @@ mod systemd {
         }
     }
 
-    pub fn render_unit(name: &str, exe: &Path, root: &Path, scope: ServiceScope) -> String {
+    pub fn render_unit(name: &str, exe: &Path, root: &Path, scope: ServiceScope, restart_policy: RestartPolicy) -> String {
         let exec_start = format!(
             "{} {} {}",
             escape_systemd_exec_arg(&exe.to_string_lossy()),
@@ -760,14 +798,44 @@ mod systemd {
             ServiceScope::User => "default.target",
             ServiceScope::System => "multi-user.target",
         };
+        // Standard systemd idiom for a service that needs a *usable*
+        // network, not just the networking subsystem having started
+        // (`network.target` alone doesn't guarantee an interface actually
+        // has an address/route/working DNS yet) — frogs's own SQL/HTTP
+        // connections at startup can otherwise race a not-yet-configured
+        // network right after boot. `After=` orders us behind it if it's
+        // going to be reached at all; `Wants=` is what actually pulls it in
+        // (a soft dependency — if the wait-online check itself fails, frogs
+        // still starts, it just isn't ordered behind a successful one).
+        // Mainly load-bearing for `--system` scope: a `--user` unit runs in
+        // its own per-user systemd instance with an independent dependency
+        // graph, so it can't reliably order against this system-level
+        // target the same way — harmless to include either way, since a
+        // `--user` session's own network is typically already up by the
+        // time a user logs in and that instance starts.
+        let unit_deps = "After=network-online.target\nWants=network-online.target\n";
+        // Emitted explicitly either way (never omitted, relying on
+        // systemd's own default) so a reader of the generated unit sees
+        // exactly what was chosen rather than having to know systemd's
+        // implicit default. `Restart=on-failure` only restarts after a
+        // non-zero exit/signal death — an intentional `systemctl stop`
+        // (which `frogs stop`/`frogs unregister` issue) is never treated as
+        // a failure, so it never triggers a restart regardless of this
+        // setting.
+        let restart = match restart_policy {
+            RestartPolicy::OnFailure => "Restart=on-failure\nRestartSec=5\n",
+            RestartPolicy::Never => "Restart=no\n",
+        };
         format!(
             "# Managed-by={FROGS_MARKER}\n\
              [Unit]\n\
              Description=frogs service ({name})\n\
+             {unit_deps}\
              \n\
              [Service]\n\
              ExecStart={exec_start}\n\
              WorkingDirectory={working_directory}\n\
+             {restart}\
              \n\
              [Install]\n\
              WantedBy={wanted_by}\n"
@@ -796,7 +864,7 @@ mod systemd {
         }
     }
 
-    pub fn install(name: &str, scope: ServiceScope, root: &Path, start_type: StartType) -> io::Result<PathBuf> {
+    pub fn install(name: &str, scope: ServiceScope, root: &Path, start_type: StartType, restart_policy: RestartPolicy) -> io::Result<PathBuf> {
         let exe = std::env::current_exe()?;
         reject_unsafe_path(&exe)?;
 
@@ -804,7 +872,7 @@ mod systemd {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, render_unit(name, &exe, root, scope))?;
+        fs::write(&path, render_unit(name, &exe, root, scope, restart_policy))?;
 
         run_systemctl(scope, &["daemon-reload"])?;
         match start_type {
@@ -867,7 +935,7 @@ mod systemd {
         #[test]
         fn render_unit_carries_the_frogs_marker_and_escapes_a_percent_in_the_working_directory() {
             let root = Path::new("/srv/100%weird&project");
-            let unit = render_unit("frogs-test", Path::new("/usr/bin/frogs"), root, ServiceScope::User);
+            let unit = render_unit("frogs-test", Path::new("/usr/bin/frogs"), root, ServiceScope::User, RestartPolicy::OnFailure);
 
             assert!(unit.contains(&format!("# Managed-by={FROGS_MARKER}")));
             assert!(
@@ -881,11 +949,45 @@ mod systemd {
             let root = Path::new("/srv/project");
             let exe = Path::new("/usr/bin/frogs");
 
-            let user_unit = render_unit("frogs-test", exe, root, ServiceScope::User);
+            let user_unit = render_unit("frogs-test", exe, root, ServiceScope::User, RestartPolicy::OnFailure);
             assert!(user_unit.contains("WantedBy=default.target"));
 
-            let system_unit = render_unit("frogs-test", exe, root, ServiceScope::System);
+            let system_unit = render_unit("frogs-test", exe, root, ServiceScope::System, RestartPolicy::OnFailure);
             assert!(system_unit.contains("WantedBy=multi-user.target"));
+        }
+
+        #[test]
+        fn render_unit_sets_restart_on_failure_and_a_restart_sec_for_on_failure_policy() {
+            let root = Path::new("/srv/project");
+            let exe = Path::new("/usr/bin/frogs");
+
+            let unit = render_unit("frogs-test", exe, root, ServiceScope::User, RestartPolicy::OnFailure);
+            assert!(unit.contains("Restart=on-failure"));
+            assert!(unit.contains("RestartSec=5"));
+        }
+
+        #[test]
+        fn render_unit_sets_restart_no_and_no_restart_sec_for_never_policy() {
+            let root = Path::new("/srv/project");
+            let exe = Path::new("/usr/bin/frogs");
+
+            let unit = render_unit("frogs-test", exe, root, ServiceScope::User, RestartPolicy::Never);
+            assert!(unit.contains("Restart=no"));
+            assert!(!unit.contains("RestartSec"));
+        }
+
+        #[test]
+        fn render_unit_orders_after_and_wants_network_online_target_regardless_of_scope() {
+            let root = Path::new("/srv/project");
+            let exe = Path::new("/usr/bin/frogs");
+
+            let user_unit = render_unit("frogs-test", exe, root, ServiceScope::User, RestartPolicy::OnFailure);
+            assert!(user_unit.contains("After=network-online.target"));
+            assert!(user_unit.contains("Wants=network-online.target"));
+
+            let system_unit = render_unit("frogs-test", exe, root, ServiceScope::System, RestartPolicy::OnFailure);
+            assert!(system_unit.contains("After=network-online.target"));
+            assert!(system_unit.contains("Wants=network-online.target"));
         }
     }
 }
@@ -908,7 +1010,7 @@ mod launchd {
         }
     }
 
-    pub fn render_plist(name: &str, exe: &Path, root: &Path, scope: ServiceScope, start_type: StartType) -> String {
+    pub fn render_plist(name: &str, exe: &Path, root: &Path, scope: ServiceScope, start_type: StartType, restart_policy: RestartPolicy) -> String {
         let _ = scope; // KeepAlive is identical for both scopes — only the install path differs.
         let exe_esc = escape_xml(&exe.to_string_lossy());
         let root_esc = escape_xml(&root.to_string_lossy());
@@ -922,6 +1024,19 @@ mod launchd {
         let run_at_load = match start_type {
             StartType::Automatic => "true",
             StartType::Manual => "false",
+        };
+        // `KeepAlive.SuccessfulExit=false` (the dict form) tells launchd to
+        // restart the job whenever its last exit was *not* a clean `exit(0)`
+        // — i.e. "on failure," the same semantics as systemd's
+        // `Restart=on-failure`. `KeepAlive` can also just be a plain `false`
+        // (not a dict at all) to mean "never restart automatically under any
+        // circumstance" — the `Never` case. Either way, an intentional
+        // `launchctl unload`/`stop` (what `frogs stop`/`frogs unregister`
+        // issue) removes the job from launchd's active management entirely,
+        // so it's never mistaken for a failure to restart from.
+        let keep_alive = match restart_policy {
+            RestartPolicy::OnFailure => "<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>\n\t</dict>".to_string(),
+            RestartPolicy::Never => "<false/>".to_string(),
         };
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -943,10 +1058,7 @@ mod launchd {
              \t<key>RunAtLoad</key>\n\
              \t<{run_at_load}/>\n\
              \t<key>KeepAlive</key>\n\
-             \t<dict>\n\
-             \t\t<key>SuccessfulExit</key>\n\
-             \t\t<false/>\n\
-             \t</dict>\n\
+             \t{keep_alive}\n\
              </dict>\n\
              </plist>\n"
         )
@@ -997,7 +1109,7 @@ mod launchd {
         }
     }
 
-    pub fn install(name: &str, scope: ServiceScope, root: &Path, start_type: StartType) -> io::Result<PathBuf> {
+    pub fn install(name: &str, scope: ServiceScope, root: &Path, start_type: StartType, restart_policy: RestartPolicy) -> io::Result<PathBuf> {
         let exe = std::env::current_exe()?;
         reject_unsafe_path(&exe)?;
 
@@ -1005,7 +1117,7 @@ mod launchd {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, render_plist(name, &exe, root, scope, start_type))?;
+        fs::write(&path, render_plist(name, &exe, root, scope, start_type, restart_policy))?;
 
         // `restart` (unload-ignore-fail + `load -w`) loads the definition;
         // with `RunAtLoad=true` (Automatic) that alone starts it. With
@@ -1061,7 +1173,14 @@ mod launchd {
         #[test]
         fn render_plist_carries_the_frogs_marker_and_escapes_hostile_xml_characters_in_the_working_directory() {
             let root = Path::new("/Users/x/100%<Weird>&\"Folder\"");
-            let plist = render_plist("frogs-test", Path::new("/usr/local/bin/frogs"), root, ServiceScope::User, StartType::Automatic);
+            let plist = render_plist(
+                "frogs-test",
+                Path::new("/usr/local/bin/frogs"),
+                root,
+                ServiceScope::User,
+                StartType::Automatic,
+                RestartPolicy::OnFailure,
+            );
 
             assert!(plist.contains(&format!("<string>{FROGS_MARKER}</string>")));
             assert!(
@@ -1078,11 +1197,31 @@ mod launchd {
             let root = Path::new("/Users/x/project");
             let exe = Path::new("/usr/local/bin/frogs");
 
-            let automatic = render_plist("frogs-test", exe, root, ServiceScope::User, StartType::Automatic);
+            let automatic = render_plist("frogs-test", exe, root, ServiceScope::User, StartType::Automatic, RestartPolicy::OnFailure);
             assert!(automatic.contains("<key>RunAtLoad</key>\n\t<true/>"));
 
-            let manual = render_plist("frogs-test", exe, root, ServiceScope::User, StartType::Manual);
+            let manual = render_plist("frogs-test", exe, root, ServiceScope::User, StartType::Manual, RestartPolicy::OnFailure);
             assert!(manual.contains("<key>RunAtLoad</key>\n\t<false/>"));
+        }
+
+        #[test]
+        fn render_plist_uses_the_successful_exit_dict_for_on_failure_policy() {
+            let root = Path::new("/Users/x/project");
+            let exe = Path::new("/usr/local/bin/frogs");
+
+            let plist = render_plist("frogs-test", exe, root, ServiceScope::User, StartType::Automatic, RestartPolicy::OnFailure);
+            assert!(plist.contains("<key>SuccessfulExit</key>"));
+            assert!(plist.contains("<key>KeepAlive</key>\n\t<dict>"));
+        }
+
+        #[test]
+        fn render_plist_uses_a_plain_false_keep_alive_for_never_policy() {
+            let root = Path::new("/Users/x/project");
+            let exe = Path::new("/usr/local/bin/frogs");
+
+            let plist = render_plist("frogs-test", exe, root, ServiceScope::User, StartType::Automatic, RestartPolicy::Never);
+            assert!(plist.contains("<key>KeepAlive</key>\n\t<false/>"));
+            assert!(!plist.contains("SuccessfulExit"));
         }
 
         #[test]
@@ -1105,7 +1244,10 @@ pub mod windows_svc {
     use super::*;
     use std::ffi::{OsStr, OsString};
 
-    use windows_service::service::{ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceState, ServiceType};
+    use windows_service::service::{
+        ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl, ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType,
+        ServiceState, ServiceType,
+    };
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
     // Standard Win32 error codes (`winerror.h`) — hardcoded rather than
@@ -1315,9 +1457,20 @@ pub mod windows_svc {
         }
     }
 
-    pub fn install(name: &str, root: &Path, account: Option<&str>, start_type: StartType) -> io::Result<()> {
+    /// A sensible default when `--description` isn't given — better than
+    /// leaving `services.msc`/`sc qdescription` blank, without requiring
+    /// the user to type anything. Pure, so it's directly unit-testable.
+    pub fn resolve_description(requested: Option<&str>, root: &Path) -> String {
+        match requested {
+            Some(text) => text.to_string(),
+            None => format!("frogs service for the project at {}", root.display()),
+        }
+    }
+
+    pub fn install(name: &str, root: &Path, account: Option<&str>, description: Option<&str>, start_type: StartType, restart_policy: RestartPolicy) -> io::Result<()> {
         let resolved = resolve_account(account);
         let (account_name, account_password) = account_credentials(&resolved)?;
+        let resolved_description = resolve_description(description, root);
         let exe = std::env::current_exe()?;
         reject_unsafe_path(&exe)?;
         reject_unsafe_path(root)?;
@@ -1356,7 +1509,58 @@ pub mod windows_svc {
                 ))
             })?;
 
+        configure_failure_actions(&service, restart_policy)?;
+        // `SERVICE_CONFIG_DESCRIPTION` via `set_description` — not part of
+        // `ServiceInfo`/`create_service` itself, a separate
+        // `ChangeServiceConfig2` call, same as failure actions above. Best
+        // effort: a failure here (e.g. a NUL byte the crate rejects) is
+        // worth surfacing but shouldn't undo an otherwise-successful
+        // registration, so it's logged rather than propagated as a hard
+        // error.
+        if let Err(e) = service.set_description(&resolved_description) {
+            tracing::warn!("registered {name} but failed to set its service description: {}", map_win_err(e));
+        }
         service.start(&[] as &[&OsStr]).map_err(map_win_err)?;
+        Ok(())
+    }
+
+    /// Configures Win32 `SERVICE_CONFIG_FAILURE_ACTIONS` so crash recovery
+    /// is consistent with the other two backends (systemd `Restart=`,
+    /// launchd `KeepAlive`): `OnFailure` restarts the process 5 seconds
+    /// after *any* failure exit, indefinitely (a single `Restart` action
+    /// with no further entries applies to every failure past the first,
+    /// matching `Restart=on-failure`/`RestartSec=5`'s own "no give-up point"
+    /// semantics); `Never` clears the action list entirely so nothing
+    /// happens on failure. `set_failure_actions_on_non_crash_failures(true)`
+    /// is required for `OnFailure` because the SCM otherwise only runs
+    /// failure actions on a genuine process crash/termination — not on the
+    /// case `service_host::run_service` actually reports on an internal
+    /// error (a clean `SetServiceStatus(Stopped, ServiceSpecific(1))` call,
+    /// not a crash) — without this flag, an ordinary startup/runtime error
+    /// would never trigger a restart at all. A deliberate stop (`frogs
+    /// stop`/`frogs unregister`, which requests `SERVICE_CONTROL_STOP`
+    /// before the process reports `Stopped` with a *success* code) is never
+    /// treated as a failure by the SCM regardless of this configuration.
+    fn configure_failure_actions(service: &windows_service::service::Service, restart_policy: RestartPolicy) -> io::Result<()> {
+        let (actions, on_non_crash) = match restart_policy {
+            RestartPolicy::OnFailure => (
+                Some(vec![ServiceAction {
+                    action_type: ServiceActionType::Restart,
+                    delay: std::time::Duration::from_secs(5),
+                }]),
+                true,
+            ),
+            RestartPolicy::Never => (Some(vec![]), false),
+        };
+        service
+            .update_failure_actions(ServiceFailureActions {
+                reset_period: ServiceFailureResetPeriod::After(std::time::Duration::from_secs(86400)),
+                reboot_msg: None,
+                command: None,
+                actions,
+            })
+            .map_err(map_win_err)?;
+        service.set_failure_actions_on_non_crash_failures(on_non_crash).map_err(map_win_err)?;
         Ok(())
     }
 
@@ -1502,6 +1706,22 @@ pub mod windows_svc {
             assert_eq!(resolve_account(Some("NETWORKSERVICE")), ResolvedAccount::WellKnown("NT AUTHORITY\\NetworkService"));
             assert_eq!(resolve_account(Some("localsystem")), ResolvedAccount::WellKnown("LocalSystem"));
             assert_eq!(resolve_account(Some("LocalSystem")), ResolvedAccount::WellKnown("LocalSystem"));
+        }
+
+        #[test]
+        fn resolve_description_with_nothing_requested_generates_one_naming_the_project_root() {
+            let root = Path::new("C:\\Projects\\my-api");
+            let description = resolve_description(None, root);
+            assert!(
+                description.contains("C:\\Projects\\my-api"),
+                "the generated default description must name the project root: {description}"
+            );
+        }
+
+        #[test]
+        fn resolve_description_with_an_explicit_value_uses_it_unchanged() {
+            let root = Path::new("C:\\Projects\\my-api");
+            assert_eq!(resolve_description(Some("My Custom Description"), root), "My Custom Description");
         }
 
         #[test]
@@ -2154,6 +2374,7 @@ mod tests {
             backend: Backend::WindowsService,
             definition_path: name.to_string(),
             account: None,
+            description: None,
             created_at: Utc::now(),
         };
         assert!(verify_definition_path_matches(&good).is_ok());
@@ -2164,6 +2385,7 @@ mod tests {
             backend: Backend::WindowsService,
             definition_path: "frogs-someone-elses-project".to_string(),
             account: None,
+            description: None,
             created_at: Utc::now(),
         };
         let err = verify_definition_path_matches(&stale).expect_err("a definition_path that doesn't match the freshly recomputed one must be rejected");
@@ -2182,6 +2404,7 @@ mod tests {
             backend: Backend::Systemd,
             definition_path: expected,
             account: None,
+            description: None,
             created_at: Utc::now(),
         };
         assert!(verify_definition_path_matches(&good).is_ok());
@@ -2192,6 +2415,7 @@ mod tests {
             backend: Backend::Systemd,
             definition_path: "/etc/systemd/system/frogs-someone-elses-project.service".to_string(),
             account: None,
+            description: None,
             created_at: Utc::now(),
         };
         let err = verify_definition_path_matches(&stale).expect_err("a definition_path that doesn't match the freshly recomputed one must be rejected");
@@ -2210,6 +2434,7 @@ mod tests {
             backend: Backend::Launchd,
             definition_path: expected,
             account: None,
+            description: None,
             created_at: Utc::now(),
         };
         assert!(verify_definition_path_matches(&good).is_ok());
@@ -2220,6 +2445,7 @@ mod tests {
             backend: Backend::Launchd,
             definition_path: "/Users/someone-else/Library/LaunchAgents/frogs-someone-elses-project.plist".to_string(),
             account: None,
+            description: None,
             created_at: Utc::now(),
         };
         let err = verify_definition_path_matches(&stale).expect_err("a definition_path that doesn't match the freshly recomputed one must be rejected");
@@ -2237,6 +2463,7 @@ mod tests {
             backend: Backend::WindowsService,
             definition_path: "frogs-sample".to_string(),
             account: None,
+            description: None,
             created_at: Utc::now(),
         }
     }

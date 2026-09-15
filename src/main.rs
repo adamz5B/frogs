@@ -14,7 +14,7 @@ mod webserve;
 use clap::{Parser, Subcommand};
 
 use commands::generate::Role;
-use server::service::{ServiceScope, StartType};
+use server::service::{RestartPolicy, ServiceScope, StartType};
 
 #[derive(Parser)]
 #[command(name = "frogs", version, about = "Free Rust OpenAPI Generated Server", disable_help_subcommand = true)]
@@ -78,12 +78,24 @@ enum Command {
         /// non-Windows platforms.
         #[arg(long)]
         account: Option<String>,
+        /// Windows only: the description shown in services.msc/`sc
+        /// qdescription` for this service. Defaults to a generated
+        /// description naming the project's path when omitted. Ignored on
+        /// non-Windows platforms
+        #[arg(long)]
+        description: Option<String>,
         /// Whether the service starts automatically at boot/login going
         /// forward (default) or only when started explicitly (`frogs run`,
         /// or the platform's own tool) — either way, `register` still
         /// starts it once immediately regardless of this choice
         #[arg(long, value_enum, default_value = "automatic")]
         start_type: StartType,
+        /// Whether the service is automatically restarted by the OS if it
+        /// later exits with a failure (default: on-failure) — never
+        /// triggered by a deliberate `frogs stop`/`frogs unregister`,
+        /// regardless of this setting
+        #[arg(long, value_enum, default_value = "on-failure")]
+        restart_policy: RestartPolicy,
     },
     /// Remove this project's OS-managed service registration
     Unregister {
@@ -210,8 +222,18 @@ fn main() {
                 user,
                 system,
                 account,
+                description,
                 start_type,
-            } => commands::register::run(&cwd, name.as_deref(), resolve_scope(user, system), account.as_deref(), start_type),
+                restart_policy,
+            } => commands::register::run(
+                &cwd,
+                name.as_deref(),
+                resolve_scope(user, system),
+                account.as_deref(),
+                description.as_deref(),
+                start_type,
+                restart_policy,
+            ),
             Command::Unregister { user, system } => commands::unregister::run(&cwd, resolve_scope(user, system)),
             Command::Test { action: None } => commands::test::run(&cwd).await,
             Command::Test {
@@ -310,14 +332,34 @@ mod tests {
                 user,
                 system,
                 account,
+                description,
                 start_type,
+                restart_policy,
             } => {
                 assert_eq!(name, None);
                 assert!(!user);
                 assert!(!system);
                 assert_eq!(account, None);
+                assert_eq!(description, None);
                 assert_eq!(start_type, StartType::Automatic, "the default start type must be Automatic");
+                assert_eq!(restart_policy, RestartPolicy::OnFailure, "the default restart policy must be OnFailure");
             }
+            _ => panic!("expected Command::Register"),
+        }
+    }
+
+    #[test]
+    fn parses_register_with_restart_policy_never() {
+        match parse(&["register", "--restart-policy", "never"]) {
+            Command::Register { restart_policy, .. } => assert_eq!(restart_policy, RestartPolicy::Never),
+            _ => panic!("expected Command::Register"),
+        }
+    }
+
+    #[test]
+    fn parses_register_with_restart_policy_on_failure_explicitly() {
+        match parse(&["register", "--restart-policy", "on-failure"]) {
+            Command::Register { restart_policy, .. } => assert_eq!(restart_policy, RestartPolicy::OnFailure),
             _ => panic!("expected Command::Register"),
         }
     }
@@ -364,6 +406,14 @@ mod tests {
                 assert!(user);
                 assert!(!system);
             }
+            _ => panic!("expected Command::Register"),
+        }
+    }
+
+    #[test]
+    fn parses_register_with_a_description() {
+        match parse(&["register", "--description", "my custom description"]) {
+            Command::Register { description, .. } => assert_eq!(description, Some("my custom description".to_string())),
             _ => panic!("expected Command::Register"),
         }
     }
