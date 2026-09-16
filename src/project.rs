@@ -34,7 +34,11 @@ fn has_html_file(dir: &Path) -> bool {
     !find_files_with_extensions(dir, &["html"]).is_empty()
 }
 
-fn is_project_root(dir: &Path) -> bool {
+/// `pub(crate)` (not just private) because `server::service_host` also uses
+/// it, on Windows, to validate an externally-supplied `--project-root`
+/// argument baked into a registered Windows Service's own command line
+/// before ever treating it as a real project root.
+pub(crate) fn is_project_root(dir: &Path) -> bool {
     dir.join(MANIFEST_FILE).is_file() || has_html_file(dir)
 }
 

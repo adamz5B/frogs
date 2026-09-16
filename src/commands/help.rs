@@ -11,8 +11,10 @@ USAGE:
 
 COMMANDS:
     generate       Generate datasource stub/reference files from openapi.yaml
-    run            Start the server for the current project
+    run            Start the server for the current project (--restart restarts a registered service)
     stop           Stop the running server for the current project
+    register       Register this project as an OS-managed service (systemd/launchd/Windows Service)
+    unregister     Remove this project's OS-managed service registration
     test           Run *.test.json cases, or record a new one from a real request
     errors freeze  Batch config/errors.discovered.json into the canonical registry
     drivers list   Print which SQL drivers this binary was built with

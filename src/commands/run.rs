@@ -6,12 +6,88 @@ use axum::Router;
 use crate::config::{Config, ManualTlsConfig, ServerConfig, TlsConfig, TlsMode};
 use crate::project::{MANIFEST_FILE, require_project_root};
 use crate::server::pidfile;
+use crate::server::service::{self, RunDecision, ServiceRecord};
 use crate::webserve::WebServeConfig;
 
-pub async fn run(cwd: &Path) -> io::Result<()> {
+/// `service_managed` is the hidden, internal-only flag baked into every
+/// registered service definition's own command line (`run
+/// --service-managed`) — it exists purely to stop the OS-supervised process
+/// from recursively delegating back to `run_registered` below. `restart` is
+/// the normal public flag that only has an effect for a registered project.
+pub async fn run(cwd: &Path, service_managed: bool, restart: bool) -> io::Result<()> {
     let root = require_project_root(cwd);
 
-    if let Some(existing) = pidfile::read(&root)? {
+    if !service_managed {
+        if let Some(record) = service::read_record(&root)? {
+            return run_registered(&root, &record, restart).await;
+        }
+        if restart {
+            println!("note: --restart has no effect — this project is not registered as a service");
+        }
+    }
+
+    run_direct(&root).await
+}
+
+/// The default, Ctrl+C-based shutdown signal every unregistered project's
+/// `frogs run` (and every existing test of this module) uses —
+/// `run_direct_with_shutdown` accepts any future so a registered Windows
+/// Service (see `server::service_host::run_service`) can instead pass one
+/// tied to the SCM's own Stop/Shutdown control events.
+pub async fn run_direct(root: &Path) -> io::Result<()> {
+    run_direct_with_shutdown(root, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
+}
+
+/// The registered-project path: revalidate the record unconditionally,
+/// then decide whether to start, report, or restart the OS-managed service
+/// — never binds a port itself, in any outcome, since the real server
+/// always runs as the separately-supervised `--service-managed` process.
+async fn run_registered(root: &Path, record: &ServiceRecord, restart_requested: bool) -> io::Result<()> {
+    if let Err(e) = service::revalidate(record, root) {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+
+    let running = service::is_running(record)?;
+    match service::decide_run_action(running, restart_requested) {
+        RunDecision::Start => {
+            service::start_registered(record, root)?;
+            println!("service {} was not running — started via {}", record.name, service::backend_label(record.backend));
+        }
+        RunDecision::AlreadyRunningReportOnly => {
+            service::report_status_only(record, root)?;
+            println!(
+                "service {} is already running via {} — run `frogs run --restart` to restart it",
+                record.name,
+                service::backend_label(record.backend)
+            );
+        }
+        RunDecision::Restart => {
+            service::restart_registered(record, root)?;
+            println!(
+                "service {} was already running — restarted via {} (--restart)",
+                record.name,
+                service::backend_label(record.backend)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Today's exact `frogs run` behavior — pidfile check, role detection,
+/// router build/serve — reached both by an unregistered project (via
+/// `run_direct`, below) and by every OS-supervised process, on any
+/// platform (`--service-managed` on Linux/macOS, `service_host::run_service`
+/// on Windows), which must always land here directly rather than ever
+/// routing back through `run_registered`. `shutdown` is awaited instead of
+/// a hardcoded `tokio::signal::ctrl_c()` so a supervised process can tie
+/// its own shutdown to whatever signal its supervisor actually uses,
+/// without duplicating this function's own pidfile/role-detection logic.
+pub async fn run_direct_with_shutdown(root: &Path, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> io::Result<()> {
+    if let Some(existing) = pidfile::read(root)? {
         if pidfile::is_alive(existing.pid) {
             eprintln!(
                 "error: a server is already running for this project (pid {}, port {}) — \
@@ -22,7 +98,7 @@ pub async fn run(cwd: &Path) -> io::Result<()> {
         }
         // Stale from a previous run that didn't get to clean up after
         // itself (e.g. killed rather than stopped via `frogs stop`).
-        pidfile::remove(&root)?;
+        pidfile::remove(root)?;
     }
 
     // `openapi.yaml`/`webserve.json`'s presence (not `.html` files or
@@ -38,13 +114,13 @@ pub async fn run(cwd: &Path) -> io::Result<()> {
             eprintln!("error: no {MANIFEST_FILE} or webserve.json found at {} — run `frogs generate` first", root.display());
             std::process::exit(1);
         }
-        (true, false) => run_api(&root).await,
-        (false, true) => run_web(&root).await,
-        (true, true) => run_both(&root).await,
+        (true, false) => run_api(root, shutdown).await,
+        (false, true) => run_web(root, shutdown).await,
+        (true, true) => run_both(root, shutdown).await,
     }
 }
 
-async fn run_api(root: &Path) -> io::Result<()> {
+async fn run_api(root: &Path, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> io::Result<()> {
     println!("project root: {}", root.display());
     let (router, server_config) = build_api_router(root).await?;
 
@@ -55,7 +131,7 @@ async fn run_api(root: &Path) -> io::Result<()> {
     );
 
     let api_dir = crate::project::api_base(root);
-    serve(root, router, server_config.port, &server_config.tls, &api_dir).await
+    serve(root, router, server_config.port, &server_config.tls, &api_dir, shutdown).await
 }
 
 /// `/healthz` (always) plus `/readyz`/`/metrics` (only when their feature
@@ -77,7 +153,7 @@ fn operational_routes_display(server_config: &ServerConfig) -> Vec<String> {
     routes
 }
 
-async fn run_web(root: &Path) -> io::Result<()> {
+async fn run_web(root: &Path, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> io::Result<()> {
     println!("project root: {}", root.display());
     let (router, config) = build_web_router(root);
 
@@ -91,10 +167,10 @@ async fn run_web(root: &Path) -> io::Result<()> {
     // No `api/` subfolder in a web-only project — `certPath`/`keyPath`
     // resolve relative to the project root itself, right alongside
     // `webserve.json`.
-    serve(root, router, config.port, &config.tls, root).await
+    serve(root, router, config.port, &config.tls, root, shutdown).await
 }
 
-async fn run_both(root: &Path) -> io::Result<()> {
+async fn run_both(root: &Path, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> io::Result<()> {
     println!("project root: {}", root.display());
     let (api_router, server_config) = build_api_router(root).await?;
     let (web_router, web_config) = build_web_router(root);
@@ -136,7 +212,7 @@ async fn run_both(root: &Path) -> io::Result<()> {
     // `config/server.json`'s `tls` is authoritative here too — same
     // single-listener reasoning as the port-authority note above.
     let api_dir = crate::project::api_base(root);
-    serve(root, router, server_config.port, &server_config.tls, &api_dir).await
+    serve(root, router, server_config.port, &server_config.tls, &api_dir, shutdown).await
 }
 
 /// Loads config, connects every SQL driver, and builds the fully-nested,
@@ -297,17 +373,22 @@ fn build_web_router(root: &Path) -> (Router, WebServeConfig) {
     (router, config)
 }
 
-/// Binds `port`, writes the PID file, serves `router` until Ctrl+C or an
-/// external `frogs stop`, then cleans the PID file up — the tail end every
-/// run mode (`run_api`/`run_web`/`run_both`) shares once its own router is
-/// built, regardless of which role(s) that router serves. `tls` selects
-/// plain HTTP (`TlsMode::Off`, unchanged behavior) or HTTPS via a
-/// user-supplied cert/key pair (`TlsMode::Manual`) — see
-/// `docs/frogs-https-development.md`. `tls_base` is where `tls.manual`'s
-/// `certPath`/`keyPath` resolve relative to — `api_base(root)` for
-/// `run_api`/`run_both` (matching where `config/server.json` itself, and
-/// every other path it reads, already resolve from), or `root` itself for
-/// `run_web` (no `api/` subfolder exists in a web-only project).
+/// Binds `port`, writes the PID file, serves `router` until `shutdown`
+/// resolves or an external `frogs stop` kills the process, then cleans the
+/// PID file up — the tail end every run mode (`run_api`/`run_web`/
+/// `run_both`) shares once its own router is built, regardless of which
+/// role(s) that router serves. `shutdown` is Ctrl+C for an unregistered
+/// project (`run_direct`'s own default) or the SCM's Stop/Shutdown control
+/// events for a registered Windows Service (`server::service_host`) —
+/// `serve`/`serve_http`/`serve_https` don't care which, they just await
+/// whatever future the caller hands them. `tls` selects plain HTTP
+/// (`TlsMode::Off`, unchanged behavior) or HTTPS via a user-supplied
+/// cert/key pair (`TlsMode::Manual`) — see `docs/frogs-https-development.md`.
+/// `tls_base` is where `tls.manual`'s `certPath`/`keyPath` resolve relative
+/// to — `api_base(root)` for `run_api`/`run_both` (matching where
+/// `config/server.json` itself, and every other path it reads, already
+/// resolve from), or `root` itself for `run_web` (no `api/` subfolder
+/// exists in a web-only project).
 ///
 /// No graceful in-flight-request draining — a deliberate scope decision,
 /// not an oversight: frogs holds no state of its own across a request (the
@@ -315,26 +396,33 @@ fn build_web_router(root: &Path) -> (Router, WebServeConfig) {
 /// content), so the only risk a hard kill carries is a caller not finding
 /// out whether their in-flight write's response made it back — which a
 /// clean shutdown signal wouldn't fully eliminate either, since the write
-/// can already have committed upstream before the signal arrives. Ctrl+C
-/// and an external `frogs stop` both just end the process; the `select!`
-/// in both `serve_http`/`serve_https` below only makes sure
-/// `.frogs/run.json` doesn't linger after the terminal (Ctrl+C) case
+/// can already have committed upstream before the signal arrives.
+/// `shutdown` resolving and an external `frogs stop` both just end the
+/// process; the `select!` in both `serve_http`/`serve_https` below only
+/// makes sure `.frogs/run.json` doesn't linger after the former case
 /// specifically, since `frogs stop` already removes it itself after
 /// terminating the process externally.
-async fn serve(root: &Path, router: Router, port: u16, tls: &TlsConfig, tls_base: &Path) -> io::Result<()> {
+async fn serve(
+    root: &Path,
+    router: Router,
+    port: u16,
+    tls: &TlsConfig,
+    tls_base: &Path,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> io::Result<()> {
     match tls.mode {
-        TlsMode::Off => serve_http(root, router, port).await,
+        TlsMode::Off => serve_http(root, router, port, shutdown).await,
         TlsMode::Manual => {
             let manual = tls
                 .manual
                 .as_ref()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "tls.mode is \"manual\" but tls.manual (certPath/keyPath) is missing"))?;
-            serve_https(root, router, port, manual, tls_base).await
+            serve_https(root, router, port, manual, tls_base, shutdown).await
         }
     }
 }
 
-async fn serve_http(root: &Path, router: Router, port: u16) -> io::Result<()> {
+async fn serve_http(root: &Path, router: Router, port: u16, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> io::Result<()> {
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
@@ -355,8 +443,8 @@ async fn serve_http(root: &Path, router: Router, port: u16) -> io::Result<()> {
     // simply never looks at `ConnectInfo`.
     let result = tokio::select! {
         result = axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()) => result,
-        _ = tokio::signal::ctrl_c() => {
-            println!("received Ctrl+C, shutting down");
+        _ = shutdown => {
+            println!("shutting down");
             Ok(())
         }
     };
@@ -367,7 +455,14 @@ async fn serve_http(root: &Path, router: Router, port: u16) -> io::Result<()> {
 
 /// `manual.certPath`/`keyPath` resolve relative to `tls_base` — see
 /// `serve`'s own doc comment for which base each caller passes and why.
-async fn serve_https(root: &Path, router: Router, port: u16, manual: &ManualTlsConfig, tls_base: &Path) -> io::Result<()> {
+async fn serve_https(
+    root: &Path,
+    router: Router,
+    port: u16,
+    manual: &ManualTlsConfig,
+    tls_base: &Path,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> io::Result<()> {
     let addr_str = format!("0.0.0.0:{port}");
     let addr: std::net::SocketAddr = addr_str
         .parse()
@@ -414,8 +509,8 @@ async fn serve_https(root: &Path, router: Router, port: u16, manual: &ManualTlsC
     // TLS acceptor supports the identical `MakeService` shape.
     let result = tokio::select! {
         result = server.serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>()) => result,
-        _ = tokio::signal::ctrl_c() => {
-            println!("received Ctrl+C, shutting down");
+        _ = shutdown => {
+            println!("shutting down");
             Ok(())
         }
     };
@@ -492,6 +587,16 @@ mod tests {
         listener.local_addr().unwrap().port()
     }
 
+    /// The same default shutdown future `run_direct` itself builds for an
+    /// unregistered project — every test below that calls `serve`/`run_web`
+    /// directly (bypassing `run_direct`) needs to supply one explicitly now
+    /// that the signature takes it as a parameter, with no behavior change
+    /// versus the hardcoded `tokio::signal::ctrl_c()` these tests exercised
+    /// before.
+    async fn ctrl_c_shutdown() {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+
     /// `tls.mode: "manual"` with no `tls.manual` block at all — a config
     /// mistake that must fail loudly before ever binding a port, not panic
     /// or silently fall back to plain HTTP.
@@ -504,7 +609,7 @@ mod tests {
         };
         let router = Router::new();
 
-        let err = serve(&root, router, free_port(), &tls, &root)
+        let err = serve(&root, router, free_port(), &tls, &root, ctrl_c_shutdown())
             .await
             .expect_err("tls.mode: manual with no tls.manual block must fail, not silently serve plain HTTP");
         assert!(err.to_string().contains("tls.manual"));
@@ -530,7 +635,7 @@ mod tests {
         };
         let router = Router::new();
 
-        let err = serve(&root, router, free_port(), &tls, &root)
+        let err = serve(&root, router, free_port(), &tls, &root, ctrl_c_shutdown())
             .await
             .expect_err("a nonexistent cert file must fail to load, not panic or hang");
         assert!(err.to_string().contains("does-not-exist-cert.pem"));
@@ -574,7 +679,7 @@ mod tests {
         let spawned_root = root.clone();
         let spawned_api_dir = api_dir.clone();
         tokio::spawn(async move {
-            let _ = serve(&spawned_root, router, port, &tls, &spawned_api_dir).await;
+            let _ = serve(&spawned_root, router, port, &tls, &spawned_api_dir, ctrl_c_shutdown()).await;
         });
         // Brief wait for the spawned task to actually bind the listener
         // before the client below tries to connect to it.
@@ -619,7 +724,7 @@ mod tests {
         let spawned_root = root.clone();
         let spawned_api_dir = api_dir.clone();
         tokio::spawn(async move {
-            let _ = serve(&spawned_root, router, port, &tls, &spawned_api_dir).await;
+            let _ = serve(&spawned_root, router, port, &tls, &spawned_api_dir, ctrl_c_shutdown()).await;
         });
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -665,7 +770,7 @@ mod tests {
 
         let spawned_root = root.clone();
         tokio::spawn(async move {
-            let _ = run_web(&spawned_root).await;
+            let _ = run_web(&spawned_root, ctrl_c_shutdown()).await;
         });
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 

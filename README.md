@@ -6,7 +6,7 @@
 
 ## What it does
 
-- **Cargo-style CLI** (`frogs generate|run|stop|test|errors|drivers|validate|help`) — a project's root is just wherever you put an `openapi.yaml` and/or a web asset file, found by walking up like `cargo` finds `Cargo.toml`.
+- **Cargo-style CLI** (`frogs generate|run|stop|register|unregister|test|errors|drivers|validate|help`) — a project's root is just wherever you put an `openapi.yaml` and/or a web asset file, found by walking up like `cargo` finds `Cargo.toml`.
 - **`frogs generate`** turns `openapi.yaml` into stub + reference files per endpoint, with drift detection and backup-and-migrate on spec changes. Hand-edited stubs are never overwritten.
 - **Real SQL sources**: SQLite (always compiled in), Postgres (default), MySQL/MariaDB, MS SQL Server, and Oracle (all opt-in Cargo features), plus real HTTP sources with templating and auth.
 - **Response formatting**, a stable **error envelope** classified against a merged `config/errors/*.json` registry, and **endpoint security** via `sql`/`http` verifiers.
@@ -14,6 +14,7 @@
 - **A mock-substitution test framework** (`*.test.json` / `frogs test`) that runs endpoint tests without touching real infrastructure.
 - **Static-content serving** (`webserve.json`) that can run standalone or alongside the API in one process, mounted under a configurable `apiRoot`.
 - Operational basics: PID-file process management, `/healthz`/`/readyz`/`/metrics`, rate limiting, a service registry, and manual-cert HTTPS.
+- **`frogs register`/`frogs unregister`** installs (or removes) this project as a platform-native service — systemd on Linux, launchd on macOS, a real Windows Service on Windows — so it starts automatically at boot/login instead of needing an open terminal.
 
 ## Quickstart
 
