@@ -1,3 +1,4 @@
+pub mod logging;
 pub mod pidfile;
 pub mod service;
 #[cfg(windows)]
@@ -553,7 +554,12 @@ async fn correlation_id_middleware(mut req: Request, next: Next) -> Response {
 
     let mut response = async move {
         let response = next.run(req).await;
-        tracing::info!(status = %response.status(), "request completed");
+        // `debug`, not `info` — see `docs/frogs-persistent-logging.md`'s
+        // severity-contract note: this fires once per HTTP request, so an
+        // `info`-level per-request line would make unbounded, request-volume
+        // -driven disk growth the *default* behavior of turning this feature
+        // on at all, now that the file layer shares this same `EnvFilter`.
+        tracing::debug!(status = %response.status(), "request completed");
         response
     }
     .instrument(span)

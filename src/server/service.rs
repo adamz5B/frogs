@@ -613,9 +613,16 @@ pub fn install(
     #[cfg(target_os = "macos")]
     let (backend, definition_path, resolved_account, resolved_description) = {
         let _ = (account, description);
+        // Same two-layer treatment `root`/`exe` already get: `reject_unsafe_path`
+        // rejects control characters that would corrupt the hand-parsed plist
+        // file, `escape_xml` (inside `render_plist`) handles XML metacharacters.
+        let log_dir = crate::server::logging::peek_logging_directory(root);
+        reject_unsafe_path(&log_dir)?;
         (
             Backend::Launchd,
-            launchd::install(name, scope, root, start_type, restart_policy)?.to_string_lossy().into_owned(),
+            launchd::install(name, scope, root, &log_dir.to_string_lossy(), start_type, restart_policy)?
+                .to_string_lossy()
+                .into_owned(),
             None,
             None,
         )
@@ -1010,10 +1017,21 @@ mod launchd {
         }
     }
 
-    pub fn render_plist(name: &str, exe: &Path, root: &Path, scope: ServiceScope, start_type: StartType, restart_policy: RestartPolicy) -> String {
+    /// `log_dir` (resolved by `server::logging::peek_logging_directory`,
+    /// already passed through `reject_unsafe_path` by the caller) backs
+    /// `StandardOutPath`/`StandardErrorPath` — launchd's own capture of
+    /// whatever this process writes to stdout/stderr directly (not through
+    /// `tracing`), which matters for a crash before the tracing subscriber
+    /// is even installed. Deliberately distinct filenames
+    /// (`launchd-std{out,err}.log`) from `tracing-appender`'s own
+    /// `frogs.log.<date>` — those are two independently-buffered writers,
+    /// and pointing both at the same path would race each other's file
+    /// offsets.
+    pub fn render_plist(name: &str, exe: &Path, root: &Path, log_dir: &str, scope: ServiceScope, start_type: StartType, restart_policy: RestartPolicy) -> String {
         let _ = scope; // KeepAlive is identical for both scopes — only the install path differs.
         let exe_esc = escape_xml(&exe.to_string_lossy());
         let root_esc = escape_xml(&root.to_string_lossy());
+        let log_dir_esc = escape_xml(log_dir);
         // `RunAtLoad=true` is what makes `load -w` (see `install`, below)
         // start the job immediately as a side effect of loading it — with
         // `false`, loading only registers the definition (and, via `-w`,
@@ -1055,6 +1073,10 @@ mod launchd {
              \t</array>\n\
              \t<key>WorkingDirectory</key>\n\
              \t<string>{root_esc}</string>\n\
+             \t<key>StandardOutPath</key>\n\
+             \t<string>{log_dir_esc}/launchd-stdout.log</string>\n\
+             \t<key>StandardErrorPath</key>\n\
+             \t<string>{log_dir_esc}/launchd-stderr.log</string>\n\
              \t<key>RunAtLoad</key>\n\
              \t<{run_at_load}/>\n\
              \t<key>KeepAlive</key>\n\
@@ -1109,7 +1131,7 @@ mod launchd {
         }
     }
 
-    pub fn install(name: &str, scope: ServiceScope, root: &Path, start_type: StartType, restart_policy: RestartPolicy) -> io::Result<PathBuf> {
+    pub fn install(name: &str, scope: ServiceScope, root: &Path, log_dir: &str, start_type: StartType, restart_policy: RestartPolicy) -> io::Result<PathBuf> {
         let exe = std::env::current_exe()?;
         reject_unsafe_path(&exe)?;
 
@@ -1117,7 +1139,7 @@ mod launchd {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, render_plist(name, &exe, root, scope, start_type, restart_policy))?;
+        fs::write(&path, render_plist(name, &exe, root, log_dir, scope, start_type, restart_policy))?;
 
         // `restart` (unload-ignore-fail + `load -w`) loads the definition;
         // with `RunAtLoad=true` (Automatic) that alone starts it. With
@@ -1177,6 +1199,7 @@ mod launchd {
                 "frogs-test",
                 Path::new("/usr/local/bin/frogs"),
                 root,
+                "/Users/x/logs",
                 ServiceScope::User,
                 StartType::Automatic,
                 RestartPolicy::OnFailure,
@@ -1197,10 +1220,26 @@ mod launchd {
             let root = Path::new("/Users/x/project");
             let exe = Path::new("/usr/local/bin/frogs");
 
-            let automatic = render_plist("frogs-test", exe, root, ServiceScope::User, StartType::Automatic, RestartPolicy::OnFailure);
+            let automatic = render_plist(
+                "frogs-test",
+                exe,
+                root,
+                "/Users/x/logs",
+                ServiceScope::User,
+                StartType::Automatic,
+                RestartPolicy::OnFailure,
+            );
             assert!(automatic.contains("<key>RunAtLoad</key>\n\t<true/>"));
 
-            let manual = render_plist("frogs-test", exe, root, ServiceScope::User, StartType::Manual, RestartPolicy::OnFailure);
+            let manual = render_plist(
+                "frogs-test",
+                exe,
+                root,
+                "/Users/x/logs",
+                ServiceScope::User,
+                StartType::Manual,
+                RestartPolicy::OnFailure,
+            );
             assert!(manual.contains("<key>RunAtLoad</key>\n\t<false/>"));
         }
 
@@ -1209,7 +1248,15 @@ mod launchd {
             let root = Path::new("/Users/x/project");
             let exe = Path::new("/usr/local/bin/frogs");
 
-            let plist = render_plist("frogs-test", exe, root, ServiceScope::User, StartType::Automatic, RestartPolicy::OnFailure);
+            let plist = render_plist(
+                "frogs-test",
+                exe,
+                root,
+                "/Users/x/logs",
+                ServiceScope::User,
+                StartType::Automatic,
+                RestartPolicy::OnFailure,
+            );
             assert!(plist.contains("<key>SuccessfulExit</key>"));
             assert!(plist.contains("<key>KeepAlive</key>\n\t<dict>"));
         }
@@ -1219,9 +1266,55 @@ mod launchd {
             let root = Path::new("/Users/x/project");
             let exe = Path::new("/usr/local/bin/frogs");
 
-            let plist = render_plist("frogs-test", exe, root, ServiceScope::User, StartType::Automatic, RestartPolicy::Never);
+            let plist = render_plist(
+                "frogs-test",
+                exe,
+                root,
+                "/Users/x/logs",
+                ServiceScope::User,
+                StartType::Automatic,
+                RestartPolicy::Never,
+            );
             assert!(plist.contains("<key>KeepAlive</key>\n\t<false/>"));
             assert!(!plist.contains("SuccessfulExit"));
+        }
+
+        /// `StandardOutPath`/`StandardErrorPath` must both be present,
+        /// correctly XML-escaped, pointed at `log_dir`, and named distinctly
+        /// from each other and from `tracing-appender`'s own
+        /// `frogs.log.<date>` naming (see this function's own doc comment).
+        #[test]
+        fn render_plist_includes_standard_out_and_error_paths_pointed_at_the_log_directory() {
+            let root = Path::new("/Users/x/project");
+            let exe = Path::new("/usr/local/bin/frogs");
+
+            let plist = render_plist(
+                "frogs-test",
+                exe,
+                root,
+                "/Users/x/100%<Weird>&\"logs\"",
+                ServiceScope::User,
+                StartType::Automatic,
+                RestartPolicy::OnFailure,
+            );
+
+            assert!(
+                plist.contains("<key>StandardOutPath</key>\n\t<string>/Users/x/100%&lt;Weird&gt;&amp;&quot;logs&quot;/launchd-stdout.log</string>"),
+                "StandardOutPath should be XML-escaped and point at launchd-stdout.log under log_dir: {plist}"
+            );
+            assert!(
+                plist.contains("<key>StandardErrorPath</key>\n\t<string>/Users/x/100%&lt;Weird&gt;&amp;&quot;logs&quot;/launchd-stderr.log</string>"),
+                "StandardErrorPath should be XML-escaped and point at launchd-stderr.log under log_dir: {plist}"
+            );
+            assert_ne!(
+                extract_plist_string_value(&plist, "StandardOutPath"),
+                extract_plist_string_value(&plist, "StandardErrorPath"),
+                "stdout and stderr must not be pointed at the same file"
+            );
+            assert!(
+                !plist.contains("frogs.log"),
+                "launchd's own stdout/stderr capture files must be named distinctly from tracing-appender's frogs.log.<date> files: {plist}"
+            );
         }
 
         #[test]
@@ -1467,6 +1560,14 @@ pub mod windows_svc {
         }
     }
 
+    /// Operator note (not enforced here — see
+    /// `docs/frogs-persistent-logging.md`): this service defaults to
+    /// running as `NT AUTHORITY\LocalService` (see `resolve_account`). If
+    /// that account can't write `logging.directory`, `frogs run`'s own
+    /// self-healing fallback silently drops to stdout-only — which, for a
+    /// real Windows Service with no console handle, means a total logging
+    /// blackout, not just a warning. Not checked as part of `register`
+    /// today; recommended for a future pass.
     pub fn install(name: &str, root: &Path, account: Option<&str>, description: Option<&str>, start_type: StartType, restart_policy: RestartPolicy) -> io::Result<()> {
         let resolved = resolve_account(account);
         let (account_name, account_password) = account_credentials(&resolved)?;
@@ -2336,6 +2437,49 @@ mod tests {
     fn reject_unsafe_path_rejects_an_embedded_carriage_return() {
         let hostile = PathBuf::from(format!("/srv/my{}project", '\r'));
         assert!(reject_unsafe_path(&hostile).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // install — macOS-only: `log_dir` (resolved via
+    // `logging::peek_logging_directory`) must go through the same
+    // `reject_unsafe_path` gate `root`/`exe` already do, before it's ever
+    // templated into the rendered plist.
+    // -----------------------------------------------------------------
+
+    /// A project whose `config/server.json` sets `logging.directory` to a
+    /// value containing an embedded NUL/CR/LF byte — `install`'s macOS
+    /// branch must reject it (the same way it already rejects one in
+    /// `root`) before ever calling `launchd::install`, not just compile a
+    /// code path that happens to touch it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn install_rejects_a_logging_directory_containing_an_embedded_control_byte() {
+        for (label, hostile) in [("nul", "\u{0}"), ("cr", "\r"), ("lf", "\n")] {
+            let root = temp_project();
+            std::fs::write(root.join("openapi.yaml"), "openapi: 3.0.3\ninfo: { title: t, version: '1' }\npaths: {}\n").unwrap();
+            let api_dir = root.join("api");
+            std::fs::create_dir_all(api_dir.join("config")).unwrap();
+            let directory = format!("logs{hostile}evil");
+            std::fs::write(
+                api_dir.join("config/server.json"),
+                serde_json::json!({ "logging": { "directory": directory } }).to_string(),
+            )
+            .unwrap();
+
+            let err = install(
+                "frogs-log-dir-test",
+                ServiceScope::User,
+                &root,
+                None,
+                None,
+                StartType::Automatic,
+                RestartPolicy::OnFailure,
+            )
+            .expect_err(&format!(
+                "a logging.directory containing an embedded {label} byte must be rejected, not smuggled into the rendered plist"
+            ));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
     }
 
     // -----------------------------------------------------------------

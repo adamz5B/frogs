@@ -150,6 +150,55 @@ impl Default for DocsUiConfig {
     }
 }
 
+/// Verbosity for `frogs run`'s persistent file logging (see
+/// `server::logging`) — also governs the stdout layer for that same run,
+/// since both share one `EnvFilter`. `RUST_LOG` still overrides this when
+/// set, same precedence the old hardcoded bootstrap subscriber already had.
+/// An unrecognized value fails to parse rather than silently falling back to
+/// `info` — same fail-closed posture `TlsMode`/`DocsUiMode` already have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Off,
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+fn default_log_directory() -> String {
+    "runtime-logs".to_string()
+}
+
+/// `config/server.json`'s `logging` block — directory relative to
+/// `project::api_base` (or the project root itself for a web-only project,
+/// which has no `api/` folder — see `server::logging::resolve_log_directory`).
+/// This is the first case of a config-trusted path being used for directory
+/// *creation* (a `std::fs::create_dir_all` write), not just a file *read*
+/// the way `TlsConfig`'s `certPath`/`keyPath` are — same trust model as
+/// everywhere else (project config is trusted, not attacker-controlled), but
+/// worth naming the distinction since it's a new kind of filesystem effect
+/// for this config surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoggingConfig {
+    #[serde(default = "default_log_directory")]
+    pub directory: String,
+    #[serde(default)]
+    pub level: LogLevel,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        LoggingConfig {
+            directory: default_log_directory(),
+            level: LogLevel::default(),
+        }
+    }
+}
+
 /// Independently toggleable capabilities — none of them imply a deployment
 /// "mode"; a monolith and a split-out microservice both just pick whichever
 /// of these they need. `metrics`/`readyzCheck`/`requestCorrelation` and
@@ -225,6 +274,11 @@ pub struct ServerConfig {
     /// plain HTTP, using this same field's `manual.certPath`/`keyPath`.
     #[serde(default)]
     pub tls: TlsConfig,
+    /// Persistent file logging for `frogs run` — see `LoggingConfig`'s own
+    /// doc comment and `server::logging`. Defaults to a `runtime-logs`
+    /// directory (relative to `project::api_base`) at `LogLevel::Info`.
+    #[serde(default)]
+    pub logging: LoggingConfig,
     /// Not part of the original design doc (which never pins down a port) —
     /// a sensible default so `frogs run` has somewhere to bind.
     #[serde(default = "default_port")]
@@ -250,6 +304,7 @@ impl Default for ServerConfig {
             cors: CorsConfig::default(),
             docs_ui: DocsUiConfig::default(),
             tls: TlsConfig::default(),
+            logging: LoggingConfig::default(),
             port: 8080,
             api_root: String::new(),
         }
@@ -367,6 +422,59 @@ mod tests {
         let err = serde_json::from_str::<ServerConfig>(r#"{ "tls": { "mode": "acme" } }"#)
             .expect_err("an unimplemented TLS mode must fail to parse, not silently serve plain HTTP");
         assert!(err.to_string().contains("acme") || err.to_string().to_lowercase().contains("unknown variant"));
+    }
+
+    #[test]
+    fn logging_defaults_to_runtime_logs_at_info_when_absent_from_the_file() {
+        let config: ServerConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.logging.directory, "runtime-logs");
+        assert_eq!(config.logging.level, LogLevel::Info);
+    }
+
+    #[test]
+    fn logging_directory_and_level_are_read_from_the_file() {
+        let config: ServerConfig = serde_json::from_str(r#"{ "logging": { "directory": "logs/custom", "level": "debug" } }"#).unwrap();
+        assert_eq!(config.logging.directory, "logs/custom");
+        assert_eq!(config.logging.level, LogLevel::Debug);
+    }
+
+    #[test]
+    fn every_log_level_variant_parses_from_its_lowercase_name() {
+        for (raw, expected) in [
+            ("off", LogLevel::Off),
+            ("error", LogLevel::Error),
+            ("warn", LogLevel::Warn),
+            ("info", LogLevel::Info),
+            ("debug", LogLevel::Debug),
+            ("trace", LogLevel::Trace),
+        ] {
+            let config: ServerConfig = serde_json::from_str(&format!(r#"{{ "logging": {{ "level": "{raw}" }} }}"#)).unwrap();
+            assert_eq!(config.logging.level, expected, "level {raw} should parse to {expected:?}");
+        }
+    }
+
+    #[test]
+    fn log_level_rejects_an_unknown_value_rather_than_silently_falling_back_to_info() {
+        let err = serde_json::from_str::<ServerConfig>(r#"{ "logging": { "level": "verbose" } }"#)
+            .expect_err("an unrecognized logging.level must fail to parse, not silently default to info");
+        assert!(err.to_string().to_lowercase().contains("unknown variant"));
+    }
+
+    #[test]
+    fn logging_round_trips_through_serialize_and_deserialize() {
+        let config = ServerConfig {
+            logging: LoggingConfig {
+                directory: "logs/custom".to_string(),
+                level: LogLevel::Trace,
+            },
+            ..ServerConfig::default()
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let reloaded: ServerConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(reloaded.logging.directory, "logs/custom");
+        assert_eq!(reloaded.logging.level, LogLevel::Trace);
     }
 
     #[test]

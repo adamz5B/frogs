@@ -19,6 +19,11 @@ pub async fn run(cwd: &Path, service_managed: bool, restart: bool) -> io::Result
 
     if !service_managed {
         if let Some(record) = service::read_record(&root)? {
+            // A registered project's `frogs run` never binds a port itself
+            // (see `run_registered`'s own doc comment) — same stdout-only
+            // posture `generate`/`stop` already have, not the persistent
+            // file subscriber `run_direct_with_shutdown` installs.
+            crate::server::logging::install_bootstrap_subscriber();
             return run_registered(&root, &record, restart).await;
         }
         if restart {
@@ -87,6 +92,26 @@ async fn run_registered(root: &Path, record: &ServiceRecord, restart_requested: 
 /// its own shutdown to whatever signal its supervisor actually uses,
 /// without duplicating this function's own pidfile/role-detection logic.
 pub async fn run_direct_with_shutdown(root: &Path, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> io::Result<()> {
+    // `openapi.yaml`/`webserve.json`'s presence (not `.html` files or
+    // `api/`'s own contents) is what `run` keys its mode off of — the same
+    // two markers `generate` itself resolves a role from, and both are
+    // present together whenever `generate` produced both sides (see
+    // `commands::generate::run`'s `(true, true)` branch). Hoisted to the top
+    // of this function (ahead of the pidfile check below) because the
+    // persistent-logging subscriber needs `has_api` to resolve the right log
+    // directory before anything else in this function runs — see
+    // `docs/frogs-persistent-logging.md`'s note on this ordering tradeoff
+    // (the log directory/file now gets created before the "already running"
+    // pidfile check, accepted rather than restructured).
+    let has_api = root.join(MANIFEST_FILE).is_file();
+    let has_web = root.join("webserve.json").is_file();
+
+    // Bound for the rest of this function's body — `LoggingHandles`'s
+    // `Drop` flushes buffered file writes, so it must not go out of scope
+    // (and drop) before `serve` actually returns.
+    let (log_dir, log_level) = crate::server::logging::resolve_log_directory(root, has_api);
+    let _logging_handles = crate::server::logging::install_run_subscriber(&log_dir, log_level);
+
     if let Some(existing) = pidfile::read(root)? {
         if pidfile::is_alive(existing.pid) {
             eprintln!(
@@ -100,14 +125,6 @@ pub async fn run_direct_with_shutdown(root: &Path, shutdown: impl std::future::F
         // itself (e.g. killed rather than stopped via `frogs stop`).
         pidfile::remove(root)?;
     }
-
-    // `openapi.yaml`/`webserve.json`'s presence (not `.html` files or
-    // `api/`'s own contents) is what `run` keys its mode off of — the same
-    // two markers `generate` itself resolves a role from, and both are
-    // present together whenever `generate` produced both sides (see
-    // `commands::generate::run`'s `(true, true)` branch).
-    let has_api = root.join(MANIFEST_FILE).is_file();
-    let has_web = root.join("webserve.json").is_file();
 
     match (has_api, has_web) {
         (false, false) => {
@@ -129,6 +146,7 @@ async fn run_api(root: &Path, shutdown: impl std::future::Future<Output = ()> + 
          above) plus {}",
         operational_routes_display(&server_config).join(", ")
     );
+    tracing::info!(roles = "api", port = server_config.port, tls_mode = ?server_config.tls.mode, "frogs run starting");
 
     let api_dir = crate::project::api_base(root);
     serve(root, router, server_config.port, &server_config.tls, &api_dir, shutdown).await
@@ -163,6 +181,7 @@ async fn run_web(root: &Path, shutdown: impl std::future::Future<Output = ()> + 
         config.port,
         config.not_found_page.as_ref().map(|p| format!(", notFoundPage: {p}")).unwrap_or_default()
     );
+    tracing::info!(roles = "web", port = config.port, tls_mode = ?config.tls.mode, "frogs run starting");
 
     // No `api/` subfolder in a web-only project — `certPath`/`keyPath`
     // resolve relative to the project root itself, right alongside
@@ -181,6 +200,7 @@ async fn run_both(root: &Path, shutdown: impl std::future::Future<Output = ()> +
         web_config.start_page
     );
     println!("API operational routes: {}", operational_routes_display(&server_config).join(", "));
+    tracing::info!(roles = "api+web", port = server_config.port, tls_mode = ?server_config.tls.mode, "frogs run starting");
     if web_config.port != server_config.port {
         // Only one process, only one listener — `config/server.json`'s port
         // is authoritative whenever both roles run together (see Point 1's
@@ -844,6 +864,67 @@ mod tests {
         assert!(
             !response.headers().contains_key("x-request-id"),
             "requestCorrelation: false must actually disable X-Request-Id, not just be a documented-but-inert toggle"
+        );
+    }
+
+    /// Same shape as `scratch_api_project`, but pinned to a caller-supplied
+    /// port (via `config/server.json`'s own `port` field) rather than the
+    /// default 8080 — needed by any test that calls `run_direct_with_shutdown`
+    /// (or `run_api`) directly, since those actually bind the real listener
+    /// rather than a test-owned ephemeral one.
+    fn scratch_api_project_with_port(port: u16) -> std::path::PathBuf {
+        let root = temp_project();
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(api_dir.join("config/errors")).unwrap();
+        std::fs::create_dir_all(api_dir.join("security")).unwrap();
+        std::fs::create_dir_all(api_dir.join("datasources/endpoints")).unwrap();
+        std::fs::write(root.join("openapi.yaml"), "openapi: 3.0.3\ninfo: { title: t, version: '1' }\npaths: {}\n").unwrap();
+        std::fs::write(
+            api_dir.join("config/server.json"),
+            format!(r#"{{ "features": {{ "requestCorrelation": false, "requestValidation": false }}, "port": {port} }}"#),
+        )
+        .unwrap();
+        std::fs::write(api_dir.join("config/errors/core.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("config/connections.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("security/schemes.json"), "{}").unwrap();
+        root
+    }
+
+    /// `run_direct_with_shutdown` hoisted `has_api`/`has_web` detection —
+    /// and the persistent-logging subscriber install that depends on it —
+    /// above the pidfile check (see that function's own doc comment on the
+    /// reordering). This pins down that the reordering didn't quietly break
+    /// the stale-pidfile cleanup that already lived there: a leftover
+    /// `.frogs/run.json` pointing at a PID that cannot possibly be alive
+    /// must still be treated as stale and removed, not mistaken for a real
+    /// "already running" server — which would otherwise `eprintln!` and
+    /// `std::process::exit(1)`, killing this very test process.
+    #[tokio::test]
+    async fn run_direct_with_shutdown_still_cleans_up_a_stale_pidfile_now_that_logging_install_runs_first() {
+        let port = free_port();
+        let root = scratch_api_project_with_port(port);
+
+        pidfile::write(
+            &root,
+            &pidfile::RunInfo {
+                pid: u32::MAX, // guaranteed to never be a real, alive process (see pidfile::tests::is_alive_is_false_for_a_pid_that_cannot_exist)
+                port,
+                started_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+
+        run_direct_with_shutdown(&root, async {})
+            .await
+            .expect("a minimal but complete scratch project with only a stale pidfile should still run cleanly");
+
+        assert!(
+            pidfile::read(&root).unwrap().is_none(),
+            "the stale pidfile should have been recognized as stale and removed, not mistaken for a live server"
+        );
+        assert!(
+            root.join("api/runtime-logs").is_dir(),
+            "the persistent-logging directory should still be created, even with its install now running before the pidfile check"
         );
     }
 

@@ -189,10 +189,20 @@ fn main() {
     #[cfg(windows)]
     if std::env::args().nth(1).as_deref() == Some("--windows-service-host") {
         install_rustls_crypto_provider();
+        // No subscriber installed here either way: real wiring only happens
+        // once `run_as_service()` reaches `run_direct_with_shutdown`'s own
+        // `server::logging::install_run_subscriber` call, deep inside
+        // `service_host::run_service`. The `tracing::error!` below is
+        // therefore inert if that point is never reached (e.g. the
+        // dispatcher itself fails to start) — accepted, since a real
+        // SCM-launched process has no console for the `eprintln!` right
+        // next to it to reach in that scenario either, so nothing is
+        // actually lost versus today.
         std::process::exit(match crate::server::service_host::run_as_service() {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("error: {e}");
+                tracing::error!("error: {e}");
                 1
             }
         });
@@ -200,11 +210,19 @@ fn main() {
 
     install_rustls_crypto_provider();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
-        .init();
-
     let cli = Cli::parse();
+
+    // Every subcommand gets the stdout-only bootstrap subscriber except
+    // `Run` — that one installs its own persistent stdout+file subscriber
+    // later, once it knows the project's role and `logging` config (see
+    // `commands::run`/`server::logging::install_run_subscriber`), so
+    // installing a bootstrap one here first would just be immediately
+    // replaced (or, for a registered project's `run`, which never reaches
+    // that point, installed separately in `commands::run::run` itself).
+    if !matches!(cli.command, Command::Run { .. }) {
+        server::logging::install_bootstrap_subscriber();
+    }
+
     let cwd = std::env::current_dir().expect("failed to read current directory");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -248,6 +266,7 @@ fn main() {
 
     if let Err(err) = result {
         eprintln!("error: {err}");
+        tracing::error!("error: {err}");
         std::process::exit(1);
     }
 }

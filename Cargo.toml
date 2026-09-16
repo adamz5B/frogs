@@ -20,6 +20,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
+# Persistent (daily-rolling) log file writer for `frogs run`'s own tracing
+# output — see `server::logging`. Deliberately does NOT enable the optional
+# `local-time` feature: that pulls in `time`'s `local-offset` feature, which
+# has a documented soundness caveat around unsafe `TZ`-env-var reads on Unix,
+# and would also grow this project's size-tuned release profile (`opt-level
+# = "z"`, `lto = true`, `codegen-units = 1`, `strip = true`) for a feature
+# this project doesn't need — logging stays UTC-only, daily rolling, as a
+# result.
+tracing-appender = "0.2"
 # `sqlite` is a base feature, not optional/toggleable — every build always
 # carries the SQLite driver (see `[features]` below for why). `postgres`
 # remains the only opt-in sub-feature, added on top by that feature.
