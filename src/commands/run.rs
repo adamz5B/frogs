@@ -1,12 +1,17 @@
+use std::collections::HashMap;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
+use std::sync::Arc;
 
 use axum::Router;
 
 use crate::config::{Config, ManualTlsConfig, ServerConfig, TlsConfig, TlsMode};
+use crate::endpoint::mock::MockProvider;
 use crate::project::{MANIFEST_FILE, require_project_root};
 use crate::server::pidfile;
 use crate::server::service::{self, RunDecision, ServiceRecord};
+use crate::sql::SqlDriver;
 use crate::webserve::WebServeConfig;
 
 /// `service_managed` is the hidden, internal-only flag baked into every
@@ -112,6 +117,23 @@ pub async fn run_direct_with_shutdown(root: &Path, shutdown: impl std::future::F
     let (log_dir, log_level) = crate::server::logging::resolve_log_directory(root, has_api);
     let _logging_handles = crate::server::logging::install_run_subscriber(&log_dir, log_level);
 
+    refuse_if_already_running(root)?;
+
+    match (has_api, has_web) {
+        (false, false) => {
+            eprintln!("error: no {MANIFEST_FILE} or webserve.json found at {} — run `frogs generate` first", root.display());
+            std::process::exit(1);
+        }
+        (true, false) => run_api(root, shutdown).await,
+        (false, true) => run_web(root, shutdown).await,
+        (true, true) => run_both(root, shutdown).await,
+    }
+}
+
+/// The "already running" pidfile check every server-binding command
+/// (`frogs run`, `frogs test`) makes before touching a port: exits the
+/// process if `.frogs/run.json` names a live PID, cleans up a stale one.
+pub(crate) fn refuse_if_already_running(root: &Path) -> io::Result<()> {
     if let Some(existing) = pidfile::read(root)? {
         if pidfile::is_alive(existing.pid) {
             eprintln!(
@@ -125,16 +147,7 @@ pub async fn run_direct_with_shutdown(root: &Path, shutdown: impl std::future::F
         // itself (e.g. killed rather than stopped via `frogs stop`).
         pidfile::remove(root)?;
     }
-
-    match (has_api, has_web) {
-        (false, false) => {
-            eprintln!("error: no {MANIFEST_FILE} or webserve.json found at {} — run `frogs generate` first", root.display());
-            std::process::exit(1);
-        }
-        (true, false) => run_api(root, shutdown).await,
-        (false, true) => run_web(root, shutdown).await,
-        (true, true) => run_both(root, shutdown).await,
-    }
+    Ok(())
 }
 
 async fn run_api(root: &Path, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> io::Result<()> {
@@ -149,7 +162,16 @@ async fn run_api(root: &Path, shutdown: impl std::future::Future<Output = ()> + 
     tracing::info!(roles = "api", port = server_config.port, tls_mode = ?server_config.tls.mode, "frogs run starting");
 
     let api_dir = crate::project::api_base(root);
-    serve(root, router, server_config.port, &server_config.tls, &api_dir, shutdown).await
+    serve(
+        root,
+        router,
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        server_config.port,
+        &server_config.tls,
+        &api_dir,
+        shutdown,
+    )
+    .await
 }
 
 /// `/healthz` (always) plus `/readyz`/`/metrics` (only when their feature
@@ -186,7 +208,7 @@ async fn run_web(root: &Path, shutdown: impl std::future::Future<Output = ()> + 
     // No `api/` subfolder in a web-only project — `certPath`/`keyPath`
     // resolve relative to the project root itself, right alongside
     // `webserve.json`.
-    serve(root, router, config.port, &config.tls, root, shutdown).await
+    serve(root, router, IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.port, &config.tls, root, shutdown).await
 }
 
 async fn run_both(root: &Path, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> io::Result<()> {
@@ -232,7 +254,16 @@ async fn run_both(root: &Path, shutdown: impl std::future::Future<Output = ()> +
     // `config/server.json`'s `tls` is authoritative here too — same
     // single-listener reasoning as the port-authority note above.
     let api_dir = crate::project::api_base(root);
-    serve(root, router, server_config.port, &server_config.tls, &api_dir, shutdown).await
+    serve(
+        root,
+        router,
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        server_config.port,
+        &server_config.tls,
+        &api_dir,
+        shutdown,
+    )
+    .await
 }
 
 /// Loads config, connects every SQL driver, and builds the fully-nested,
@@ -272,8 +303,23 @@ async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
         }
     };
     println!("connected {} SQL data source(s)", drivers.len());
-    let drivers = std::sync::Arc::new(drivers);
 
+    assemble_api_router(root, config, Arc::new(drivers), None).await
+}
+
+/// Composes the fully-nested, middleware-wrapped API router from an
+/// already-loaded `Config` and already-connected drivers — the half of
+/// `build_api_router` that doesn't touch real infrastructure, so `frogs
+/// test` can reuse every bit of route/middleware composition with an empty
+/// driver map and a `MockProvider` installed, while `frogs run` passes
+/// `None` and is otherwise unchanged.
+pub(crate) async fn assemble_api_router(
+    root: &Path,
+    config: Config,
+    drivers: Arc<HashMap<String, Box<dyn SqlDriver>>>,
+    mock_provider: Option<Arc<dyn MockProvider>>,
+) -> io::Result<(Router, ServerConfig)> {
+    let api_dir = crate::project::api_base(root);
     let debug_mode = config.server.debug_mode;
     let errors = std::sync::Arc::new(config.errors);
     let security = std::sync::Arc::new(config.security);
@@ -314,6 +360,7 @@ async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
         discovered_errors,
         debug_mode,
         openapi_document.as_deref(),
+        mock_provider,
     );
     let mut router = crate::server::router().merge(endpoint_router);
 
@@ -421,30 +468,33 @@ fn build_web_router(root: &Path) -> (Router, WebServeConfig) {
 /// process; the `select!` in both `serve_http`/`serve_https` below only
 /// makes sure `.frogs/run.json` doesn't linger after the former case
 /// specifically, since `frogs stop` already removes it itself after
-/// terminating the process externally.
-async fn serve(
+/// terminating the process externally. `bind` is the interface to listen
+/// on — every `frogs run` caller passes the unspecified address (all
+/// interfaces); `frogs test` defaults to loopback.
+pub(crate) async fn serve(
     root: &Path,
     router: Router,
+    bind: IpAddr,
     port: u16,
     tls: &TlsConfig,
     tls_base: &Path,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> io::Result<()> {
     match tls.mode {
-        TlsMode::Off => serve_http(root, router, port, shutdown).await,
+        TlsMode::Off => serve_http(root, router, bind, port, shutdown).await,
         TlsMode::Manual => {
             let manual = tls
                 .manual
                 .as_ref()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "tls.mode is \"manual\" but tls.manual (certPath/keyPath) is missing"))?;
-            serve_https(root, router, port, manual, tls_base, shutdown).await
+            serve_https(root, router, bind, port, manual, tls_base, shutdown).await
         }
     }
 }
 
-async fn serve_http(root: &Path, router: Router, port: u16, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> io::Result<()> {
-    let addr = format!("0.0.0.0:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+async fn serve_http(root: &Path, router: Router, bind: IpAddr, port: u16, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> io::Result<()> {
+    let addr = SocketAddr::new(bind, port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
 
     pidfile::write(
         root,
@@ -478,15 +528,13 @@ async fn serve_http(root: &Path, router: Router, port: u16, shutdown: impl std::
 async fn serve_https(
     root: &Path,
     router: Router,
+    bind: IpAddr,
     port: u16,
     manual: &ManualTlsConfig,
     tls_base: &Path,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> io::Result<()> {
-    let addr_str = format!("0.0.0.0:{port}");
-    let addr: std::net::SocketAddr = addr_str
-        .parse()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid port {port}: {e}")))?;
+    let addr = SocketAddr::new(bind, port);
 
     let cert_path = tls_base.join(&manual.cert_path);
     let key_path = tls_base.join(&manual.key_path);
@@ -523,7 +571,7 @@ async fn serve_https(
         },
     )?;
 
-    println!("listening on https://{addr_str} (Ctrl+C to stop, or `frogs stop` from another terminal)");
+    println!("listening on https://{addr} (Ctrl+C to stop, or `frogs stop` from another terminal)");
 
     // Same `with_connect_info` reasoning as `serve_http` — axum-server's
     // TLS acceptor supports the identical `MakeService` shape.
@@ -629,7 +677,7 @@ mod tests {
         };
         let router = Router::new();
 
-        let err = serve(&root, router, free_port(), &tls, &root, ctrl_c_shutdown())
+        let err = serve(&root, router, IpAddr::V4(Ipv4Addr::UNSPECIFIED), free_port(), &tls, &root, ctrl_c_shutdown())
             .await
             .expect_err("tls.mode: manual with no tls.manual block must fail, not silently serve plain HTTP");
         assert!(err.to_string().contains("tls.manual"));
@@ -655,7 +703,7 @@ mod tests {
         };
         let router = Router::new();
 
-        let err = serve(&root, router, free_port(), &tls, &root, ctrl_c_shutdown())
+        let err = serve(&root, router, IpAddr::V4(Ipv4Addr::UNSPECIFIED), free_port(), &tls, &root, ctrl_c_shutdown())
             .await
             .expect_err("a nonexistent cert file must fail to load, not panic or hang");
         assert!(err.to_string().contains("does-not-exist-cert.pem"));
@@ -699,7 +747,16 @@ mod tests {
         let spawned_root = root.clone();
         let spawned_api_dir = api_dir.clone();
         tokio::spawn(async move {
-            let _ = serve(&spawned_root, router, port, &tls, &spawned_api_dir, ctrl_c_shutdown()).await;
+            let _ = serve(
+                &spawned_root,
+                router,
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                port,
+                &tls,
+                &spawned_api_dir,
+                ctrl_c_shutdown(),
+            )
+            .await;
         });
         // Brief wait for the spawned task to actually bind the listener
         // before the client below tries to connect to it.
@@ -744,7 +801,16 @@ mod tests {
         let spawned_root = root.clone();
         let spawned_api_dir = api_dir.clone();
         tokio::spawn(async move {
-            let _ = serve(&spawned_root, router, port, &tls, &spawned_api_dir, ctrl_c_shutdown()).await;
+            let _ = serve(
+                &spawned_root,
+                router,
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                port,
+                &tls,
+                &spawned_api_dir,
+                ctrl_c_shutdown(),
+            )
+            .await;
         });
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -1117,5 +1183,110 @@ mod tests {
         let body: serde_json::Value = reqwest::get(format!("http://{addr}/docs/endpoints.json")).await.unwrap().json().await.unwrap();
         assert_eq!(body["endpoints"][0]["operationId"], "ping");
         assert_eq!(body["endpoints"][0]["path"], "/ping");
+    }
+
+    /// The design doc's hard requirement for the scenario control plane:
+    /// it must be *structurally absent* from the router `frogs run` builds
+    /// — not disabled, not gated — and the `X-Frogs-Scenario` header must
+    /// be inert there. Proven through the real `build_api_router` against a
+    /// project that even has a `.test.json` file with mocks sitting next to
+    /// its endpoint: under `frogs run` the real upstream is what answers.
+    #[tokio::test]
+    async fn the_scenario_control_plane_and_header_do_not_exist_under_frogs_run() {
+        use axum::extract::State;
+        use axum::{Json, Router};
+
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let upstream = Router::new()
+            .fallback(|State(hits): State<Arc<std::sync::atomic::AtomicUsize>>| async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Json(serde_json::json!({ "maker": "REAL" }))
+            })
+            .with_state(hits.clone());
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream).await.unwrap();
+        });
+
+        let root = temp_project();
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(api_dir.join("config/errors")).unwrap();
+        std::fs::create_dir_all(api_dir.join("security")).unwrap();
+        std::fs::create_dir_all(api_dir.join("datasources/http")).unwrap();
+        std::fs::create_dir_all(api_dir.join("datasources/endpoints/cars")).unwrap();
+        std::fs::write(root.join("openapi.yaml"), "openapi: 3.0.3\ninfo: { title: t, version: '1' }\npaths: {}\n").unwrap();
+        std::fs::write(api_dir.join("config/server.json"), r#"{ "features": { "requestValidation": false } }"#).unwrap();
+        std::fs::write(api_dir.join("config/errors/core.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("config/connections.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("security/schemes.json"), "{}").unwrap();
+        std::fs::write(
+            api_dir.join("datasources/http/upstream.json"),
+            format!(r#"{{ "method": "GET", "url": "http://{upstream_addr}/cars" }}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            api_dir.join("datasources/endpoints/cars/endpoint.get.json"),
+            r#"{ "operationId": "listCars", "sources": { "car": { "type": "http", "request": "upstream.json" } }, "response": { "maker": "sources.car.maker" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            api_dir.join("datasources/endpoints/cars/endpoint.get.test.json"),
+            r#"{ "cases": [
+                { "name": "baseline", "mocks": { "car": { "maker": "MOCKED" } }, "expect": {} },
+                { "name": "tagged", "scenario": "pricing-down", "mocks": { "car": { "maker": "MOCKED-SCENARIO" } }, "expect": {} }
+            ] }"#,
+        )
+        .unwrap();
+
+        let (router, _) = build_api_router(&root).await.expect("a minimal but complete scratch project should build cleanly");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+
+        for (method, label) in [(reqwest::Method::GET, "GET"), (reqwest::Method::POST, "POST"), (reqwest::Method::DELETE, "DELETE")] {
+            let response = client
+                .request(method, format!("http://{addr}/_frogs/scenario"))
+                .json(&serde_json::json!({ "name": "pricing-down" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 404, "{label} /_frogs/scenario must not exist under frogs run");
+        }
+
+        let response = client
+            .get(format!("http://{addr}/cars"))
+            .header("X-Frogs-Scenario", "pricing-down")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            body["maker"], "REAL",
+            "under frogs run the real upstream answers, the .test.json mocks and the header are ignored"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "frogs run really did dial the upstream — no mock provider is installed"
+        );
+
+        let response = client
+            .get(format!("http://{addr}/cars"))
+            .header("X-Frogs-Scenario", "no-such-scenario")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "an unknown scenario name is not even inspected under frogs run, let alone rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -11,10 +11,15 @@ mod sql;
 mod testing;
 mod webserve;
 
+use std::net::IpAddr;
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 use commands::generate::Role;
+use commands::test::TestServerOptions;
 use server::service::{RestartPolicy, ServiceScope, StartType};
+use testing::ReportFormat;
 
 #[derive(Parser)]
 #[command(name = "frogs", version, about = "Free Rust OpenAPI Generated Server", disable_help_subcommand = true)]
@@ -106,11 +111,33 @@ enum Command {
         #[arg(long, conflicts_with = "user")]
         system: bool,
     },
-    /// Run every *.test.json file's cases against the mock-substitution
-    /// framework
+    /// Serve the API as a mock server: every source resolves from the
+    /// project's *.test.json mocks, never a real database or upstream
+    /// service, until stopped (Ctrl+C) — or record a new case from a real
+    /// request
     Test {
         #[command(subcommand)]
         action: Option<TestCommand>,
+        /// Override config/server.json's port for this process only
+        #[arg(long)]
+        port: Option<u16>,
+        /// Interface to listen on — loopback by default; anything else
+        /// exposes the unauthenticated /_frogs/scenario control plane to
+        /// the network
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: IpAddr,
+        /// Fix the active scenario for the whole process (a header or the
+        /// control plane can still override it per request/session)
+        #[arg(long)]
+        scenario: Option<String>,
+        /// Report format — text streams one line per request to stdout;
+        /// json/junit are written to --report-file
+        #[arg(long, value_enum, default_value = "text")]
+        report: ReportFormat,
+        /// Where to write the report (required for json/junit; optional
+        /// for text, which then also appends its lines there)
+        #[arg(long, required_if_eq_any([("report", "json"), ("report", "junit")]))]
+        report_file: Option<PathBuf>,
     },
     /// Manage the error code registry
     Errors {
@@ -253,9 +280,29 @@ fn main() {
                 restart_policy,
             ),
             Command::Unregister { user, system } => commands::unregister::run(&cwd, resolve_scope(user, system)),
-            Command::Test { action: None } => commands::test::run(&cwd).await,
+            Command::Test {
+                action: None,
+                port,
+                bind,
+                scenario,
+                report,
+                report_file,
+            } => {
+                commands::test::run(
+                    &cwd,
+                    TestServerOptions {
+                        port,
+                        bind,
+                        scenario,
+                        report,
+                        report_file,
+                    },
+                )
+                .await
+            }
             Command::Test {
                 action: Some(TestCommand::Record { path, method }),
+                ..
             } => commands::test::record(&cwd, &path, &method).await,
             Command::Errors { action: ErrorsCommand::Freeze } => commands::errors::freeze(&cwd),
             Command::Drivers { action: DriversCommand::List } => commands::drivers::list(),
@@ -478,7 +525,7 @@ mod tests {
 
     #[test]
     fn parses_test_with_no_subcommand() {
-        assert!(matches!(parse(&["test"]), Command::Test { action: None }));
+        assert!(matches!(parse(&["test"]), Command::Test { action: None, .. }));
     }
 
     #[test]
@@ -486,6 +533,7 @@ mod tests {
         match parse(&["test", "record", "/cars/1HGCM82633A004352", "get"]) {
             Command::Test {
                 action: Some(TestCommand::Record { path, method }),
+                ..
             } => {
                 assert_eq!(path, "/cars/1HGCM82633A004352");
                 assert_eq!(method, "get");
@@ -497,6 +545,93 @@ mod tests {
     #[test]
     fn parses_errors_freeze() {
         assert!(matches!(parse(&["errors", "freeze"]), Command::Errors { action: ErrorsCommand::Freeze }));
+    }
+
+    #[test]
+    fn bare_test_defaults_to_loopback_text_report_and_no_port_scenario_or_report_file() {
+        match parse(&["test"]) {
+            Command::Test {
+                action: None,
+                port,
+                bind,
+                scenario,
+                report,
+                report_file,
+            } => {
+                assert_eq!(port, None);
+                assert_eq!(bind, IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), "loopback by default, never all interfaces");
+                assert_eq!(scenario, None);
+                assert_eq!(report, ReportFormat::Text);
+                assert_eq!(report_file, None);
+            }
+            _ => panic!("expected a bare Command::Test"),
+        }
+    }
+
+    #[test]
+    fn parses_test_with_a_port() {
+        match parse(&["test", "--port", "9090"]) {
+            Command::Test { port, .. } => assert_eq!(port, Some(9090)),
+            _ => panic!("expected Command::Test"),
+        }
+    }
+
+    #[test]
+    fn parses_test_with_a_bind_address() {
+        match parse(&["test", "--bind", "0.0.0.0"]) {
+            Command::Test { bind, .. } => assert_eq!(bind, IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            _ => panic!("expected Command::Test"),
+        }
+        assert!(Cli::try_parse_from(["frogs", "test", "--bind", "not-an-ip"]).is_err(), "--bind must be a real IpAddr");
+    }
+
+    #[test]
+    fn parses_test_with_a_scenario() {
+        match parse(&["test", "--scenario", "db-down"]) {
+            Command::Test { scenario, .. } => assert_eq!(scenario, Some("db-down".to_string())),
+            _ => panic!("expected Command::Test"),
+        }
+    }
+
+    #[test]
+    fn parses_test_with_a_json_report_and_its_file() {
+        match parse(&["test", "--report", "json", "--report-file", "out/report.json"]) {
+            Command::Test { report, report_file, .. } => {
+                assert_eq!(report, ReportFormat::Json);
+                assert_eq!(report_file, Some(PathBuf::from("out/report.json")));
+            }
+            _ => panic!("expected Command::Test"),
+        }
+        match parse(&["test", "--report", "junit", "--report-file", "junit.xml"]) {
+            Command::Test { report, .. } => assert_eq!(report, ReportFormat::Junit),
+            _ => panic!("expected Command::Test"),
+        }
+    }
+
+    #[test]
+    fn a_json_or_junit_report_without_a_report_file_is_a_parse_error() {
+        assert!(Cli::try_parse_from(["frogs", "test", "--report", "json"]).is_err());
+        assert!(Cli::try_parse_from(["frogs", "test", "--report", "junit"]).is_err());
+    }
+
+    #[test]
+    fn a_text_report_file_is_optional() {
+        match parse(&["test", "--report", "text"]) {
+            Command::Test { report_file, .. } => assert_eq!(report_file, None),
+            _ => panic!("expected Command::Test"),
+        }
+        match parse(&["test", "--report-file", "log.txt"]) {
+            Command::Test { report, report_file, .. } => {
+                assert_eq!(report, ReportFormat::Text);
+                assert_eq!(report_file, Some(PathBuf::from("log.txt")));
+            }
+            _ => panic!("expected Command::Test"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_report_format_is_a_parse_error() {
+        assert!(Cli::try_parse_from(["frogs", "test", "--report", "yaml", "--report-file", "x"]).is_err());
     }
 
     #[test]

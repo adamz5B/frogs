@@ -164,6 +164,18 @@ impl ErrorRegistry {
     pub fn len(&self) -> usize {
         self.codes.len()
     }
+
+    /// Adds a definition for `code` only if the merged registry doesn't
+    /// already have one — `true` if it was inserted. Used by `frogs test`
+    /// for its own harness codes, so a project that deliberately
+    /// classifies one of them in `config/errors/` keeps its own definition.
+    pub fn insert_if_absent(&mut self, code: &str, definition: ErrorDefinition) -> bool {
+        if self.codes.contains_key(code) {
+            return false;
+        }
+        self.codes.insert(code.to_string(), definition);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +265,68 @@ mod tests {
             }
             other => panic!("expected Conflicts, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn insert_if_absent_adds_a_code_the_project_never_defined() {
+        let dir = tempdir();
+        write_json(dir.path(), "core.json", "{}");
+        let mut registry = ErrorRegistry::load(dir.path()).unwrap();
+
+        let inserted = registry.insert_if_absent(
+            "test.source_not_mocked",
+            ErrorDefinition {
+                http_status: 501,
+                expose_detail: true,
+            },
+        );
+
+        assert!(inserted);
+        assert_eq!(registry.lookup("test.source_not_mocked").http_status, 501);
+        assert!(
+            registry.get("test.source_not_mocked").is_some(),
+            "a harness code must classify as a real registry entry, not a fallback"
+        );
+    }
+
+    /// A project that deliberately classifies a harness code in its own
+    /// `config/errors/` keeps its definition — the harness never overrides.
+    #[test]
+    fn insert_if_absent_returns_false_and_keeps_the_project_definition_when_the_code_already_exists() {
+        let dir = tempdir();
+        write_json(
+            dir.path(),
+            "core.json",
+            r#"{ "test.source_not_mocked": { "httpStatus": 418, "exposeDetail": false } }"#,
+        );
+        let mut registry = ErrorRegistry::load(dir.path()).unwrap();
+
+        let inserted = registry.insert_if_absent(
+            "test.source_not_mocked",
+            ErrorDefinition {
+                http_status: 501,
+                expose_detail: true,
+            },
+        );
+
+        assert!(!inserted);
+        let kept = registry.lookup("test.source_not_mocked");
+        assert_eq!(kept.http_status, 418);
+        assert!(!kept.expose_detail);
+    }
+
+    #[test]
+    fn insert_if_absent_never_replaces_the_synthesized_unexpected_error() {
+        let dir = tempdir();
+        let mut registry = ErrorRegistry::load(&dir.path().join("missing")).unwrap();
+        assert!(!registry.insert_if_absent(
+            UNEXPECTED_ERROR_CODE,
+            ErrorDefinition {
+                http_status: 200,
+                expose_detail: true,
+            },
+        ));
+        assert_eq!(registry.lookup(UNEXPECTED_ERROR_CODE).http_status, 500);
     }
 
     // Minimal throwaway temp-dir helper — avoids pulling in a dev-dependency

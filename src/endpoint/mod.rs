@@ -1,6 +1,7 @@
 mod docs_summary;
 mod error;
 mod format;
+pub(crate) mod mock;
 mod request_validation;
 mod resolve;
 mod schema;
@@ -33,6 +34,7 @@ use serde_json::{Map, Value};
 /// capture pass needs to find each `allowNestedMany` source's bracket
 /// parent the same way `resolve_nested_many`/`validate_nested_many` do.
 pub(crate) use docs_summary::endpoint_summaries;
+use mock::{InboundRequest, MockProvider, MockSelection, RouteKey, Served};
 pub(crate) use resolve::{MockOutcome, nested_many_parent};
 use schema::{Cardinality, ErrorOverride};
 pub(crate) use schema::{EndpointFile, SourceDef};
@@ -46,6 +48,9 @@ const ROUTABLE_METHODS: &[&str] = &["get", "post", "put", "patch", "delete"];
 /// function itself can stay generic and shared across every route.
 struct RouteState {
     endpoint: EndpointFile,
+    /// This route in OpenAPI-style `{name}` form — what a `MockProvider`
+    /// keys its `.test.json` files by, and what the report names.
+    route: RouteKey,
     sql_root: PathBuf,
     http_root: PathBuf,
     drivers: Arc<HashMap<String, Box<dyn SqlDriver>>>,
@@ -77,6 +82,11 @@ struct RouteState {
     /// fresh copy per route) — only ever consulted when `operation` above
     /// is `Some`, for resolving a request body schema's `$ref`s.
     component_schemas: Arc<Map<String, Value>>,
+    /// `Some` only under `frogs test` — every request on this route then
+    /// resolves from the provider's mocks instead of real infrastructure
+    /// (see `mock::MockProvider`). `frogs run` always passes `None`, so its
+    /// request path is byte-for-byte the pre-mock-server one.
+    mock_provider: Option<Arc<dyn MockProvider>>,
 }
 
 /// Scans `datasources/endpoints/` for `endpoint.<method>.json` files (one
@@ -103,6 +113,7 @@ pub fn build_router(
     // case — this function just degrades to "no route gets validation"
     // rather than failing every route registration over it).
     openapi_document: Option<&crate::openapi::OpenApiDocument>,
+    mock_provider: Option<Arc<dyn MockProvider>>,
 ) -> Router {
     let sql_root = project_root.join("datasources/sql");
     let http_root = project_root.join("datasources/http");
@@ -175,6 +186,10 @@ pub fn build_router(
         // `Arc<RouteState>` this particular route was registered with.
         let state = Arc::new(RouteState {
             endpoint,
+            route: RouteKey {
+                method: method.clone(),
+                path: mock::openapi_style_path(&url_path),
+            },
             sql_root: sql_root.clone(),
             http_root: http_root.clone(),
             drivers: drivers.clone(),
@@ -188,6 +203,7 @@ pub fn build_router(
             debug_mode,
             operation: operation.cloned(),
             component_schemas: component_schemas.clone(),
+            mock_provider: mock_provider.clone(),
         });
         // Read back out before `state` moves into `.with_state` below —
         // this endpoint's own `rateLimit`, if it declared one, gets its own
@@ -436,32 +452,149 @@ async fn handle_request(
     };
     let transaction_id = transaction_id.map(|Extension(RequestId(id))| id).unwrap_or_default();
 
-    let (http_status, response_body) = resolve_for_test(
-        &state.endpoint,
-        &state.security,
-        &state.services,
-        &state.drivers,
-        &state.sql_root,
-        &state.http_root,
-        &state.http_client,
-        &state.errors,
-        &state.discovered_errors,
-        &state.discovered_errors_path,
-        state.debug_mode,
-        &state.verifier_cache,
-        &headers,
-        &path_params,
-        &query_params,
-        &body,
-        &transaction_id,
-        &HashMap::new(),
-        state.operation.as_ref(),
-        &state.component_schemas,
-    )
-    .await;
+    let (http_status, response_body) = match &state.mock_provider {
+        None => {
+            resolve_request(
+                &state.endpoint,
+                &state.security,
+                &state.services,
+                &state.drivers,
+                &state.sql_root,
+                &state.http_root,
+                &state.http_client,
+                &state.errors,
+                &state.discovered_errors,
+                &state.discovered_errors_path,
+                state.debug_mode,
+                &state.verifier_cache,
+                &headers,
+                &path_params,
+                &query_params,
+                &body,
+                &transaction_id,
+                &HashMap::new(),
+                state.operation.as_ref(),
+                &state.component_schemas,
+            )
+            .await
+        }
+        Some(provider) => handle_mocked(&state, provider.as_ref(), &headers, &path_params, &query_params, &body, &transaction_id).await,
+    };
 
     let status = StatusCode::from_u16(http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (status, Json(response_body)).into_response()
+}
+
+/// The `frogs test` request path: ask the provider which case (and mocks)
+/// this request gets, fill in every unmocked source so nothing real is
+/// ever contacted, resolve through the exact same `resolve_request` a real
+/// request uses, then hand the outcome back to the provider for its
+/// report. A `Reject`/`NoMatch` never reaches resolution at all — it's
+/// classified through `error_envelope` like any other failure, honoring
+/// the endpoint's own `debugMode`/`errorOverrides` the same way
+/// `resolve_request` itself does.
+#[allow(clippy::too_many_arguments)]
+async fn handle_mocked(
+    state: &RouteState,
+    provider: &dyn MockProvider,
+    headers: &HeaderMap,
+    path_params: &HashMap<String, String>,
+    query_params: &HashMap<String, String>,
+    body: &Value,
+    transaction_id: &str,
+) -> (u16, Value) {
+    let started = std::time::Instant::now();
+    let inbound = InboundRequest {
+        path_params,
+        query_params,
+        headers,
+        body,
+    };
+    let selection = provider.select(&state.route, &inbound);
+    let debug_mode = state.endpoint.debug_mode.unwrap_or(state.debug_mode);
+
+    let mut unmocked = Vec::new();
+    let (status, response_body) = match &selection {
+        MockSelection::Reject { code, detail, .. } => error_envelope(
+            &state.errors,
+            &state.discovered_errors,
+            &state.discovered_errors_path,
+            debug_mode,
+            code,
+            detail,
+            None,
+            &state.endpoint.error_overrides,
+        ),
+        MockSelection::NoMatch { detail, .. } => error_envelope(
+            &state.errors,
+            &state.discovered_errors,
+            &state.discovered_errors_path,
+            debug_mode,
+            mock::NO_MATCHING_CASE,
+            detail,
+            None,
+            &state.endpoint.error_overrides,
+        ),
+        MockSelection::Case { case, mocks, .. } => {
+            let mut mocks = mocks.clone();
+            unmocked = mock::enforce_no_real_infrastructure(&state.endpoint, &mut mocks);
+            let (status, mut response_body) = resolve_request(
+                &state.endpoint,
+                &state.security,
+                &state.services,
+                &state.drivers,
+                &state.sql_root,
+                &state.http_root,
+                &state.http_client,
+                &state.errors,
+                &state.discovered_errors,
+                &state.discovered_errors_path,
+                state.debug_mode,
+                &state.verifier_cache,
+                headers,
+                path_params,
+                query_params,
+                body,
+                transaction_id,
+                &mocks,
+                state.operation.as_ref(),
+                &state.component_schemas,
+            )
+            .await;
+            // The generic "mocked failure: <code>" detail `resolve_request`
+            // produces is replaced with one naming what wasn't mocked and
+            // which case was matched — only when a detail is being exposed
+            // at all, so `exposeDetail`/`debugMode`/`errorOverrides` still
+            // have the last word on whether a caller sees any detail.
+            if response_body.get("name").and_then(Value::as_str) == Some(mock::SOURCE_NOT_MOCKED) && response_body.get("detail").is_some() {
+                response_body["detail"] = Value::String(not_mocked_detail(&unmocked, case.as_ref()));
+            }
+            (status, response_body)
+        }
+    };
+
+    let served = Served {
+        status,
+        body: &response_body,
+        unmocked: &unmocked,
+        request_id: transaction_id,
+        elapsed: started.elapsed(),
+    };
+    provider.observe(&state.route, &selection, &served);
+
+    (status, response_body)
+}
+
+fn not_mocked_detail(unmocked: &[mock::Unmocked], case: Option<&mock::CaseRef>) -> String {
+    let required: Vec<&str> = unmocked.iter().filter(|u| !u.optional).map(|u| u.name.as_str()).collect();
+    let matched = match case {
+        Some(case) => format!("matched case \"{}\" in {}", case.name, case.file.display()),
+        None => "no .test.json file exists for this route".to_string(),
+    };
+    format!(
+        "source(s) not mocked: {} — {matched}; frogs test never contacts real infrastructure, add a mock for each",
+        required.join(", ")
+    )
 }
 
 /// Runs one endpoint's whole request — the security check (real, or mocked
@@ -476,7 +609,7 @@ async fn handle_request(
 /// `resolve::resolve_sources` only ever looks up real source names, so a
 /// `"verifier"` entry already present is simply never matched there.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn resolve_for_test(
+pub(crate) async fn resolve_request(
     endpoint: &EndpointFile,
     security: &SecurityConfig,
     services: &HashMap<String, String>,
@@ -647,11 +780,11 @@ pub(crate) async fn resolve_for_test(
 /// regardless of what a sibling `.test.json` file declares — and returns
 /// each source's own resolved value alongside the would-be `(status,
 /// body)` a real request would get. This is `frogs test record`'s engine:
-/// unlike `resolve_for_test`, it never touches the security check at all
+/// unlike `resolve_request`, it never touches the security check at all
 /// (recording captures *data-source* output; a verifier mock only ever
 /// needs one field, `active`, cheap enough to author by hand — the design
 /// doc's own example does exactly that) and it hands back the per-source
-/// breakdown `resolve_for_test` normally collapses away, since that
+/// breakdown `resolve_request` normally collapses away, since that
 /// breakdown *is* the `mocks` block record mode exists to produce.
 ///
 /// `Err` is only returned for a *non-optional* source failure — nothing
@@ -708,7 +841,7 @@ pub(crate) async fn record_sources(
 /// in `discovered_errors` (so hand-editing `errors.discovered.json` takes
 /// effect on the very next request, without waiting for `errors freeze` to
 /// promote it into `config/errors/`); otherwise `unexpected.error`.
-/// `resolve_for_test` is this function's only caller; `handle_request` gets
+/// `resolve_request` is this function's only caller; `handle_request` gets
 /// the same envelope indirectly through it, converting the plain `(u16,
 /// Value)` into an axum `Response` itself. Also where the design doc's
 /// observe–react discovery happens: `code` reaching here with no entry in
@@ -783,7 +916,7 @@ fn record_discovered_error(discovered_errors: &Mutex<DiscoveredErrors>, path: &P
     }
 }
 
-fn discover_endpoint_files(root: &Path) -> Vec<(String, String, PathBuf)> {
+pub(crate) fn discover_endpoint_files(root: &Path) -> Vec<(String, String, PathBuf)> {
     let mut out = Vec::new();
     walk(root, root, &mut out);
     out
@@ -1021,6 +1154,10 @@ mod tests {
 
         let state = Arc::new(RouteState {
             endpoint,
+            route: RouteKey {
+                method: "get".to_string(),
+                path: "/secret".to_string(),
+            },
             sql_root: root.join("sql"),
             http_root: root.join("http"),
             drivers: Arc::new(drivers),
@@ -1034,6 +1171,7 @@ mod tests {
             debug_mode: true,
             operation: None,
             component_schemas: Arc::new(Map::new()),
+            mock_provider: None,
         });
 
         let router = Router::new().route("/secret", get(handle_request)).with_state(state);
@@ -1090,6 +1228,7 @@ mod tests {
             Arc::new(HashMap::new()),
             Arc::new(Mutex::new(DiscoveredErrors::default())),
             false,
+            None,
             None,
         );
 
@@ -1152,6 +1291,7 @@ mod tests {
             Arc::new(HashMap::new()),
             Arc::new(Mutex::new(DiscoveredErrors::default())),
             false,
+            None,
             None,
         );
 
@@ -1241,6 +1381,7 @@ mod tests {
             Arc::new(HashMap::new()),
             Arc::new(Mutex::new(DiscoveredErrors::default())),
             false,
+            None,
             None,
         );
         let router = crate::server::apply_middleware(router);
@@ -1641,6 +1782,7 @@ mod tests {
             Arc::new(Mutex::new(DiscoveredErrors::default())),
             true,
             None,
+            None,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1667,7 +1809,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `errorOverrides` end to end through `resolve_for_test` — parsed from
+    /// `errorOverrides` end to end through `resolve_request` — parsed from
     /// real endpoint-file JSON (not constructed via `ErrorOverride`
     /// literals), through a genuine source failure, not just the direct
     /// `error_envelope` unit tests above.
@@ -1725,7 +1867,7 @@ mod tests {
         };
         let discovered_errors = Mutex::new(DiscoveredErrors::default());
 
-        let (status, body) = resolve_for_test(
+        let (status, body) = resolve_request(
             &endpoint,
             &security,
             &HashMap::new(),
@@ -1799,7 +1941,7 @@ mod tests {
         let discovered_errors = Mutex::new(DiscoveredErrors::default());
         let root = std::env::temp_dir();
 
-        let (status, body) = resolve_for_test(
+        let (status, body) = resolve_request(
             &endpoint,
             &security,
             &HashMap::new(),
@@ -1839,7 +1981,7 @@ mod tests {
         let discovered_errors = Mutex::new(DiscoveredErrors::default());
         let root = std::env::temp_dir();
 
-        let (status, body) = resolve_for_test(
+        let (status, body) = resolve_request(
             &endpoint,
             &security,
             &HashMap::new(),
@@ -1882,7 +2024,7 @@ mod tests {
         let discovered_errors = Mutex::new(DiscoveredErrors::default());
         let root = std::env::temp_dir();
 
-        let (status, _) = resolve_for_test(
+        let (status, _) = resolve_request(
             &endpoint,
             &security,
             &HashMap::new(),
@@ -1910,7 +2052,7 @@ mod tests {
     }
 
     /// End to end through a real running server via `build_router` — not
-    /// just the direct `resolve_for_test` calls above.
+    /// just the direct `resolve_request` calls above.
     #[tokio::test]
     async fn a_generated_stub_returns_501_through_a_real_running_server() {
         let root = std::env::temp_dir().join(format!(
@@ -1939,6 +2081,7 @@ mod tests {
             Arc::new(Mutex::new(DiscoveredErrors::default())),
             false,
             None,
+            None,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1957,7 +2100,7 @@ mod tests {
 
     /// A helper shared by the per-endpoint `debugMode` tests below: one
     /// non-optional SQL source that always fails, resolved through
-    /// `resolve_for_test` with a fresh, isolated `errors`/`discovered`/`root`
+    /// `resolve_request` with a fresh, isolated `errors`/`discovered`/`root`
     /// set each call, returning just the built response body.
     async fn run_with_debug_mode(endpoint_json: &str, global_debug_mode: bool) -> Value {
         #[derive(Debug)]
@@ -1997,7 +2140,7 @@ mod tests {
         };
         let discovered_errors = Mutex::new(DiscoveredErrors::default());
 
-        let (_, body) = resolve_for_test(
+        let (_, body) = resolve_request(
             &endpoint,
             &security,
             &HashMap::new(),
@@ -2114,7 +2257,7 @@ mod tests {
         };
         let discovered_errors = Mutex::new(DiscoveredErrors::default());
 
-        resolve_for_test(
+        resolve_request(
             &endpoint,
             &security,
             &HashMap::new(),
@@ -2147,7 +2290,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `resolve_for_test`'s own request-validation step, exercised directly
+    /// `resolve_request`'s own request-validation step, exercised directly
     /// rather than through a real HTTP server — it's `pub(crate)` and
     /// already the exact integration point both `handle_request` and
     /// `frogs test`'s case runner call through.
@@ -2212,7 +2355,7 @@ mod tests {
             std::fs::write(root.join("db/verify_key.sql"), "SELECT active FROM api_keys WHERE key = :key;").unwrap();
             let discovered_errors = Mutex::new(DiscoveredErrors::default());
             let component_schemas = Map::new();
-            let result = resolve_for_test(
+            let result = resolve_request(
                 endpoint,
                 security,
                 &HashMap::new(),
@@ -2801,6 +2944,7 @@ mod tests {
             Arc::new(Mutex::new(DiscoveredErrors::default())),
             false,
             None,
+            None,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2819,6 +2963,216 @@ mod tests {
             problems.iter().any(|p| p.contains("maxConcurrency")),
             "validate_endpoint_files should report the same missing-maxConcurrency problem as a string: {problems:?}"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A scripted `MockProvider` for pinning the `handle_mocked` seam
+    /// itself, independently of `testing::session`: it returns whatever
+    /// selection it was built with and records every `observe` call.
+    struct Observed {
+        route: RouteKey,
+        status: u16,
+        body: Value,
+        unmocked: Vec<mock::Unmocked>,
+    }
+
+    struct ScriptedProvider {
+        selection: MockSelection,
+        observed: Mutex<Vec<Observed>>,
+    }
+
+    impl MockProvider for ScriptedProvider {
+        fn select(&self, _route: &RouteKey, _request: &InboundRequest<'_>) -> MockSelection {
+            self.selection.clone()
+        }
+
+        fn observe(&self, route: &RouteKey, _selection: &MockSelection, served: &Served<'_>) {
+            self.observed.lock().unwrap().push(Observed {
+                route: route.clone(),
+                status: served.status,
+                body: served.body.clone(),
+                unmocked: served.unmocked.to_vec(),
+            });
+        }
+    }
+
+    fn baseline_choice() -> mock::ScenarioChoice {
+        mock::ScenarioChoice {
+            name: None,
+            source: mock::ScenarioSource::Baseline,
+        }
+    }
+
+    /// Builds a one-route router (`GET /cars`) from `endpoint_json` with
+    /// `provider` installed and serves it on an ephemeral port.
+    async fn serve_with_provider(endpoint_json: &str, provider: Arc<ScriptedProvider>) -> (String, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "frogs-endpoint-mock-seam-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let dir = root.join("datasources/endpoints/cars");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("endpoint.get.json"), endpoint_json).unwrap();
+
+        let mut errors = ErrorRegistry::load(&root.join("does-not-exist")).unwrap();
+        errors.insert_if_absent(
+            mock::NO_MATCHING_CASE,
+            crate::errors::ErrorDefinition {
+                http_status: 404,
+                expose_detail: true,
+            },
+        );
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        let router = build_router(
+            &root,
+            Arc::new(drivers),
+            &HashMap::new(),
+            Arc::new(errors),
+            Arc::new(SecurityConfig::default()),
+            Arc::new(HashMap::new()),
+            Arc::new(Mutex::new(DiscoveredErrors::default())),
+            false,
+            None,
+            Some(provider),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (format!("http://{addr}"), root)
+    }
+
+    /// The route is keyed in OpenAPI `{name}` form for the provider, and
+    /// the served status/body/unmocked list reach `observe` exactly as the
+    /// client saw them — including an optional source the enforcer had to
+    /// degrade.
+    #[tokio::test]
+    async fn handle_mocked_keys_the_route_in_openapi_form_and_hands_the_served_outcome_to_observe() {
+        let provider = Arc::new(ScriptedProvider {
+            selection: MockSelection::Case {
+                case: None,
+                mocks: HashMap::from([("car".to_string(), MockOutcome::Success(serde_json::json!({ "maker": "Honda" })))]),
+                scenario: baseline_choice(),
+            },
+            observed: Mutex::new(Vec::new()),
+        });
+        let (base, root) = serve_with_provider(
+            r#"{
+                "operationId": "getCar",
+                "sources": {
+                    "car": { "type": "http", "request": "never-read.json" },
+                    "pricing": { "type": "http", "request": "never-read.json", "optional": true }
+                },
+                "response": { "maker": "sources.car.maker", "price": "sources.pricing.amount" }
+            }"#,
+            provider.clone(),
+        )
+        .await;
+
+        let response = reqwest::get(format!("{base}/cars")).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body, serde_json::json!({ "maker": "Honda", "price": null }));
+
+        let observed = provider.observed.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        let Observed {
+            route,
+            status,
+            body: served_body,
+            unmocked,
+        } = &observed[0];
+        assert_eq!(
+            route,
+            &RouteKey {
+                method: "get".to_string(),
+                path: "/cars".to_string()
+            }
+        );
+        assert_eq!(*status, 200);
+        assert_eq!(served_body, &body);
+        assert_eq!(
+            unmocked,
+            &vec![mock::Unmocked {
+                name: "pricing".to_string(),
+                optional: true
+            }]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `NoMatch` never reaches resolution, but it is still classified
+    /// through `error_envelope` — so the endpoint's own `errorOverrides`
+    /// apply to it exactly as they would to any other failure.
+    #[tokio::test]
+    async fn handle_mocked_classifies_a_no_match_through_the_endpoints_own_error_overrides() {
+        let provider = Arc::new(ScriptedProvider {
+            selection: MockSelection::NoMatch {
+                scenario: baseline_choice(),
+                detail: "nothing matched".to_string(),
+            },
+            observed: Mutex::new(Vec::new()),
+        });
+        let (base, root) = serve_with_provider(
+            r#"{
+                "operationId": "getCar",
+                "sources": {},
+                "response": {},
+                "errorOverrides": { "test.no_matching_case": { "httpStatus": 418, "exposeDetail": false } }
+            }"#,
+            provider.clone(),
+        )
+        .await;
+
+        let response = reqwest::get(format!("{base}/cars")).await.unwrap();
+        assert_eq!(response.status(), 418, "the endpoint's own override of the harness code must win");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["name"], mock::NO_MATCHING_CASE);
+        assert!(
+            body.get("detail").is_none(),
+            "exposeDetail: false must hide the detail even for a harness code: {body}"
+        );
+
+        let observed = provider.observed.lock().unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].status, 418, "observe sees the status the client actually got");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A provider-side `Reject` is served with the provider's own code —
+    /// and, like `NoMatch`, never reaches source resolution.
+    #[tokio::test]
+    async fn handle_mocked_serves_a_reject_with_the_providers_code_without_resolving_any_source() {
+        let provider = Arc::new(ScriptedProvider {
+            selection: MockSelection::Reject {
+                code: mock::UNKNOWN_SCENARIO,
+                detail: "unknown scenario 'x'".to_string(),
+                scenario: baseline_choice(),
+            },
+            observed: Mutex::new(Vec::new()),
+        });
+        let (base, root) = serve_with_provider(
+            r#"{
+                "operationId": "getCar",
+                "sources": { "car": { "type": "http", "request": "never-read.json" } },
+                "response": { "maker": "sources.car.maker" },
+                "errorOverrides": { "test.unknown_scenario": { "httpStatus": 400, "exposeDetail": true } }
+            }"#,
+            provider.clone(),
+        )
+        .await;
+
+        let response = reqwest::get(format!("{base}/cars")).await.unwrap();
+        assert_eq!(response.status(), 400);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["name"], mock::UNKNOWN_SCENARIO);
+        assert_eq!(body["detail"], "unknown scenario 'x'");
+        assert_eq!(provider.observed.lock().unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }

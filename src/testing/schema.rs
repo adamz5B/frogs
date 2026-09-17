@@ -13,13 +13,20 @@ pub struct TestFile {
     pub cases: Vec<TestCase>,
 }
 
-/// One test case. Cases in a file's `cases` array always run in order,
-/// never in parallel — this is what makes `save`/`{{memory.X}}` well
-/// defined at all: a later case can rely on an earlier one's saved value
-/// existing, with no ambiguity from concurrent execution.
+/// One test case. Under `frogs test`'s mock server a case is what an
+/// inbound request gets matched *back* to (see `testing::select`): its
+/// `request` block is the match constraint, its `mocks` are what the
+/// route then serves from, and its `expect` is an assertion recorded in
+/// the session report — never something that alters the served response.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TestCase {
     pub name: String,
+    /// The scenario this case belongs to — `None` (the common case) is the
+    /// untagged baseline, eligible under every scenario but losing to a
+    /// case tagged with the active one. Names are global across every
+    /// file in the project, not per-file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenario: Option<String>,
     #[serde(default, skip_serializing_if = "TestRequest::is_empty")]
     pub request: TestRequest,
     /// Keyed by source name (matching `endpoint.<method>.json`'s own
@@ -30,10 +37,10 @@ pub struct TestCase {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub mocks: HashMap<String, MockOutcome>,
     pub expect: Expectation,
-    /// Values to carry forward into later cases in the same file, keyed by
-    /// the name a later case references as `{{memory.<name>}}`. Reset at
-    /// the start of every file (never shared across files, never across
-    /// runs) — see `testing::memory`.
+    /// Values to carry forward into later requests, keyed by the name a
+    /// later case references as `{{memory.<name>}}`. One process-lifetime
+    /// memory shared by every route, never reset while the mock server is
+    /// up — see `testing::memory`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub save: HashMap<String, SaveEntry>,
 }
@@ -45,7 +52,7 @@ pub struct TestCase {
 /// ever reads `header.*` (see `security::verify`), so an *unmocked*
 /// verifier check on a protected endpoint has no other way to receive a
 /// credential in a test case.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TestRequest {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub path: HashMap<String, String>,
@@ -58,7 +65,7 @@ pub struct TestRequest {
 }
 
 impl TestRequest {
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.path.is_empty() && self.query.is_empty() && self.headers.is_empty() && self.body.is_none()
     }
 }
@@ -349,6 +356,45 @@ mod tests {
     }
 
     #[test]
+    fn a_case_scenario_tag_parses_and_is_absent_by_default() {
+        let json = r#"{
+            "cases": [
+                { "name": "happy path", "expect": { "status": 200 } },
+                { "name": "pricing down", "scenario": "pricing-down", "expect": { "status": 200 } }
+            ]
+        }"#;
+        let test_file: TestFile = serde_json::from_str(json).unwrap();
+        assert_eq!(test_file.cases[0].scenario, None, "an untagged case is the baseline");
+        assert_eq!(test_file.cases[1].scenario.as_deref(), Some("pricing-down"));
+    }
+
+    /// An untagged case must serialize without a `scenario` key at all —
+    /// what keeps a `frogs test record`-written file byte-identical to what
+    /// it produced before scenarios existed.
+    #[test]
+    fn an_untagged_case_serializes_with_no_scenario_key_and_a_tagged_one_keeps_its_tag() {
+        let untagged = TestCase {
+            name: "recorded".to_string(),
+            scenario: None,
+            request: TestRequest::default(),
+            mocks: HashMap::new(),
+            expect: Expectation { status: Some(200), body: None },
+            save: HashMap::new(),
+        };
+        let serialized = serde_json::to_string(&untagged).unwrap();
+        assert!(!serialized.contains("scenario"), "{serialized}");
+
+        let tagged = TestCase {
+            scenario: Some("db-down".to_string()),
+            ..untagged
+        };
+        let serialized = serde_json::to_string(&tagged).unwrap();
+        assert!(serialized.contains(r#""scenario":"db-down""#), "{serialized}");
+        let reloaded: TestCase = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(reloaded.scenario.as_deref(), Some("db-down"));
+    }
+
+    #[test]
     fn malformed_json_is_a_clear_parse_error() {
         let dir = std::env::temp_dir().join(format!(
             "frogs-testing-schema-test-{}-{}",
@@ -426,6 +472,7 @@ mod tests {
         let mut test_file = TestFile { cases: vec![] };
         test_file.cases.push(TestCase {
             name: "recorded case".to_string(),
+            scenario: None,
             request: TestRequest::default(),
             mocks: HashMap::from([("car".to_string(), MockOutcome::Success(serde_json::json!({ "vin": "X" })))]),
             expect: Expectation { status: Some(200), body: None },

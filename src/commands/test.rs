@@ -1,187 +1,232 @@
 use std::collections::HashMap;
 use std::io;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::Arc;
 
-use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use axum::Router;
 use serde_json::Value;
 
-use crate::config::Config;
-use crate::endpoint::{EndpointFile, MockOutcome, SourceDef, nested_many_parent, resolve_for_test};
-use crate::project::require_project_root;
-use crate::security::VerifierCache;
+use crate::config::{Config, ServerConfig};
+use crate::endpoint::mock::{NO_MATCHING_CASE, RouteKey, SOURCE_NOT_MOCKED, UNKNOWN_SCENARIO};
+use crate::endpoint::{EndpointFile, MockOutcome, SourceDef, nested_many_parent};
+use crate::errors::ErrorDefinition;
+use crate::project::{MANIFEST_FILE, require_project_root};
+use crate::server::service;
+use crate::testing::{LoadedTestFile, MockSession, ReportConfig, ReportFormat};
 
-/// Discovers every `endpoint.<method>.test.json` file under
-/// `datasources/endpoints/` and runs its cases through `resolve_for_test` —
-/// the same security-check/source-resolution/response-building/error-
-/// envelope logic a real request goes through, per source either run for
-/// real or substituted per the case's own `mocks`. Prints pass/fail per
-/// case and exits non-zero if anything failed or a file couldn't be read.
-pub async fn run(cwd: &Path) -> io::Result<()> {
+/// The bare `frogs test` command line, already parsed by clap.
+#[derive(Debug, Clone)]
+pub struct TestServerOptions {
+    /// Overrides `config/server.json`'s `port` for this process only.
+    pub port: Option<u16>,
+    pub bind: IpAddr,
+    pub scenario: Option<String>,
+    pub report: ReportFormat,
+    pub report_file: Option<PathBuf>,
+}
+
+/// `frogs test` — boots the project's API as a mock server and serves
+/// until stopped: every route `build_router` registers resolves its
+/// sources from the sibling `*.test.json` files' `mocks` (matched back to
+/// a case per request, see `testing::select`), never from a real database
+/// or upstream HTTP service. `sql::connect_all` is never called. Writes
+/// nothing into the project except `.frogs/run.json` (so `frogs stop`
+/// works and `frogs run` can't double-bind) and the `--report-file` the
+/// user chose. Exits 1 after shutdown if any request failed its `expect`,
+/// matched no case, or hit an unmocked required source.
+pub async fn run(cwd: &Path, opts: TestServerOptions) -> io::Result<()> {
     let root = require_project_root(cwd);
-    let api_root = crate::project::api_base(&root);
-    let config = Config::load_or_exit(&api_root);
+    if !root.join(MANIFEST_FILE).is_file() {
+        eprintln!("error: no {MANIFEST_FILE} at {} — frogs test serves the API role only", root.display());
+        std::process::exit(1);
+    }
 
-    let drivers = match crate::sql::connect_all(&config.connections).await {
-        Ok(drivers) => drivers,
-        Err(err) => {
-            eprintln!("error: {err}");
-            std::process::exit(1);
-        }
-    };
-
-    let sql_root = api_root.join("datasources/sql");
-    let http_root = api_root.join("datasources/http");
-    let endpoints_root = api_root.join("datasources/endpoints");
-    let discovered_errors_path = api_root.join("config/errors.discovered.json");
-    let http_client = reqwest::Client::new();
-    let verifier_cache = VerifierCache::new();
-    // A plain `Mutex`, not `Arc`-wrapped — `run()` itself is the only
-    // caller of `resolve_for_test` here (unlike `build_router`'s per-route
-    // `Arc<RouteState>`, nothing else needs to share ownership of this).
-    let discovered_errors = Mutex::new(config.discovered_errors);
-
-    // Same "load once, gated by the feature flag, degrade gracefully on a
-    // load failure" posture as `commands::run` — a test run exercises the
-    // exact same validation a real request would (or wouldn't) go through,
-    // so a case can legitimately assert on a 400 from a malformed request.
-    let openapi_document = if config.server.features.request_validation {
-        match crate::openapi::load(&root.join(crate::project::MANIFEST_FILE)) {
-            Ok(doc) => Some(doc),
-            Err(e) => {
+    // Never dispatches through `service::read_record`/`run_registered` the
+    // way `frogs run` does — a mock server always serves in-process. A
+    // registered service that's actually up would fight this process over
+    // the pidfile, so that one case is refused outright.
+    if let Some(record) = service::read_record(&root)? {
+        match service::is_running(&record) {
+            Ok(true) => {
                 eprintln!(
-                    "warning: failed to load {}: {e} — request validation is disabled for this run",
-                    crate::project::MANIFEST_FILE
+                    "error: this project is registered as service {} and it is currently running — run `frogs stop` first, \
+                     or unregister it, before serving mocks from the same project",
+                    record.name
                 );
-                None
+                std::process::exit(1);
             }
-        }
-    } else {
-        None
-    };
-    let empty_component_schemas = serde_json::Map::new();
-
-    let test_files = discover_test_files(&endpoints_root);
-    if test_files.is_empty() {
-        println!("no *.test.json files found under datasources/endpoints/");
-        return Ok(());
-    }
-
-    let mut passed = 0usize;
-    let mut failed = 0usize;
-    let mut errored = 0usize;
-
-    for (display_path, method, test_file_path, endpoint_file_path) in test_files {
-        let endpoint = match read_endpoint_file(&endpoint_file_path) {
-            Ok(endpoint) => endpoint,
-            Err(message) => {
-                eprintln!("error: {message}");
-                errored += 1;
-                continue;
-            }
-        };
-
-        let test_file = match crate::testing::load(&test_file_path) {
-            Ok(file) => file,
-            Err(e) => {
-                eprintln!("error: {}: {e}", test_file_path.display());
-                errored += 1;
-                continue;
-            }
-        };
-
-        println!("{} {display_path}", method.to_uppercase());
-        // `display_path` keeps its OpenAPI-style `{name}` braces (unlike
-        // `build_router`'s axum-converted `:name` routes), so it matches
-        // `Operation::path` directly with no conversion needed.
-        let operation = openapi_document
-            .as_ref()
-            .and_then(|doc| doc.operations.iter().find(|op| op.method == method && op.path == display_path));
-        let component_schemas = openapi_document.as_ref().map(|doc| &doc.component_schemas).unwrap_or(&empty_component_schemas);
-        // Fresh per file, never shared across files or reused across runs —
-        // this is what `{{memory.X}}` scoping to "this file's cases, run in
-        // order" actually means in practice.
-        let mut memory = crate::testing::Memory::new();
-        for case in &test_file.cases {
-            let path_params = memory.substitute_string_map(&case.request.path);
-            let query_params = memory.substitute_string_map(&case.request.query);
-            let header_values = memory.substitute_string_map(&case.request.headers);
-            let headers = build_headers(&header_values);
-            let body = case.request.body.as_ref().map(|b| memory.substitute(b)).unwrap_or(Value::Null);
-            let mocks: HashMap<String, MockOutcome> = case
-                .mocks
-                .iter()
-                .map(|(name, outcome)| {
-                    let substituted = match outcome {
-                        MockOutcome::Success(v) => MockOutcome::Success(memory.substitute(v)),
-                        MockOutcome::Fail(code) => MockOutcome::Fail(code.clone()),
-                    };
-                    (name.clone(), substituted)
-                })
-                .collect();
-
-            // A distinct, recognizable value per run rather than a real
-            // correlation ID — there's no HTTP middleware generating one
-            // here, and a case asserting on `context.transactionId` cares
-            // that *some* stable value flows through, not what it is.
-            let (status, response_body) = resolve_for_test(
-                &endpoint,
-                &config.security,
-                &config.services,
-                &drivers,
-                &sql_root,
-                &http_root,
-                &http_client,
-                &config.errors,
-                &discovered_errors,
-                &discovered_errors_path,
-                config.server.debug_mode,
-                &verifier_cache,
-                &headers,
-                &path_params,
-                &query_params,
-                &body,
-                "frogs-test-run",
-                &mocks,
-                operation,
-                component_schemas,
-            )
-            .await;
-
-            let expect_body = case.expect.body.as_ref().map(|b| memory.substitute(b));
-            let expect = crate::testing::Expectation {
-                status: case.expect.status,
-                body: expect_body,
-            };
-            let mismatches = crate::testing::evaluate(&expect, status, &response_body);
-            if mismatches.is_empty() {
-                println!("  \u{2713} {}", case.name);
-                passed += 1;
-            } else {
-                println!("  \u{2717} {}", case.name);
-                for mismatch in &mismatches {
-                    println!("      {}: expected {}, got {}", mismatch.path, mismatch.expected, mismatch.actual);
-                }
-                failed += 1;
-            }
-
-            if !case.save.is_empty() {
-                memory.save(&case.save, status, &response_body);
-            }
+            Ok(false) => println!(
+                "note: this project is registered as service {} — `frogs stop` targets that service, so stop this mock server with Ctrl+C",
+                record.name
+            ),
+            Err(e) => println!(
+                "note: this project is registered as service {} (could not check whether it's running: {e}) — `frogs stop` targets \
+                 that service, so stop this mock server with Ctrl+C",
+                record.name
+            ),
         }
     }
 
-    println!();
-    if errored > 0 {
-        println!("{passed} passed, {failed} failed, {errored} errored");
-    } else {
-        println!("{passed} passed, {failed} failed");
+    let (router, session, server_config) = build_mock_router(&root, &opts).await?;
+
+    if root.join("webserve.json").is_file() {
+        println!("note: webserve.json found — frogs test serves the API role only, static content is not served");
+    }
+    if !opts.bind.is_loopback() {
+        println!(
+            "warning: binding {} — /_frogs/scenario is unauthenticated and will be reachable from the network",
+            opts.bind
+        );
     }
 
-    if failed > 0 || errored > 0 {
+    crate::commands::run::refuse_if_already_running(&root)?;
+
+    let port = opts.port.unwrap_or(server_config.port);
+    tracing::info!(port, tls_mode = ?server_config.tls.mode, scenario = ?opts.scenario, "frogs test starting");
+    let api_dir = crate::project::api_base(&root);
+    let result = crate::commands::run::serve(&root, router, opts.bind, port, &server_config.tls, &api_dir, shutdown_signal()).await;
+
+    let summary = session.finish();
+    println!("{}", crate::testing::report::render_summary_line(&summary));
+    if let Some(path) = &opts.report_file {
+        println!("report written to {}", path.display());
+    }
+    result?;
+    if summary.has_problems() {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Ctrl+C everywhere, plus SIGTERM on Unix — the signal a supervisor or
+/// CI runner actually sends, so the report still gets finalized then.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("registering a SIGTERM handler should succeed");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Everything `run` does before binding a port, returned rather than
+/// served so a test can drive the router itself: loads config, every
+/// `*.test.json` file (a malformed one is exit 1), prints corpus warnings,
+/// resolves `--scenario`, and assembles the real API router with the
+/// session installed as every route's `MockProvider` plus the
+/// `/_frogs/scenario` control plane merged at the absolute root.
+pub(crate) async fn build_mock_router(root: &Path, opts: &TestServerOptions) -> io::Result<(Router, Arc<MockSession>, ServerConfig)> {
+    let api_root = crate::project::api_base(root);
+    let mut config = Config::load_or_exit(&api_root);
+    let endpoints_root = api_root.join("datasources/endpoints");
+
+    // Harness-owned codes classify like any other — a project that
+    // deliberately defines one of them in `config/errors/` keeps its own.
+    for (code, http_status) in [(SOURCE_NOT_MOCKED, 501), (NO_MATCHING_CASE, 404), (UNKNOWN_SCENARIO, 400)] {
+        config.errors.insert_if_absent(
+            code,
+            ErrorDefinition {
+                http_status,
+                expose_detail: true,
+            },
+        );
+    }
+
+    let mut files = Vec::new();
+    for (display_path, method, test_file_path, endpoint_file_path) in discover_test_files(&endpoints_root) {
+        let file = match crate::testing::load(&test_file_path) {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("error: {}: {e}", test_file_path.display());
+                std::process::exit(1);
+            }
+        };
+        let endpoint = match read_endpoint_file(&endpoint_file_path) {
+            Ok(endpoint) => Some(endpoint),
+            Err(message) => {
+                if endpoint_file_path.is_file() {
+                    eprintln!("warning: {message}");
+                }
+                None
+            }
+        };
+        files.push(LoadedTestFile {
+            route: RouteKey { method, path: display_path },
+            path: test_file_path,
+            file,
+            endpoint,
+        });
+    }
+
+    let mut routable = HashMap::new();
+    for (url_path, method, file_path) in crate::endpoint::discover_endpoint_files(&endpoints_root) {
+        if let Ok(endpoint) = read_endpoint_file(&file_path) {
+            routable.insert(
+                RouteKey {
+                    method,
+                    path: crate::endpoint::mock::openapi_style_path(&url_path),
+                },
+                endpoint,
+            );
+        }
+    }
+    for loaded in &files {
+        tracing::info!(
+            "{} {} <- {} ({} case(s))",
+            loaded.route.method.to_uppercase(),
+            loaded.route.path,
+            loaded.path.display(),
+            loaded.file.cases.len()
+        );
+    }
+    for warning in crate::testing::validate::validate_corpus(&files, &routable) {
+        eprintln!("warning: {warning}");
+    }
+    println!(
+        "loaded {} test file(s) with {} case(s) — {} route(s) discovered",
+        files.len(),
+        files.iter().map(|f| f.file.cases.len()).sum::<usize>(),
+        routable.len()
+    );
+
+    let session = match MockSession::new(
+        files,
+        opts.scenario.clone(),
+        ReportConfig {
+            format: opts.report,
+            file: opts.report_file.clone(),
+        },
+    ) {
+        Ok(session) => session,
+        Err(message) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+    };
+    if !session.known_scenarios().is_empty() {
+        println!("scenarios: {}", session.known_scenarios().join(", "));
+    }
+    if let Some(flag) = session.scenario_flag() {
+        println!("active scenario (--scenario): {flag}");
+    }
+
+    let provider: Arc<dyn crate::endpoint::mock::MockProvider> = session.clone();
+    let (router, server_config) = crate::commands::run::assemble_api_router(root, config, Arc::new(HashMap::new()), Some(provider)).await?;
+    // Merged last, at the absolute root: outside `apiRoot`, outside every
+    // optional middleware layer (correlation, metrics, rate limiting, CORS)
+    // — merging never retroactively shares layers, which is exactly what
+    // keeps this route un-CORS'd.
+    let router = router.merge(crate::testing::control_plane::router(session.clone()));
+    println!("scenario control plane: GET/POST/DELETE /_frogs/scenario");
+
+    Ok((router, session, server_config))
 }
 
 /// `frogs test record <path> <method>` — runs one real request against
@@ -304,6 +349,7 @@ pub async fn record(cwd: &Path, path: &str, method: &str) -> io::Result<()> {
 
     test_file.cases.push(crate::testing::TestCase {
         name: format!("recorded {}", chrono::Utc::now().to_rfc3339()),
+        scenario: None,
         request: crate::testing::TestRequest {
             path: path_params,
             query: query_params,
@@ -407,21 +453,6 @@ fn read_endpoint_file(path: &Path) -> Result<EndpointFile, String> {
     serde_json::from_str(&contents).map_err(|e| format!("{}: invalid JSON: {e}", path.display()))
 }
 
-/// A header whose name or value doesn't parse as valid HTTP (rare, but
-/// possible in a hand-authored `.test.json`) is silently skipped rather
-/// than failing the whole run — the case itself will fail its own
-/// assertions soon enough if that header actually mattered, with a much
-/// clearer signal (a mismatch, not a crash) than a parse-time error would.
-fn build_headers(headers: &HashMap<String, String>) -> HeaderMap {
-    let mut map = HeaderMap::new();
-    for (name, value) in headers {
-        if let (Ok(header_name), Ok(header_value)) = (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
-            map.insert(header_name, header_value);
-        }
-    }
-    map
-}
-
 fn discover_test_files(root: &Path) -> Vec<(String, String, PathBuf, PathBuf)> {
     let mut out = Vec::new();
     walk(root, root, &mut out);
@@ -459,11 +490,11 @@ fn test_file_method(path: &Path) -> Option<String> {
 }
 
 /// Converts a folder path under `datasources/endpoints/` into a readable
-/// display path for test output, e.g. `.../cars/{vin}/endpoint.get.test.json`
-/// -> `/cars/{vin}` — deliberately keeping OpenAPI's own `{name}` braces
-/// (unlike `endpoint::url_path_for`'s axum `:name` translation), since
-/// nothing here ever registers a real axum route.
-fn display_path(root: &Path, file_path: &Path) -> String {
+/// display path, e.g. `.../cars/{vin}/endpoint.get.test.json` ->
+/// `/cars/{vin}` — deliberately keeping OpenAPI's own `{name}` braces
+/// (unlike `endpoint::url_path_for`'s axum `:name` translation); this is
+/// the form `RouteKey::path` carries and the report names routes by.
+pub(crate) fn display_path(root: &Path, file_path: &Path) -> String {
     let dir = file_path.parent().expect("a file always has a parent");
     let relative = dir.strip_prefix(root).unwrap_or(dir);
     let segments: Vec<String> = relative.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
@@ -721,5 +752,690 @@ mod tests {
         };
         assert_eq!(cars_mock[0]["pricing"]["amount"], 111);
         assert_eq!(cars_mock[1]["pricing"]["amount"], 222);
+    }
+
+    /// `frogs test record` must keep writing exactly the file shape it did
+    /// before scenarios existed — a freshly recorded (untagged) case must
+    /// not gain a `scenario` key, or every recorded corpus would churn.
+    #[tokio::test]
+    async fn record_writes_no_scenario_key_for_a_freshly_recorded_case() {
+        let fixture = record_fixture().await;
+        record(&fixture.root, "/cars", "get").await.expect("record should succeed");
+        let raw = std::fs::read_to_string(fixture.root.join("api/datasources/endpoints/cars/endpoint.get.test.json")).unwrap();
+        assert!(!raw.contains("scenario"), "an untagged recorded case must serialize without any scenario key:\n{raw}");
+    }
+
+    // ----------------------------------------------------------------------
+    // `frogs test` as a mock server, driven through `build_mock_router`
+    // (everything `run` does short of binding the configured port).
+    // ----------------------------------------------------------------------
+
+    /// A real HTTP server every "real infrastructure" reference in the
+    /// fixture points at — every hit is counted, and the whole point of the
+    /// tests below is that the count stays at zero.
+    struct FakeUpstream {
+        addr: std::net::SocketAddr,
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl FakeUpstream {
+        fn hits(&self) -> usize {
+            self.hits.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    async fn fake_upstream() -> FakeUpstream {
+        use axum::extract::State;
+        use axum::{Json, Router};
+
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new()
+            .fallback(|State(hits): State<Arc<std::sync::atomic::AtomicUsize>>| async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Json(serde_json::json!({ "maker": "REAL-UPSTREAM", "active": true, "vin": "REAL" }))
+            })
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        FakeUpstream { addr, hits }
+    }
+
+    struct MockProject {
+        root: PathBuf,
+        upstream: FakeUpstream,
+    }
+
+    impl Drop for MockProject {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// A complete scratch API project whose every source and verifier
+    /// points at real-but-must-never-be-touched infrastructure: HTTP
+    /// sources and the verifier at `fake_upstream`, and a sqlite connection
+    /// at a path that cannot be opened.
+    ///
+    /// Routes:
+    /// - `GET /cars/{vin}` — `car` (required HTTP) + `pricing` (optional
+    ///   HTTP), with a test file covering happy/unmocked/scenario cases.
+    /// - `POST /cars` — `create` (HTTP), one case that `save`s the vin.
+    /// - `GET /secret` — `security: apiKeyAuth` (HTTP verifier), no sources.
+    /// - `GET /untested` — an HTTP source, no test file.
+    /// - `GET /sqlcar` — a SQL source on the unreachable connection, no test file.
+    /// - `GET /ping` — no sources, no security, no test file.
+    async fn mock_project() -> MockProject {
+        let upstream = fake_upstream().await;
+        let addr = upstream.addr;
+        let root = std::env::temp_dir().join(format!(
+            "frogs-commands-test-mock-server-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let api = root.join("api");
+        for dir in [
+            "config/errors",
+            "security/verifiers",
+            "datasources/http",
+            "datasources/sql/db",
+            "datasources/endpoints/cars/{vin}",
+            "datasources/endpoints/secret",
+            "datasources/endpoints/untested",
+            "datasources/endpoints/sqlcar",
+            "datasources/endpoints/ping",
+        ] {
+            std::fs::create_dir_all(api.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("openapi.yaml"), "openapi: 3.0.3\ninfo: { title: t, version: '1' }\npaths: {}\n").unwrap();
+        std::fs::write(api.join("config/server.json"), r#"{ "features": { "requestValidation": false } }"#).unwrap();
+        std::fs::write(
+            api.join("config/errors/core.json"),
+            r#"{
+                "auth.invalid_credentials": { "httpStatus": 401, "exposeDetail": true },
+                "auth.verifier_unavailable": { "httpStatus": 500, "exposeDetail": false }
+            }"#,
+        )
+        .unwrap();
+        let unreachable_db = root.join("does-not-exist").join("db.sqlite").display().to_string().replace('\\', "/");
+        std::fs::write(
+            api.join("config/connections.json"),
+            format!(r#"{{ "db": {{ "driver": "sqlite", "database": "{unreachable_db}" }} }}"#),
+        )
+        .unwrap();
+        std::fs::write(api.join("security/schemes.json"), r#"{ "apiKeyAuth": { "verifier": "apiKeyVerifier.json" } }"#).unwrap();
+        std::fs::write(
+            api.join("security/verifiers/apiKeyVerifier.json"),
+            r#"{ "type": "http", "request": "verify.json", "parameters": [{ "name": "key", "from": "header.X-Api-Key" }], "validIf": "response.active = true" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            api.join("datasources/http/upstream.json"),
+            format!(r#"{{ "method": "GET", "url": "http://{addr}/car" }}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            api.join("datasources/http/verify.json"),
+            format!(r#"{{ "method": "GET", "url": "http://{addr}/verify?key={{{{key}}}}" }}"#),
+        )
+        .unwrap();
+        std::fs::write(api.join("datasources/sql/db/car.sql"), "SELECT 'REAL' AS maker;").unwrap();
+
+        let endpoints = api.join("datasources/endpoints");
+        std::fs::write(
+            endpoints.join("cars/{vin}/endpoint.get.json"),
+            r#"{
+                "operationId": "getCar",
+                "sources": {
+                    "car": { "type": "http", "request": "upstream.json" },
+                    "pricing": { "type": "http", "request": "upstream.json", "optional": true }
+                },
+                "response": { "maker": "sources.car.maker", "price": "sources.pricing.amount" }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            endpoints.join("cars/{vin}/endpoint.get.test.json"),
+            r#"{ "cases": [
+                {
+                    "name": "happy path",
+                    "request": { "path": { "vin": "AAA" } },
+                    "mocks": { "car": { "maker": "Honda" }, "pricing": { "amount": 1 } },
+                    "expect": { "status": 200, "body": { "maker": "Honda", "price": 1 } }
+                },
+                {
+                    "name": "pricing unmocked",
+                    "request": { "path": { "vin": "BBB" } },
+                    "mocks": { "car": { "maker": "Honda" } },
+                    "expect": { "status": 200, "body": { "maker": "Honda" } }
+                },
+                {
+                    "name": "car unmocked",
+                    "request": { "path": { "vin": "CCC" } },
+                    "mocks": { "pricing": { "amount": 1 } },
+                    "expect": { "status": 200 }
+                },
+                {
+                    "name": "pricing down",
+                    "scenario": "pricing-down",
+                    "request": { "path": { "vin": "AAA" } },
+                    "mocks": { "car": { "maker": "Scenario" }, "pricing": { "fail": "datasource.http.timeout" } },
+                    "expect": { "status": 200, "body": { "maker": "Scenario", "price": null } }
+                },
+                {
+                    "name": "db down",
+                    "scenario": "db-down",
+                    "request": { "path": { "vin": "AAA" } },
+                    "mocks": { "car": { "fail": "datasource.sql.connection_failed" } },
+                    "expect": { "status": 500 }
+                },
+                {
+                    "name": "read back created",
+                    "request": { "path": { "vin": "{{memory.vin}}" } },
+                    "mocks": { "car": { "maker": "FromMemory" }, "pricing": { "amount": 2 } },
+                    "expect": { "status": 200, "body": { "maker": "FromMemory" } }
+                }
+            ] }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            endpoints.join("cars/endpoint.post.json"),
+            r#"{
+                "operationId": "createCar",
+                "successStatus": 201,
+                "sources": { "create": { "type": "http", "request": "upstream.json" } },
+                "response": { "vin": "sources.create.vin" }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            endpoints.join("cars/endpoint.post.test.json"),
+            r#"{ "cases": [
+                {
+                    "name": "create",
+                    "request": { "body": { "maker": "Honda" } },
+                    "mocks": { "create": { "vin": "NEW123" } },
+                    "expect": { "status": 201 },
+                    "save": { "vin": "response.body.vin" }
+                }
+            ] }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            endpoints.join("secret/endpoint.get.json"),
+            r#"{ "operationId": "getSecret", "security": "apiKeyAuth", "sources": {}, "response": {} }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            endpoints.join("secret/endpoint.get.test.json"),
+            r#"{ "cases": [
+                { "name": "verifier not mocked", "request": { "headers": { "X-Api-Key": "unmocked" } }, "expect": { "status": 200 } },
+                { "name": "verifier mocked", "request": { "headers": { "X-Api-Key": "mocked" } }, "mocks": { "verifier": { "active": true } }, "expect": { "status": 200 } }
+            ] }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            endpoints.join("untested/endpoint.get.json"),
+            r#"{ "operationId": "untested", "sources": { "car": { "type": "http", "request": "upstream.json" } }, "response": { "maker": "sources.car.maker" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            endpoints.join("sqlcar/endpoint.get.json"),
+            r#"{ "operationId": "sqlcar", "sources": { "car": { "type": "sql", "connection": "db", "script": "car.sql" } }, "response": { "maker": "sources.car.maker" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            endpoints.join("ping/endpoint.get.json"),
+            r#"{ "operationId": "ping", "sources": {}, "response": {} }"#,
+        )
+        .unwrap();
+
+        MockProject { root, upstream }
+    }
+
+    fn default_opts() -> TestServerOptions {
+        TestServerOptions {
+            port: None,
+            bind: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            scenario: None,
+            report: ReportFormat::Text,
+            report_file: None,
+        }
+    }
+
+    /// Boots the mock router on an ephemeral loopback port and hands back
+    /// the base URL plus the session, so a test can both hit routes and
+    /// read the verdicts the session recorded.
+    async fn serve_mock(project: &MockProject, opts: TestServerOptions) -> (String, Arc<MockSession>) {
+        let (router, session, _) = build_mock_router(&project.root, &opts)
+            .await
+            .expect("the mock router must build without touching any infrastructure");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (format!("http://{addr}"), session)
+    }
+
+    async fn get_json(client: &reqwest::Client, url: &str) -> (u16, Value) {
+        let response = client.get(url).send().await.unwrap();
+        let status = response.status().as_u16();
+        (status, response.json().await.unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn the_mock_router_builds_without_connecting_even_though_the_configured_connection_is_unreachable() {
+        let project = mock_project().await;
+
+        // First prove the fixture's connection genuinely can't be opened —
+        // otherwise "built without connecting" would be a hollow claim.
+        let config = Config::load_or_exit(&crate::project::api_base(&project.root));
+        assert!(
+            crate::sql::connect_all(&config.connections).await.is_err(),
+            "the fixture's sqlite path is inside a nonexistent directory and must be unopenable"
+        );
+
+        let (router, session, _) = build_mock_router(&project.root, &default_opts())
+            .await
+            .expect("frogs test must never call connect_all, so an unreachable connection can't stop it");
+        drop(router);
+        assert_eq!(session.known_scenarios(), ["db-down", "pricing-down"]);
+        assert_eq!(project.upstream.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unmocked_required_source_returns_501_source_not_mocked_and_never_contacts_the_upstream() {
+        let project = mock_project().await;
+        let (base, session) = serve_mock(&project, default_opts()).await;
+        let client = reqwest::Client::new();
+
+        let (status, body) = get_json(&client, &format!("{base}/cars/CCC")).await;
+
+        assert_eq!(status, 501, "{body}");
+        assert_eq!(body["name"], SOURCE_NOT_MOCKED);
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("source(s) not mocked: car"), "{detail}");
+        assert!(detail.contains("matched case \"car unmocked\" in /cars/{vin}/endpoint.get.test.json"), "{detail}");
+        assert!(
+            !detail.contains(&project.root.display().to_string()),
+            "a served detail must never leak an absolute path: {detail}"
+        );
+        assert_eq!(project.upstream.hits(), 0, "the real upstream must never be dialed for an unmocked source");
+        assert_eq!(session.summary().not_mocked, 1);
+    }
+
+    #[tokio::test]
+    async fn a_route_with_sources_but_no_test_file_returns_501_without_dialing_out() {
+        let project = mock_project().await;
+        let (base, session) = serve_mock(&project, default_opts()).await;
+        let client = reqwest::Client::new();
+
+        let (status, body) = get_json(&client, &format!("{base}/untested")).await;
+        assert_eq!(status, 501, "{body}");
+        assert_eq!(body["name"], SOURCE_NOT_MOCKED);
+        assert!(
+            body["detail"].as_str().unwrap_or_default().contains("no .test.json file exists for this route"),
+            "{body}"
+        );
+
+        let (status, body) = get_json(&client, &format!("{base}/sqlcar")).await;
+        assert_eq!(
+            status, 501,
+            "a SQL source on the unreachable connection must fail the same way, never try the driver: {body}"
+        );
+        assert_eq!(body["name"], SOURCE_NOT_MOCKED);
+
+        assert_eq!(project.upstream.hits(), 0);
+        assert_eq!(session.summary().not_mocked, 2);
+    }
+
+    #[tokio::test]
+    async fn a_route_with_no_sources_no_security_and_no_test_file_serves_normally() {
+        let project = mock_project().await;
+        let (base, session) = serve_mock(&project, default_opts()).await;
+        let client = reqwest::Client::new();
+
+        let (status, body) = get_json(&client, &format!("{base}/ping")).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, serde_json::json!({}));
+        let summary = session.summary();
+        assert_eq!(summary.served, 1);
+        assert!(!summary.has_problems());
+    }
+
+    #[tokio::test]
+    async fn a_fully_mocked_case_is_served_through_the_real_response_mapping_and_passes_its_expect() {
+        let project = mock_project().await;
+        let (base, session) = serve_mock(&project, default_opts()).await;
+        let client = reqwest::Client::new();
+
+        let (status, body) = get_json(&client, &format!("{base}/cars/AAA")).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, serde_json::json!({ "maker": "Honda", "price": 1 }));
+        assert_eq!(project.upstream.hits(), 0);
+        let summary = session.summary();
+        assert_eq!(summary.passed, 1);
+        assert!(!summary.has_problems());
+    }
+
+    #[tokio::test]
+    async fn an_unmocked_verifier_on_a_secured_route_returns_501_and_never_reaches_the_real_verifier() {
+        let project = mock_project().await;
+        let (base, session) = serve_mock(&project, default_opts()).await;
+        let client = reqwest::Client::new();
+
+        let response = client.get(format!("{base}/secret")).header("X-Api-Key", "unmocked").send().await.unwrap();
+        let status = response.status().as_u16();
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(status, 501, "{body}");
+        assert_eq!(body["name"], SOURCE_NOT_MOCKED);
+        assert!(body["detail"].as_str().unwrap_or_default().contains("source(s) not mocked: verifier"), "{body}");
+        assert_eq!(project.upstream.hits(), 0, "security::verify must never run its real HTTP verifier under frogs test");
+
+        let response = client.get(format!("{base}/secret")).header("X-Api-Key", "mocked").send().await.unwrap();
+        assert_eq!(response.status(), 200, "a mocked verifier satisfying validIf authorizes the request");
+        assert_eq!(project.upstream.hits(), 0);
+
+        let summary = session.summary();
+        assert_eq!((summary.not_mocked, summary.passed), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn an_unmocked_optional_source_degrades_to_null_and_the_case_still_passes() {
+        let project = mock_project().await;
+        let (base, session) = serve_mock(&project, default_opts()).await;
+        let client = reqwest::Client::new();
+
+        let (status, body) = get_json(&client, &format!("{base}/cars/BBB")).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, serde_json::json!({ "maker": "Honda", "price": null }));
+        assert_eq!(project.upstream.hits(), 0, "an optional source is degraded, never actually attempted");
+        let summary = session.summary();
+        assert_eq!(summary.passed, 1);
+        assert!(!summary.has_problems(), "an optional unmocked source is reported but is not a problem");
+    }
+
+    #[tokio::test]
+    async fn a_request_no_case_matches_returns_404_no_matching_case() {
+        let project = mock_project().await;
+        let (base, session) = serve_mock(&project, default_opts()).await;
+        let client = reqwest::Client::new();
+
+        let (status, body) = get_json(&client, &format!("{base}/cars/ZZZ")).await;
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(body["name"], NO_MATCHING_CASE);
+        assert!(body["detail"].as_str().unwrap_or_default().contains("GET /cars/{vin}"), "{body}");
+        assert_eq!(project.upstream.hits(), 0);
+        assert_eq!(session.summary().unmatched, 1);
+    }
+
+    #[tokio::test]
+    async fn the_scenario_header_selects_a_tagged_case_for_that_one_request_only() {
+        let project = mock_project().await;
+        let (base, _) = serve_mock(&project, default_opts()).await;
+        let client = reqwest::Client::new();
+
+        let response = client
+            .get(format!("{base}/cars/AAA"))
+            .header("X-Frogs-Scenario", "pricing-down")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({ "maker": "Scenario", "price": null }),
+            "the tagged case's mocks, with the mocked pricing failure degraded"
+        );
+
+        let (_, body) = get_json(&client, &format!("{base}/cars/AAA")).await;
+        assert_eq!(body["maker"], "Honda", "the header is per-request — the next request is back on the baseline");
+        assert_eq!(project.upstream.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_scenario_header_is_a_400_unknown_scenario() {
+        let project = mock_project().await;
+        let (base, session) = serve_mock(&project, default_opts()).await;
+        let client = reqwest::Client::new();
+
+        let response = client.get(format!("{base}/cars/AAA")).header("X-Frogs-Scenario", "made-up").send().await.unwrap();
+        assert_eq!(response.status(), 400);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["name"], UNKNOWN_SCENARIO);
+        assert!(
+            body["detail"].as_str().unwrap_or_default().contains("known scenarios: db-down, pricing-down"),
+            "{body}"
+        );
+        assert_eq!(session.summary().unmatched, 1);
+    }
+
+    #[tokio::test]
+    async fn the_control_plane_reports_sets_and_clears_the_process_wide_scenario() {
+        let project = mock_project().await;
+        let (base, _) = serve_mock(&project, default_opts()).await;
+        let client = reqwest::Client::new();
+        let control = format!("{base}/_frogs/scenario");
+
+        let (status, body) = get_json(&client, &control).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body,
+            serde_json::json!({ "scenario": null, "source": "baseline", "known": ["db-down", "pricing-down"] })
+        );
+
+        let response = client.post(&control).json(&serde_json::json!({ "name": "pricing-down" })).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["scenario"], "pricing-down");
+        assert_eq!(body["source"], "control-plane");
+
+        let (_, body) = get_json(&client, &format!("{base}/cars/AAA")).await;
+        assert_eq!(body["maker"], "Scenario", "every subsequent request sees the override without any per-request change");
+
+        let response = client.post(&control).json(&serde_json::json!({ "name": null })).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["source"], "baseline", "{{\"name\": null}} clears the override");
+        let (_, body) = get_json(&client, &format!("{base}/cars/AAA")).await;
+        assert_eq!(body["maker"], "Honda");
+
+        client.post(&control).json(&serde_json::json!({ "name": "pricing-down" })).send().await.unwrap();
+        let response = client.delete(&control).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["source"], "baseline", "DELETE clears the override too");
+        let (_, body) = get_json(&client, &format!("{base}/cars/AAA")).await;
+        assert_eq!(body["maker"], "Honda");
+    }
+
+    #[tokio::test]
+    async fn the_control_plane_refuses_an_unknown_name_and_a_non_json_body() {
+        let project = mock_project().await;
+        let (base, _) = serve_mock(&project, default_opts()).await;
+        let client = reqwest::Client::new();
+        let control = format!("{base}/_frogs/scenario");
+
+        let response = client.post(&control).json(&serde_json::json!({ "name": "made-up" })).send().await.unwrap();
+        assert_eq!(response.status(), 400);
+        let body: Value = response.json().await.unwrap();
+        assert!(body["error"].as_str().unwrap_or_default().contains("unknown scenario 'made-up'"), "{body}");
+        let (_, body) = get_json(&client, &control).await;
+        assert_eq!(body["source"], "baseline", "a refused name must not have changed anything");
+
+        let response = client
+            .post(&control)
+            .header("content-type", "text/plain")
+            .body(r#"{ "name": "pricing-down" }"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            415,
+            "a non-JSON content type is refused outright — this is what keeps a cross-origin form post from flipping the scenario"
+        );
+        let (_, body) = get_json(&client, &control).await;
+        assert_eq!(body["source"], "baseline");
+    }
+
+    #[tokio::test]
+    async fn scenario_precedence_is_header_over_control_plane_over_flag_over_baseline() {
+        let project = mock_project().await;
+        let opts = TestServerOptions {
+            scenario: Some("pricing-down".to_string()),
+            ..default_opts()
+        };
+        let (base, _) = serve_mock(&project, opts).await;
+        let client = reqwest::Client::new();
+        let control = format!("{base}/_frogs/scenario");
+
+        let (_, body) = get_json(&client, &control).await;
+        assert_eq!(body["scenario"], "pricing-down");
+        assert_eq!(body["source"], "flag");
+        let (_, body) = get_json(&client, &format!("{base}/cars/AAA")).await;
+        assert_eq!(body["maker"], "Scenario", "the --scenario flag is the default for every request");
+
+        client.post(&control).json(&serde_json::json!({ "name": "db-down" })).send().await.unwrap();
+        let (status, body) = get_json(&client, &format!("{base}/cars/AAA")).await;
+        assert_eq!(status, 500, "the control plane beats the flag — db-down's mocked failure now serves: {body}");
+        assert_eq!(body["name"], "datasource.sql.connection_failed");
+
+        let response = client
+            .get(format!("{base}/cars/AAA"))
+            .header("X-Frogs-Scenario", "pricing-down")
+            .send()
+            .await
+            .unwrap();
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["maker"], "Scenario", "the header beats the control plane");
+
+        client.delete(&control).send().await.unwrap();
+        let (_, body) = get_json(&client, &control).await;
+        assert_eq!(body["source"], "flag", "clearing the override falls back to the flag, not the baseline");
+    }
+
+    #[tokio::test]
+    async fn a_value_saved_by_a_post_case_matches_a_later_get_through_a_memory_placeholder() {
+        let project = mock_project().await;
+        let (base, session) = serve_mock(&project, default_opts()).await;
+        let client = reqwest::Client::new();
+
+        let (status, _) = get_json(&client, &format!("{base}/cars/NEW123")).await;
+        assert_eq!(status, 404, "before anything is saved the {{{{memory.vin}}}} case can't match");
+
+        let response = client
+            .post(format!("{base}/cars"))
+            .json(&serde_json::json!({ "maker": "Honda" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body, serde_json::json!({ "vin": "NEW123" }));
+
+        let (status, body) = get_json(&client, &format!("{base}/cars/NEW123")).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["maker"], "FromMemory", "the GET on another route matched via the vin the POST case saved");
+
+        assert_eq!(project.upstream.hits(), 0);
+        let summary = session.summary();
+        assert_eq!((summary.unmatched, summary.passed), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn a_json_report_file_records_every_request_with_its_scenario_once_the_session_finishes() {
+        let project = mock_project().await;
+        let report_path = project.root.join("report.json");
+        let opts = TestServerOptions {
+            report: ReportFormat::Json,
+            report_file: Some(report_path.clone()),
+            ..default_opts()
+        };
+        let (base, session) = serve_mock(&project, opts).await;
+        let client = reqwest::Client::new();
+
+        get_json(&client, &format!("{base}/cars/AAA")).await;
+        client
+            .get(format!("{base}/cars/AAA"))
+            .header("X-Frogs-Scenario", "pricing-down")
+            .send()
+            .await
+            .unwrap();
+        get_json(&client, &format!("{base}/cars/CCC")).await;
+
+        let summary = session.finish();
+        assert_eq!(summary.requests, 3);
+        assert!(summary.has_problems(), "the unmocked required source must flip the exit-code rule");
+
+        let report: Value = serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).expect("the report file must be valid JSON");
+        assert_eq!(report["summary"]["requests"], 3);
+        assert_eq!(report["summary"]["passed"], 2);
+        assert_eq!(report["summary"]["notMocked"], 1);
+        assert_eq!(report["entries"][0]["scenario"], Value::Null);
+        assert_eq!(report["entries"][1]["scenario"], "pricing-down");
+        assert_eq!(report["entries"][1]["scenarioSource"], "header");
+        assert_eq!(report["entries"][1]["case"], "pricing down");
+        assert_eq!(report["entries"][2]["verdict"], "notMocked");
+        assert_eq!(report["entries"][2]["unmocked"][0]["name"], "car");
+
+        let leftovers: Vec<String> = std::fs::read_dir(&project.root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// The harness codes are inserted into the loaded registry at startup
+    /// specifically so they classify like any other code — under
+    /// `debugMode` (the only mode that writes the discovery scratch file)
+    /// a 501/404/400 from the harness must not create
+    /// `config/errors.discovered.json`.
+    #[tokio::test]
+    async fn harness_error_codes_never_land_in_the_discovered_errors_scratch_file_even_under_debug_mode() {
+        let project = mock_project().await;
+        let api = crate::project::api_base(&project.root);
+        std::fs::write(api.join("config/server.json"), r#"{ "debugMode": true, "features": { "requestValidation": false } }"#).unwrap();
+        let (base, _) = serve_mock(&project, default_opts()).await;
+        let client = reqwest::Client::new();
+
+        let (status, _) = get_json(&client, &format!("{base}/cars/CCC")).await;
+        assert_eq!(status, 501);
+        let (status, _) = get_json(&client, &format!("{base}/cars/ZZZ")).await;
+        assert_eq!(status, 404);
+        let response = client.get(format!("{base}/cars/AAA")).header("X-Frogs-Scenario", "made-up").send().await.unwrap();
+        assert_eq!(response.status(), 400);
+
+        assert!(
+            !api.join("config/errors.discovered.json").is_file(),
+            "test.source_not_mocked / test.no_matching_case / test.unknown_scenario are registry entries, not discoveries"
+        );
+    }
+
+    /// A project that classifies a harness code itself keeps its own
+    /// definition end to end — the served status is the project's, not the
+    /// harness default.
+    #[tokio::test]
+    async fn a_project_defined_harness_code_wins_over_the_harness_default_when_served() {
+        let project = mock_project().await;
+        let api = crate::project::api_base(&project.root);
+        std::fs::write(
+            api.join("config/errors/harness.json"),
+            r#"{ "test.no_matching_case": { "httpStatus": 422, "exposeDetail": false } }"#,
+        )
+        .unwrap();
+        let (base, _) = serve_mock(&project, default_opts()).await;
+        let client = reqwest::Client::new();
+
+        let (status, body) = get_json(&client, &format!("{base}/cars/ZZZ")).await;
+        assert_eq!(status, 422, "{body}");
+        assert_eq!(body["name"], NO_MATCHING_CASE);
+        assert!(body.get("detail").is_none(), "the project said exposeDetail: false, so no detail: {body}");
     }
 }

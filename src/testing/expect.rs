@@ -37,6 +37,16 @@ pub fn evaluate(expect: &Expectation, actual_status: u16, actual_body: &Value) -
     mismatches
 }
 
+/// Whether `actual` satisfies `expected` under the same partial-compare
+/// rules `evaluate` uses for a case's `expect.body` (`$any`/`$type:`
+/// matchers included) — what `testing::select` uses to match an inbound
+/// request body against a case's declared `request.body`.
+pub(crate) fn matches_subset(expected: &Value, actual: &Value) -> bool {
+    let mut mismatches = Vec::new();
+    compare(expected, actual, "body", &mut mismatches);
+    mismatches.is_empty()
+}
+
 /// Partial (subset) matching, not exact equality: only keys present in
 /// `expected` are checked; extra keys `actual` has that `expected` doesn't
 /// mention are never a mismatch. This is what lets the design doc's own

@@ -4,11 +4,11 @@ use serde_json::Value;
 
 use super::schema::SaveEntry;
 
-/// One test file's `{{memory.<key>}}` scope. Reset at the start of every
-/// file (a fresh `Memory::new()` per file, never shared across files or
-/// across separate `frogs test` runs) — cases within *one* file always run
-/// in order, which is what makes referencing an earlier case's saved value
-/// well defined at all.
+/// The `{{memory.<key>}}` scope. Under `frogs test`'s mock server there is
+/// exactly one, process-lifetime, shared by every route and never reset
+/// while the server is up (see `testing::session`) — a value one request's
+/// matched case `save`d is visible to every later request, whichever
+/// endpoint it hits, in whatever order the client sends them.
 #[derive(Debug, Default)]
 pub struct Memory {
     values: HashMap<String, Value>,
