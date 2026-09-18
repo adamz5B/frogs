@@ -1,0 +1,49 @@
+{
+  "cases": [
+    {
+      "name": "happy path",
+      "request": { "path": { "id": "1" } },
+      "mocks": {
+        "verifier": { "active": true },
+        "customer": { "id": 1, "name": "Alice Nguyen", "email": "alice@example.com", "tier": "gold", "created_at": "2025-01-01T00:00:00Z" },
+        "loyalty": { "points": 450 }
+      },
+      "expect": {
+        "status": 200,
+        "body": { "id": 1, "tier": "gold", "loyaltyPoints": 450 }
+      }
+    },
+    {
+      "name": "loyalty service down — optional source, should degrade gracefully",
+      "scenario": "loyalty-down",
+      "request": { "path": { "id": "1" } },
+      "mocks": {
+        "verifier": { "active": true },
+        "customer": { "id": 1, "name": "Alice Nguyen", "email": "alice@example.com", "tier": "gold", "created_at": "2025-01-01T00:00:00Z" },
+        "loyalty": { "fail": "datasource.http.timeout" }
+      },
+      "expect": {
+        "status": 200,
+        "body": { "loyaltyPoints": null }
+      }
+    },
+    {
+      "name": "customer not found",
+      "request": { "path": { "id": "999" } },
+      "mocks": {
+        "verifier": { "active": true },
+        "customer": { "fail": "datasource.sql.not_found" }
+      },
+      "expect": { "status": 404 }
+    },
+    {
+      "name": "no api key — verifier mocked as inactive",
+      "scenario": "no-api-key",
+      "request": { "path": { "id": "1" } },
+      "mocks": {
+        "verifier": { "active": false }
+      },
+      "expect": { "status": 401 }
+    }
+  ]
+}

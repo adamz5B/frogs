@@ -1,0 +1,9 @@
+{
+  "method": "GET",
+  "url": "https://payments.example.com/api/v1/orders/{{orderId}}/status",
+  "auth": {
+    "type": "bearer",
+    "tokenEnv": "PAYMENTS_API_KEY"
+  },
+  "timeoutMs": 3000
+}

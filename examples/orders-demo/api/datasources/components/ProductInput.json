@@ -1,0 +1,9 @@
+{
+  "_hash": "28f7dbc1b189e8a7",
+  "sku": "string",
+  "name": "string",
+  "category": "string",
+  "price": "number",
+  "currency": "string",
+  "description": "string"
+}

@@ -1,0 +1,50 @@
+{
+  "datasource.sql.connection_failed": {
+    "httpStatus": 500,
+    "exposeDetail": false
+  },
+  "datasource.sql.query_failed": {
+    "httpStatus": 500,
+    "exposeDetail": false
+  },
+  "datasource.sql.constraint_violation": {
+    "httpStatus": 409,
+    "exposeDetail": true
+  },
+  "datasource.sql.not_found": {
+    "httpStatus": 404,
+    "exposeDetail": true
+  },
+  "datasource.http.timeout": {
+    "httpStatus": 502,
+    "exposeDetail": false
+  },
+  "datasource.http.not_found": {
+    "httpStatus": 404,
+    "exposeDetail": true
+  },
+  "datasource.http.upstream_error": {
+    "httpStatus": 502,
+    "exposeDetail": false
+  },
+  "auth.invalid_credentials": {
+    "httpStatus": 401,
+    "exposeDetail": true
+  },
+  "auth.verifier_unavailable": {
+    "httpStatus": 500,
+    "exposeDetail": false
+  },
+  "validation.missing_parameter": {
+    "httpStatus": 400,
+    "exposeDetail": true
+  },
+  "validation.invalid_type": {
+    "httpStatus": 400,
+    "exposeDetail": true
+  },
+  "unexpected.error": {
+    "httpStatus": 500,
+    "exposeDetail": false
+  }
+}

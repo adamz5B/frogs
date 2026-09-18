@@ -1,0 +1,34 @@
+{
+  "operationId": "getProduct",
+  "sources": {
+    "product": {
+      "type": "sql",
+      "connection": "orders_db",
+      "script": "get_product.sql",
+      "cardinality": "one",
+      "parameters": [
+        { "name": "sku", "from": "path.sku" }
+      ]
+    },
+    "stock": {
+      "type": "http",
+      "request": "inventory_lookup.json",
+      "cardinality": "one",
+      "onError": 502,
+      "optional": true,
+      "parameters": [
+        { "name": "sku", "from": "path.sku" }
+      ]
+    }
+  },
+  "response": {
+    "sku": "sources.product.sku",
+    "name": "sources.product.name",
+    "category": "sources.product.category",
+    "price": { "from": "sources.product.price", "format": "decimal", "precision": 2 },
+    "currency": "sources.product.currency",
+    "description": "sources.product.description",
+    "inStock": { "from": "sources.product.in_stock", "format": "boolean" },
+    "liveStock": { "from": "sources.stock.quantity", "format": "integer" }
+  }
+}

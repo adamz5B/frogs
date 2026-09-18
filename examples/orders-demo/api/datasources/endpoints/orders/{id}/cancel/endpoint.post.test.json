@@ -1,0 +1,54 @@
+{
+  "cases": [
+    {
+      "name": "pending order — cancels successfully",
+      "request": { "path": { "id": "2" } },
+      "mocks": {
+        "verifier": { "active": true },
+        "order": {
+          "id": 2, "customer_id": 2, "customer_name": "Ben Carter", "status": "pending",
+          "subtotal": 79.0, "tax": 6.32, "total": 85.32, "currency": "USD",
+          "placed_at": "2026-09-18T12:00:00Z", "tracking_number": null
+        },
+        "cancelled": { "id": 2, "status": "cancelled" }
+      },
+      "expect": {
+        "status": 200,
+        "body": { "id": 2, "status": "cancelled" }
+      }
+    },
+    {
+      "name": "order already shipped — cancel_order.sql's UPDATE matches zero rows, mapped to 409 via this source's own onError override",
+      "request": { "path": { "id": "3" } },
+      "mocks": {
+        "verifier": { "active": true },
+        "order": {
+          "id": 3, "customer_id": 3, "customer_name": "Chloe Dubois", "status": "shipped",
+          "subtotal": 49.5, "tax": 3.96, "total": 53.46, "currency": "USD",
+          "placed_at": "2026-09-17T14:00:00Z", "tracking_number": "1Z999AA10987654321"
+        },
+        "cancelled": { "fail": "datasource.sql.not_found" }
+      },
+      "expect": { "status": 409 }
+    },
+    {
+      "name": "order not found",
+      "request": { "path": { "id": "999" } },
+      "mocks": {
+        "verifier": { "active": true },
+        "order": { "fail": "datasource.sql.not_found" },
+        "cancelled": { "id": 999, "status": "pending" }
+      },
+      "expect": { "status": 404 }
+    },
+    {
+      "name": "no api key — verifier mocked as inactive",
+      "scenario": "no-api-key",
+      "request": { "path": { "id": "2" } },
+      "mocks": {
+        "verifier": { "active": false }
+      },
+      "expect": { "status": 401 }
+    }
+  ]
+}

@@ -1,0 +1,104 @@
+{
+  "cases": [
+    {
+      "name": "happy path — one stock call fanned out per row, merged into each item; payment resolved",
+      "request": { "path": { "id": "1" } },
+      "mocks": {
+        "order": {
+          "id": 1, "customer_id": 1, "customer_name": "Alice Nguyen", "status": "delivered",
+          "subtotal": 39.97, "tax": 3.2, "total": 43.17, "currency": "USD",
+          "placed_at": "2026-09-08T14:00:00Z", "tracking_number": "1Z999AA10123456784"
+        },
+        "items": [
+          { "sku": "WIDGET-S", "name": "Small Widget", "quantity": 1, "unit_price": 9.99, "line_total": 9.99 },
+          { "sku": "WIDGET-L", "name": "Large Widget", "quantity": 1, "unit_price": 19.99, "line_total": 19.99 }
+        ],
+        "stock": { "available": true, "quantity": 10 },
+        "payment": { "status": "captured" }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "id": 1,
+          "status": "delivered",
+          "paymentStatus": "captured",
+          "trackingNumber": "1Z999AA10123456784",
+          "items": [
+            { "sku": "WIDGET-S", "quantity": 1, "inStock": true },
+            { "sku": "WIDGET-L", "quantity": 1, "inStock": true }
+          ]
+        }
+      }
+    },
+    {
+      "name": "inventory and payment services both down — both optional, should degrade gracefully rather than fail the request",
+      "scenario": "services-down",
+      "request": { "path": { "id": "1" } },
+      "mocks": {
+        "order": {
+          "id": 1, "customer_id": 1, "customer_name": "Alice Nguyen", "status": "delivered",
+          "subtotal": 39.97, "tax": 3.2, "total": 43.17, "currency": "USD",
+          "placed_at": "2026-09-08T14:00:00Z", "tracking_number": null
+        },
+        "items": [
+          { "sku": "WIDGET-S", "name": "Small Widget", "quantity": 1, "unit_price": 9.99, "line_total": 9.99 }
+        ],
+        "stock": { "fail": "datasource.http.timeout" },
+        "payment": { "fail": "datasource.http.timeout" }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "paymentStatus": null,
+          "trackingNumber": null,
+          "items": [ { "sku": "WIDGET-S", "inStock": null } ]
+        }
+      }
+    },
+    {
+      "name": "order not found",
+      "request": { "path": { "id": "999" } },
+      "mocks": {
+        "order": { "fail": "datasource.sql.not_found" },
+        "items": []
+      },
+      "expect": { "status": 404 }
+    },
+    {
+      "name": "maxRows exceeded — nested fan-out rejected, stock (optional) degrades every row to null instead of failing the request",
+      "scenario": "too-many-items",
+      "request": { "path": { "id": "1" } },
+      "mocks": {
+        "order": {
+          "id": 1, "customer_id": 1, "customer_name": "Alice Nguyen", "status": "delivered",
+          "subtotal": 0, "tax": 0, "total": 0, "currency": "USD",
+          "placed_at": "2026-09-08T14:00:00Z", "tracking_number": null
+        },
+        "items": [
+          { "sku": "ROW00", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW01", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW02", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW03", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW04", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW05", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW06", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW07", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW08", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW09", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW10", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW11", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW12", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW13", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW14", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW15", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW16", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW17", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW18", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW19", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 },
+          { "sku": "ROW20", "name": "Row", "quantity": 1, "unit_price": 1, "line_total": 1 }
+        ]
+      },
+      "expect": { "status": 200 }
+    }
+  ]
+}

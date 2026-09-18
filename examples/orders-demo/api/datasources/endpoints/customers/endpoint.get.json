@@ -1,0 +1,23 @@
+{
+  "operationId": "listCustomers",
+  "sources": {
+    "customers": {
+      "type": "sql",
+      "connection": "orders_db",
+      "script": "list_customers.sql",
+      "cardinality": "many"
+    }
+  },
+  "response": {
+    "type": "array",
+    "source": "sources.customers",
+    "items": {
+      "id": { "from": "id", "format": "integer" },
+      "name": "name",
+      "email": "email",
+      "tier": "tier",
+      "loyaltyPoints": null,
+      "createdAt": { "from": "created_at", "format": "date-time" }
+    }
+  }
+}

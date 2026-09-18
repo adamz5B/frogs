@@ -1,0 +1,6 @@
+{
+  "orders_db": {
+    "driver": "sqlite",
+    "database": "api/orders.db"
+  }
+}

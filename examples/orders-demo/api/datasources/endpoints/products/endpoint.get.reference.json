@@ -1,0 +1,26 @@
+{
+  "operationId": "listProducts",
+  "_hash": "4e4150bff17f86b2",
+  "security": null,
+  "request": {
+    "query": [],
+    "path": [],
+    "header": [],
+    "body": null
+  },
+  "response": {
+    "type": "array",
+    "items": {
+      "$component": "Product",
+      "sku": "string",
+      "name": "string",
+      "category": "string",
+      "price": "number",
+      "currency": "string",
+      "description": "string",
+      "inStock": "boolean",
+      "liveStock": "integer"
+    }
+  },
+  "availableParameterSources": []
+}

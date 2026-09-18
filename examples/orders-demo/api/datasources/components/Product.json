@@ -1,0 +1,11 @@
+{
+  "_hash": "76bf1118d1ec9e96",
+  "sku": "string",
+  "name": "string",
+  "category": "string",
+  "price": "number",
+  "currency": "string",
+  "description": "string",
+  "inStock": "boolean",
+  "liveStock": "integer"
+}

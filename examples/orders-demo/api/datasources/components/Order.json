@@ -1,0 +1,27 @@
+{
+  "_hash": "6ba70baa8c7335cd",
+  "$component": "OrderSummary",
+  "id": "integer",
+  "customerId": "integer",
+  "customerName": "string",
+  "status": "string",
+  "subtotal": "number",
+  "tax": "number",
+  "total": "number",
+  "currency": "string",
+  "placedAt": "string (date-time)",
+  "items": {
+    "type": "array",
+    "items": {
+      "$component": "OrderItem",
+      "sku": "string",
+      "name": "string",
+      "quantity": "integer",
+      "unitPrice": "number",
+      "lineTotal": "number",
+      "inStock": "boolean"
+    }
+  },
+  "paymentStatus": "string",
+  "trackingNumber": "string"
+}

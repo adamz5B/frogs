@@ -1,0 +1,26 @@
+{
+  "operationId": "listOrders",
+  "sources": {
+    "orders": {
+      "type": "sql",
+      "connection": "orders_db",
+      "script": "list_orders.sql",
+      "cardinality": "many"
+    }
+  },
+  "response": {
+    "type": "array",
+    "source": "sources.orders",
+    "items": {
+      "id": { "from": "id", "format": "integer" },
+      "customerId": { "from": "customer_id", "format": "integer" },
+      "customerName": "customer_name",
+      "status": "status",
+      "subtotal": { "from": "subtotal", "format": "decimal", "precision": 2 },
+      "tax": { "from": "tax", "format": "decimal", "precision": 2 },
+      "total": { "from": "total", "format": "decimal", "precision": 2 },
+      "currency": "currency",
+      "placedAt": { "from": "placed_at", "format": "date-time" }
+    }
+  }
+}

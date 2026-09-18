@@ -1,0 +1,12 @@
+{
+  "_hash": "9c58ddf580da096a",
+  "customerId": "integer",
+  "items": {
+    "type": "array",
+    "items": {
+      "$component": "OrderItemInput",
+      "sku": "string",
+      "quantity": "integer"
+    }
+  }
+}

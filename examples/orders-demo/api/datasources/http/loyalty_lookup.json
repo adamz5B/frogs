@@ -1,0 +1,9 @@
+{
+  "method": "GET",
+  "url": "https://loyalty.example.com/api/v1/customers/{{customerId}}/points",
+  "auth": {
+    "type": "bearer",
+    "tokenEnv": "LOYALTY_API_KEY"
+  },
+  "timeoutMs": 3000
+}

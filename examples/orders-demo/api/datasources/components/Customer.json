@@ -1,0 +1,9 @@
+{
+  "_hash": "821bd489b4be0fe8",
+  "id": "integer",
+  "name": "string",
+  "email": "string",
+  "tier": "string",
+  "loyaltyPoints": "integer",
+  "createdAt": "string (date-time)"
+}

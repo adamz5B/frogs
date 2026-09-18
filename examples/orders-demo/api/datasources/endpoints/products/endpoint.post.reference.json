@@ -1,0 +1,23 @@
+{
+  "operationId": "createProduct",
+  "_hash": "77b9f3cc818cce9d",
+  "security": null,
+  "request": {
+    "query": [],
+    "path": [],
+    "header": [],
+    "body": null
+  },
+  "response": {
+    "$component": "Product",
+    "sku": "string",
+    "name": "string",
+    "category": "string",
+    "price": "number",
+    "currency": "string",
+    "description": "string",
+    "inStock": "boolean",
+    "liveStock": "integer"
+  },
+  "availableParameterSources": []
+}

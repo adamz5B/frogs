@@ -1,0 +1,72 @@
+{
+  "operationId": "getOrder",
+  "sources": {
+    "order": {
+      "type": "sql",
+      "connection": "orders_db",
+      "script": "get_order.sql",
+      "cardinality": "one",
+      "parameters": [
+        { "name": "id", "from": "path.id" }
+      ]
+    },
+    "items": {
+      "type": "sql",
+      "connection": "orders_db",
+      "script": "list_order_items.sql",
+      "cardinality": "many",
+      "parameters": [
+        { "name": "id", "from": "sources.order.id" }
+      ]
+    },
+    "stock": {
+      "type": "http",
+      "request": "inventory_lookup.json",
+      "cardinality": "one",
+      "allowNestedMany": true,
+      "maxConcurrency": 3,
+      "maxRows": 20,
+      "rowTimeoutMs": 4000,
+      "onError": 502,
+      "optional": true,
+      "parameters": [
+        { "name": "sku", "from": "sources.items[].sku" }
+      ]
+    },
+    "payment": {
+      "type": "http",
+      "request": "payment_status_lookup.json",
+      "cardinality": "one",
+      "onError": 502,
+      "optional": true,
+      "parameters": [
+        { "name": "orderId", "from": "path.id" }
+      ]
+    }
+  },
+  "response": {
+    "id": { "from": "sources.order.id", "format": "integer" },
+    "customerId": { "from": "sources.order.customer_id", "format": "integer" },
+    "customerName": "sources.order.customer_name",
+    "status": "sources.order.status",
+    "subtotal": { "from": "sources.order.subtotal", "format": "decimal", "precision": 2 },
+    "tax": { "from": "sources.order.tax", "format": "decimal", "precision": 2 },
+    "total": { "from": "sources.order.total", "format": "decimal", "precision": 2 },
+    "currency": "sources.order.currency",
+    "placedAt": { "from": "sources.order.placed_at", "format": "date-time" },
+    "items": {
+      "type": "array",
+      "source": "sources.items",
+      "items": {
+        "sku": "sku",
+        "name": "name",
+        "quantity": { "from": "quantity", "format": "integer" },
+        "unitPrice": { "from": "unit_price", "format": "decimal", "precision": 2 },
+        "lineTotal": { "from": "line_total", "format": "decimal", "precision": 2 },
+        "inStock": { "from": "stock.available", "format": "boolean" }
+      }
+    },
+    "paymentStatus": "sources.payment.status",
+    "trackingNumber": "sources.order.tracking_number"
+  }
+}

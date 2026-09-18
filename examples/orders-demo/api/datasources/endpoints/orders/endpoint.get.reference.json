@@ -1,0 +1,27 @@
+{
+  "operationId": "listOrders",
+  "_hash": "b4b511b871572119",
+  "security": null,
+  "request": {
+    "query": [],
+    "path": [],
+    "header": [],
+    "body": null
+  },
+  "response": {
+    "type": "array",
+    "items": {
+      "$component": "OrderSummary",
+      "id": "integer",
+      "customerId": "integer",
+      "customerName": "string",
+      "status": "string",
+      "subtotal": "number",
+      "tax": "number",
+      "total": "number",
+      "currency": "string",
+      "placedAt": "string (date-time)"
+    }
+  },
+  "availableParameterSources": []
+}

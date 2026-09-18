@@ -1,0 +1,24 @@
+{
+  "operationId": "listProducts",
+  "sources": {
+    "products": {
+      "type": "sql",
+      "connection": "orders_db",
+      "script": "list_products.sql",
+      "cardinality": "many"
+    }
+  },
+  "response": {
+    "type": "array",
+    "source": "sources.products",
+    "items": {
+      "sku": "sku",
+      "name": "name",
+      "category": "category",
+      "price": { "from": "price", "format": "decimal", "precision": 2 },
+      "currency": "currency",
+      "description": "description",
+      "inStock": { "from": "in_stock", "format": "boolean" }
+    }
+  }
+}

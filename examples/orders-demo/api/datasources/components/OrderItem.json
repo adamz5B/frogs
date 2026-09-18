@@ -1,0 +1,9 @@
+{
+  "_hash": "c4415059c4e68a9a",
+  "sku": "string",
+  "name": "string",
+  "quantity": "integer",
+  "unitPrice": "number",
+  "lineTotal": "number",
+  "inStock": "boolean"
+}

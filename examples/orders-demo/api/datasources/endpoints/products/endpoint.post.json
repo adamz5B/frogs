@@ -1,0 +1,30 @@
+{
+  "operationId": "createProduct",
+  "successStatus": 201,
+  "sources": {
+    "product": {
+      "type": "sql",
+      "connection": "orders_db",
+      "script": "create_product.sql",
+      "cardinality": "one",
+      "parameters": [
+        { "name": "sku", "from": "body.sku" },
+        { "name": "name", "from": "body.name" },
+        { "name": "category", "from": "body.category" },
+        { "name": "price", "from": "body.price" },
+        { "name": "currency", "from": "body.currency" },
+        { "name": "description", "from": "body.description" }
+      ]
+    }
+  },
+  "response": {
+    "sku": "sources.product.sku",
+    "name": "sources.product.name",
+    "category": "sources.product.category",
+    "price": { "from": "sources.product.price", "format": "decimal", "precision": 2 },
+    "currency": "sources.product.currency",
+    "description": "sources.product.description",
+    "inStock": { "from": "sources.product.in_stock", "format": "boolean" },
+    "liveStock": null
+  }
+}

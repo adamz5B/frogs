@@ -1,0 +1,21 @@
+{
+  "operationId": "createCustomer",
+  "_hash": "15b6617485bb68dc",
+  "security": null,
+  "request": {
+    "query": [],
+    "path": [],
+    "header": [],
+    "body": null
+  },
+  "response": {
+    "$component": "Customer",
+    "id": "integer",
+    "name": "string",
+    "email": "string",
+    "tier": "string",
+    "loyaltyPoints": "integer",
+    "createdAt": "string (date-time)"
+  },
+  "availableParameterSources": []
+}

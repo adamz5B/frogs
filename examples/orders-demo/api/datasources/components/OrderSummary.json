@@ -1,0 +1,12 @@
+{
+  "_hash": "087fb87e65c232de",
+  "id": "integer",
+  "customerId": "integer",
+  "customerName": "string",
+  "status": "string",
+  "subtotal": "number",
+  "tax": "number",
+  "total": "number",
+  "currency": "string",
+  "placedAt": "string (date-time)"
+}

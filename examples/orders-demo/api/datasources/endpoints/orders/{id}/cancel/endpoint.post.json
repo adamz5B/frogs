@@ -1,0 +1,39 @@
+{
+  "operationId": "cancelOrder",
+  "security": "apiKeyAuth",
+  "sources": {
+    "order": {
+      "type": "sql",
+      "connection": "orders_db",
+      "script": "get_order.sql",
+      "cardinality": "one",
+      "parameters": [
+        { "name": "id", "from": "path.id" }
+      ]
+    },
+    "cancelled": {
+      "type": "sql",
+      "connection": "orders_db",
+      "script": "cancel_order.sql",
+      "cardinality": "one",
+      "onError": 409,
+      "parameters": [
+        { "name": "id", "from": "sources.order.id" }
+      ]
+    }
+  },
+  "response": {
+    "id": { "from": "sources.order.id", "format": "integer" },
+    "customerId": { "from": "sources.order.customer_id", "format": "integer" },
+    "customerName": "sources.order.customer_name",
+    "status": "sources.cancelled.status",
+    "subtotal": { "from": "sources.order.subtotal", "format": "decimal", "precision": 2 },
+    "tax": { "from": "sources.order.tax", "format": "decimal", "precision": 2 },
+    "total": { "from": "sources.order.total", "format": "decimal", "precision": 2 },
+    "currency": "sources.order.currency",
+    "placedAt": { "from": "sources.order.placed_at", "format": "date-time" },
+    "items": null,
+    "paymentStatus": null,
+    "trackingNumber": { "from": "sources.order.tracking_number" }
+  }
+}

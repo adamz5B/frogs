@@ -11,7 +11,7 @@
 - **Real SQL sources**: SQLite (always compiled in), Postgres (default), MySQL/MariaDB, MS SQL Server, and Oracle (all opt-in Cargo features), plus real HTTP sources with templating and auth.
 - **Response formatting**, a stable **error envelope** classified against a merged `config/errors/*.json` registry, and **endpoint security** via `sql`/`http` verifiers.
 - **Write operations** (POST/PUT/PATCH/DELETE) with body parameters and per-request transaction correlation.
-- **A mock-substitution test framework** (`*.test.json` / `frogs test`) that runs endpoint tests without touching real infrastructure.
+- **A mock server for testing** (`*.test.json` / `frogs test`) that serves real HTTP from canned per-source mocks — request matching, scenario switching, and a pass/fail report — without touching real infrastructure.
 - **Static-content serving** (`webserve.json`) that can run standalone or alongside the API in one process, mounted under a configurable `apiRoot`.
 - Operational basics: PID-file process management, `/healthz`/`/readyz`/`/metrics`, rate limiting, a service registry, and manual-cert HTTPS.
 - **`frogs register`/`frogs unregister`** installs (or removes) this project as a platform-native service — systemd on Linux, launchd on macOS, a real Windows Service on Windows — so it starts automatically at boot/login instead of needing an open terminal.
@@ -66,7 +66,7 @@ src/
 ├── security/     # schemes/verifiers, validIf parsing, TTL caching
 ├── sql/          # the SqlDriver trait + postgres/sqlite/mysql/mssql/oracle adapters
 ├── http/         # outbound HTTP source execution
-├── testing/      # *.test.json schema, mock substitution, matching
+├── testing/      # *.test.json schema, mock server (case selection, scenarios, report)
 ├── webserve/     # webserve.json schema + static file serving
 ├── server/       # the axum process skeleton (/healthz, correlation IDs, PID file)
 └── project.rs    # project-root discovery

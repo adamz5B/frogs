@@ -1,0 +1,35 @@
+{
+  "debugMode": false,
+  "features": {
+    "metrics": true,
+    "readyzCheck": true,
+    "requestCorrelation": true,
+    "rateLimiting": false,
+    "serviceRegistry": false,
+    "requestValidation": true,
+    "cors": false
+  },
+  "autoMigrateEndpoints": true,
+  "discoveredErrorsWarnThreshold": 20,
+  "rateLimit": {
+    "requestsPerSecond": 20,
+    "burst": 40
+  },
+  "cors": {
+    "allowedOrigins": []
+  },
+  "docsUi": {
+    "mode": "off",
+    "path": "docs"
+  },
+  "tls": {
+    "mode": "off",
+    "manual": null
+  },
+  "logging": {
+    "directory": "runtime-logs",
+    "level": "info"
+  },
+  "port": 8080,
+  "apiRoot": ""
+}

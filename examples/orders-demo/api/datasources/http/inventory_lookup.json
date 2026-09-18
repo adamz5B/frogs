@@ -1,0 +1,9 @@
+{
+  "method": "GET",
+  "url": "https://inventory.example.com/api/v1/stock/{{sku}}",
+  "auth": {
+    "type": "bearer",
+    "tokenEnv": "INVENTORY_API_KEY"
+  },
+  "timeoutMs": 3000
+}

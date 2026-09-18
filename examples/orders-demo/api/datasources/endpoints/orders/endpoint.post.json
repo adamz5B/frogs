@@ -1,0 +1,51 @@
+{
+  "operationId": "createOrder",
+  "successStatus": 201,
+  "sources": {
+    "order": {
+      "type": "sql",
+      "connection": "orders_db",
+      "script": "create_order.sql",
+      "cardinality": "one",
+      "parameters": [
+        { "name": "customerId", "from": "body.customerId" },
+        { "name": "items", "from": "body.items" }
+      ]
+    },
+    "insertedItems": {
+      "type": "sql",
+      "connection": "orders_db",
+      "script": "create_order_items.sql",
+      "cardinality": "many",
+      "parameters": [
+        { "name": "orderId", "from": "sources.order.id" },
+        { "name": "items", "from": "body.items" }
+      ]
+    }
+  },
+  "response": {
+    "id": { "from": "sources.order.id", "format": "integer" },
+    "customerId": { "from": "sources.order.customer_id", "format": "integer" },
+    "customerName": "sources.order.customer_name",
+    "status": "sources.order.status",
+    "subtotal": { "from": "sources.order.subtotal", "format": "decimal", "precision": 2 },
+    "tax": { "from": "sources.order.tax", "format": "decimal", "precision": 2 },
+    "total": { "from": "sources.order.total", "format": "decimal", "precision": 2 },
+    "currency": "sources.order.currency",
+    "placedAt": { "from": "sources.order.placed_at", "format": "date-time" },
+    "items": {
+      "type": "array",
+      "source": "sources.insertedItems",
+      "items": {
+        "sku": "sku",
+        "name": "name",
+        "quantity": { "from": "quantity", "format": "integer" },
+        "unitPrice": { "from": "unit_price", "format": "decimal", "precision": 2 },
+        "lineTotal": { "from": "line_total", "format": "decimal", "precision": 2 },
+        "inStock": null
+      }
+    },
+    "paymentStatus": null,
+    "trackingNumber": null
+  }
+}

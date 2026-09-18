@@ -1,0 +1,307 @@
+openapi: 3.0.3
+info:
+  title: Orders Demo API
+  description: >-
+    A small e-commerce backend — products, customers, and orders — built to
+    exercise more of frogs than cars-demo or library-demo do on their own:
+    an endpoint whose sources mix SQL and HTTP; optional/onError degradation
+    (an unreachable inventory/loyalty/payment service should degrade a field
+    to null, never fail the whole request); two-level allowNestedMany
+    fan-out (an order's SQL-backed line items, each further enriched by a
+    per-row HTTP stock check); security schemes with verifiers; and an
+    allOf merge in components/schemas for `frogs generate`'s SchemaWalker.
+    The conditional cancel-order business logic (pending-only, else 409) is
+    also meant as a `frogs test` scenario target once mapping files exist.
+  version: 1.0.0
+paths:
+  /products:
+    get:
+      operationId: listProducts
+      description: Every product in the catalog. Store-level stock only — no live inventory check.
+      responses:
+        '200':
+          description: The product catalog.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Product'
+    post:
+      operationId: createProduct
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductInput'
+      responses:
+        '201':
+          description: The newly created product.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+  /products/{sku}:
+    get:
+      operationId: getProduct
+      description: >-
+        One product, with a live stock count layered on top of the catalog
+        row via an optional HTTP source — if the inventory service is down,
+        `liveStock` degrades to null rather than failing the request.
+      parameters:
+        - name: sku
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The product, with live stock where available.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Product'
+        '404':
+          description: No product with this SKU.
+  /customers:
+    get:
+      operationId: listCustomers
+      responses:
+        '200':
+          description: Every registered customer.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Customer'
+    post:
+      operationId: createCustomer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerInput'
+      responses:
+        '201':
+          description: The newly registered customer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+  /customers/{id}:
+    get:
+      operationId: getCustomer
+      description: >-
+        One customer, with loyalty tier/points layered on top of the SQL
+        row via an optional HTTP source — degrades `loyaltyPoints` to null
+        if the loyalty service can't be reached. Requires an API key.
+      security:
+        - apiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: The customer, with loyalty info where available.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '404':
+          description: No customer with this id.
+  /orders:
+    get:
+      operationId: listOrders
+      description: Every order, newest first — headers only, no line items.
+      responses:
+        '200':
+          description: Every order.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/OrderSummary'
+    post:
+      operationId: createOrder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderInput'
+      responses:
+        '201':
+          description: The newly placed order, in pending status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '404':
+          description: Referenced customer or a line item's SKU doesn't exist.
+  /orders/{id}:
+    get:
+      operationId: getOrder
+      description: >-
+        One order in full. `items` is a cardinality:"many" SQL source
+        (one row per line item); each item is then further enriched with a
+        per-row `inStock` HTTP check via a second, nested allowNestedMany
+        fan-out keyed off that same items source. `paymentStatus` is a
+        separate optional HTTP source on the order itself — it degrades to
+        null rather than failing the request if the payment gateway is
+        unreachable.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: The order, with line items and payment/tracking status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '404':
+          description: No order with this id.
+  /orders/{id}/cancel:
+    post:
+      operationId: cancelOrder
+      description: >-
+        Cancels a pending order. Requires an API key. Returns 409 if the
+        order has already moved past `pending` (paid/shipped/delivered) —
+        a good `frogs test` scenario target for asserting an error code
+        rather than a happy-path response.
+      security:
+        - apiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        '200':
+          description: The order, now cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '404':
+          description: No order with this id.
+        '409':
+          description: The order is no longer pending and can't be cancelled.
+components:
+  securitySchemes:
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+  schemas:
+    Product:
+      type: object
+      required: [sku, name, category, price, currency, inStock]
+      properties:
+        sku:         { type: string }
+        name:        { type: string }
+        category:    { type: string }
+        price:       { type: number, description: Decimal, two-place precision applied server-side. }
+        currency:    { type: string }
+        description: { type: string }
+        inStock:     { type: boolean, description: Catalog-level flag, always known. }
+        liveStock:
+          type: integer
+          nullable: true
+          description: Live count from the inventory service; null if that service is unreachable.
+    ProductInput:
+      type: object
+      required: [sku, name, category, price, currency]
+      properties:
+        sku:         { type: string }
+        name:        { type: string }
+        category:    { type: string }
+        price:       { type: number }
+        currency:    { type: string }
+        description: { type: string }
+    Customer:
+      type: object
+      required: [id, name, email, tier, createdAt]
+      properties:
+        id:        { type: integer }
+        name:      { type: string }
+        email:     { type: string }
+        tier:      { type: string, enum: [bronze, silver, gold] }
+        loyaltyPoints:
+          type: integer
+          nullable: true
+          description: From the loyalty service; null if that service is unreachable.
+        createdAt: { type: string, format: date-time }
+    CustomerInput:
+      type: object
+      required: [name, email]
+      properties:
+        name:  { type: string }
+        email: { type: string }
+    OrderItem:
+      type: object
+      required: [sku, name, quantity, unitPrice, lineTotal]
+      properties:
+        sku:       { type: string }
+        name:      { type: string }
+        quantity:  { type: integer }
+        unitPrice: { type: number }
+        lineTotal: { type: number }
+        inStock:
+          type: boolean
+          nullable: true
+          description: Per-row live check via the nested fan-out; null if that check couldn't be made.
+    OrderItemInput:
+      type: object
+      required: [sku, quantity]
+      properties:
+        sku:      { type: string }
+        quantity: { type: integer }
+    OrderSummary:
+      type: object
+      required: [id, customerId, customerName, status, subtotal, tax, total, currency, placedAt]
+      properties:
+        id:           { type: integer }
+        customerId:   { type: integer }
+        customerName: { type: string }
+        status:       { type: string, enum: [pending, paid, shipped, delivered, cancelled] }
+        subtotal:     { type: number }
+        tax:          { type: number }
+        total:        { type: number }
+        currency:     { type: string }
+        placedAt:     { type: string, format: date-time }
+    Order:
+      description: An OrderSummary plus line items and post-placement status — exercises SchemaWalker's allOf merge.
+      allOf:
+        - $ref: '#/components/schemas/OrderSummary'
+        - type: object
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/OrderItem'
+            paymentStatus:
+              type: string
+              nullable: true
+              enum: [authorized, captured, failed, null]
+              description: From the payment gateway; null if that service is unreachable.
+            trackingNumber:
+              type: string
+              nullable: true
+              description: Set once the order has shipped.
+    OrderInput:
+      type: object
+      required: [customerId, items]
+      properties:
+        customerId: { type: integer }
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItemInput'

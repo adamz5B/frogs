@@ -1,0 +1,37 @@
+{
+  "cases": [
+    {
+      "name": "happy path",
+      "request": { "path": { "sku": "WIDGET-S" } },
+      "mocks": {
+        "product": { "sku": "WIDGET-S", "name": "Small Widget", "category": "widgets", "price": 9.99, "currency": "USD", "description": "A small widget.", "in_stock": true },
+        "stock": { "available": true, "quantity": 42 }
+      },
+      "expect": {
+        "status": 200,
+        "body": { "sku": "WIDGET-S", "inStock": true, "liveStock": 42, "price": 9.99 }
+      }
+    },
+    {
+      "name": "inventory service down — optional source, should degrade liveStock to null",
+      "scenario": "inventory-down",
+      "request": { "path": { "sku": "WIDGET-S" } },
+      "mocks": {
+        "product": { "sku": "WIDGET-S", "name": "Small Widget", "category": "widgets", "price": 9.99, "currency": "USD", "in_stock": true },
+        "stock": { "fail": "datasource.http.timeout" }
+      },
+      "expect": {
+        "status": 200,
+        "body": { "liveStock": null }
+      }
+    },
+    {
+      "name": "product not found",
+      "request": { "path": { "sku": "NOPE" } },
+      "mocks": {
+        "product": { "fail": "datasource.sql.not_found" }
+      },
+      "expect": { "status": 404 }
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "operationId": "getCustomer",
+  "security": "apiKeyAuth",
+  "sources": {
+    "customer": {
+      "type": "sql",
+      "connection": "orders_db",
+      "script": "get_customer.sql",
+      "cardinality": "one",
+      "parameters": [
+        { "name": "id", "from": "path.id" }
+      ]
+    },
+    "loyalty": {
+      "type": "http",
+      "request": "loyalty_lookup.json",
+      "cardinality": "one",
+      "onError": 502,
+      "optional": true,
+      "parameters": [
+        { "name": "customerId", "from": "path.id" }
+      ]
+    }
+  },
+  "response": {
+    "id": { "from": "sources.customer.id", "format": "integer" },
+    "name": "sources.customer.name",
+    "email": "sources.customer.email",
+    "tier": "sources.customer.tier",
+    "loyaltyPoints": { "from": "sources.loyalty.points", "format": "integer" },
+    "createdAt": { "from": "sources.customer.created_at", "format": "date-time" }
+  }
+}

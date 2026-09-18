@@ -1,0 +1,24 @@
+{
+  "operationId": "createCustomer",
+  "successStatus": 201,
+  "sources": {
+    "customer": {
+      "type": "sql",
+      "connection": "orders_db",
+      "script": "create_customer.sql",
+      "cardinality": "one",
+      "parameters": [
+        { "name": "name", "from": "body.name" },
+        { "name": "email", "from": "body.email" }
+      ]
+    }
+  },
+  "response": {
+    "id": { "from": "sources.customer.id", "format": "integer" },
+    "name": "sources.customer.name",
+    "email": "sources.customer.email",
+    "tier": "sources.customer.tier",
+    "loyaltyPoints": null,
+    "createdAt": { "from": "sources.customer.created_at", "format": "date-time" }
+  }
+}

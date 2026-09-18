@@ -1,0 +1,43 @@
+{
+  "cases": [
+    {
+      "name": "happy path — insertedItems depends on sources.order.id, so it only mocks/runs after order resolves",
+      "request": {
+        "body": { "customerId": 2, "items": [ { "sku": "WIDGET-S", "quantity": 3 }, { "sku": "GADGET-1", "quantity": 1 } ] }
+      },
+      "mocks": {
+        "order": {
+          "id": 4, "customer_id": 2, "customer_name": "Ben Carter", "status": "pending",
+          "subtotal": 79.47, "tax": 6.36, "total": 85.83, "currency": "USD", "placed_at": "2026-09-18T15:05:45Z"
+        },
+        "insertedItems": [
+          { "sku": "WIDGET-S", "name": "Small Widget", "quantity": 3, "unit_price": 9.99, "line_total": 29.97 },
+          { "sku": "GADGET-1", "name": "Gadget Mk1", "quantity": 1, "unit_price": 49.5, "line_total": 49.5 }
+        ]
+      },
+      "expect": {
+        "status": 201,
+        "body": {
+          "id": 4,
+          "status": "pending",
+          "paymentStatus": null,
+          "items": [
+            { "sku": "WIDGET-S", "quantity": 3, "inStock": null },
+            { "sku": "GADGET-1", "quantity": 1, "inStock": null }
+          ]
+        }
+      }
+    },
+    {
+      "name": "unknown customer or sku — create_order.sql's WHERE guard matches zero rows, both failure reasons collapse to 404",
+      "request": {
+        "body": { "customerId": 999, "items": [ { "sku": "WIDGET-S", "quantity": 1 } ] }
+      },
+      "mocks": {
+        "order": { "fail": "datasource.sql.not_found" },
+        "insertedItems": []
+      },
+      "expect": { "status": 404 }
+    }
+  ]
+}
