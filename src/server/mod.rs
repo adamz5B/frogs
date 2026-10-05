@@ -299,7 +299,18 @@ impl Metrics {
     fn record(&self, status: u16, elapsed: Duration) {
         self.total.fetch_add(1, Ordering::Relaxed);
         self.sum_millis.fetch_add(elapsed.as_millis() as u64, Ordering::Relaxed);
-        *self.status_counts.lock().unwrap().entry(status).or_insert(0) += 1;
+        *self
+            .status_counts
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                tracing::error!(
+                    mutex = "server::Metrics status_counts (record)",
+                    "recovered a poisoned mutex — a previous request panicked while holding it; metrics continue accumulating onto the recovered counts"
+                );
+                poisoned.into_inner()
+            })
+            .entry(status)
+            .or_insert(0) += 1;
 
         let elapsed_secs = elapsed.as_secs_f64();
         match LATENCY_BUCKETS_SECONDS.iter().position(|&bound| elapsed_secs <= bound) {
@@ -319,7 +330,19 @@ impl Metrics {
 
         out.push_str("# HELP http_requests_total Total HTTP requests handled, by status code.\n");
         out.push_str("# TYPE http_requests_total counter\n");
-        let mut statuses: Vec<(u16, u64)> = self.status_counts.lock().unwrap().iter().map(|(&s, &c)| (s, c)).collect();
+        let mut statuses: Vec<(u16, u64)> = self
+            .status_counts
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                tracing::error!(
+                    mutex = "server::Metrics status_counts (render)",
+                    "recovered a poisoned mutex — a previous request panicked while holding it; the scrape reports the recovered counts"
+                );
+                poisoned.into_inner()
+            })
+            .iter()
+            .map(|(&s, &c)| (s, c))
+            .collect();
         statuses.sort_unstable_by_key(|(status, _)| *status);
         for (status, count) in statuses {
             out.push_str(&format!("http_requests_total{{status=\"{status}\"}} {count}\n"));
@@ -448,7 +471,17 @@ impl RateLimiter {
     }
 
     fn try_acquire(&self) -> Result<(), RateLimitExceeded> {
-        let mut state = self.state.lock().unwrap();
+        // `into_inner` deliberately keeps whatever `tokens`/`last_refill` were
+        // in the bucket at poison time — resetting to full capacity here would
+        // hand every caller a fresh burst allowance, i.e. a fail-open rate
+        // limiter.
+        let mut state = self.state.lock().unwrap_or_else(|poisoned| {
+            tracing::error!(
+                mutex = "server::RateLimiter state",
+                "recovered a poisoned mutex — a previous request panicked while holding it; the existing token state is preserved, not refilled"
+            );
+            poisoned.into_inner()
+        });
 
         let now = Instant::now();
         let elapsed = now.duration_since(state.last_refill).as_secs_f64();
@@ -692,6 +725,43 @@ mod tests {
         assert!(rendered.contains("http_request_duration_seconds_bucket{le=\"10\"} 0"));
     }
 
+    /// Poisons `status_counts` (a previous request panicked mid-`record`),
+    /// then confirms both `record` and `render` recover via `into_inner()`
+    /// — preserving whatever counts were already there, rather than
+    /// panicking themselves or silently resetting to empty.
+    #[test]
+    fn metrics_record_and_render_recover_a_poisoned_status_counts_mutex_preserving_existing_counts() {
+        let metrics = Metrics::new();
+        metrics.record(200, Duration::from_millis(10));
+
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let _guard = metrics.status_counts.lock().unwrap();
+                panic!("deliberately poisoning the mutex for this test");
+            });
+            let _ = handle.join();
+        });
+        std::panic::set_hook(previous_hook);
+
+        assert!(metrics.status_counts.lock().is_err(), "sanity check: the mutex really is poisoned at this point");
+
+        // Must not panic, and must keep accumulating onto the recovered
+        // counts rather than starting over from empty.
+        metrics.record(404, Duration::from_millis(5));
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("http_requests_total{status=\"200\"} 1"),
+            "the count recorded before poisoning must survive recovery: {rendered}"
+        );
+        assert!(
+            rendered.contains("http_requests_total{status=\"404\"} 1"),
+            "a new count recorded after recovering from poisoning must still be tracked: {rendered}"
+        );
+    }
+
     #[tokio::test]
     async fn metrics_endpoint_reflects_requests_recorded_by_the_middleware() {
         let metrics = Arc::new(Metrics::new());
@@ -834,6 +904,41 @@ mod tests {
         assert!(limiter.try_acquire().is_ok());
         assert!(limiter.try_acquire().is_ok());
         assert!(limiter.try_acquire().is_err());
+    }
+
+    /// The fail-open bug this fix specifically guards against: a rate
+    /// limiter whose bucket was already exhausted before its mutex got
+    /// poisoned must stay exhausted after recovering — `into_inner()`
+    /// deliberately keeps whatever `tokens`/`last_refill` state was there,
+    /// rather than resetting to a fresh, full bucket (which would hand every
+    /// caller a brand-new burst allowance for free).
+    #[test]
+    fn a_poisoned_rate_limiter_recovers_without_refilling_an_exhausted_bucket() {
+        let limiter = RateLimiter::new(10, 3);
+        assert!(limiter.try_acquire().is_ok());
+        assert!(limiter.try_acquire().is_ok());
+        assert!(limiter.try_acquire().is_ok());
+        assert!(limiter.try_acquire().is_err(), "the bucket must already be exhausted before poisoning");
+
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let _guard = limiter.state.lock().unwrap();
+                panic!("deliberately poisoning the mutex for this test");
+            });
+            let _ = handle.join();
+        });
+        std::panic::set_hook(previous_hook);
+
+        assert!(limiter.state.lock().is_err(), "sanity check: the mutex really is poisoned at this point");
+
+        // Must not panic, and — the actual point of this test — must not
+        // have been handed a fresh, full bucket by the recovery path.
+        assert!(
+            limiter.try_acquire().is_err(),
+            "an already-exhausted bucket must still be exhausted immediately after recovering from a poisoned mutex, not refilled to full capacity"
+        );
     }
 
     #[tokio::test]

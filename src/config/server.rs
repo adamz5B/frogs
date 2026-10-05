@@ -1,3 +1,5 @@
+use std::num::NonZeroU64;
+
 use serde::{Deserialize, Serialize};
 
 fn default_true() -> bool {
@@ -19,6 +21,23 @@ fn default_requests_per_second() -> u32 {
 fn default_burst() -> u32 {
     40
 }
+
+/// Deliberately below both `sql::DEFAULT_POOL_ACQUIRE_TIMEOUT_SECS` (30s)
+/// and a nested-many source's `rowTimeoutMs` default (30s), so "our own
+/// configured call bound elapsed" and "the pool/row bound elapsed" are
+/// temporally distinguishable in logs instead of racing at the same value.
+fn default_source_call_timeout_ms() -> NonZeroU64 {
+    NonZeroU64::new(10_000).expect("10_000 is non-zero")
+}
+
+/// Hard ceiling on any resolved source-call timeout — a declared per-source
+/// `callTimeoutMs` above this is a validation problem (see
+/// `endpoint::validate_source_call_timeout`), while a `server.json`
+/// `sourceCallTimeoutMs` above it is clamped by
+/// `ServerConfig::effective_source_call_timeout_ms`. Shares
+/// `resolve::MAX_NESTED_MANY_ROW_TIMEOUT_MS`'s 5-minute value, independently
+/// stated: the two bound different mechanisms.
+pub const MAX_SOURCE_CALL_TIMEOUT_MS: u64 = 300_000;
 
 /// Token-bucket parameters for `features.rateLimiting` — a single shared
 /// bucket for the whole process (not one per client), a deliberate scope
@@ -279,6 +298,14 @@ pub struct ServerConfig {
     /// directory (relative to `project::api_base`) at `LogLevel::Info`.
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// The project-wide fallback bound on one ordinary (non-`allowNestedMany`)
+    /// source's real SQL `query()`/HTTP `execute()` call, in milliseconds —
+    /// a source's own `callTimeoutMs` wins when it sets one. Never read
+    /// directly when bounding a real call: go through
+    /// `effective_source_call_timeout_ms` below, which is what applies the
+    /// `MAX_SOURCE_CALL_TIMEOUT_MS` ceiling.
+    #[serde(default = "default_source_call_timeout_ms")]
+    pub source_call_timeout_ms: NonZeroU64,
     /// Not part of the original design doc (which never pins down a port) —
     /// a sensible default so `frogs run` has somewhere to bind.
     #[serde(default = "default_port")]
@@ -305,9 +332,30 @@ impl Default for ServerConfig {
             docs_ui: DocsUiConfig::default(),
             tls: TlsConfig::default(),
             logging: LoggingConfig::default(),
+            source_call_timeout_ms: default_source_call_timeout_ms(),
             port: 8080,
             api_root: String::new(),
         }
+    }
+}
+
+impl ServerConfig {
+    /// The one producer of a real source-call bound: `source_call_timeout_ms`
+    /// clamped to `MAX_SOURCE_CALL_TIMEOUT_MS`, warning once if the file
+    /// asked for more. Call this at startup/router-assembly time only (once
+    /// per process or test run — `commands::run::assemble_api_router` and
+    /// `commands::test::record` are its only call sites), never from the
+    /// request path: a misconfigured `server.json` would otherwise emit this
+    /// warning on every single request and drown out real signal.
+    pub fn effective_source_call_timeout_ms(&self) -> NonZeroU64 {
+        if self.source_call_timeout_ms.get() > MAX_SOURCE_CALL_TIMEOUT_MS {
+            tracing::warn!(
+                "server.json: sourceCallTimeoutMs {} exceeds the hard ceiling of {MAX_SOURCE_CALL_TIMEOUT_MS} — using {MAX_SOURCE_CALL_TIMEOUT_MS}",
+                self.source_call_timeout_ms.get()
+            );
+            return NonZeroU64::new(MAX_SOURCE_CALL_TIMEOUT_MS).expect("MAX_SOURCE_CALL_TIMEOUT_MS is non-zero");
+        }
+        self.source_call_timeout_ms
     }
 }
 
@@ -490,5 +538,45 @@ mod tests {
 
         assert_eq!(reloaded.api_root, "/api");
         assert_eq!(reloaded.port, 9090);
+    }
+
+    #[test]
+    fn source_call_timeout_ms_defaults_to_10_seconds_when_absent_from_the_file() {
+        let config: ServerConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.source_call_timeout_ms.get(), 10_000);
+    }
+
+    #[test]
+    fn source_call_timeout_ms_is_read_as_camel_case() {
+        let config: ServerConfig = serde_json::from_str(r#"{ "sourceCallTimeoutMs": 2500 }"#).unwrap();
+        assert_eq!(config.source_call_timeout_ms.get(), 2500);
+    }
+
+    #[test]
+    fn effective_source_call_timeout_ms_returns_the_default_10000_when_absent() {
+        let config = ServerConfig::default();
+        assert_eq!(config.effective_source_call_timeout_ms().get(), 10_000);
+    }
+
+    #[test]
+    fn effective_source_call_timeout_ms_passes_through_an_under_ceiling_configured_value_unchanged() {
+        let config: ServerConfig = serde_json::from_str(r#"{ "sourceCallTimeoutMs": 60000 }"#).unwrap();
+        assert_eq!(config.effective_source_call_timeout_ms().get(), 60_000);
+    }
+
+    #[test]
+    fn effective_source_call_timeout_ms_clamps_an_over_ceiling_configured_value_down_to_the_ceiling() {
+        let config: ServerConfig = serde_json::from_str(r#"{ "sourceCallTimeoutMs": 999999 }"#).unwrap();
+        assert_eq!(
+            config.effective_source_call_timeout_ms().get(),
+            MAX_SOURCE_CALL_TIMEOUT_MS,
+            "an over-ceiling configured value must be clamped down to MAX_SOURCE_CALL_TIMEOUT_MS, not passed through or defaulted"
+        );
+    }
+
+    #[test]
+    fn effective_source_call_timeout_ms_treats_a_value_exactly_at_the_ceiling_as_not_over_it() {
+        let config: ServerConfig = serde_json::from_str(&format!(r#"{{ "sourceCallTimeoutMs": {MAX_SOURCE_CALL_TIMEOUT_MS} }}"#)).unwrap();
+        assert_eq!(config.effective_source_call_timeout_ms().get(), MAX_SOURCE_CALL_TIMEOUT_MS);
     }
 }

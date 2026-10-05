@@ -361,6 +361,7 @@ pub(crate) async fn assemble_api_router(
         debug_mode,
         openapi_document.as_deref(),
         mock_provider,
+        config.server.effective_source_call_timeout_ms(),
     );
     let mut router = crate::server::router().merge(endpoint_router);
 

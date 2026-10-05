@@ -282,6 +282,7 @@ pub async fn record(cwd: &Path, path: &str, method: &str) -> io::Result<()> {
         &query_params,
         &Value::Null,
         "frogs-test-record",
+        config.server.effective_source_call_timeout_ms(),
     )
     .await
     {

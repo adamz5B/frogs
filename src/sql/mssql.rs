@@ -150,36 +150,35 @@ fn classify_query_error(e: tiberius::error::Error) -> SqlError {
 /// branch dropped entirely: T-SQL has no such operator (casts go through
 /// `CAST`/`CONVERT`), so there's nothing here for it to misread.
 fn translate_named_params(script: &str) -> (String, Vec<String>) {
-    let bytes = script.as_bytes();
     let mut output = String::with_capacity(script.len());
     let mut order: Vec<String> = Vec::new();
-    let mut i = 0;
+    let mut chars = script.char_indices().peekable();
 
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-
-        if c == ':' && i + 1 < bytes.len() && (bytes[i + 1] as char == '_' || (bytes[i + 1] as char).is_alphabetic()) {
-            let start = i + 1;
-            let mut end = start;
-            while end < bytes.len() && ((bytes[end] as char == '_') || (bytes[end] as char).is_alphanumeric()) {
-                end += 1;
-            }
-            let name = &script[start..end];
-            let position = match order.iter().position(|n| n == name) {
-                Some(pos) => pos + 1,
-                None => {
-                    order.push(name.to_string());
-                    order.len()
+    while let Some((i, c)) = chars.next() {
+        if c == ':' {
+            // No `::` lookahead, deliberately — see this function's doc
+            // comment. `i` is the colon, which is ASCII, so `i + 1` is always
+            // a character boundary. The scan itself never advances by raw
+            // index: the only way forward is `chars.next()`, so no index
+            // arithmetic can stall the loop or land mid-character.
+            if let Some((name, end)) = super::ascii_param_name_at(script, i + 1) {
+                let position = match order.iter().position(|n| n == name) {
+                    Some(pos) => pos + 1,
+                    None => {
+                        order.push(name.to_string());
+                        order.len()
+                    }
+                };
+                output.push_str("@P");
+                output.push_str(&position.to_string());
+                while chars.peek().is_some_and(|&(j, _)| j < end) {
+                    chars.next();
                 }
-            };
-            output.push_str("@P");
-            output.push_str(&position.to_string());
-            i = end;
-            continue;
+                continue;
+            }
         }
 
         output.push(c);
-        i += 1;
     }
 
     (output, order)
@@ -270,6 +269,77 @@ mod tests {
         let (sql, order) = translate_named_params("SELECT * FROM hosts WHERE ip = '::1' AND id = :id");
         assert_eq!(sql, "SELECT * FROM hosts WHERE ip = '::1' AND id = @P1");
         assert_eq!(order, vec!["id"]);
+    }
+
+    /// Runs a synchronous, potentially-hanging call on its own thread with a
+    /// hard deadline — a infinite-loop regression in `translate_named_params`
+    /// (the single worst-case outcome called out for this fix) must fail
+    /// this test loudly rather than hang the whole `cargo test` run forever.
+    fn run_with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("translate_named_params did not return within 2s — likely an infinite-loop regression in the char-advance logic")
+    }
+
+    /// Previously panicked: a byte-wise scan that reinterpreted the lead
+    /// byte of 'é' as alphabetic could stop mid-character and slice at a
+    /// non-char-boundary.
+    #[test]
+    fn a_colon_immediately_followed_by_a_multibyte_character_does_not_panic_or_hang() {
+        let (sql, order) = run_with_timeout(|| translate_named_params("SELECT 1 -- :é"));
+        assert_eq!(
+            sql, "SELECT 1 -- :é",
+            "no identifier starts right after the colon, so the text passes through unchanged"
+        );
+        assert!(order.is_empty());
+    }
+
+    /// Previously panicked for the same reason — the "real placeholder
+    /// immediately followed by non-ASCII" shape (`:idé`).
+    #[test]
+    fn a_placeholder_name_truncated_by_a_trailing_non_ascii_character_binds_only_its_ascii_prefix() {
+        let (sql, order) = run_with_timeout(|| translate_named_params("SELECT :idé FROM t"));
+        assert_eq!(sql, "SELECT @P1é FROM t");
+        assert_eq!(order, vec!["id"]);
+    }
+
+    /// Previously corrupted: non-ASCII passthrough text was being
+    /// re-encoded as Latin-1 (`'José'` became `'JosÃ©'` in the SQL actually
+    /// sent). Run under the same watchdog as the "doesn't hang" case above —
+    /// this is the "ordinary passthrough text, must return promptly" case.
+    #[test]
+    fn non_ascii_passthrough_text_round_trips_byte_identically_not_latin1_corrupted() {
+        let (sql, order) = run_with_timeout(|| translate_named_params("SELECT 'José' AS n WHERE x = :x"));
+        assert_eq!(sql, "SELECT 'José' AS n WHERE x = @P1");
+        assert_eq!(order, vec!["x"]);
+    }
+
+    /// Pins the mssql-specific `::` direction explicitly, the opposite of
+    /// every other driver: T-SQL has no `::` cast operator, so the *second*
+    /// colon in `"::name"` genuinely starts a real placeholder — the first
+    /// colon has no identifier right after it (another colon isn't
+    /// ASCII-alphabetic/`_`) and passes through literally.
+    #[test]
+    fn a_double_colon_prefix_is_a_real_placeholder_here_not_a_cast_marker() {
+        let (sql, order) = translate_named_params("::name");
+        assert_eq!(
+            sql, ":@P1",
+            "the first colon passes through literally; the second one starts the real `name` placeholder"
+        );
+        assert_eq!(order, vec!["name"]);
+    }
+
+    /// Same point as above, in a more realistic shape: `id::text` isn't a
+    /// cast in T-SQL at all, so `:text` right after the first colon is read
+    /// as a genuine second placeholder, distinct from `:a`.
+    #[test]
+    fn a_postgres_style_cast_looking_expression_is_actually_two_real_placeholders_on_mssql() {
+        let (sql, order) = translate_named_params("SELECT id::text FROM t WHERE a = :a");
+        assert_eq!(sql, "SELECT id:@P1 FROM t WHERE a = @P2");
+        assert_eq!(order, vec!["text", "a"]);
     }
 
     fn config_with(settings: &[(&str, serde_json::Value)]) -> ConnectionConfig {

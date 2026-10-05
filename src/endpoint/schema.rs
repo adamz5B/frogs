@@ -168,6 +168,14 @@ pub enum SourceDef {
         /// time. Only meaningful alongside `allow_nested_many: true`.
         #[serde(rename = "rowTimeoutMs")]
         row_timeout_ms: Option<NonZeroU64>,
+        /// Bounds this source's one real `query()` call when it resolves the
+        /// ordinary (non-fan-out) way — `None` falls back to
+        /// `server.json`'s `sourceCallTimeoutMs`. Mutually exclusive with
+        /// `allow_nested_many: true` (whose per-row calls are bounded by
+        /// `row_timeout_ms` instead); that exclusivity is enforced by
+        /// `validate_source_call_timeout` in `endpoint::mod`, not here.
+        #[serde(rename = "callTimeoutMs")]
+        call_timeout_ms: Option<NonZeroU64>,
     },
     Http {
         /// The `datasources/http/<request>.json` file this source executes.
@@ -188,6 +196,11 @@ pub enum SourceDef {
         max_rows: Option<NonZeroUsize>,
         #[serde(rename = "rowTimeoutMs")]
         row_timeout_ms: Option<NonZeroU64>,
+        /// Bounds this source's one real `http::execute` call when it
+        /// resolves the ordinary (non-fan-out) way — see the `Sql` variant's
+        /// own `call_timeout_ms` doc comment.
+        #[serde(rename = "callTimeoutMs")]
+        call_timeout_ms: Option<NonZeroU64>,
     },
 }
 

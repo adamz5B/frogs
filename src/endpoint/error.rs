@@ -34,6 +34,17 @@ pub enum SourceErrorCause {
     NestedManyRowTimedOut {
         after_ms: u64,
     },
+    /// An ordinary source's real SQL `query()` call didn't complete within
+    /// its resolved `callTimeoutMs`/`sourceCallTimeoutMs` bound — see
+    /// `docs/frogs-source-call-timeout.md`.
+    SqlCallTimedOut {
+        after_ms: u64,
+    },
+    /// An ordinary source's real HTTP `execute()` call didn't complete
+    /// within its resolved `callTimeoutMs`/`sourceCallTimeoutMs` bound.
+    HttpCallTimedOut {
+        after_ms: u64,
+    },
 }
 
 impl SourceErrorCause {
@@ -55,6 +66,13 @@ impl SourceErrorCause {
             SourceErrorCause::Mocked(code) => code,
             SourceErrorCause::NestedManyRowLimitExceeded { .. } => "datasource.nested_many.row_limit_exceeded",
             SourceErrorCause::NestedManyRowTimedOut { .. } => "datasource.nested_many.row_timed_out",
+            SourceErrorCause::SqlCallTimedOut { .. } => "datasource.sql.timeout",
+            // Deliberately *not* the existing `datasource.http.timeout`,
+            // which stays reserved for `HttpError::Request(_)`'s "upstream
+            // was slow or unreachable" family — keeping "the upstream was
+            // slow" separately triageable from "our own configured bound
+            // elapsed".
+            SourceErrorCause::HttpCallTimedOut { .. } => "datasource.http.call_timeout",
         }
     }
 
@@ -74,6 +92,8 @@ impl SourceErrorCause {
             SourceErrorCause::NestedManyRowTimedOut { after_ms } => {
                 format!("nested fan-out row call did not complete within {after_ms}ms")
             }
+            SourceErrorCause::SqlCallTimedOut { after_ms } => format!("SQL query did not complete within {after_ms}ms"),
+            SourceErrorCause::HttpCallTimedOut { after_ms } => format!("HTTP request did not complete within {after_ms}ms"),
         }
     }
 }

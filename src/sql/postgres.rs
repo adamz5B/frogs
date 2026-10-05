@@ -17,6 +17,7 @@ impl PostgresDriver {
         let url = build_connection_url(config)?;
         let pool = PgPoolOptions::new()
             .max_connections(super::DEFAULT_POOL_MAX_CONNECTIONS)
+            .acquire_timeout(std::time::Duration::from_secs(super::DEFAULT_POOL_ACQUIRE_TIMEOUT_SECS))
             .connect(&url)
             .await
             .map_err(|e| SqlError::ConnectionFailed(e.to_string()))?;
@@ -123,42 +124,39 @@ fn build_connection_url(config: &ConnectionConfig) -> Result<String, SqlError> {
 /// files are trusted, hand-authored config, not untrusted input, so that's
 /// an intentional scope limit rather than an oversight.
 fn translate_named_params(script: &str) -> (String, Vec<String>) {
-    let bytes = script.as_bytes();
     let mut output = String::with_capacity(script.len());
     let mut order: Vec<String> = Vec::new();
-    let mut i = 0;
+    let mut chars = script.char_indices().peekable();
 
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-
-        if c == ':' && i + 1 < bytes.len() && bytes[i + 1] as char == ':' {
-            output.push_str("::");
-            i += 2;
-            continue;
-        }
-
-        if c == ':' && i + 1 < bytes.len() && (bytes[i + 1] as char == '_' || (bytes[i + 1] as char).is_alphabetic()) {
-            let start = i + 1;
-            let mut end = start;
-            while end < bytes.len() && ((bytes[end] as char == '_') || (bytes[end] as char).is_alphanumeric()) {
-                end += 1;
+    while let Some((i, c)) = chars.next() {
+        if c == ':' {
+            if chars.peek().map(|&(_, next)| next) == Some(':') {
+                chars.next();
+                output.push_str("::");
+                continue;
             }
-            let name = &script[start..end];
-            let position = match order.iter().position(|n| n == name) {
-                Some(pos) => pos + 1,
-                None => {
-                    order.push(name.to_string());
-                    order.len()
+            // `i` is the colon, which is ASCII, so `i + 1` is always a
+            // character boundary. The scan itself never advances by raw index:
+            // the only way forward is `chars.next()`, so no index arithmetic
+            // can stall the loop or land mid-character.
+            if let Some((name, end)) = super::ascii_param_name_at(script, i + 1) {
+                let position = match order.iter().position(|n| n == name) {
+                    Some(pos) => pos + 1,
+                    None => {
+                        order.push(name.to_string());
+                        order.len()
+                    }
+                };
+                output.push('$');
+                output.push_str(&position.to_string());
+                while chars.peek().is_some_and(|&(j, _)| j < end) {
+                    chars.next();
                 }
-            };
-            output.push('$');
-            output.push_str(&position.to_string());
-            i = end;
-            continue;
+                continue;
+            }
         }
 
         output.push(c);
-        i += 1;
     }
 
     (output, order)
@@ -217,6 +215,68 @@ mod tests {
         let (sql, order) = translate_named_params("SELECT amount::numeric FROM pricing WHERE id = :id");
         assert_eq!(sql, "SELECT amount::numeric FROM pricing WHERE id = $1");
         assert_eq!(order, vec!["id"]);
+    }
+
+    /// Runs a synchronous, potentially-hanging call on its own thread with a
+    /// hard deadline — a infinite-loop regression in `translate_named_params`
+    /// (the single worst-case outcome called out for this fix) must fail
+    /// this test loudly rather than hang the whole `cargo test` run forever.
+    fn run_with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("translate_named_params did not return within 2s — likely an infinite-loop regression in the char-advance logic")
+    }
+
+    /// Previously panicked: a byte-wise scan that reinterpreted the lead
+    /// byte of 'é' as alphabetic could stop mid-character and slice at a
+    /// non-char-boundary. Run under a watchdog since the specifically
+    /// called-out worst-case regression here is an infinite loop, not just
+    /// a panic.
+    #[test]
+    fn a_colon_immediately_followed_by_a_multibyte_character_does_not_panic_or_hang() {
+        let (sql, order) = run_with_timeout(|| translate_named_params("SELECT 1 -- :é"));
+        assert_eq!(
+            sql, "SELECT 1 -- :é",
+            "no identifier starts right after the colon, so the text passes through unchanged"
+        );
+        assert!(order.is_empty());
+    }
+
+    /// Previously panicked for the same reason as the comment case above —
+    /// this is the "real placeholder immediately followed by non-ASCII"
+    /// shape (`:idé`), not just a bare colon in prose.
+    #[test]
+    fn a_placeholder_name_truncated_by_a_trailing_non_ascii_character_binds_only_its_ascii_prefix() {
+        let (sql, order) = run_with_timeout(|| translate_named_params("SELECT :idé FROM t"));
+        assert_eq!(sql, "SELECT $1é FROM t");
+        assert_eq!(order, vec!["id"]);
+    }
+
+    /// Previously corrupted: non-ASCII passthrough text was being
+    /// re-encoded as Latin-1 (`'José'` became `'JosÃ©'` in the SQL actually
+    /// sent). `char_indices`/`String::push(char)` can't reproduce that bug —
+    /// pinned here as a regression test, run under the same watchdog since
+    /// this is exactly the "ordinary passthrough text, must return promptly"
+    /// case called out for this fix.
+    #[test]
+    fn non_ascii_passthrough_text_round_trips_byte_identically_not_latin1_corrupted() {
+        let (sql, order) = run_with_timeout(|| translate_named_params("SELECT 'José' AS n WHERE x = :x"));
+        assert_eq!(sql, "SELECT 'José' AS n WHERE x = $1");
+        assert_eq!(order, vec!["x"]);
+    }
+
+    /// Pins the `::`-is-a-cast-operator direction explicitly: a `::name`
+    /// with nothing before the first colon is still read as a (two-colon)
+    /// cast marker followed by literal text, not a placeholder named `name`
+    /// — empty order, not `["name"]`.
+    #[test]
+    fn a_double_colon_prefix_is_a_cast_marker_not_a_placeholder() {
+        let (sql, order) = translate_named_params("::name");
+        assert_eq!(sql, "::name");
+        assert!(order.is_empty());
     }
 
     fn config_with(settings: &[(&str, serde_json::Value)]) -> ConnectionConfig {
@@ -400,5 +460,40 @@ mod tests {
         assert!(matches!(err, SqlError::ConstraintViolation(_)), "expected ConstraintViolation, got {err:?}");
 
         sqlx::query("DROP TABLE frogs_constraint_test").execute(&driver.pool).await.unwrap();
+    }
+
+    /// The point of `DEFAULT_POOL_ACQUIRE_TIMEOUT_SECS` existing at all
+    /// (see `docs/frogs-source-call-timeout.md`): wrapping a real query in
+    /// `tokio::time::timeout` and letting it elapse must not poison the
+    /// shared connection pool out from under every other caller. A
+    /// `pg_sleep(2)` call, bounded by a much shorter `tokio::time::timeout`
+    /// (the same wrapper `endpoint::resolve::run_sql_source` applies around
+    /// an ordinary source's real call), is left to keep running on its own
+    /// connection after we stop awaiting it — an immediately following
+    /// ordinary `SELECT 1` on the very same driver/pool must still succeed,
+    /// proving the pool handed back a healthy connection rather than one
+    /// stuck mid-query or otherwise wedged.
+    #[tokio::test]
+    #[ignore]
+    async fn a_timed_out_query_does_not_poison_the_shared_connection_pool() {
+        let url = std::env::var("DATABASE_URL_TEST").expect("set DATABASE_URL_TEST to a reachable Postgres connection string to run this test");
+        let pool = sqlx::PgPool::connect(&url).await.expect("failed to connect");
+        let driver = PostgresDriver { pool };
+
+        let empty_params = HashMap::new();
+        let slow_query = driver.query("SELECT pg_sleep(2)", &empty_params);
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(100), slow_query).await;
+        assert!(outcome.is_err(), "the 2-second pg_sleep must not complete within the 100ms bound");
+
+        // The same driver, same pool, immediately afterwards — if the timed-
+        // out call above left the pool in a bad state (e.g. a connection
+        // that's still mid-query and never returned), this would hang or
+        // fail instead of returning promptly.
+        let rows = driver
+            .query("SELECT 1 AS one", &empty_params)
+            .await
+            .expect("an ordinary query on the same pool must still succeed after a prior call timed out");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("one"), Some(&SqlValue::Int(1)));
     }
 }

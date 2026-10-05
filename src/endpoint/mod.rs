@@ -7,6 +7,7 @@ mod resolve;
 mod schema;
 
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -82,6 +83,12 @@ struct RouteState {
     /// fresh copy per route) — only ever consulted when `operation` above
     /// is `Some`, for resolving a request body schema's `$ref`s.
     component_schemas: Arc<Map<String, Value>>,
+    /// The project-wide fallback bound on one ordinary source's real call,
+    /// already clamped at router-assembly time via
+    /// `ServerConfig::effective_source_call_timeout_ms` — a source's own
+    /// `callTimeoutMs` overrides it per source (see
+    /// `resolve::resolve_sources`).
+    source_call_timeout_ms: NonZeroU64,
     /// `Some` only under `frogs test` — every request on this route then
     /// resolves from the provider's mocks instead of real infrastructure
     /// (see `mock::MockProvider`). `frogs run` always passes `None`, so its
@@ -114,6 +121,11 @@ pub fn build_router(
     // rather than failing every route registration over it).
     openapi_document: Option<&crate::openapi::OpenApiDocument>,
     mock_provider: Option<Arc<dyn MockProvider>>,
+    // Already-resolved and already-clamped — the caller
+    // (`commands::run::assemble_api_router`) passes
+    // `config.server.effective_source_call_timeout_ms()`, which is where the
+    // `MAX_SOURCE_CALL_TIMEOUT_MS` ceiling and its one-time warning live.
+    source_call_timeout_ms: NonZeroU64,
 ) -> Router {
     let sql_root = project_root.join("datasources/sql");
     let http_root = project_root.join("datasources/http");
@@ -157,9 +169,10 @@ pub fn build_router(
             continue;
         }
 
-        let nested_many_problems = validate_nested_many(&endpoint, connections);
-        if !nested_many_problems.is_empty() {
-            for problem in &nested_many_problems {
+        let mut source_problems = validate_nested_many(&endpoint, connections);
+        source_problems.extend(validate_source_call_timeout(&endpoint));
+        if !source_problems.is_empty() {
+            for problem in &source_problems {
                 tracing::warn!("skipping {}: {problem}", file_path.display());
             }
             continue;
@@ -203,6 +216,7 @@ pub fn build_router(
             debug_mode,
             operation: operation.cloned(),
             component_schemas: component_schemas.clone(),
+            source_call_timeout_ms,
             mock_provider: mock_provider.clone(),
         });
         // Read back out before `state` moves into `.with_state` below —
@@ -271,6 +285,9 @@ pub(crate) fn validate_endpoint_files(endpoints_root: &Path, security: &Security
             ));
         }
         for problem in validate_nested_many(&endpoint, connections) {
+            problems.push(format!("{}: {problem}", file_path.display()));
+        }
+        for problem in validate_source_call_timeout(&endpoint) {
             problems.push(format!("{}: {problem}", file_path.display()));
         }
     }
@@ -423,6 +440,51 @@ fn validate_nested_many(endpoint: &EndpointFile, connections: &HashMap<String, C
     problems
 }
 
+/// Rejects a per-source `callTimeoutMs` misconfiguration before it can ever
+/// run — same two callers and same fail-closed "skip the route" posture as
+/// `validate_nested_many`. No pool-capacity-relative ceiling here, unlike
+/// nested-many's `maxConcurrency`: bounding a *single* call's duration
+/// doesn't create the same concurrency-vs-pool-size pressure.
+/// `server.json`'s own `sourceCallTimeoutMs` isn't checked here at all —
+/// `ServerConfig::effective_source_call_timeout_ms` clamps it (and
+/// `commands::validate` reports it), rather than a startup refusal.
+fn validate_source_call_timeout(endpoint: &EndpointFile) -> Vec<String> {
+    let mut problems = Vec::new();
+
+    for (name, source) in &endpoint.sources {
+        let (allow_nested_many, call_timeout_ms) = match source {
+            SourceDef::Sql {
+                allow_nested_many,
+                call_timeout_ms,
+                ..
+            }
+            | SourceDef::Http {
+                allow_nested_many,
+                call_timeout_ms,
+                ..
+            } => (*allow_nested_many, *call_timeout_ms),
+        };
+
+        let Some(call_timeout_ms) = call_timeout_ms else { continue };
+
+        if call_timeout_ms.get() > crate::config::MAX_SOURCE_CALL_TIMEOUT_MS {
+            problems.push(format!(
+                "source '{name}': callTimeoutMs {} exceeds the hard ceiling of {}",
+                call_timeout_ms.get(),
+                crate::config::MAX_SOURCE_CALL_TIMEOUT_MS
+            ));
+        }
+        if allow_nested_many {
+            problems.push(format!(
+                "source '{name}' declares both allowNestedMany and callTimeoutMs — callTimeoutMs only bounds an ordinary single call; \
+                 use rowTimeoutMs to bound this source's per-row fan-out calls instead"
+            ));
+        }
+    }
+
+    problems
+}
+
 async fn handle_request(
     State(state): State<Arc<RouteState>>,
     AxumPath(path_params): AxumPath<HashMap<String, String>>,
@@ -475,6 +537,7 @@ async fn handle_request(
                 &HashMap::new(),
                 state.operation.as_ref(),
                 &state.component_schemas,
+                state.source_call_timeout_ms,
             )
             .await
         }
@@ -559,6 +622,7 @@ async fn handle_mocked(
                 &mocks,
                 state.operation.as_ref(),
                 &state.component_schemas,
+                state.source_call_timeout_ms,
             )
             .await;
             // The generic "mocked failure: <code>" detail `resolve_request`
@@ -636,6 +700,10 @@ pub(crate) async fn resolve_request(
     // concern; this one isn't).
     operation: Option<&Operation>,
     component_schemas: &Map<String, Value>,
+    // The project-wide source-call bound, already resolved and clamped by
+    // the caller — threaded into both ordinary source resolution and the
+    // security verifier (which has no per-verifier override of its own).
+    source_call_timeout_ms: NonZeroU64,
 ) -> (u16, Value) {
     // A still-`_generated: true` stub is refused *before* anything else
     // runs — including the security check below. It isn't really "this
@@ -690,9 +758,19 @@ pub(crate) async fn resolve_request(
                 }
             }
             Some(MockOutcome::Fail(code)) => Err((code.clone(), format!("mocked failure: {code}"))),
-            None => crate::security::verify(scheme, verifier, drivers, sql_root, http_root, http_client, headers, verifier_cache)
-                .await
-                .map_err(|cause| (cause.code().to_string(), cause.message())),
+            None => crate::security::verify(
+                scheme,
+                verifier,
+                drivers,
+                sql_root,
+                http_root,
+                http_client,
+                headers,
+                verifier_cache,
+                source_call_timeout_ms,
+            )
+            .await
+            .map_err(|cause| (cause.code().to_string(), cause.message())),
         };
 
         if let Err((code, message)) = verify_result {
@@ -742,6 +820,7 @@ pub(crate) async fn resolve_request(
         transaction_id,
         mocks,
         headers,
+        source_call_timeout_ms,
     )
     .await
     {
@@ -803,6 +882,7 @@ pub(crate) async fn record_sources(
     query_params: &HashMap<String, String>,
     body: &Value,
     transaction_id: &str,
+    source_call_timeout_ms: NonZeroU64,
 ) -> Result<(u16, Value, HashMap<String, Option<Value>>), (String, String, String)> {
     match resolve::resolve_sources(
         endpoint,
@@ -821,6 +901,7 @@ pub(crate) async fn record_sources(
         // `header.*` parameter resolves to null during recording, same as
         // any other value that isn't available yet.
         &HeaderMap::new(),
+        source_call_timeout_ms,
     )
     .await
     {
@@ -872,7 +953,21 @@ fn error_envelope(
     let fallback_definition = errors.lookup(code);
     let (tiered_http_status, tiered_expose_detail) = match errors.get(code) {
         Some(definition) => (definition.http_status, definition.expose_detail),
-        None => match discovered_errors.lock().unwrap().lookup(code) {
+        // This guard MUST stay a statement-scoped temporary: `std::sync::Mutex`
+        // is non-reentrant, and `record_discovered_error` below locks this same
+        // mutex — hoisting this to a `let guard = ...` deadlocks the request
+        // thread forever.
+        None => match discovered_errors
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                tracing::error!(
+                    mutex = "endpoint::error_envelope discovered_errors",
+                    "recovered a poisoned mutex — a previous request panicked while holding it; error classification continues with the recovered state"
+                );
+                poisoned.into_inner()
+            })
+            .lookup(code)
+        {
             Some(entry) => (entry.http_status, entry.expose_detail),
             None => (fallback_definition.http_status, fallback_definition.expose_detail),
         },
@@ -909,7 +1004,13 @@ fn error_envelope(
 /// which only ever runs against a development-time trickle of unclassified
 /// errors, never production request volume.
 fn record_discovered_error(discovered_errors: &Mutex<DiscoveredErrors>, path: &Path, code: &str, definition: &crate::errors::ErrorDefinition, message: &str) {
-    let mut discovered = discovered_errors.lock().unwrap();
+    let mut discovered = discovered_errors.lock().unwrap_or_else(|poisoned| {
+        tracing::error!(
+            mutex = "endpoint::record_discovered_error discovered_errors",
+            "recovered a poisoned mutex — a previous request panicked while holding it; error discovery continues with the recovered state"
+        );
+        poisoned.into_inner()
+    });
     discovered.record(code, definition.http_status, definition.expose_detail, message);
     if let Err(e) = discovered.save(path) {
         tracing::warn!("failed to save {}: {e}", path.display());
@@ -1005,6 +1106,13 @@ fn url_path_for(root: &Path, file_path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A generous bound for every test that isn't itself about the source-
+    /// call timeout — what `ServerConfig::effective_source_call_timeout_ms`
+    /// would hand `build_router`/`resolve_request` in production.
+    fn test_call_timeout() -> NonZeroU64 {
+        NonZeroU64::new(5_000).unwrap()
+    }
 
     #[test]
     fn converts_openapi_style_path_params_to_axum_syntax() {
@@ -1171,6 +1279,7 @@ mod tests {
             debug_mode: true,
             operation: None,
             component_schemas: Arc::new(Map::new()),
+            source_call_timeout_ms: test_call_timeout(),
             mock_provider: None,
         });
 
@@ -1230,6 +1339,7 @@ mod tests {
             false,
             None,
             None,
+            test_call_timeout(),
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1293,6 +1403,7 @@ mod tests {
             false,
             None,
             None,
+            test_call_timeout(),
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1383,6 +1494,7 @@ mod tests {
             false,
             None,
             None,
+            test_call_timeout(),
         );
         let router = crate::server::apply_middleware(router);
 
@@ -1490,6 +1602,110 @@ mod tests {
         assert_eq!(locked.lookup("datasource.sql.not_found").unwrap().occurrences, 2);
 
         drop(locked);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The single most important regression this fix touches: `error_envelope`
+    /// locks `discovered_errors` once, and `record_discovered_error` (called
+    /// from inside it, only when `debugMode` is on and `code` is
+    /// unclassified) locks the very same `Mutex` again a few lines later.
+    /// `std::sync::Mutex` is non-reentrant, so if the first lock's guard were
+    /// ever hoisted into a `let` spanning both lock sites instead of staying
+    /// a statement-scoped temporary, this would deadlock the calling thread
+    /// forever. Run on its own thread with a hard deadline so a regression
+    /// here fails this test loudly instead of hanging the whole `cargo test`
+    /// run silently.
+    #[test]
+    fn error_envelope_does_not_self_deadlock_when_recording_a_discovered_error() {
+        let discovered = Arc::new(Mutex::new(DiscoveredErrors::default()));
+        let path = temp_discovered_errors_path();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let discovered_for_thread = discovered.clone();
+        let path_for_thread = path.clone();
+        std::thread::spawn(move || {
+            let errors = ErrorRegistry::load(Path::new("/does/not/exist")).unwrap();
+            let result = error_envelope(
+                &errors,
+                &discovered_for_thread,
+                &path_for_thread,
+                true,
+                "datasource.sql.not_found",
+                "no rows",
+                None,
+                &HashMap::new(),
+            );
+            let _ = tx.send(result);
+        });
+
+        let (status, body) = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("error_envelope hung — the discovered_errors mutex guard was likely hoisted across both lock sites, self-deadlocking the thread");
+
+        assert_eq!(status, 500, "unexpected.error's fallback status, since this code has no canonical registry entry");
+        assert_eq!(body["name"], "datasource.sql.not_found");
+        assert_eq!(
+            discovered.lock().unwrap().len(),
+            1,
+            "record_discovered_error must actually have run, not just returned promptly"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Same canary, but with `discovered_errors` already poisoned before
+    /// this call — a previous (simulated) request panicked while holding
+    /// the lock. Confirms the request path recovers via
+    /// `poisoned.into_inner()` at *both* lock sites rather than deadlocking
+    /// or panicking again. The panic hook is swapped to a no-op only for the
+    /// duration of the deliberate poisoning so the expected panic doesn't
+    /// spam this test run's own stderr, then restored unconditionally.
+    #[test]
+    fn error_envelope_recovers_a_poisoned_discovered_errors_mutex_without_hanging() {
+        let discovered = Arc::new(Mutex::new(DiscoveredErrors::default()));
+        let path = temp_discovered_errors_path();
+
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poison_target = discovered.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = poison_target.lock().unwrap();
+            panic!("deliberately poisoning the mutex for this test");
+        });
+        let _ = handle.join();
+        std::panic::set_hook(previous_hook);
+        assert!(discovered.lock().is_err(), "sanity check: the mutex really is poisoned at this point");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let discovered_for_thread = discovered.clone();
+        let path_for_thread = path.clone();
+        std::thread::spawn(move || {
+            let errors = ErrorRegistry::load(Path::new("/does/not/exist")).unwrap();
+            let result = error_envelope(
+                &errors,
+                &discovered_for_thread,
+                &path_for_thread,
+                true,
+                "datasource.sql.not_found",
+                "no rows",
+                None,
+                &HashMap::new(),
+            );
+            let _ = tx.send(result);
+        });
+
+        let (status, body) = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("error_envelope hung against an already-poisoned mutex — recovery via into_inner() at one of the two lock sites likely regressed");
+
+        assert_eq!(status, 500, "the same prompt, correct envelope must come back even after recovering from poisoning");
+        assert_eq!(body["name"], "datasource.sql.not_found");
+        assert_eq!(
+            discovered.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len(),
+            1,
+            "the discovery write must still have gone through despite the recovered poisoned state"
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1783,6 +1999,7 @@ mod tests {
             true,
             None,
             None,
+            test_call_timeout(),
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1888,6 +2105,7 @@ mod tests {
             &HashMap::new(),
             None,
             &Map::new(),
+            test_call_timeout(),
         )
         .await;
 
@@ -1962,6 +2180,7 @@ mod tests {
             &HashMap::new(),
             None,
             &Map::new(),
+            test_call_timeout(),
         )
         .await;
 
@@ -2002,6 +2221,7 @@ mod tests {
             &HashMap::new(),
             None,
             &Map::new(),
+            test_call_timeout(),
         )
         .await;
 
@@ -2045,6 +2265,7 @@ mod tests {
             &HashMap::new(),
             None,
             &Map::new(),
+            test_call_timeout(),
         )
         .await;
 
@@ -2082,6 +2303,7 @@ mod tests {
             false,
             None,
             None,
+            test_call_timeout(),
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2161,6 +2383,7 @@ mod tests {
             &HashMap::new(),
             None,
             &Map::new(),
+            test_call_timeout(),
         )
         .await;
 
@@ -2278,6 +2501,7 @@ mod tests {
             &HashMap::new(),
             None,
             &Map::new(),
+            test_call_timeout(),
         )
         .await;
 
@@ -2376,6 +2600,7 @@ mod tests {
                 &HashMap::new(),
                 operation,
                 &component_schemas,
+                test_call_timeout(),
             )
             .await;
             let _ = std::fs::remove_dir_all(&root);
@@ -2900,6 +3125,95 @@ mod tests {
         }
     }
 
+    // ---- `validate_source_call_timeout` ----
+
+    mod validate_source_call_timeout_tests {
+        use super::*;
+
+        fn endpoint_with_source(source_json: &str) -> EndpointFile {
+            let json = format!(
+                r#"{{
+                    "operationId": "test",
+                    "sources": {{ "car": {source_json} }},
+                    "response": {{}}
+                }}"#
+            );
+            serde_json::from_str(&json).unwrap()
+        }
+
+        #[test]
+        fn accepts_an_ordinary_source_with_no_call_timeout_ms_at_all() {
+            let endpoint = endpoint_with_source(r#"{ "type": "sql", "connection": "db", "script": "q.sql" }"#);
+            let problems = validate_source_call_timeout(&endpoint);
+            assert!(
+                problems.is_empty(),
+                "an ordinary source with no callTimeoutMs must not be rejected, got: {problems:?}"
+            );
+        }
+
+        #[test]
+        fn accepts_a_call_timeout_ms_at_the_hard_ceiling() {
+            let endpoint = endpoint_with_source(r#"{ "type": "sql", "connection": "db", "script": "q.sql", "callTimeoutMs": 300000 }"#);
+            let problems = validate_source_call_timeout(&endpoint);
+            assert!(
+                problems.is_empty(),
+                "callTimeoutMs exactly at the hard ceiling must not be rejected, got: {problems:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_a_sql_sources_call_timeout_ms_exceeding_the_hard_ceiling() {
+            let endpoint = endpoint_with_source(r#"{ "type": "sql", "connection": "db", "script": "q.sql", "callTimeoutMs": 300001 }"#);
+            let problems = validate_source_call_timeout(&endpoint);
+            assert!(
+                problems.iter().any(|p| p.contains("callTimeoutMs") && p.contains("hard ceiling")),
+                "expected a hard-ceiling callTimeoutMs problem, got: {problems:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_a_http_sources_call_timeout_ms_exceeding_the_hard_ceiling() {
+            let endpoint = endpoint_with_source(r#"{ "type": "http", "request": "car.json", "callTimeoutMs": 300001 }"#);
+            let problems = validate_source_call_timeout(&endpoint);
+            assert!(
+                problems.iter().any(|p| p.contains("callTimeoutMs") && p.contains("hard ceiling")),
+                "expected a hard-ceiling callTimeoutMs problem for an HTTP source too, got: {problems:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_a_source_declaring_both_allow_nested_many_and_call_timeout_ms() {
+            let endpoint = endpoint_with_source(
+                r#"{
+                    "type": "http", "request": "car.json",
+                    "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10, "callTimeoutMs": 1000,
+                    "parameters": [{ "name": "vin", "from": "sources.car[].vin" }]
+                }"#,
+            );
+            let problems = validate_source_call_timeout(&endpoint);
+            assert!(
+                problems.iter().any(|p| p.contains("allowNestedMany") && p.contains("callTimeoutMs")),
+                "expected a problem naming the allowNestedMany/callTimeoutMs conflict, got: {problems:?}"
+            );
+        }
+
+        #[test]
+        fn does_not_reject_allow_nested_many_alone_without_call_timeout_ms() {
+            let endpoint = endpoint_with_source(
+                r#"{
+                    "type": "http", "request": "car.json",
+                    "allowNestedMany": true, "maxConcurrency": 2, "maxRows": 10,
+                    "parameters": [{ "name": "vin", "from": "sources.car[].vin" }]
+                }"#,
+            );
+            let problems = validate_source_call_timeout(&endpoint);
+            assert!(
+                problems.is_empty(),
+                "allowNestedMany without callTimeoutMs is not this validator's concern, got: {problems:?}"
+            );
+        }
+    }
+
     /// Mirrors the existing unmatched-security-scheme precedent: an endpoint
     /// file with an invalid nested-many configuration is skipped at
     /// `build_router` time (the route is simply never registered, a plain
@@ -2945,6 +3259,7 @@ mod tests {
             false,
             None,
             None,
+            test_call_timeout(),
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3036,6 +3351,7 @@ mod tests {
             false,
             None,
             Some(provider),
+            test_call_timeout(),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

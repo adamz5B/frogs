@@ -151,6 +151,13 @@ impl Serialize for MockOutcome {
 /// `mocks` is keyed by source name; a source with no entry runs for real.
 /// The real (non-test) request path always passes an empty map — same
 /// "empty means nothing special" convention `transaction_id: ""` uses.
+///
+/// `default_call_timeout_ms` is the caller's already-resolved
+/// `ServerConfig::effective_source_call_timeout_ms()` — a concrete
+/// `NonZeroU64` rather than an `Option`, so "no bound at all" isn't
+/// representable here; a source's own `callTimeoutMs` overrides it. The
+/// nested-many path ignores it entirely and keeps its independent
+/// `rowTimeoutMs` mechanism (see `docs/frogs-source-call-timeout.md`).
 #[allow(clippy::too_many_arguments)]
 pub async fn resolve_sources(
     endpoint: &EndpointFile,
@@ -165,6 +172,7 @@ pub async fn resolve_sources(
     transaction_id: &str,
     mocks: &HashMap<String, MockOutcome>,
     headers: &HeaderMap,
+    default_call_timeout_ms: NonZeroU64,
 ) -> Result<ResolvedSources, SourceFailure> {
     let mut resolved: ResolvedSources = HashMap::new();
     let mut in_progress: HashSet<String> = HashSet::new();
@@ -185,6 +193,7 @@ pub async fn resolve_sources(
                 body,
                 transaction_id,
                 mocks,
+                default_call_timeout_ms,
                 &mut resolved,
                 &mut in_progress,
             )
@@ -221,6 +230,7 @@ fn resolve_one<'a>(
     body: &'a Value,
     transaction_id: &'a str,
     mocks: &'a HashMap<String, MockOutcome>,
+    default_call_timeout_ms: NonZeroU64,
     resolved: &'a mut ResolvedSources,
     in_progress: &'a mut HashSet<String>,
 ) -> Pin<Box<dyn Future<Output = Result<(), SourceFailure>> + Send + 'a>> {
@@ -232,7 +242,7 @@ fn resolve_one<'a>(
             return Ok(());
         };
 
-        let (on_error, optional, parameters, allow_nested_many, max_concurrency, max_rows, row_timeout_ms) = match source {
+        let (on_error, optional, parameters, allow_nested_many, max_concurrency, max_rows, row_timeout_ms, call_timeout_ms) = match source {
             SourceDef::Sql {
                 on_error,
                 optional,
@@ -241,8 +251,18 @@ fn resolve_one<'a>(
                 max_concurrency,
                 max_rows,
                 row_timeout_ms,
+                call_timeout_ms,
                 ..
-            } => (*on_error, *optional, parameters, *allow_nested_many, *max_concurrency, *max_rows, *row_timeout_ms),
+            } => (
+                *on_error,
+                *optional,
+                parameters,
+                *allow_nested_many,
+                *max_concurrency,
+                *max_rows,
+                *row_timeout_ms,
+                *call_timeout_ms,
+            ),
             SourceDef::Http {
                 on_error,
                 optional,
@@ -251,8 +271,18 @@ fn resolve_one<'a>(
                 max_concurrency,
                 max_rows,
                 row_timeout_ms,
+                call_timeout_ms,
                 ..
-            } => (*on_error, *optional, parameters, *allow_nested_many, *max_concurrency, *max_rows, *row_timeout_ms),
+            } => (
+                *on_error,
+                *optional,
+                parameters,
+                *allow_nested_many,
+                *max_concurrency,
+                *max_rows,
+                *row_timeout_ms,
+                *call_timeout_ms,
+            ),
         };
 
         if allow_nested_many {
@@ -277,11 +307,16 @@ fn resolve_one<'a>(
                 body,
                 transaction_id,
                 mocks,
+                default_call_timeout_ms,
                 resolved,
                 in_progress,
             )
             .await;
         }
+
+        // Resolved once, here, so everything below this point works with a
+        // single concrete bound rather than two competing `Option`s.
+        let call_timeout = Duration::from_millis(call_timeout_ms.unwrap_or(default_call_timeout_ms).get());
 
         let mock = mocks.get(name);
 
@@ -312,6 +347,7 @@ fn resolve_one<'a>(
                         body,
                         transaction_id,
                         mocks,
+                        default_call_timeout_ms,
                         resolved,
                         in_progress,
                     )
@@ -338,6 +374,7 @@ fn resolve_one<'a>(
                     query_params,
                     body,
                     transaction_id,
+                    Some(call_timeout),
                     ResolvedView::Map(resolved),
                 )
                 .await
@@ -380,6 +417,14 @@ fn source_dependency(from: &str) -> Option<&str> {
 /// shared by `resolve_one`'s ordinary path (`ResolvedView::Map`) and
 /// `resolve_nested_many`'s per-row fan-out (`ResolvedView::RowOverride`), so
 /// the SQL-vs-HTTP dispatch logic isn't duplicated between the two.
+///
+/// `call_timeout` is `Some` for every ordinary source — resolve_one always
+/// has a concrete bound to apply (`callTimeoutMs`, else the project-wide
+/// `sourceCallTimeoutMs`). It's `None` only on `resolve_nested_many`'s
+/// per-row path, where the caller already wraps this whole call in its own
+/// independent `rowTimeoutMs` bound; a second, nested wrapper there would
+/// race the outer one at the same deadline and non-deterministically
+/// reclassify a row timeout. See `docs/frogs-source-call-timeout.md`.
 #[allow(clippy::too_many_arguments)]
 async fn run_source_row(
     source: &SourceDef,
@@ -394,6 +439,7 @@ async fn run_source_row(
     query_params: &HashMap<String, String>,
     body: &Value,
     transaction_id: &str,
+    call_timeout: Option<Duration>,
     resolved: ResolvedView<'_>,
 ) -> Result<Value, SourceErrorCause> {
     match source {
@@ -412,6 +458,7 @@ async fn run_source_row(
                 query_params,
                 body,
                 transaction_id,
+                call_timeout,
                 resolved,
             )
             .await
@@ -429,6 +476,7 @@ async fn run_source_row(
                 query_params,
                 body,
                 transaction_id,
+                call_timeout,
                 resolved,
             )
             .await
@@ -449,6 +497,11 @@ async fn run_source_row(
 /// that skipped `validate_nested_many` (`resolve_for_test`'s test-runner
 /// path, or `record_sources`) — classified as a config error, same
 /// precedent as an unmatched security scheme.
+///
+/// `default_call_timeout_ms` is carried purely to forward to `resolve_one`
+/// for this source's own dependencies (ordinary sources, bounded like any
+/// other). It is deliberately *not* applied to the per-row calls below —
+/// those keep their independent `rowTimeoutMs` bound, unchanged.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_nested_many<'a>(
     name: &'a str,
@@ -471,6 +524,7 @@ async fn resolve_nested_many<'a>(
     body: &'a Value,
     transaction_id: &'a str,
     mocks: &'a HashMap<String, MockOutcome>,
+    default_call_timeout_ms: NonZeroU64,
     resolved: &'a mut ResolvedSources,
     in_progress: &'a mut HashSet<String>,
 ) -> Result<(), SourceFailure> {
@@ -526,6 +580,7 @@ async fn resolve_nested_many<'a>(
                 body,
                 transaction_id,
                 mocks,
+                default_call_timeout_ms,
                 resolved,
                 in_progress,
             )
@@ -621,6 +676,9 @@ async fn resolve_nested_many<'a>(
                             query_params,
                             body,
                             transaction_id,
+                            // `None`: this call is already bounded by the
+                            // `row_timeout` wrapper right above it.
+                            None,
                             view,
                         ),
                     )
@@ -698,6 +756,7 @@ async fn run_sql_source(
     query_params: &HashMap<String, String>,
     body: &Value,
     transaction_id: &str,
+    call_timeout: Option<Duration>,
     resolved: ResolvedView<'_>,
 ) -> Result<Value, SourceErrorCause> {
     let driver = drivers
@@ -707,13 +766,41 @@ async fn run_sql_source(
     let script_path = sql_root.join(connection).join(script);
     let script_contents = std::fs::read_to_string(&script_path).map_err(|e| SourceErrorCause::Config(format!("failed to read {}: {e}", script_path.display())))?;
 
+    // `debug!`, not `warn!`: this condition is a property of a script file, so
+    // it would otherwise re-log on every single request for the life of the
+    // process without an operator being able to fix it without a redeploy.
+    // `frogs validate` is the loud, actionable report for the same check.
+    if !script_contents.is_ascii() {
+        let truncated = crate::sql::truncated_placeholder_names(&script_contents);
+        if !truncated.is_empty() {
+            tracing::debug!(
+                script = %script_path.display(),
+                placeholders = ?truncated,
+                "SQL placeholder name(s) are immediately followed by a non-ASCII character; only the ASCII prefix is bound, \
+                 and an unknown name binds as NULL — rename the placeholder or run `frogs validate`"
+            );
+        }
+    }
+
     let mut bound = HashMap::new();
     for param in parameters {
         let value = resolve_from(&param.from, headers, path_params, query_params, body, transaction_id, resolved);
         bound.insert(param.name.clone(), clamp_numeric(value, param.default, param.min, param.max));
     }
 
-    let rows = driver.query(&script_contents, &bound).await.map_err(SourceErrorCause::Sql)?;
+    // Only the real call is bounded — the synchronous script read above
+    // stays unbounded (pre-existing; see
+    // `docs/frogs-source-call-timeout.md`).
+    let query = driver.query(&script_contents, &bound);
+    let rows = match call_timeout {
+        Some(limit) => tokio::time::timeout(limit, query)
+            .await
+            .map_err(|_| SourceErrorCause::SqlCallTimedOut {
+                after_ms: limit.as_millis() as u64,
+            })?
+            .map_err(SourceErrorCause::Sql)?,
+        None => query.await.map_err(SourceErrorCause::Sql)?,
+    };
 
     match cardinality {
         Cardinality::One => rows
@@ -745,6 +832,7 @@ async fn run_http_source(
     query_params: &HashMap<String, String>,
     body: &Value,
     transaction_id: &str,
+    call_timeout: Option<Duration>,
     resolved: ResolvedView<'_>,
 ) -> Result<Value, SourceErrorCause> {
     let request_path = http_root.join(request);
@@ -773,9 +861,18 @@ async fn run_http_source(
         }
     }
 
-    let value = crate::http::execute(client, &request_file, &bound, &array_params, headers)
-        .await
-        .map_err(SourceErrorCause::Http)?;
+    // As in `run_sql_source`: only the real call is bounded, not the
+    // request-file read/parse above.
+    let call = crate::http::execute(client, &request_file, &bound, &array_params, headers);
+    let value = match call_timeout {
+        Some(limit) => tokio::time::timeout(limit, call)
+            .await
+            .map_err(|_| SourceErrorCause::HttpCallTimedOut {
+                after_ms: limit.as_millis() as u64,
+            })?
+            .map_err(SourceErrorCause::Http)?,
+        None => call.await.map_err(SourceErrorCause::Http)?,
+    };
 
     // `responsePath` (if declared) has already been unwrapped by `execute`
     // above — the array `cardinality: "many"` expects is exactly whatever
@@ -1134,6 +1231,12 @@ mod tests {
     use crate::sql::SqlError;
     use std::path::PathBuf;
 
+    /// A generous bound for every test that isn't itself about the source-
+    /// call timeout — nothing here should ever come close to it.
+    fn test_call_timeout() -> NonZeroU64 {
+        NonZeroU64::new(5_000).unwrap()
+    }
+
     #[test]
     fn a_fail_object_parses_as_a_fail_mock() {
         let mock: MockOutcome = serde_json::from_str(r#"{ "fail": "datasource.sql.not_found" }"#).unwrap();
@@ -1246,6 +1349,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("non-optional source with a row should resolve");
@@ -1284,6 +1388,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("an endpoint with no sources at all should resolve trivially");
@@ -1320,6 +1425,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("an endpoint with no sources at all should resolve trivially");
@@ -1400,6 +1506,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("the http source should resolve");
@@ -1432,6 +1539,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("an optional source's failure must not fail the whole request");
@@ -1461,6 +1569,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("a non-optional source's failure must fail the request");
@@ -1504,6 +1613,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("a non-optional source's failure must fail the request");
@@ -1532,6 +1642,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("zero rows for cardinality 'one' should be treated as not found");
@@ -1587,6 +1698,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("the real HTTP source should resolve");
@@ -1648,6 +1760,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("the registry-resolved URL should reach the real server");
@@ -1716,6 +1829,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("an empty-but-present placeholder should still resolve, not fail");
@@ -1758,6 +1872,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("a many-cardinality source with rows should resolve");
@@ -1798,6 +1913,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("zero rows is a valid result for a list, not a failure");
@@ -1843,6 +1959,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .unwrap();
@@ -1892,6 +2009,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .unwrap();
@@ -1935,6 +2053,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .unwrap();
@@ -1998,6 +2117,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .unwrap();
@@ -2040,6 +2160,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .unwrap();
@@ -2093,6 +2214,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .unwrap();
@@ -2136,6 +2258,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .unwrap();
@@ -2187,6 +2310,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("a real JSON array response should resolve for cardinality: many");
@@ -2244,6 +2368,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("responsePath should unwrap the envelope before the array check runs");
@@ -2291,6 +2416,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("a non-array response for cardinality: many must fail clearly, not silently coerce or empty out");
@@ -2321,6 +2447,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("a source referencing a connection that isn't configured must fail clearly");
@@ -2357,6 +2484,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("a script file that isn't on disk must fail before ever reaching the driver");
@@ -2407,6 +2535,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("a non-optional http source returning a server error must fail the request");
@@ -2480,6 +2609,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("both sources should resolve independently");
@@ -2784,6 +2914,7 @@ mod tests {
             "shared-txn-id",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("both sources should resolve");
@@ -2857,6 +2988,7 @@ mod tests {
             "shared-txn-id",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("the http source should resolve");
@@ -2922,6 +3054,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("the sql source should resolve using the body-derived parameter");
@@ -2988,6 +3121,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("the sql source should resolve using the array-typed body parameter");
@@ -3052,6 +3186,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("the sql source should resolve using the scalar array body parameter");
@@ -3167,6 +3302,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("the sql source should resolve using the clamped parameters");
@@ -3221,6 +3357,7 @@ mod tests {
             "",
             &mocks,
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("a mocked source should resolve without touching the real driver");
@@ -3252,6 +3389,7 @@ mod tests {
             "",
             &mocks,
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("a mocked failure on a non-optional source must fail the request");
@@ -3284,6 +3422,7 @@ mod tests {
             "",
             &mocks,
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("an optional source's mocked failure must not fail the whole request");
@@ -3341,6 +3480,7 @@ mod tests {
             "",
             &mocks,
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("the real sql source and the mocked http source should both resolve");
@@ -3382,6 +3522,7 @@ mod tests {
             "",
             &mocks,
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("a mocked http source must resolve without ever reading its request file");
@@ -3462,6 +3603,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("pricing's dependency on car should resolve car first, then chain into pricing");
@@ -3543,6 +3685,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("notify's nested chained parameter should resolve against pricing's real nested response");
@@ -3589,6 +3732,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("two sources depending on each other must fail clearly, not hang or loop forever");
@@ -3638,6 +3782,7 @@ mod tests {
             "",
             &mocks,
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("both mocked sources should resolve without touching real drivers");
@@ -3678,6 +3823,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("car's non-optional failure must fail the request before pricing ever runs");
@@ -3745,6 +3891,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("car's optional failure must not stop pricing from resolving, chained parameter or not");
@@ -3810,6 +3957,7 @@ mod tests {
             "",
             &HashMap::new(),
             &headers,
+            test_call_timeout(),
         )
         .await
         .expect("the sql source should resolve using the header-derived parameter");
@@ -3879,6 +4027,7 @@ mod tests {
             "",
             &HashMap::new(),
             &headers,
+            test_call_timeout(),
         )
         .await
         .expect("the http source should resolve using the header-derived parameter");
@@ -3899,6 +4048,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("a missing header must not fail the request, just bind null");
@@ -3982,6 +4132,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("3 rows exceeds maxRows: 2 with optional: false, the whole request must fail");
@@ -4061,6 +4212,7 @@ mod tests {
             "",
             &mocks,
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("a mocked parent with 3 rows still exceeds maxRows: 2");
@@ -4124,6 +4276,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("optional: true must degrade gracefully rather than fail the whole request");
@@ -4197,6 +4350,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("the happy path should resolve cleanly");
@@ -4274,6 +4428,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("6 rows within maxRows should resolve cleanly");
@@ -4332,6 +4487,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("a per-row call slower than rowTimeoutMs must fail a non-optional nested-many source");
@@ -4395,6 +4551,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("zero parent rows must resolve cleanly, not error");
@@ -4463,6 +4620,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("a failed-optional parent must not fail the whole request, even with a non-optional nested-many child");
@@ -4552,6 +4710,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("both nested-many sources should resolve cleanly");
@@ -4623,6 +4782,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("a per-row optional: true failure must not fail the whole request");
@@ -4691,6 +4851,7 @@ mod tests {
             "",
             &HashMap::new(),
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("a per-row optional: false failure must fail the whole request");
@@ -4753,6 +4914,7 @@ mod tests {
             "",
             &mocks,
             &HeaderMap::new(),
+            test_call_timeout(),
         )
         .await
         .expect("a mocked nested-many source should resolve cleanly");
@@ -4768,6 +4930,261 @@ mod tests {
             call_count.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "a mocked nested-many source must never make a real call"
+        );
+    }
+
+    // ---- ordinary-source `callTimeoutMs`/`sourceCallTimeoutMs` (ADR:
+    // docs/frogs-source-call-timeout.md) ----
+
+    /// A `SqlDriver` that sleeps a configurable duration before returning its
+    /// rows — exercises the real `tokio::time::timeout` wrapper
+    /// `run_sql_source` applies around its one real `query()` call, without
+    /// a live database.
+    #[derive(Debug)]
+    struct SlowDriver {
+        delay: std::time::Duration,
+        rows: Vec<HashMap<String, SqlValue>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SqlDriver for SlowDriver {
+        async fn query(&self, _script: &str, _params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(self.rows.clone())
+        }
+    }
+
+    fn endpoint_with_one_sql_source_with_call_timeout(name: &str, optional: bool, call_timeout_ms: Option<u64>) -> EndpointFile {
+        let call_timeout_field = call_timeout_ms.map(|ms| format!(r#", "callTimeoutMs": {ms}"#)).unwrap_or_default();
+        let json = format!(
+            r#"{{
+                "operationId": "test",
+                "sources": {{
+                    "{name}": {{
+                        "type": "sql",
+                        "connection": "db",
+                        "script": "q.sql",
+                        "cardinality": "one",
+                        "onError": 500,
+                        "optional": {optional}{call_timeout_field}
+                    }}
+                }},
+                "response": {{ "vin": "sources.{name}.vin" }}
+            }}"#
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_sql_ordinary_source_exceeding_the_project_default_call_timeout_classifies_as_sql_timeout() {
+        let endpoint = endpoint_with_one_sql_source_with_call_timeout("car", false, None);
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert(
+            "db".to_string(),
+            Box::new(SlowDriver {
+                delay: std::time::Duration::from_millis(100),
+                rows: vec![row(&[("vin", SqlValue::Text("AAA".to_string()))])],
+            }),
+        );
+
+        let root = temp_project_root();
+        let client = reqwest::Client::new();
+        let failure = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+            NonZeroU64::new(20).unwrap(),
+        )
+        .await
+        .expect_err("a sql call slower than the project-wide default must time out");
+
+        assert_eq!(failure.cause.code(), "datasource.sql.timeout");
+        assert!(
+            failure.cause.message().contains("20"),
+            "message should mention the configured timeout: {}",
+            failure.cause.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sources_own_call_timeout_ms_overrides_a_longer_project_default_and_is_the_one_that_fires() {
+        let endpoint = endpoint_with_one_sql_source_with_call_timeout("car", false, Some(20));
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert(
+            "db".to_string(),
+            Box::new(SlowDriver {
+                delay: std::time::Duration::from_millis(100),
+                rows: vec![row(&[("vin", SqlValue::Text("AAA".to_string()))])],
+            }),
+        );
+
+        let root = temp_project_root();
+        let client = reqwest::Client::new();
+        // The project-wide default (`test_call_timeout()`, 5s) is generous —
+        // only the source's own, much tighter 20ms `callTimeoutMs` should be
+        // able to fire here.
+        let failure = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+            test_call_timeout(),
+        )
+        .await
+        .expect_err("the source's own tighter callTimeoutMs must override the generous project default");
+
+        assert_eq!(failure.cause.code(), "datasource.sql.timeout");
+        assert!(
+            failure.cause.message().contains("20"),
+            "message should mention the source's own 20ms callTimeoutMs, not the 5000ms project default: {}",
+            failure.cause.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sources_own_call_timeout_ms_can_raise_above_a_tighter_project_default_and_let_a_slow_call_succeed() {
+        let endpoint = endpoint_with_one_sql_source_with_call_timeout("car", false, Some(500));
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert(
+            "db".to_string(),
+            Box::new(SlowDriver {
+                delay: std::time::Duration::from_millis(100),
+                rows: vec![row(&[("vin", SqlValue::Text("AAA".to_string()))])],
+            }),
+        );
+
+        let root = temp_project_root();
+        let client = reqwest::Client::new();
+        // The project-wide default handed in here (20ms) is too tight for
+        // this 100ms call — only the source's own, more generous 500ms
+        // `callTimeoutMs` lets it succeed.
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+            NonZeroU64::new(20).unwrap(),
+        )
+        .await
+        .expect("the source's own more generous callTimeoutMs should let the slow call complete");
+
+        let body = build_response(&endpoint, &resolved);
+        assert_eq!(body["vin"], "AAA");
+    }
+
+    #[tokio::test]
+    async fn an_optional_sql_source_that_times_out_degrades_to_null() {
+        let endpoint = endpoint_with_one_sql_source_with_call_timeout("car", true, None);
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert(
+            "db".to_string(),
+            Box::new(SlowDriver {
+                delay: std::time::Duration::from_millis(100),
+                rows: vec![row(&[("vin", SqlValue::Text("AAA".to_string()))])],
+            }),
+        );
+
+        let root = temp_project_root();
+        let client = reqwest::Client::new();
+        let resolved = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+            NonZeroU64::new(20).unwrap(),
+        )
+        .await
+        .expect("an optional source's timeout must not fail the whole request");
+
+        let body = build_response(&endpoint, &resolved);
+        assert_eq!(body["vin"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn an_http_ordinary_source_exceeding_the_call_timeout_classifies_as_http_call_timeout() {
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        let app = Router::new().route(
+            "/car",
+            get(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                Json(serde_json::json!({ "vin": "AAA" }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let root = temp_project_root();
+        std::fs::write(root.join("http/car.json"), format!(r#"{{ "method": "GET", "url": "http://{addr}/car" }}"#)).unwrap();
+
+        let json = r#"{
+            "operationId": "test",
+            "sources": { "car": { "type": "http", "request": "car.json", "onError": 500 } },
+            "response": { "vin": "sources.car.vin" }
+        }"#;
+        let endpoint: EndpointFile = serde_json::from_str(json).unwrap();
+        let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        let client = reqwest::Client::new();
+        let failure = resolve_sources(
+            &endpoint,
+            &HashMap::new(),
+            &drivers,
+            &root,
+            &root.join("http"),
+            &client,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Value::Null,
+            "",
+            &HashMap::new(),
+            &HeaderMap::new(),
+            NonZeroU64::new(20).unwrap(),
+        )
+        .await
+        .expect_err("an http call slower than the configured timeout must fail");
+
+        assert_eq!(failure.cause.code(), "datasource.http.call_timeout");
+        assert!(
+            failure.cause.message().contains("20"),
+            "message should mention the configured timeout: {}",
+            failure.cause.message()
         );
     }
 }

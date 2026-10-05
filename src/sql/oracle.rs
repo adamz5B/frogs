@@ -248,44 +248,41 @@ fn classify_query_error(e: oracle_rs::Error) -> SqlError {
 /// PL/SQL has no `::` cast operator, but a script copy-pasted from a
 /// Postgres connection should still behave the same either way).
 fn translate_named_params(script: &str) -> (String, Vec<String>) {
-    let bytes = script.as_bytes();
     let mut output = String::with_capacity(script.len());
     let mut first_seen: Vec<String> = Vec::new();
     let mut occurrences: Vec<String> = Vec::new();
-    let mut i = 0;
+    let mut chars = script.char_indices().peekable();
 
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-
-        if c == ':' && i + 1 < bytes.len() && bytes[i + 1] as char == ':' {
-            output.push_str("::");
-            i += 2;
-            continue;
-        }
-
-        if c == ':' && i + 1 < bytes.len() && (bytes[i + 1] as char == '_' || (bytes[i + 1] as char).is_alphabetic()) {
-            let start = i + 1;
-            let mut end = start;
-            while end < bytes.len() && ((bytes[end] as char == '_') || (bytes[end] as char).is_alphanumeric()) {
-                end += 1;
+    while let Some((i, c)) = chars.next() {
+        if c == ':' {
+            if chars.peek().map(|&(_, next)| next) == Some(':') {
+                chars.next();
+                output.push_str("::");
+                continue;
             }
-            let name = &script[start..end];
-            let position = match first_seen.iter().position(|n| n == name) {
-                Some(pos) => pos + 1,
-                None => {
-                    first_seen.push(name.to_string());
-                    first_seen.len()
+            // `i` is the colon, which is ASCII, so `i + 1` is always a
+            // character boundary. The scan itself never advances by raw index:
+            // the only way forward is `chars.next()`, so no index arithmetic
+            // can stall the loop or land mid-character.
+            if let Some((name, end)) = super::ascii_param_name_at(script, i + 1) {
+                let position = match first_seen.iter().position(|n| n == name) {
+                    Some(pos) => pos + 1,
+                    None => {
+                        first_seen.push(name.to_string());
+                        first_seen.len()
+                    }
+                };
+                output.push(':');
+                output.push_str(&position.to_string());
+                occurrences.push(name.to_string());
+                while chars.peek().is_some_and(|&(j, _)| j < end) {
+                    chars.next();
                 }
-            };
-            output.push(':');
-            output.push_str(&position.to_string());
-            occurrences.push(name.to_string());
-            i = end;
-            continue;
+                continue;
+            }
         }
 
         output.push(c);
-        i += 1;
     }
 
     (output, occurrences)
@@ -474,6 +471,63 @@ mod tests {
         let (sql, occurrences) = translate_named_params("SELECT amount::numeric FROM pricing WHERE id = :id");
         assert_eq!(sql, "SELECT amount::numeric FROM pricing WHERE id = :1");
         assert_eq!(occurrences, vec!["id"]);
+    }
+
+    /// Runs a synchronous, potentially-hanging call on its own thread with a
+    /// hard deadline — a infinite-loop regression in `translate_named_params`
+    /// (the single worst-case outcome called out for this fix) must fail
+    /// this test loudly rather than hang the whole `cargo test` run forever.
+    fn run_with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("translate_named_params did not return within 2s — likely an infinite-loop regression in the char-advance logic")
+    }
+
+    /// Previously panicked: a byte-wise scan that reinterpreted the lead
+    /// byte of 'é' as alphabetic could stop mid-character and slice at a
+    /// non-char-boundary.
+    #[test]
+    fn a_colon_immediately_followed_by_a_multibyte_character_does_not_panic_or_hang() {
+        let (sql, occurrences) = run_with_timeout(|| translate_named_params("SELECT 1 -- :é"));
+        assert_eq!(
+            sql, "SELECT 1 -- :é",
+            "no identifier starts right after the colon, so the text passes through unchanged"
+        );
+        assert!(occurrences.is_empty());
+    }
+
+    /// Previously panicked for the same reason — the "real placeholder
+    /// immediately followed by non-ASCII" shape (`:idé`).
+    #[test]
+    fn a_placeholder_name_truncated_by_a_trailing_non_ascii_character_binds_only_its_ascii_prefix() {
+        let (sql, occurrences) = run_with_timeout(|| translate_named_params("SELECT :idé FROM t"));
+        assert_eq!(sql, "SELECT :1é FROM t");
+        assert_eq!(occurrences, vec!["id"]);
+    }
+
+    /// Previously corrupted: non-ASCII passthrough text was being
+    /// re-encoded as Latin-1 (`'José'` became `'JosÃ©'` in the SQL actually
+    /// sent). Run under the same watchdog as the "doesn't hang" case above —
+    /// this is the "ordinary passthrough text, must return promptly" case.
+    #[test]
+    fn non_ascii_passthrough_text_round_trips_byte_identically_not_latin1_corrupted() {
+        let (sql, occurrences) = run_with_timeout(|| translate_named_params("SELECT 'José' AS n WHERE x = :x"));
+        assert_eq!(sql, "SELECT 'José' AS n WHERE x = :1");
+        assert_eq!(occurrences, vec!["x"]);
+    }
+
+    /// Pins the `::`-is-a-cast-marker direction explicitly (oracle keeps the
+    /// `::` lookahead, like postgres/sqlite/mysql, unlike mssql): a `::name`
+    /// with nothing before the first colon is still read as a cast marker
+    /// followed by literal text, not a placeholder named `name`.
+    #[test]
+    fn a_double_colon_prefix_is_a_cast_marker_not_a_placeholder() {
+        let (sql, occurrences) = translate_named_params("::name");
+        assert_eq!(sql, "::name");
+        assert!(occurrences.is_empty());
     }
 
     fn config_with(settings: &[(&str, serde_json::Value)]) -> ConnectionConfig {

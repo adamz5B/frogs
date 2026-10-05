@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::Duration;
 
@@ -52,6 +53,13 @@ impl VerifyErrorCause {
 /// key, so a hit for one caller's key never leaks into another's, and a
 /// verifier with no `cacheTtlSeconds` never touches the cache at all —
 /// every request re-runs the check, exactly as the design doc specifies.
+///
+/// `call_timeout_ms` is the same already-resolved
+/// `ServerConfig::effective_source_call_timeout_ms()` an ordinary source
+/// gets — a verifier has no per-verifier override of its own. An elapsed
+/// bound is `Unavailable` (fail-closed, `auth.verifier_unavailable`), and
+/// returns via `?` below *before* the cache write, so a timed-out
+/// verification is never cached.
 #[allow(clippy::too_many_arguments)]
 pub async fn verify(
     scheme_name: &str,
@@ -62,6 +70,7 @@ pub async fn verify(
     http_client: &reqwest::Client,
     headers: &HeaderMap,
     cache: &VerifierCache,
+    call_timeout_ms: NonZeroU64,
 ) -> Result<(), VerifyErrorCause> {
     let bound = bind_headers(verifier.def.parameters(), headers);
     let ttl = verifier.def.cache_ttl_seconds();
@@ -73,9 +82,10 @@ pub async fn verify(
         return if valid { Ok(()) } else { Err(VerifyErrorCause::Invalid) };
     }
 
+    let call_timeout = Duration::from_millis(call_timeout_ms.get());
     let resolved = match &verifier.def {
-        VerifierDef::Sql { connection, script, .. } => run_sql(drivers, sql_root, connection, script, &bound).await?,
-        VerifierDef::Http { request, .. } => run_http(http_root, http_client, request, &bound, headers).await?,
+        VerifierDef::Sql { connection, script, .. } => run_sql(drivers, sql_root, connection, script, &bound, call_timeout).await?,
+        VerifierDef::Http { request, .. } => run_http(http_root, http_client, request, &bound, headers, call_timeout).await?,
     };
 
     let valid = verifier.valid_if.evaluate(&resolved);
@@ -130,6 +140,7 @@ async fn run_sql(
     connection: &str,
     script: &str,
     bound: &HashMap<String, SqlValue>,
+    call_timeout: Duration,
 ) -> Result<Value, VerifyErrorCause> {
     let driver = drivers
         .get(connection)
@@ -138,9 +149,30 @@ async fn run_sql(
     let script_path = sql_root.join(connection).join(script);
     let script_contents = std::fs::read_to_string(&script_path).map_err(|e| VerifyErrorCause::Unavailable(format!("failed to read {}: {e}", script_path.display())))?;
 
-    let rows = driver
-        .query(&script_contents, bound)
+    // `debug!`, not `warn!`: this condition is a property of a script file, so
+    // it would otherwise re-log on every single request for the life of the
+    // process without an operator being able to fix it without a redeploy.
+    // `frogs validate` is the loud, actionable report for the same check.
+    // Only the script path and the placeholder names (both read from the
+    // script file) are logged — never `bound`, which here holds the caller's
+    // actual credential material.
+    if !script_contents.is_ascii() {
+        let truncated = crate::sql::truncated_placeholder_names(&script_contents);
+        if !truncated.is_empty() {
+            tracing::debug!(
+                script = %script_path.display(),
+                placeholders = ?truncated,
+                "SQL placeholder name(s) are immediately followed by a non-ASCII character; only the ASCII prefix is bound, \
+                 and an unknown name binds as NULL — rename the placeholder or run `frogs validate`"
+            );
+        }
+    }
+
+    // Only the real query is bounded, matching
+    // `endpoint::resolve::run_sql_source`'s own wrapper boundary.
+    let rows = tokio::time::timeout(call_timeout, driver.query(&script_contents, bound))
         .await
+        .map_err(|_| VerifyErrorCause::Unavailable(format!("verifier query did not complete within {}ms", call_timeout.as_millis())))?
         .map_err(|e| VerifyErrorCause::Unavailable(e.to_string()))?;
 
     // Zero rows (e.g. an API key that simply isn't in the table) is the
@@ -151,7 +183,14 @@ async fn run_sql(
     Ok(Value::Object(row.iter().map(|(k, v)| (k.clone(), sql_value_to_json(v))).collect()))
 }
 
-async fn run_http(http_root: &Path, client: &reqwest::Client, request: &str, bound: &HashMap<String, SqlValue>, headers: &HeaderMap) -> Result<Value, VerifyErrorCause> {
+async fn run_http(
+    http_root: &Path,
+    client: &reqwest::Client,
+    request: &str,
+    bound: &HashMap<String, SqlValue>,
+    headers: &HeaderMap,
+    call_timeout: Duration,
+) -> Result<Value, VerifyErrorCause> {
     let request_path = http_root.join(request);
     let contents = std::fs::read_to_string(&request_path).map_err(|e| VerifyErrorCause::Unavailable(format!("failed to read {}: {e}", request_path.display())))?;
     let request_file: crate::http::HttpRequestFile =
@@ -165,9 +204,13 @@ async fn run_http(http_root: &Path, client: &reqwest::Client, request: &str, bou
     // A verifier's own parameters are always `header.*` scalars, never
     // array-typed (see the design doc's own examples), so no array names
     // are ever passed through here.
-    crate::http::execute(client, &request_file, bound, &std::collections::HashSet::new(), headers)
-        .await
-        .map_err(|e| VerifyErrorCause::Unavailable(e.to_string()))
+    tokio::time::timeout(
+        call_timeout,
+        crate::http::execute(client, &request_file, bound, &std::collections::HashSet::new(), headers),
+    )
+    .await
+    .map_err(|_| VerifyErrorCause::Unavailable(format!("verifier request did not complete within {}ms", call_timeout.as_millis())))?
+    .map_err(|e| VerifyErrorCause::Unavailable(e.to_string()))
 }
 
 /// Binds each verifier parameter from the caller's request headers — the
@@ -198,6 +241,13 @@ mod tests {
     use crate::security::ValidIf;
     use crate::sql::SqlError;
     use std::path::PathBuf;
+
+    /// A generous bound for every test that isn't itself about the verifier
+    /// call timeout — what `resolve_request` hands `verify` in production
+    /// (`ServerConfig::effective_source_call_timeout_ms`).
+    fn test_call_timeout() -> NonZeroU64 {
+        NonZeroU64::new(5_000).unwrap()
+    }
 
     #[derive(Debug)]
     struct FakeDriver {
@@ -281,6 +331,7 @@ mod tests {
             &client,
             &headers,
             &VerifierCache::new(),
+            test_call_timeout(),
         )
         .await;
 
@@ -310,6 +361,7 @@ mod tests {
             &client,
             &headers,
             &VerifierCache::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("an inactive key must fail validIf");
@@ -334,6 +386,7 @@ mod tests {
             &client,
             &headers,
             &VerifierCache::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("zero rows must be treated as invalid credentials");
@@ -359,6 +412,7 @@ mod tests {
             &client,
             &headers,
             &VerifierCache::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("a request with no credential at all must be rejected");
@@ -383,6 +437,7 @@ mod tests {
             &client,
             &headers,
             &VerifierCache::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("a broken datasource must not be conflated with an invalid credential");
@@ -406,6 +461,7 @@ mod tests {
             &client,
             &headers,
             &VerifierCache::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("a connection that isn't configured must fail as unavailable");
@@ -461,9 +517,19 @@ mod tests {
 
         let ok_headers = headers_with("Authorization", "good-token");
         assert!(
-            verify("bearerAuth", &verifier, &drivers, &root.join("sql"), &root.join("http"), &client, &ok_headers, &cache,)
-                .await
-                .is_ok()
+            verify(
+                "bearerAuth",
+                &verifier,
+                &drivers,
+                &root.join("sql"),
+                &root.join("http"),
+                &client,
+                &ok_headers,
+                &cache,
+                test_call_timeout()
+            )
+            .await
+            .is_ok()
         );
 
         let bad_headers = headers_with("Authorization", "bad-token");
@@ -476,6 +542,7 @@ mod tests {
             &client,
             &bad_headers,
             &cache,
+            test_call_timeout(),
         )
         .await
         .expect_err("an inactive token must be rejected");
@@ -526,7 +593,18 @@ mod tests {
         let cache = VerifierCache::new();
 
         for _ in 0..3 {
-            let result = verify("apiKeyAuth", &verifier, &drivers, &root.join("sql"), &root.join("http"), &client, &headers, &cache).await;
+            let result = verify(
+                "apiKeyAuth",
+                &verifier,
+                &drivers,
+                &root.join("sql"),
+                &root.join("http"),
+                &client,
+                &headers,
+                &cache,
+                test_call_timeout(),
+            )
+            .await;
             assert!(result.is_ok());
         }
 
@@ -586,6 +664,7 @@ mod tests {
             &client,
             &good_headers,
             &cache,
+            test_call_timeout(),
         )
         .await
         .expect("the first, real check for a good key should succeed");
@@ -593,9 +672,19 @@ mod tests {
         // A request with no key at all must still be rejected, not
         // accidentally reuse the cached "good-key" entry.
         let no_headers = HeaderMap::new();
-        let err = verify("apiKeyAuth", &verifier, &drivers, &root.join("sql"), &root.join("http"), &client, &no_headers, &cache)
-            .await
-            .expect_err("a missing credential must never hit another caller's cache entry");
+        let err = verify(
+            "apiKeyAuth",
+            &verifier,
+            &drivers,
+            &root.join("sql"),
+            &root.join("http"),
+            &client,
+            &no_headers,
+            &cache,
+            test_call_timeout(),
+        )
+        .await
+        .expect_err("a missing credential must never hit another caller's cache entry");
         assert_eq!(err.code(), "auth.invalid_credentials");
     }
 
@@ -679,6 +768,7 @@ mod tests {
             &client,
             &malicious_headers,
             &cache,
+            test_call_timeout(),
         )
         .await;
 
@@ -730,6 +820,7 @@ mod tests {
             &client,
             &headers,
             &VerifierCache::new(),
+            test_call_timeout(),
         )
         .await
         .expect_err("a non-UTF8 header value must be rejected as a missing credential, not panic");
@@ -785,7 +876,18 @@ mod tests {
             // definitely expired by the time this iteration's `cache.get`
             // runs — same technique `VerifierCache`'s own expiry test uses.
             std::thread::sleep(std::time::Duration::from_millis(5));
-            let result = verify("apiKeyAuth", &verifier, &drivers, &root.join("sql"), &root.join("http"), &client, &headers, &cache).await;
+            let result = verify(
+                "apiKeyAuth",
+                &verifier,
+                &drivers,
+                &root.join("sql"),
+                &root.join("http"),
+                &client,
+                &headers,
+                &cache,
+                test_call_timeout(),
+            )
+            .await;
             assert!(result.is_ok());
         }
 
@@ -794,5 +896,186 @@ mod tests {
             3,
             "a 0-second TTL must not effectively cache anything across calls, unlike a real TTL"
         );
+    }
+
+    /// The load-bearing security guarantee around `verify`'s new timeout
+    /// bound: a timed-out verification must NEVER be written to
+    /// `VerifierCache`, whether it would have cached as valid or invalid —
+    /// otherwise an attacker who can make the verifier's own datasource slow
+    /// could force either a cached pass or a cached fail baked in from a
+    /// transient timeout. Proven here the strong way: call `verify` twice
+    /// with a verifier whose own datasource always sleeps longer than the
+    /// configured bound, and assert the driver was actually invoked both
+    /// times — if the first timed-out call had wrongly cached anything, the
+    /// second call would short-circuit through that cache entry (`Ok` or a
+    /// plain `Invalid`, never reaching the driver at all) instead of timing
+    /// out again with `Unavailable`.
+    #[tokio::test]
+    async fn a_timed_out_verification_is_never_cached_and_every_subsequent_call_re_runs_the_datasource() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct AlwaysSlowDriver {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl SqlDriver for AlwaysSlowDriver {
+            async fn query(&self, _script: &str, _params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                // Long enough to always exceed the tiny call_timeout below,
+                // on any machine.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Ok(vec![row(&[("active", SqlValue::Bool(true))])])
+            }
+        }
+
+        let root = temp_project_root("never-cache-timeout");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), Box::new(AlwaysSlowDriver { calls: calls.clone() }));
+
+        // `cacheTtlSeconds` is set so a *successful* (non-timed-out) result
+        // would be cached — the point is proving a timed-out one is not,
+        // even with caching otherwise fully enabled for this scheme.
+        let def: VerifierDef = serde_json::from_str(
+            r#"{
+                "type": "sql",
+                "connection": "db",
+                "script": "verify.sql",
+                "parameters": [{ "name": "key", "from": "header.X-Api-Key" }],
+                "validIf": "row.active = true",
+                "cacheTtlSeconds": 30
+            }"#,
+        )
+        .unwrap();
+        let verifier = LoadedVerifier {
+            valid_if: ValidIf::parse(def.valid_if()).unwrap(),
+            def,
+        };
+
+        let headers = headers_with("X-Api-Key", "good-key");
+        let client = reqwest::Client::new();
+        let cache = VerifierCache::new();
+        let tiny_call_timeout = NonZeroU64::new(20).unwrap();
+
+        for attempt in 1..=2 {
+            let err = verify(
+                "apiKeyAuth",
+                &verifier,
+                &drivers,
+                &root.join("sql"),
+                &root.join("http"),
+                &client,
+                &headers,
+                &cache,
+                tiny_call_timeout,
+            )
+            .await
+            .expect_err("a call slower than the configured timeout must fail, not succeed");
+
+            assert_eq!(
+                err.code(),
+                "auth.verifier_unavailable",
+                "attempt {attempt} should classify as a timeout, not a cached outcome"
+            );
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the driver must be invoked once per call — a cached entry written by the first timed-out call would have \
+             let the second call short-circuit without ever reaching the driver"
+        );
+    }
+
+    /// An in-memory `MakeWriter` so a test can capture real tracing output
+    /// into a buffer it can inspect afterwards, rather than just reading the
+    /// source by eye.
+    #[derive(Clone, Default)]
+    struct SharedLogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedLogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogBuffer {
+        type Writer = SharedLogBuffer;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Security-critical: `run_sql`'s truncated-placeholder `debug!` must
+    /// name only the script path and the (file-derived) placeholder
+    /// names — never `bound`, which here holds the caller's actual
+    /// credential material. Captures real tracing output into an in-memory
+    /// buffer (not just source inspection) to prove the credential value
+    /// never reaches it, even though the log fires on the very same call
+    /// that has that credential in scope.
+    #[tokio::test]
+    async fn run_sqls_truncated_placeholder_debug_log_never_includes_a_bound_credential_value() {
+        let root = std::env::temp_dir().join(format!(
+            "frogs-verify-leak-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("sql/db")).unwrap();
+        // The truncated placeholder (":idé") is unrelated to the actually
+        // bound ":key" parameter below — the log fires off the script's own
+        // content, independent of what gets bound.
+        std::fs::write(root.join("sql/db/verify.sql"), "SELECT active FROM api_keys WHERE id = :idé AND key = :key").unwrap();
+
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert(
+            "db".to_string(),
+            Box::new(FakeDriver {
+                rows: vec![row(&[("active", SqlValue::Bool(true))])],
+                fail: false,
+            }),
+        );
+
+        let secret_credential = "super-secret-credential-xyz789";
+        let mut bound = HashMap::new();
+        bound.insert("key".to_string(), SqlValue::Text(secret_credential.to_string()));
+
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        // A thread-local default dispatcher (rather than
+        // `tracing::subscriber::with_default`, which only wraps a sync
+        // closure) so this stays set across the `.await` below — safe here
+        // because `#[tokio::test]` defaults to a single-threaded runtime,
+        // so the task never actually hops to another OS thread mid-poll.
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        let result = run_sql(&drivers, &root.join("sql"), "db", "verify.sql", &bound, Duration::from_secs(5)).await;
+        drop(guard);
+
+        assert!(result.is_ok(), "sanity check: the call itself should succeed so the log path really did run");
+
+        let log_text = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            log_text.contains("verify.sql") || log_text.contains("placeholder"),
+            "sanity check: the truncated-placeholder log should actually have fired: {log_text:?}"
+        );
+        assert!(
+            !log_text.contains(secret_credential),
+            "the bound credential value must never appear in this log line: {log_text:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -1,5 +1,5 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::project::{MANIFEST_FILE, api_base, require_project_root};
@@ -59,6 +59,18 @@ async fn validate_api(root: &Path) -> usize {
         config.security.schemes.len()
     );
 
+    // `frogs run` clamps this at startup rather than refusing to start (see
+    // `ServerConfig::effective_source_call_timeout_ms`) — reported here so
+    // it's visible without a live run.
+    if config.server.source_call_timeout_ms.get() > crate::config::MAX_SOURCE_CALL_TIMEOUT_MS {
+        println!(
+            "  server.json: sourceCallTimeoutMs {} exceeds the hard ceiling of {} — it will be clamped at startup",
+            config.server.source_call_timeout_ms.get(),
+            crate::config::MAX_SOURCE_CALL_TIMEOUT_MS
+        );
+        problems += 1;
+    }
+
     match crate::openapi::load(&root.join(MANIFEST_FILE)) {
         Ok(doc) => println!("  {MANIFEST_FILE}: OK ({} operation(s))", doc.operations.len()),
         Err(e) => {
@@ -89,7 +101,39 @@ async fn validate_api(root: &Path) -> usize {
     }
     problems += endpoint_problems.len();
 
+    for script_path in sql_script_files(&api_dir.join("datasources/sql")) {
+        let Ok(contents) = std::fs::read_to_string(&script_path) else { continue };
+        for name in crate::sql::truncated_placeholder_names(&contents) {
+            println!(
+                "  {}: placeholder ':{name}' is immediately followed by a non-ASCII character — only ':{name}' is bound, and an unknown name binds as NULL",
+                script_path.display()
+            );
+            problems += 1;
+        }
+    }
+
     problems
+}
+
+/// Every `*.sql` file under `root`, recursively — an empty vec for a missing
+/// directory (a project may legitimately have no SQL sources at all), never
+/// an error.
+fn sql_script_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    collect_sql_scripts(root, &mut out);
+    out
+}
+
+fn collect_sql_scripts(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_sql_scripts(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("sql") {
+            out.push(path);
+        }
+    }
 }
 
 fn validate_web(root: &Path) -> usize {
@@ -177,6 +221,57 @@ mod tests {
         fs::write(root.join("api/config/connections.json"), r#"{ "db": { "driver": "nosuchdriver" } }"#).unwrap();
 
         assert_eq!(validate_api(&root).await, 1);
+    }
+
+    /// `frogs run` only clamps (and warns) an over-ceiling `sourceCallTimeoutMs`
+    /// rather than refusing to start — `frogs validate` is where this is
+    /// surfaced as a real problem a user can catch without a live run (see
+    /// `ServerConfig::effective_source_call_timeout_ms`).
+    #[tokio::test]
+    async fn validate_api_counts_a_server_json_source_call_timeout_ms_over_the_ceiling_as_a_problem() {
+        let root = temp_project();
+        write_minimal_openapi(&root);
+        fs::create_dir_all(root.join("api/config")).unwrap();
+        fs::write(root.join("api/config/server.json"), r#"{ "sourceCallTimeoutMs": 999999 }"#).unwrap();
+
+        assert_eq!(validate_api(&root).await, 1);
+    }
+
+    #[tokio::test]
+    async fn validate_api_does_not_flag_an_under_ceiling_server_json_source_call_timeout_ms() {
+        let root = temp_project();
+        write_minimal_openapi(&root);
+        fs::create_dir_all(root.join("api/config")).unwrap();
+        fs::write(root.join("api/config/server.json"), r#"{ "sourceCallTimeoutMs": 60000 }"#).unwrap();
+
+        assert_eq!(validate_api(&root).await, 0);
+    }
+
+    /// `é` right after `:id` means only the ASCII prefix `id` is actually
+    /// bound — a scripted-but-wrong placeholder name, reported (not
+    /// fatal to startup) via `truncated_placeholder_names`.
+    #[tokio::test]
+    async fn validate_api_reports_a_sql_script_with_a_truncated_placeholder_as_one_problem() {
+        let root = temp_project();
+        write_minimal_openapi(&root);
+        fs::create_dir_all(root.join("api/config")).unwrap();
+        fs::create_dir_all(root.join("api/datasources/sql/db")).unwrap();
+        fs::write(root.join("api/datasources/sql/db/query.sql"), "SELECT * FROM cars WHERE id = :idé").unwrap();
+
+        assert_eq!(validate_api(&root).await, 1);
+    }
+
+    /// The same check must stay silent for an all-ASCII script — only a
+    /// `:name` truncated by a trailing non-ASCII byte is ever flagged.
+    #[tokio::test]
+    async fn validate_api_does_not_flag_an_all_ascii_sql_script() {
+        let root = temp_project();
+        write_minimal_openapi(&root);
+        fs::create_dir_all(root.join("api/config")).unwrap();
+        fs::create_dir_all(root.join("api/datasources/sql/db")).unwrap();
+        fs::write(root.join("api/datasources/sql/db/query.sql"), "SELECT * FROM cars WHERE id = :id").unwrap();
+
+        assert_eq!(validate_api(&root).await, 0);
     }
 
     #[tokio::test]
