@@ -233,6 +233,11 @@ pub fn pool_capacity(conn: &ConnectionConfig) -> Option<u32> {
 /// `connections.json`'s `"driver"` field selects which implementation runs
 /// at startup — same mechanism regardless of whether it resolves to
 /// `sqlx`/postgres, `tiberius`, `rusqlite`, or eventually `odbc-api`.
+// `async_trait`'s macro expansion redundantly tags the generated method with
+// `#[must_use]` even though it already returns a must_use pinned boxed
+// future — a newer clippy flags that as `double_must_use`. The redundancy is
+// in the macro's own expansion, not anything we can fix here.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait SqlDriver: Send + Sync + std::fmt::Debug {
     /// Runs `script` (a driver-native SQL string using `:name` placeholders,
