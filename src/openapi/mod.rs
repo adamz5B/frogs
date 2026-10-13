@@ -248,6 +248,11 @@ pub struct OpenApiDocument {
     /// since resolving it is a distinct step (`resolve_components`) a
     /// caller may or may not need yet.
     pub component_schemas: Map<String, Value>,
+    /// `components/securitySchemes/<name>/type` for every declared scheme
+    /// (`apiKey`, `http`, `mutualTLS`, ...) — how `generate` and `validate`
+    /// recognize a `mutualTLS` scheme, which OpenAPI 3.1 defines but 3.0
+    /// documents may still use as a free-form name.
+    pub security_scheme_types: HashMap<String, String>,
 }
 
 impl OpenApiDocument {
@@ -336,7 +341,23 @@ pub fn load(path: &Path) -> Result<OpenApiDocument, OpenApiError> {
         .cloned()
         .unwrap_or_default();
 
-    Ok(OpenApiDocument { operations, component_schemas })
+    let security_scheme_types = doc
+        .get("components")
+        .and_then(|components| components.get("securitySchemes"))
+        .and_then(Value::as_object)
+        .map(|schemes| {
+            schemes
+                .iter()
+                .filter_map(|(name, scheme)| Some((name.clone(), scheme.get("type")?.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(OpenApiDocument {
+        operations,
+        component_schemas,
+        security_scheme_types,
+    })
 }
 
 #[cfg(test)]

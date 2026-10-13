@@ -105,6 +105,26 @@ deadpool-tiberius = { version = "0.1.9", default-features = false, features = ["
 # installs, with no second provider to conflict.
 oracle-rs = { version = "0.1.7", optional = true }
 deadpool-oracle = { version = "0.1.1", optional = true }
+# mTLS client-certificate identity extraction (`security::client_cert`):
+# parses the already-chain-validated leaf cert's subject/issuer/serial/SANs
+# after the handshake. Pure Rust, no C toolchain, consistent with the rest of
+# this project's TLS posture. `default-features = false` drops its optional
+# `verify`/`validate` extras (this crate never validates a chain itself;
+# rustls's `WebPkiClientVerifier` does that).
+x509-parser = { version = "0.18", default-features = false }
+# SHA-256 of the leaf cert DER for `cert.fingerprint`. Already in the tree
+# via rustls's `ring` provider (see `rustls` above); named directly here so
+# the digest doesn't rely on that dependency's re-exports.
+ring = "0.17"
+# The mTLS acceptor wrapper (`server::tls`) reads the peer certificate off
+# axum-server's `tokio_rustls::server::TlsStream` after the handshake, and
+# the dev-side handshake tests use it as a real TLS client. Already in the
+# tree via axum-server's rustls acceptor (same version, same
+# `default-features = false`); `tls12` matches rustls's own defaults.
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+# Names the `Service` trait the per-connection identity wrapper
+# (`server::tls::IdentityService`) implements; already in the tree via axum.
+tower-service = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 # Windows-only, and a deliberate reversal of this feature's original

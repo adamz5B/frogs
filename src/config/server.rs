@@ -118,6 +118,111 @@ pub struct TlsConfig {
     pub mode: TlsMode,
     #[serde(default)]
     pub manual: Option<ManualTlsConfig>,
+    /// mTLS: whether (and how strictly) this listener asks clients for a
+    /// certificate. Absent, or `mode: off`, is today's behavior exactly —
+    /// and a default config serializes without this key at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_auth: Option<ClientAuthConfig>,
+}
+
+/// Whether the TLS listener requests a client certificate. Deliberately has
+/// no `Default`/serde default: a `clientAuth` block that omits `mode` fails
+/// to parse rather than quietly picking one (an accidental `required` would
+/// lock out every cert-less client, an accidental `optional` is a silent
+/// security posture change).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientAuthMode {
+    Off,
+    /// The handshake succeeds with or without a certificate (a presented one
+    /// must still fully validate); routes decide.
+    Optional,
+    /// No valid certificate, no connection.
+    Required,
+}
+
+/// What to do when a presented certificate's revocation status can't be
+/// established from the loaded CRLs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CrlPolicy {
+    /// A certificate whose issuer has no loaded CRL, or whose CRL has
+    /// expired, is rejected (the default whenever `crlPaths` is non-empty).
+    FailClosed,
+    /// Accepts a certificate whose issuer has no loaded CRL and doesn't
+    /// enforce CRL expiry; a loaded, current CRL still rejects what it lists.
+    BestEffort,
+}
+
+/// `tls.clientAuth` — see `docs/frogs-mtls.md`. Paths resolve against the
+/// same base as `tls.manual`'s `certPath`/`keyPath`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClientAuthConfig {
+    pub mode: ClientAuthMode,
+    /// PEM bundle of the CA(s) allowed to issue client certificates. Never
+    /// merged with the OS trust store — client CAs are a private PKI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_path: Option<String>,
+    /// Static CRL files (PEM with one or more `X509 CRL` blocks, or a single
+    /// DER CRL). Empty means revocation is not checked at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crl_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crl_policy: Option<CrlPolicy>,
+    /// Defaults to `true`: the leaf certificate must carry an extended key
+    /// usage extension listing `clientAuth`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_client_auth_eku: Option<bool>,
+}
+
+impl ClientAuthConfig {
+    pub fn effective_crl_policy(&self) -> CrlPolicy {
+        self.crl_policy.unwrap_or(CrlPolicy::FailClosed)
+    }
+
+    pub fn effective_require_client_auth_eku(&self) -> bool {
+        self.require_client_auth_eku.unwrap_or(true)
+    }
+}
+
+impl TlsConfig {
+    /// Whether this listener will request client certificates (so request
+    /// handlers can ever see a `ClientCertIdentity`).
+    pub fn client_identity_enabled(&self) -> bool {
+        self.mode == TlsMode::Manual && self.client_auth.as_ref().is_some_and(|c| c.mode != ClientAuthMode::Off)
+    }
+
+    /// The I/O-free half of `clientAuth` validation, shared by `serve` and
+    /// `frogs validate`: contradictory or incomplete combinations fail here
+    /// by naming the offending field.
+    pub fn validate_structure(&self) -> Result<(), String> {
+        let Some(client_auth) = &self.client_auth else { return Ok(()) };
+        if client_auth.mode == ClientAuthMode::Off {
+            let stray = [
+                ("caPath", client_auth.ca_path.is_some()),
+                ("crlPaths", !client_auth.crl_paths.is_empty()),
+                ("crlPolicy", client_auth.crl_policy.is_some()),
+                ("requireClientAuthEku", client_auth.require_client_auth_eku.is_some()),
+            ];
+            if let Some((field, _)) = stray.iter().find(|(_, set)| *set) {
+                return Err(format!(
+                    "tls.clientAuth.{field} is set but tls.clientAuth.mode is \"off\" — remove it or enable clientAuth"
+                ));
+            }
+            return Ok(());
+        }
+        if self.mode != TlsMode::Manual {
+            return Err("tls.clientAuth is enabled but tls.mode is not \"manual\" — client certificates only make sense over TLS".to_string());
+        }
+        if client_auth.ca_path.as_deref().is_none_or(|p| p.trim().is_empty()) {
+            return Err("tls.clientAuth.caPath is required when tls.clientAuth.mode is not \"off\"".to_string());
+        }
+        if client_auth.crl_policy.is_some() && client_auth.crl_paths.is_empty() {
+            return Err("tls.clientAuth.crlPolicy is set but tls.clientAuth.crlPaths is empty — a policy only applies to loaded CRLs".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// Visibility for the docs UI console (`/docs`) — modeled as its own mode
@@ -580,3 +685,6 @@ mod tests {
         assert_eq!(config.effective_source_call_timeout_ms().get(), MAX_SOURCE_CALL_TIMEOUT_MS);
     }
 }
+
+#[cfg(test)]
+mod mtls_tests;

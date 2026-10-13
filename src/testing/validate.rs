@@ -35,6 +35,9 @@ pub fn validate_corpus(files: &[LoadedTestFile], routable: &HashMap<RouteKey, En
             }
 
             if let Some(endpoint) = &loaded.endpoint {
+                if case.client_cert.is_some() && endpoint.security.is_none() {
+                    warnings.push(format!("{label}: sets clientCert but the endpoint declares no security scheme"));
+                }
                 for key in case.mocks.keys() {
                     if key == VERIFIER_MOCK_KEY {
                         if endpoint.security.is_none() {

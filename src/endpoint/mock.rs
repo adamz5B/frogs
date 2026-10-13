@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use super::resolve::MockOutcome;
 use super::schema::{EndpointFile, SourceDef};
+use crate::security::ClientCertIdentity;
 
 /// The harness-owned error codes `frogs test` inserts into the loaded
 /// registry at startup (only if the project hasn't defined them itself —
@@ -85,6 +86,10 @@ pub enum MockSelection {
         case: Option<CaseRef>,
         mocks: HashMap<String, MockOutcome>,
         scenario: ScenarioChoice,
+        /// The matched case's `clientCert`, standing in for the identity a
+        /// real TLS handshake would have produced. Never a matching
+        /// constraint, and never read from a request header.
+        client_cert: Option<Box<ClientCertIdentity>>,
     },
     NoMatch {
         scenario: ScenarioChoice,
@@ -141,8 +146,12 @@ pub trait MockProvider: Send + Sync {
 /// only ever dial a real driver/HTTP/verifier when their lookup is `None`,
 /// so a map covering every name is a structural guarantee nothing is
 /// contacted. Returns what was filled in, with each source's `optional`
-/// flag (the verifier is never optional).
-pub fn enforce_no_real_infrastructure(endpoint: &EndpointFile, mocks: &mut HashMap<String, MockOutcome>) -> Vec<Unmocked> {
+/// flag (the verifier is never optional). `verifier_is_datasource_free` is
+/// true for an `mtls` verifier — a pure in-memory comparison with nothing
+/// real to dial, so it runs for real rather than being filled with a
+/// synthetic failure (a `cert.*`-parameterized sql/http verifier is still
+/// filled in like any other).
+pub fn enforce_no_real_infrastructure(endpoint: &EndpointFile, verifier_is_datasource_free: bool, mocks: &mut HashMap<String, MockOutcome>) -> Vec<Unmocked> {
     let mut filled = Vec::new();
     let mut names: Vec<&String> = endpoint.sources.keys().collect();
     names.sort();
@@ -156,7 +165,7 @@ pub fn enforce_no_real_infrastructure(endpoint: &EndpointFile, mocks: &mut HashM
         mocks.insert(name.clone(), MockOutcome::Fail(SOURCE_NOT_MOCKED.to_string()));
         filled.push(Unmocked { name: name.clone(), optional });
     }
-    if endpoint.security.is_some() && !mocks.contains_key(VERIFIER_MOCK_KEY) {
+    if endpoint.security.is_some() && !verifier_is_datasource_free && !mocks.contains_key(VERIFIER_MOCK_KEY) {
         mocks.insert(VERIFIER_MOCK_KEY.to_string(), MockOutcome::Fail(SOURCE_NOT_MOCKED.to_string()));
         filled.push(Unmocked {
             name: VERIFIER_MOCK_KEY.to_string(),
@@ -203,7 +212,7 @@ mod tests {
         let endpoint = endpoint(TWO_SOURCES_AND_SECURITY);
         let mut mocks = HashMap::new();
 
-        let filled = enforce_no_real_infrastructure(&endpoint, &mut mocks);
+        let filled = enforce_no_real_infrastructure(&endpoint, false, &mut mocks);
 
         assert_eq!(mocks.get("car"), Some(&MockOutcome::Fail(SOURCE_NOT_MOCKED.to_string())));
         assert_eq!(mocks.get("pricing"), Some(&MockOutcome::Fail(SOURCE_NOT_MOCKED.to_string())));
@@ -241,7 +250,7 @@ mod tests {
             (VERIFIER_MOCK_KEY.to_string(), MockOutcome::Success(serde_json::json!({ "active": true }))),
         ]);
 
-        let filled = enforce_no_real_infrastructure(&endpoint, &mut mocks);
+        let filled = enforce_no_real_infrastructure(&endpoint, false, &mut mocks);
 
         assert_eq!(mocks.get("car"), Some(&MockOutcome::Success(serde_json::json!({ "maker": "Honda" }))));
         assert_eq!(mocks.get(VERIFIER_MOCK_KEY), Some(&MockOutcome::Success(serde_json::json!({ "active": true }))));
@@ -252,7 +261,7 @@ mod tests {
     fn no_verifier_entry_is_added_for_an_endpoint_without_security() {
         let endpoint = endpoint(r#"{ "operationId": "ping", "sources": {}, "response": {} }"#);
         let mut mocks = HashMap::new();
-        let filled = enforce_no_real_infrastructure(&endpoint, &mut mocks);
+        let filled = enforce_no_real_infrastructure(&endpoint, false, &mut mocks);
         assert!(mocks.is_empty());
         assert!(filled.is_empty());
     }

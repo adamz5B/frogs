@@ -13,7 +13,7 @@
 - **Write operations** (POST/PUT/PATCH/DELETE) with body parameters and per-request transaction correlation.
 - **A mock server for testing** (`*.test.json` / `frogs test`) that serves real HTTP from canned per-source mocks — request matching, scenario switching, and a pass/fail report — without touching real infrastructure.
 - **Static-content serving** (`webserve.json`) that can run standalone or alongside the API in one process, mounted under a configurable `apiRoot`.
-- Operational basics: PID-file process management, `/healthz`/`/readyz`/`/metrics`, rate limiting, a service registry, and manual-cert HTTPS.
+- Operational basics: PID-file process management, `/healthz`/`/readyz`/`/metrics`, rate limiting, a service registry, and manual-cert HTTPS with optional mutual TLS (client-certificate auth, with static CRL revocation, authorized per route via `mtls` or `cert.*`-parameterized verifiers; CA/CRL changes need a restart).
 - **`frogs register`/`frogs unregister`** installs (or removes) this project as a platform-native service — systemd on Linux, launchd on macOS, a real Windows Service on Windows — so it starts automatically at boot/login instead of needing an open terminal.
 
 ## Quickstart

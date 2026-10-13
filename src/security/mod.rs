@@ -1,10 +1,13 @@
 mod cache;
+pub(crate) mod client_cert;
 mod schemes;
 mod valid_if;
 mod verifier;
 mod verify;
 
 pub use cache::VerifierCache;
+pub use client_cert::MtlsCondition;
+pub(crate) use client_cert::{CertField, ClientCertIdentity};
 pub use schemes::SchemeConfig;
 pub use valid_if::{ValidIf, ValidIfParseError};
 pub use verifier::VerifierDef;
@@ -40,6 +43,14 @@ pub enum SecurityLoadError {
         file: PathBuf,
         source: ValidIfParseError,
     },
+    /// An `mtls` verifier file that's malformed in a certificate-specific
+    /// way, or a sql/http verifier parameter naming a `cert.*` field that
+    /// doesn't exist or can't be bound — caught at startup like the rest.
+    InvalidClientCertConfig {
+        scheme: String,
+        file: PathBuf,
+        message: String,
+    },
 }
 
 impl fmt::Display for SecurityLoadError {
@@ -49,6 +60,7 @@ impl fmt::Display for SecurityLoadError {
             SecurityLoadError::Parse { file, source } => write!(f, "failed to parse {}: {source}", file.display()),
             SecurityLoadError::MissingVerifierFile { scheme, file } => write!(f, "security scheme '{scheme}' names verifier file {} which doesn't exist", file.display()),
             SecurityLoadError::InvalidValidIf { scheme, file, source } => write!(f, "verifier {} (scheme '{scheme}') has an invalid validIf: {source}", file.display()),
+            SecurityLoadError::InvalidClientCertConfig { scheme, file, message } => write!(f, "verifier {} (scheme '{scheme}'): {message}", file.display()),
         }
     }
 }
@@ -62,6 +74,20 @@ impl std::error::Error for SecurityLoadError {}
 pub struct LoadedVerifier {
     pub def: VerifierDef,
     pub valid_if: ValidIf,
+    /// `Some` only for an `mtls` verifier — its `validIf`, compiled against
+    /// the client-certificate fields rather than evaluated as a generic
+    /// `ValidIf` over a datasource result.
+    pub mtls: Option<MtlsCondition>,
+}
+
+impl LoadedVerifier {
+    /// Whether this verifier needs the connection's client certificate to
+    /// run at all (an `mtls` verifier, or any parameter bound from
+    /// `cert.*`) — such a route can only be served on a listener that
+    /// actually requests client certificates.
+    pub fn requires_client_cert(&self) -> bool {
+        matches!(self.def, VerifierDef::Mtls { .. }) || self.def.parameters().iter().any(|p| p.from.starts_with("cert."))
+    }
 }
 
 /// Everything under `<project root>/security/`: which OpenAPI security
@@ -119,7 +145,41 @@ impl SecurityConfig {
                 file: verifier_path.clone(),
                 source,
             })?;
-            verifiers.insert(scheme_name.clone(), LoadedVerifier { def, valid_if });
+            let invalid_cert_config = |message: String| SecurityLoadError::InvalidClientCertConfig {
+                scheme: scheme_name.clone(),
+                file: verifier_path.clone(),
+                message,
+            };
+            let mut mtls = None;
+            if matches!(def, VerifierDef::Mtls { .. }) {
+                let forbidden = def.forbidden_mtls_fields();
+                if !forbidden.is_empty() {
+                    return Err(invalid_cert_config(format!(
+                        "an mtls verifier has no datasource and must not set {} — it only declares validIf",
+                        forbidden.join(", ")
+                    )));
+                }
+                mtls = Some(MtlsCondition::compile(def.valid_if()).map_err(invalid_cert_config)?);
+            }
+            for param in def.parameters() {
+                let Some(field_name) = param.from.strip_prefix("cert.") else { continue };
+                match CertField::parse(field_name) {
+                    None => {
+                        return Err(invalid_cert_config(format!(
+                            "parameter '{}' reads from unknown certificate field '{}' — expected cert.cn, cert.subject, cert.issuer, cert.serial, cert.fingerprint or cert.notAfter",
+                            param.name, param.from
+                        )));
+                    }
+                    Some(field) if !field.is_bindable() => {
+                        return Err(invalid_cert_config(format!(
+                            "parameter '{}' reads from '{}', but a certificate can carry several of those and a single bound value would silently pick one — bind cert.fingerprint (or cert.issuer plus cert.serial) in a sql/http verifier, or use an mtls verifier to match any SAN",
+                            param.name, param.from
+                        )));
+                    }
+                    Some(_) => {}
+                }
+            }
+            verifiers.insert(scheme_name.clone(), LoadedVerifier { def, valid_if, mtls });
         }
 
         Ok(SecurityConfig { schemes, verifiers })
@@ -253,3 +313,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod mtls_load_tests;

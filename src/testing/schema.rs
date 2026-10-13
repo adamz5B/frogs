@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub(crate) use crate::endpoint::MockOutcome;
+use crate::security::client_cert::{ClientCertIdentity, TestIdentityFields};
 
 /// One `datasources/endpoints/<path>/endpoint.<method>.test.json` file.
 /// Sibling to the endpoint file it tests, same "config lives next to what
@@ -43,6 +44,117 @@ pub struct TestCase {
     /// up — see `testing::memory`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub save: HashMap<String, SaveEntry>,
+    /// The client-certificate identity this case simulates, standing in for
+    /// what a real mTLS handshake would have produced (the mock server is
+    /// plain HTTP). Never a matching constraint — it's applied to whichever
+    /// case is selected — and never read from a request header.
+    #[serde(default, rename = "clientCert", skip_serializing_if = "Option::is_none")]
+    pub client_cert: Option<TestClientCert>,
+}
+
+/// A case's `clientCert` block. Every field is optional; `notAfter` (RFC
+/// 3339) is enforced against the clock when present and absent means "never
+/// expires". `san` entries each take a string or an array of strings.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TestClientCert {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_after: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub san: Option<TestClientCertSan>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestClientCertSan {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<StringOrList>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<StringOrList>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<StringOrList>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum StringOrList {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StringOrList {
+    fn to_vec(&self) -> Vec<String> {
+        match self {
+            StringOrList::One(s) => vec![s.clone()],
+            StringOrList::Many(items) => items.clone(),
+        }
+    }
+}
+
+impl TestClientCert {
+    /// Load-time check: `notAfter` must be RFC 3339 and no value may carry a
+    /// control character (mirroring what a real certificate parse rejects).
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(raw) = &self.not_after
+            && chrono::DateTime::parse_from_rfc3339(raw).is_err()
+        {
+            return Err(format!("clientCert.notAfter '{raw}' is not an RFC 3339 timestamp"));
+        }
+        let mut values: Vec<(&str, &str)> = Vec::new();
+        for (name, value) in [
+            ("cn", &self.cn),
+            ("subject", &self.subject),
+            ("issuer", &self.issuer),
+            ("serial", &self.serial),
+            ("fingerprint", &self.fingerprint),
+        ] {
+            if let Some(v) = value {
+                values.push((name, v));
+            }
+        }
+        if let Some(san) = &self.san {
+            for (name, list) in [("san.dns", &san.dns), ("san.uri", &san.uri), ("san.email", &san.email)] {
+                match list {
+                    Some(StringOrList::One(v)) => values.push((name, v)),
+                    Some(StringOrList::Many(items)) => values.extend(items.iter().map(|v| (name, v.as_str()))),
+                    None => {}
+                }
+            }
+        }
+        match values.iter().find(|(_, v)| v.chars().any(char::is_control)) {
+            Some((name, _)) => Err(format!("clientCert.{name} contains a control character")),
+            None => Ok(()),
+        }
+    }
+
+    pub fn to_identity(&self) -> ClientCertIdentity {
+        let san = self.san.clone().unwrap_or_default();
+        ClientCertIdentity::from_test_fields(TestIdentityFields {
+            cn: self.cn.clone(),
+            subject: self.subject.clone(),
+            issuer: self.issuer.clone(),
+            serial: self.serial.clone(),
+            fingerprint: self.fingerprint.clone(),
+            not_after: self
+                .not_after
+                .as_deref()
+                .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+                .map(|t| t.with_timezone(&chrono::Utc)),
+            san_dns: san.dns.map(|v| v.to_vec()).unwrap_or_default(),
+            san_uri: san.uri.map(|v| v.to_vec()).unwrap_or_default(),
+            san_email: san.email.map(|v| v.to_vec()).unwrap_or_default(),
+        })
+    }
 }
 
 /// The inbound request this case simulates — path/query params, an
@@ -138,7 +250,15 @@ impl std::error::Error for TestLoadError {}
 
 pub fn load(path: &std::path::Path) -> Result<TestFile, TestLoadError> {
     let contents = std::fs::read_to_string(path).map_err(TestLoadError::Io)?;
-    serde_json::from_str(&contents).map_err(TestLoadError::Parse)
+    let file: TestFile = serde_json::from_str(&contents).map_err(TestLoadError::Parse)?;
+    for case in &file.cases {
+        if let Some(client_cert) = &case.client_cert {
+            client_cert
+                .validate()
+                .map_err(|message| TestLoadError::Parse(<serde_json::Error as serde::de::Error>::custom(format!("case \"{}\": {message}", case.name))))?;
+        }
+    }
+    Ok(file)
 }
 
 /// Writes a whole `TestFile` back out — `frogs test record`'s only writer.
@@ -380,6 +500,7 @@ mod tests {
             mocks: HashMap::new(),
             expect: Expectation { status: Some(200), body: None },
             save: HashMap::new(),
+            client_cert: None,
         };
         let serialized = serde_json::to_string(&untagged).unwrap();
         assert!(!serialized.contains("scenario"), "{serialized}");
@@ -477,6 +598,7 @@ mod tests {
             mocks: HashMap::from([("car".to_string(), MockOutcome::Success(serde_json::json!({ "vin": "X" })))]),
             expect: Expectation { status: Some(200), body: None },
             save: HashMap::new(),
+            client_cert: None,
         });
         save_to(&path, &test_file).unwrap();
 

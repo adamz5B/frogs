@@ -20,7 +20,7 @@ use axum::{Json, Router};
 use crate::config::ConnectionConfig;
 use crate::errors::{DiscoveredErrors, ErrorRegistry};
 use crate::openapi::Operation;
-use crate::security::{SecurityConfig, VerifierCache};
+use crate::security::{ClientCertIdentity, SecurityConfig, VerifierCache};
 use crate::server::RequestId;
 use crate::sql::SqlDriver;
 use serde_json::{Map, Value};
@@ -126,6 +126,12 @@ pub fn build_router(
     // `config.server.effective_source_call_timeout_ms()`, which is where the
     // `MAX_SOURCE_CALL_TIMEOUT_MS` ceiling and its one-time warning live.
     source_call_timeout_ms: NonZeroU64,
+    // Whether this process can ever hand a handler a client-certificate
+    // identity (a `clientAuth`-enabled TLS listener, or `frogs test`'s mock
+    // provider). A route whose verifier needs one is refused otherwise —
+    // it could never succeed, and "no certificate required" must never be
+    // what an unreachable cert-dependent route silently degrades to.
+    client_identity_available: bool,
 ) -> Router {
     let sql_root = project_root.join("datasources/sql");
     let http_root = project_root.join("datasources/http");
@@ -164,6 +170,19 @@ pub fn build_router(
         {
             tracing::warn!(
                 "skipping {}: security scheme '{scheme}' has no matching entry in security/schemes.json",
+                file_path.display()
+            );
+            continue;
+        }
+
+        if let Some(scheme) = &endpoint.security
+            && let Some(verifier) = security.verifiers.get(scheme)
+            && verifier.requires_client_cert()
+            && !client_identity_available
+        {
+            tracing::warn!(
+                "skipping {}: security scheme '{scheme}' needs a client certificate, but this server's TLS listener doesn't request one \
+                 (set tls.mode to \"manual\" and enable tls.clientAuth in config/server.json)",
                 file_path.display()
             );
             continue;
@@ -256,7 +275,12 @@ pub fn build_router(
 /// check logic (parse JSON, confirm a declared security scheme resolves)
 /// is small enough that duplicating it here stays cheaper than
 /// restructuring `build_router` to serve both callers.
-pub(crate) fn validate_endpoint_files(endpoints_root: &Path, security: &SecurityConfig, connections: &HashMap<String, ConnectionConfig>) -> (usize, Vec<String>) {
+pub(crate) fn validate_endpoint_files(
+    endpoints_root: &Path,
+    security: &SecurityConfig,
+    connections: &HashMap<String, ConnectionConfig>,
+    client_identity_available: bool,
+) -> (usize, Vec<String>) {
     let discovered = discover_endpoint_files(endpoints_root);
     let count = discovered.len();
     let mut problems = Vec::new();
@@ -281,6 +305,16 @@ pub(crate) fn validate_endpoint_files(endpoints_root: &Path, security: &Security
         {
             problems.push(format!(
                 "{}: security scheme '{scheme}' has no matching entry in security/schemes.json",
+                file_path.display()
+            ));
+        }
+        if let Some(scheme) = &endpoint.security
+            && let Some(verifier) = security.verifiers.get(scheme)
+            && verifier.requires_client_cert()
+            && !client_identity_available
+        {
+            problems.push(format!(
+                "{}: security scheme '{scheme}' needs a client certificate, but tls.clientAuth is off or absent — this route would be refused at startup",
                 file_path.display()
             ));
         }
@@ -497,6 +531,9 @@ async fn handle_request(
     // falling back gracefully here (see below) keeps that an operational
     // guarantee this handler benefits from, not one it silently requires.
     transaction_id: Option<Extension<RequestId>>,
+    // Set only by `server::tls::ClientCertAcceptor` (which strips any
+    // pre-existing copy first) — never derived from a header.
+    client_cert: Option<Extension<Arc<ClientCertIdentity>>>,
     // A body-consuming extractor must come last — axum can only hand the
     // request body to one extractor. `Bytes` (not `Json<Value>`) since a
     // GET/DELETE typically sends none at all, and `Json` would hard-fail
@@ -513,6 +550,7 @@ async fn handle_request(
         serde_json::from_slice(&raw_body).unwrap_or(Value::Null)
     };
     let transaction_id = transaction_id.map(|Extension(RequestId(id))| id).unwrap_or_default();
+    let client_cert = client_cert.map(|Extension(identity)| identity);
 
     let (http_status, response_body) = match &state.mock_provider {
         None => {
@@ -530,6 +568,7 @@ async fn handle_request(
                 state.debug_mode,
                 &state.verifier_cache,
                 &headers,
+                client_cert.as_deref(),
                 &path_params,
                 &query_params,
                 &body,
@@ -541,7 +580,19 @@ async fn handle_request(
             )
             .await
         }
-        Some(provider) => handle_mocked(&state, provider.as_ref(), &headers, &path_params, &query_params, &body, &transaction_id).await,
+        Some(provider) => {
+            handle_mocked(
+                &state,
+                provider.as_ref(),
+                &headers,
+                client_cert.as_deref(),
+                &path_params,
+                &query_params,
+                &body,
+                &transaction_id,
+            )
+            .await
+        }
     };
 
     let status = StatusCode::from_u16(http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -561,6 +612,10 @@ async fn handle_mocked(
     state: &RouteState,
     provider: &dyn MockProvider,
     headers: &HeaderMap,
+    // The identity of a real TLS connection to the mock server, when it
+    // runs with `clientAuth` — a case's own `clientCert` wins over it, and
+    // neither is ever read from a header.
+    connection_cert: Option<&ClientCertIdentity>,
     path_params: &HashMap<String, String>,
     query_params: &HashMap<String, String>,
     body: &Value,
@@ -598,9 +653,15 @@ async fn handle_mocked(
             None,
             &state.endpoint.error_overrides,
         ),
-        MockSelection::Case { case, mocks, .. } => {
+        MockSelection::Case { case, mocks, client_cert, .. } => {
             let mut mocks = mocks.clone();
-            unmocked = mock::enforce_no_real_infrastructure(&state.endpoint, &mut mocks);
+            let verifier_is_datasource_free = state
+                .endpoint
+                .security
+                .as_ref()
+                .and_then(|scheme| state.security.verifiers.get(scheme))
+                .is_some_and(|verifier| verifier.mtls.is_some());
+            unmocked = mock::enforce_no_real_infrastructure(&state.endpoint, verifier_is_datasource_free, &mut mocks);
             let (status, mut response_body) = resolve_request(
                 &state.endpoint,
                 &state.security,
@@ -615,6 +676,7 @@ async fn handle_mocked(
                 state.debug_mode,
                 &state.verifier_cache,
                 headers,
+                client_cert.as_deref().or(connection_cert),
                 path_params,
                 query_params,
                 body,
@@ -687,6 +749,9 @@ pub(crate) async fn resolve_request(
     debug_mode: bool,
     verifier_cache: &VerifierCache,
     headers: &HeaderMap,
+    // The connection's validated client certificate, if it presented one —
+    // see `server::tls`. Only a certificate-dependent verifier ever reads it.
+    client_cert: Option<&ClientCertIdentity>,
     path_params: &HashMap<String, String>,
     query_params: &HashMap<String, String>,
     body: &Value,
@@ -749,28 +814,53 @@ pub(crate) async fn resolve_request(
             );
         };
 
-        let verify_result = match mocks.get("verifier") {
-            Some(MockOutcome::Success(mock_value)) => {
-                if verifier.valid_if.evaluate(mock_value) {
-                    Ok(())
-                } else {
-                    Err(("auth.invalid_credentials".to_string(), "mocked verifier: validIf did not hold".to_string()))
+        // Before the verifier is consulted at all (real or mocked): a
+        // certificate-dependent scheme with no certificate, or one that has
+        // outlived its validity on a long-lived connection, is refused
+        // without touching any datasource.
+        let cert_failure = if verifier.requires_client_cert() {
+            match client_cert {
+                None => Some(("auth.client_cert_missing", "no client certificate was presented")),
+                Some(identity) if !identity.is_valid_at(chrono::Utc::now()) => {
+                    Some(("auth.client_cert_expired", "the client certificate is outside its validity period"))
                 }
+                Some(_) => None,
             }
-            Some(MockOutcome::Fail(code)) => Err((code.clone(), format!("mocked failure: {code}"))),
-            None => crate::security::verify(
-                scheme,
-                verifier,
-                drivers,
-                sql_root,
-                http_root,
-                http_client,
-                headers,
-                verifier_cache,
-                source_call_timeout_ms,
-            )
-            .await
-            .map_err(|cause| (cause.code().to_string(), cause.message())),
+        } else {
+            None
+        };
+
+        let verify_result = if let Some((code, message)) = cert_failure {
+            Err((code.to_string(), message.to_string()))
+        } else {
+            match mocks.get("verifier") {
+                Some(MockOutcome::Success(mock_value)) => {
+                    let holds = match &verifier.mtls {
+                        Some(condition) => ClientCertIdentity::from_identity_json(mock_value).is_some_and(|identity| condition.matches(&identity)),
+                        None => verifier.valid_if.evaluate(mock_value),
+                    };
+                    if holds {
+                        Ok(())
+                    } else {
+                        Err(("auth.invalid_credentials".to_string(), "mocked verifier: validIf did not hold".to_string()))
+                    }
+                }
+                Some(MockOutcome::Fail(code)) => Err((code.clone(), format!("mocked failure: {code}"))),
+                None => crate::security::verify(
+                    scheme,
+                    verifier,
+                    drivers,
+                    sql_root,
+                    http_root,
+                    http_client,
+                    headers,
+                    client_cert,
+                    verifier_cache,
+                    source_call_timeout_ms,
+                )
+                .await
+                .map_err(|cause| (cause.code().to_string(), cause.message())),
+            }
         };
 
         if let Err((code, message)) = verify_result {
@@ -1247,6 +1337,7 @@ mod tests {
         let verifier = LoadedVerifier {
             valid_if: ValidIf::parse(def.valid_if()).unwrap(),
             def,
+            mtls: None,
         };
         let mut verifiers = HashMap::new();
         verifiers.insert("apiKeyAuth".to_string(), verifier);
@@ -1340,6 +1431,7 @@ mod tests {
             None,
             None,
             test_call_timeout(),
+            false,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1404,6 +1496,7 @@ mod tests {
             None,
             None,
             test_call_timeout(),
+            false,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1495,6 +1588,7 @@ mod tests {
             None,
             None,
             test_call_timeout(),
+            false,
         );
         let router = crate::server::apply_middleware(router);
 
@@ -2000,6 +2094,7 @@ mod tests {
             None,
             None,
             test_call_timeout(),
+            false,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2098,6 +2193,7 @@ mod tests {
             false,
             &crate::security::VerifierCache::new(),
             &HeaderMap::new(),
+            None,
             &HashMap::new(),
             &HashMap::new(),
             &Value::Null,
@@ -2173,6 +2269,7 @@ mod tests {
             false,
             &crate::security::VerifierCache::new(),
             &HeaderMap::new(),
+            None,
             &HashMap::new(),
             &HashMap::new(),
             &Value::Null,
@@ -2214,6 +2311,7 @@ mod tests {
             false,
             &crate::security::VerifierCache::new(),
             &HeaderMap::new(),
+            None,
             &HashMap::new(),
             &HashMap::new(),
             &Value::Null,
@@ -2258,6 +2356,7 @@ mod tests {
             false,
             &crate::security::VerifierCache::new(),
             &HeaderMap::new(),
+            None,
             &HashMap::new(),
             &HashMap::new(),
             &Value::Null,
@@ -2304,6 +2403,7 @@ mod tests {
             None,
             None,
             test_call_timeout(),
+            false,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2376,6 +2476,7 @@ mod tests {
             global_debug_mode,
             &crate::security::VerifierCache::new(),
             &HeaderMap::new(),
+            None,
             &HashMap::new(),
             &HashMap::new(),
             &Value::Null,
@@ -2494,6 +2595,7 @@ mod tests {
             false, // global default is off
             &crate::security::VerifierCache::new(),
             &HeaderMap::new(),
+            None,
             &HashMap::new(),
             &HashMap::new(),
             &Value::Null,
@@ -2593,6 +2695,7 @@ mod tests {
                 false,
                 &crate::security::VerifierCache::new(),
                 headers,
+                None,
                 path_params,
                 query_params,
                 body,
@@ -2776,6 +2879,7 @@ mod tests {
             let verifier = LoadedVerifier {
                 valid_if: ValidIf::parse(def.valid_if()).unwrap(),
                 def,
+                mtls: None,
             };
             let mut verifiers = HashMap::new();
             verifiers.insert("apiKeyAuth".to_string(), verifier);
@@ -3260,6 +3364,7 @@ mod tests {
             None,
             None,
             test_call_timeout(),
+            false,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3272,7 +3377,7 @@ mod tests {
         let resp = client.get(format!("http://{addr}/pricing")).send().await.unwrap();
         assert_eq!(resp.status(), 404, "an invalid nested-many config must mean the route was never registered at all");
 
-        let (count, problems) = validate_endpoint_files(&root.join("datasources/endpoints"), &SecurityConfig::default(), &HashMap::new());
+        let (count, problems) = validate_endpoint_files(&root.join("datasources/endpoints"), &SecurityConfig::default(), &HashMap::new(), false);
         assert_eq!(count, 1, "the file was still discovered — just invalid");
         assert!(
             problems.iter().any(|p| p.contains("maxConcurrency")),
@@ -3352,6 +3457,7 @@ mod tests {
             None,
             Some(provider),
             test_call_timeout(),
+            false,
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3372,6 +3478,7 @@ mod tests {
                 case: None,
                 mocks: HashMap::from([("car".to_string(), MockOutcome::Success(serde_json::json!({ "maker": "Honda" })))]),
                 scenario: baseline_choice(),
+                client_cert: None,
             },
             observed: Mutex::new(Vec::new()),
         });
@@ -3493,3 +3600,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(test)]
+mod mtls_tests;

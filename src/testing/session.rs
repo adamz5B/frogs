@@ -222,6 +222,7 @@ impl MockProvider for MockSession {
                 case: None,
                 mocks: HashMap::new(),
                 scenario,
+                client_cert: None,
             };
         };
 
@@ -247,6 +248,7 @@ impl MockProvider for MockSession {
                     }),
                     mocks,
                     scenario,
+                    client_cert: case.client_cert.as_ref().map(|c| Box::new(c.to_identity())),
                 }
             }
             None => {
@@ -582,7 +584,7 @@ mod tests {
         let session = session_with_flag(None);
         let inbound = Inbound::new(HeaderMap::new());
         match session.select(&route("get", "/ping"), &inbound.as_request()) {
-            MockSelection::Case { case, mocks, scenario } => {
+            MockSelection::Case { case, mocks, scenario, .. } => {
                 assert!(case.is_none());
                 assert!(mocks.is_empty());
                 assert_eq!(scenario.source, ScenarioSource::Baseline);
@@ -639,6 +641,7 @@ mod tests {
                 case: Some(case),
                 mocks,
                 scenario,
+                ..
             } => {
                 assert_eq!(case.name, "db down");
                 assert_eq!(case.index, 2);

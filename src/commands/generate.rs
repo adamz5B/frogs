@@ -144,6 +144,10 @@ fn generate_api(root: &Path) -> io::Result<()> {
             );
         }
 
+        for hint in mutual_tls_hints(&doc, &config.security) {
+            println!("{hint}");
+        }
+
         let validation_errors = validate_success_statuses(&api_root, &doc);
         for error in &validation_errors {
             eprintln!("error: {error}");
@@ -159,6 +163,39 @@ fn generate_api(root: &Path) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// For each `mutualTLS` security scheme an operation uses that
+/// `security/schemes.json` doesn't define yet, a ready-to-paste example.
+/// Printed only — `generate` never writes `schemes.json` or a verifier file
+/// (what a client certificate should be authorized *for* is a decision for
+/// the project, not something to invent).
+fn mutual_tls_hints(doc: &crate::openapi::OpenApiDocument, security: &crate::security::SecurityConfig) -> Vec<String> {
+    let mut names: Vec<&String> = doc
+        .operations
+        .iter()
+        .filter_map(|op| op.security.as_ref())
+        .filter(|name| doc.security_scheme_types.get(*name).map(String::as_str) == Some("mutualTLS") && !security.schemes.contains_key(*name))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .map(|name| {
+            format!(
+                "note: security scheme '{name}' is a mutualTLS scheme but security/schemes.json has no entry for it — nothing has been written. To enable it:\n\
+                 \n\
+                 \x20\x20security/schemes.json:\n\
+                 \x20\x20\x20\x20\"{name}\": {{ \"verifier\": \"{name}.json\" }}\n\
+                 \n\
+                 \x20\x20security/verifiers/{name}.json (authorize one SAN; or use a sql/http verifier with a \"cert.fingerprint\" parameter for an allowlist):\n\
+                 \x20\x20\x20\x20{{ \"type\": \"mtls\", \"validIf\": \"cert.san.dns = client.example.com\" }}\n\
+                 \n\
+                 \x20\x20config/server.json (the listener must request client certificates):\n\
+                 \x20\x20\x20\x20\"tls\": {{ \"mode\": \"manual\", \"manual\": {{ ... }}, \"clientAuth\": {{ \"mode\": \"optional\", \"caPath\": \"security/client-ca.pem\" }} }}"
+            )
+        })
+        .collect()
 }
 
 /// Writes every `api/`-rooted config file once, if it doesn't already exist
@@ -225,6 +262,8 @@ fn default_core_errors() -> Value {
         "datasource.http.upstream_error":      { "httpStatus": 502, "exposeDetail": false },
         "auth.invalid_credentials":            { "httpStatus": 401, "exposeDetail": true },
         "auth.verifier_unavailable":           { "httpStatus": 500, "exposeDetail": false },
+        "auth.client_cert_missing":            { "httpStatus": 401, "exposeDetail": true },
+        "auth.client_cert_expired":            { "httpStatus": 401, "exposeDetail": true },
         "validation.missing_parameter":        { "httpStatus": 400, "exposeDetail": true },
         "validation.invalid_type":             { "httpStatus": 400, "exposeDetail": true },
         "unexpected.error": { "httpStatus": 500, "exposeDetail": false }
@@ -1277,3 +1316,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(test)]
+mod mtls_tests;

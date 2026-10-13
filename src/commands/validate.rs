@@ -1,8 +1,16 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::config::Config;
+use crate::config::{ClientAuthMode, Config, CrlPolicy, TlsConfig, TlsMode};
 use crate::project::{MANIFEST_FILE, api_base, require_project_root};
+use crate::server::tls::{CRL_EXPIRY_WARNING_DAYS, CrlStatus, build_server_config, crl_freshness};
+
+/// A finding that's worth printing but doesn't fail the run (and isn't
+/// counted in the problem total) — e.g. revocation not being checked is a
+/// legitimate (if risky) choice, not a misconfiguration.
+fn warn(message: &str) {
+    println!("  warning: {message}");
+}
 
 /// A read-only dry run of everything `frogs run` would otherwise only
 /// surface as a side effect of actually starting: config loading, every
@@ -71,8 +79,37 @@ async fn validate_api(root: &Path) -> usize {
         problems += 1;
     }
 
+    problems += validate_tls("config/server.json", &config.server.tls, &api_dir);
+    if config.server.tls.client_auth.as_ref().is_some_and(|c| c.mode == ClientAuthMode::Required)
+        && (config.server.features.readyz_check || config.server.features.metrics || config.server.docs_ui.mode != crate::config::DocsUiMode::Off)
+    {
+        warn(
+            "tls.clientAuth.mode is \"required\" while readyz/metrics/docsUi is enabled — load-balancer probes and browsers without a client certificate \
+             can't even connect to those; use \"optional\" and let routes decide",
+        );
+    }
+
     match crate::openapi::load(&root.join(MANIFEST_FILE)) {
-        Ok(doc) => println!("  {MANIFEST_FILE}: OK ({} operation(s))", doc.operations.len()),
+        Ok(doc) => {
+            println!("  {MANIFEST_FILE}: OK ({} operation(s))", doc.operations.len());
+            for op in &doc.operations {
+                let Some(scheme) = &op.security else { continue };
+                if doc.security_scheme_types.get(scheme).map(String::as_str) != Some("mutualTLS") {
+                    continue;
+                }
+                if let Some(verifier) = config.security.verifiers.get(scheme)
+                    && !verifier.requires_client_cert()
+                {
+                    println!(
+                        "  {MANIFEST_FILE}: {} {} uses the mutualTLS scheme '{scheme}', but its verifier never looks at the client certificate \
+                         (use an mtls verifier or a cert.* parameter)",
+                        op.method.to_uppercase(),
+                        op.path
+                    );
+                    problems += 1;
+                }
+            }
+        }
         Err(e) => {
             println!("  {MANIFEST_FILE}: FAILED — {e}");
             problems += 1;
@@ -94,7 +131,8 @@ async fn validate_api(root: &Path) -> usize {
     }
 
     let endpoints_root = api_dir.join("datasources/endpoints");
-    let (count, endpoint_problems) = crate::endpoint::validate_endpoint_files(&endpoints_root, &config.security, &config.connections);
+    let (count, endpoint_problems) =
+        crate::endpoint::validate_endpoint_files(&endpoints_root, &config.security, &config.connections, config.server.tls.client_identity_enabled());
     println!("  endpoint files: {count} discovered, {} problem(s)", endpoint_problems.len());
     for problem in &endpoint_problems {
         println!("    - {problem}");
@@ -136,12 +174,65 @@ fn collect_sql_scripts(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// A TLS dry run for one listener's config: the I/O-free structure checks,
+/// then (for `manual` mode) the very same `build_server_config` `frogs run`
+/// uses — cert/key, CA bundle and CRLs all read and parsed, nothing bound.
+/// An already-lapsed CRL is a problem under `failClosed` (every
+/// certificate-presenting client would be refused) and a warning otherwise.
+fn validate_tls(label: &str, tls: &TlsConfig, tls_base: &Path) -> usize {
+    if let Err(message) = tls.validate_structure() {
+        println!("  {label}: tls FAILED — {message}");
+        return 1;
+    }
+    if tls.mode != TlsMode::Manual {
+        return 0;
+    }
+    let built = match build_server_config(tls, tls_base) {
+        Ok(built) => built,
+        Err(e) => {
+            println!("  {label}: tls FAILED — {e}");
+            return 1;
+        }
+    };
+    println!("  {label}: tls OK");
+    for warning in &built.warnings {
+        warn(warning);
+    }
+
+    let fail_closed = tls.client_auth.as_ref().is_some_and(|c| c.effective_crl_policy() == CrlPolicy::FailClosed);
+    let mut problems = 0usize;
+    for (path, next_update, status) in crl_freshness(&built.crl_next_updates, chrono::Utc::now()) {
+        match status {
+            CrlStatus::Expired if fail_closed => {
+                println!(
+                    "  {label}: CRL {} expired at {next_update} and crlPolicy is failClosed — every client presenting a certificate would be rejected",
+                    path.display()
+                );
+                problems += 1;
+            }
+            CrlStatus::Expired => warn(&format!("CRL {} expired at {next_update} — revocations since then are not seen", path.display())),
+            CrlStatus::ExpiringSoon => warn(&format!(
+                "CRL {} expires at {next_update} (within {CRL_EXPIRY_WARNING_DAYS} days) — replace it and restart before then",
+                path.display()
+            )),
+        }
+    }
+    problems
+}
+
 fn validate_web(root: &Path) -> usize {
     println!("static-content project at {}", root.display());
     match crate::webserve::load(&root.join("webserve.json")) {
         Ok(config) => {
             println!("  webserve.json: OK (startPage: {})", config.start_page);
-            0
+            // With an API role present the single listener is configured by
+            // config/server.json (validated above); webserve.json's own tls
+            // is ignored then, so a dry run of it would only mislead.
+            if root.join(MANIFEST_FILE).is_file() {
+                0
+            } else {
+                validate_tls("webserve.json", &config.tls, root)
+            }
         }
         Err(e) => {
             println!("  webserve.json: FAILED — {e}");
@@ -332,3 +423,6 @@ mod tests {
         assert!(run(&root).await.is_ok());
     }
 }
+
+#[cfg(test)]
+mod mtls_tests;

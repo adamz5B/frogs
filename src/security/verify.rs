@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use super::LoadedVerifier;
 use super::cache::VerifierCache;
+use super::client_cert::{CertField, ClientCertIdentity};
 use super::verifier::{Parameter, VerifierDef};
 use crate::sql::{SqlDriver, SqlValue, sql_value_to_json};
 
@@ -44,15 +45,17 @@ impl VerifyErrorCause {
     }
 }
 
-/// Runs one scheme's verifier against the caller's request headers — the
-/// only parameter source a verifier's own examples in the design doc ever
-/// use — and checks its result with `validIf`. `Ok(())` means the request
-/// is authorized to proceed.
+/// Runs one scheme's verifier against the caller's request headers (and, for
+/// a certificate-dependent verifier, the connection's client-certificate
+/// identity) and checks its result with `validIf`. `Ok(())` means the
+/// request is authorized to proceed.
 ///
 /// `scheme_name` plus the exact bound credential value(s) form the cache
-/// key, so a hit for one caller's key never leaks into another's, and a
-/// verifier with no `cacheTtlSeconds` never touches the cache at all —
-/// every request re-runs the check, exactly as the design doc specifies.
+/// key (see `cache_key`), so a hit for one caller's key never leaks into
+/// another's, and a verifier with no `cacheTtlSeconds` never touches the
+/// cache at all — every request re-runs the check, exactly as the design doc
+/// specifies. An `mtls` verifier is a pure in-memory comparison and never
+/// caches.
 ///
 /// `call_timeout_ms` is the same already-resolved
 /// `ServerConfig::effective_source_call_timeout_ms()` an ordinary source
@@ -69,12 +72,22 @@ pub async fn verify(
     http_root: &Path,
     http_client: &reqwest::Client,
     headers: &HeaderMap,
+    client_cert: Option<&ClientCertIdentity>,
     cache: &VerifierCache,
     call_timeout_ms: NonZeroU64,
 ) -> Result<(), VerifyErrorCause> {
-    let bound = bind_headers(verifier.def.parameters(), headers);
+    if let Some(condition) = &verifier.mtls {
+        return match client_cert {
+            Some(identity) if condition.matches(identity) => Ok(()),
+            _ => Err(VerifyErrorCause::Invalid),
+        };
+    }
+
+    let cert_dependent = verifier.requires_client_cert();
+    let bound = bind_credentials(verifier.def.parameters(), headers, client_cert);
     let ttl = verifier.def.cache_ttl_seconds();
-    let key = ttl.map(|_| cache_key(scheme_name, &bound));
+    let fingerprint = cert_dependent.then(|| client_cert.map(ClientCertIdentity::fingerprint).unwrap_or(""));
+    let key = ttl.map(|_| cache_key(scheme_name, fingerprint, &bound));
 
     if let Some(key) = &key
         && let Some(valid) = cache.get(key)
@@ -84,8 +97,9 @@ pub async fn verify(
 
     let call_timeout = Duration::from_millis(call_timeout_ms.get());
     let resolved = match &verifier.def {
-        VerifierDef::Sql { connection, script, .. } => run_sql(drivers, sql_root, connection, script, &bound, call_timeout).await?,
-        VerifierDef::Http { request, .. } => run_http(http_root, http_client, request, &bound, headers, call_timeout).await?,
+        VerifierDef::Sql { connection, script, .. } => run_sql(drivers, sql_root, connection, script, &bound, call_timeout, cert_dependent).await?,
+        VerifierDef::Http { request, .. } => run_http(http_root, http_client, request, &bound, headers, call_timeout, cert_dependent).await?,
+        VerifierDef::Mtls { .. } => unreachable!("an mtls verifier always carries a compiled condition and returned above"),
     };
 
     let valid = verifier.valid_if.evaluate(&resolved);
@@ -100,37 +114,73 @@ pub async fn verify(
     if valid { Ok(()) } else { Err(VerifyErrorCause::Invalid) }
 }
 
-/// Folds the scheme name and every bound parameter's value into one cache
-/// key, sorted by parameter name for a stable key regardless of iteration
-/// order — so the same credential against the same scheme always hits the
-/// same entry, and a different credential (or a different scheme reusing
-/// the same parameter names) never collides with it.
-fn cache_key(scheme_name: &str, bound: &HashMap<String, SqlValue>) -> String {
+/// A fixed-width, injective cache key: `v2:` + the lowercase hex SHA-256 of a
+/// length-prefixed encoding of the scheme name, (for a certificate-dependent
+/// verifier) the presented certificate's fingerprint, then every bound
+/// parameter sorted by name as (name, one-byte type tag, value). Length
+/// prefixes and type tags are what make it collision-free — the old
+/// delimiter-joined text key let a credential containing the delimiter, or a
+/// text `"1"` vs an integer `1`, alias another entry. The fingerprint is
+/// folded in explicitly (not just via a `cert.fingerprint` parameter) so
+/// even a verifier that binds only `cert.cn` can never reuse one
+/// certificate's cached decision for a different certificate.
+fn cache_key(scheme_name: &str, fingerprint: Option<&str>, bound: &HashMap<String, SqlValue>) -> String {
+    fn put(buf: &mut Vec<u8>, bytes: &[u8]) {
+        buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(bytes);
+    }
+
     let mut pairs: Vec<(&String, &SqlValue)> = bound.iter().collect();
     pairs.sort_by_key(|(name, _)| name.as_str());
 
-    let mut key = scheme_name.to_string();
+    let mut encoded = Vec::new();
+    put(&mut encoded, scheme_name.as_bytes());
+    if let Some(fingerprint) = fingerprint {
+        put(&mut encoded, fingerprint.as_bytes());
+    }
     for (name, value) in pairs {
-        key.push('\u{1}');
-        key.push_str(name);
-        key.push('=');
-        key.push_str(&sql_value_cache_repr(value));
+        put(&mut encoded, name.as_bytes());
+        let (tag, repr) = sql_value_cache_repr(value);
+        encoded.push(tag);
+        put(&mut encoded, repr.as_bytes());
+    }
+
+    let digest = ring::digest::digest(&ring::digest::SHA256, &encoded);
+    let mut key = String::with_capacity(3 + 64);
+    key.push_str("v2:");
+    for byte in digest.as_ref() {
+        key.push_str(&format!("{byte:02x}"));
     }
     key
 }
 
-fn sql_value_cache_repr(value: &SqlValue) -> String {
+fn sql_value_cache_repr(value: &SqlValue) -> (u8, String) {
     match value {
-        SqlValue::Null => "\u{2}null".to_string(),
-        SqlValue::Bool(b) => b.to_string(),
-        SqlValue::Int(n) => n.to_string(),
-        SqlValue::Float(f) => f.to_string(),
-        SqlValue::Text(s) => s.clone(),
-        SqlValue::Timestamp(ts) => ts.to_rfc3339(),
+        SqlValue::Null => (0, String::new()),
+        SqlValue::Bool(b) => (1, b.to_string()),
+        SqlValue::Int(n) => (2, n.to_string()),
+        SqlValue::Float(f) => (3, f.to_string()),
+        SqlValue::Text(s) => (4, s.clone()),
+        SqlValue::Timestamp(ts) => (5, ts.to_rfc3339()),
         // Unreachable in practice — a verifier's parameters are always
-        // `header.*` scalars (see `bind_headers`), never array-typed — but
-        // still a real, unambiguous representation rather than a panic.
-        SqlValue::Array(_) => sql_value_to_json(value).to_string(),
+        // `header.*`/`cert.*` scalars (see `bind_credentials`), never
+        // array-typed — but still a real, unambiguous representation rather
+        // than a panic.
+        SqlValue::Array(_) => (6, sql_value_to_json(value).to_string()),
+    }
+}
+
+/// Maps a datasource-side failure to `Unavailable`. For a
+/// certificate-dependent verifier the raw driver/HTTP error text (which can
+/// echo a bound value — the fingerprint, a CN) is kept to `debug!` and the
+/// returned message is a fixed, config-derived string: that message is what
+/// can reach a response (under `debugMode`) or `errors.discovered.json`.
+fn unavailable(redact: bool, fixed: impl FnOnce() -> String, raw: impl FnOnce() -> String) -> VerifyErrorCause {
+    if redact {
+        tracing::debug!(detail = %raw(), "verifier datasource error");
+        VerifyErrorCause::Unavailable(fixed())
+    } else {
+        VerifyErrorCause::Unavailable(raw())
     }
 }
 
@@ -141,13 +191,20 @@ async fn run_sql(
     script: &str,
     bound: &HashMap<String, SqlValue>,
     call_timeout: Duration,
+    redact: bool,
 ) -> Result<Value, VerifyErrorCause> {
     let driver = drivers
         .get(connection)
         .ok_or_else(|| VerifyErrorCause::Unavailable(format!("no connection named '{connection}'")))?;
 
     let script_path = sql_root.join(connection).join(script);
-    let script_contents = std::fs::read_to_string(&script_path).map_err(|e| VerifyErrorCause::Unavailable(format!("failed to read {}: {e}", script_path.display())))?;
+    let script_contents = std::fs::read_to_string(&script_path).map_err(|e| {
+        unavailable(
+            redact,
+            || format!("failed to read verifier script '{script}'"),
+            || format!("failed to read {}: {e}", script_path.display()),
+        )
+    })?;
 
     // `debug!`, not `warn!`: this condition is a property of a script file, so
     // it would otherwise re-log on every single request for the life of the
@@ -173,7 +230,7 @@ async fn run_sql(
     let rows = tokio::time::timeout(call_timeout, driver.query(&script_contents, bound))
         .await
         .map_err(|_| VerifyErrorCause::Unavailable(format!("verifier query did not complete within {}ms", call_timeout.as_millis())))?
-        .map_err(|e| VerifyErrorCause::Unavailable(e.to_string()))?;
+        .map_err(|e| unavailable(redact, || format!("verifier datasource error (connection '{connection}')"), || e.to_string()))?;
 
     // Zero rows (e.g. an API key that simply isn't in the table) is the
     // credential's own fault, not the datasource's — `Invalid`, not
@@ -190,11 +247,23 @@ async fn run_http(
     bound: &HashMap<String, SqlValue>,
     headers: &HeaderMap,
     call_timeout: Duration,
+    redact: bool,
 ) -> Result<Value, VerifyErrorCause> {
     let request_path = http_root.join(request);
-    let contents = std::fs::read_to_string(&request_path).map_err(|e| VerifyErrorCause::Unavailable(format!("failed to read {}: {e}", request_path.display())))?;
-    let request_file: crate::http::HttpRequestFile =
-        serde_json::from_str(&contents).map_err(|e| VerifyErrorCause::Unavailable(format!("invalid JSON in {}: {e}", request_path.display())))?;
+    let contents = std::fs::read_to_string(&request_path).map_err(|e| {
+        unavailable(
+            redact,
+            || format!("failed to read verifier request '{request}'"),
+            || format!("failed to read {}: {e}", request_path.display()),
+        )
+    })?;
+    let request_file: crate::http::HttpRequestFile = serde_json::from_str(&contents).map_err(|e| {
+        unavailable(
+            redact,
+            || format!("invalid JSON in verifier request '{request}'"),
+            || format!("invalid JSON in {}: {e}", request_path.display()),
+        )
+    })?;
 
     // Every failure here is a genuine infra problem, not a rejected
     // credential: a token-introspection endpoint (the design doc's own
@@ -210,26 +279,34 @@ async fn run_http(
     )
     .await
     .map_err(|_| VerifyErrorCause::Unavailable(format!("verifier request did not complete within {}ms", call_timeout.as_millis())))?
-    .map_err(|e| VerifyErrorCause::Unavailable(e.to_string()))
+    .map_err(|e| unavailable(redact, || format!("verifier request failed ('{request}')"), || e.to_string()))
 }
 
-/// Binds each verifier parameter from the caller's request headers — the
-/// only `from` prefix a verifier needs, per the design doc's own examples
-/// (`header.X-Api-Key`, `header.Authorization`). `HeaderMap::get` is
-/// case-insensitive already, matching HTTP's own header-name semantics. An
-/// absent header becomes `SqlValue::Null`, same "say so via a failed
-/// check, don't crash" posture `endpoint::resolve`'s `resolve_from` uses.
-fn bind_headers(parameters: &[Parameter], headers: &HeaderMap) -> HashMap<String, SqlValue> {
+/// Binds each verifier parameter from the caller's request headers
+/// (`header.X-Api-Key`, `header.Authorization`) or, for a
+/// certificate-dependent verifier, the connection's client-certificate
+/// identity (`cert.fingerprint`, ...). `HeaderMap::get` is case-insensitive
+/// already, matching HTTP's own header-name semantics. An absent header (or
+/// a `cert.*` field the certificate doesn't carry, or no certificate at all)
+/// becomes `SqlValue::Null`, same "say so via a failed check, don't crash"
+/// posture `endpoint::resolve`'s `resolve_from` uses.
+fn bind_credentials(parameters: &[Parameter], headers: &HeaderMap, client_cert: Option<&ClientCertIdentity>) -> HashMap<String, SqlValue> {
     parameters
         .iter()
         .map(|param| {
-            let value = param
-                .from
-                .strip_prefix("header.")
-                .and_then(|name| headers.get(name))
-                .and_then(|v| v.to_str().ok())
-                .map(|v| SqlValue::Text(v.to_string()))
-                .unwrap_or(SqlValue::Null);
+            let value = if let Some(field_name) = param.from.strip_prefix("cert.") {
+                CertField::parse(field_name)
+                    .and_then(|field| client_cert.and_then(|identity| identity.bind_value(field)))
+                    .unwrap_or(SqlValue::Null)
+            } else {
+                param
+                    .from
+                    .strip_prefix("header.")
+                    .and_then(|name| headers.get(name))
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| SqlValue::Text(v.to_string()))
+                    .unwrap_or(SqlValue::Null)
+            };
             (param.name.clone(), value)
         })
         .collect()
@@ -292,6 +369,7 @@ mod tests {
         LoadedVerifier {
             valid_if: ValidIf::parse(def.valid_if()).unwrap(),
             def,
+            mtls: None,
         }
     }
 
@@ -330,6 +408,7 @@ mod tests {
             &root.join("http"),
             &client,
             &headers,
+            None,
             &VerifierCache::new(),
             test_call_timeout(),
         )
@@ -360,6 +439,7 @@ mod tests {
             &root.join("http"),
             &client,
             &headers,
+            None,
             &VerifierCache::new(),
             test_call_timeout(),
         )
@@ -385,6 +465,7 @@ mod tests {
             &root.join("http"),
             &client,
             &headers,
+            None,
             &VerifierCache::new(),
             test_call_timeout(),
         )
@@ -411,6 +492,7 @@ mod tests {
             &root.join("http"),
             &client,
             &headers,
+            None,
             &VerifierCache::new(),
             test_call_timeout(),
         )
@@ -436,6 +518,7 @@ mod tests {
             &root.join("http"),
             &client,
             &headers,
+            None,
             &VerifierCache::new(),
             test_call_timeout(),
         )
@@ -460,6 +543,7 @@ mod tests {
             &root.join("http"),
             &client,
             &headers,
+            None,
             &VerifierCache::new(),
             test_call_timeout(),
         )
@@ -509,6 +593,7 @@ mod tests {
         let verifier = LoadedVerifier {
             valid_if: ValidIf::parse(def.valid_if()).unwrap(),
             def,
+            mtls: None,
         };
 
         let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
@@ -525,6 +610,7 @@ mod tests {
                 &root.join("http"),
                 &client,
                 &ok_headers,
+                None,
                 &cache,
                 test_call_timeout()
             )
@@ -541,6 +627,7 @@ mod tests {
             &root.join("http"),
             &client,
             &bad_headers,
+            None,
             &cache,
             test_call_timeout(),
         )
@@ -586,6 +673,7 @@ mod tests {
         let verifier = LoadedVerifier {
             valid_if: ValidIf::parse(def.valid_if()).unwrap(),
             def,
+            mtls: None,
         };
 
         let headers = headers_with("X-Api-Key", "good-key");
@@ -601,6 +689,7 @@ mod tests {
                 &root.join("http"),
                 &client,
                 &headers,
+                None,
                 &cache,
                 test_call_timeout(),
             )
@@ -649,6 +738,7 @@ mod tests {
         let verifier = LoadedVerifier {
             valid_if: ValidIf::parse(def.valid_if()).unwrap(),
             def,
+            mtls: None,
         };
         let client = reqwest::Client::new();
         let cache = VerifierCache::new();
@@ -663,6 +753,7 @@ mod tests {
             &root.join("http"),
             &client,
             &good_headers,
+            None,
             &cache,
             test_call_timeout(),
         )
@@ -680,6 +771,7 @@ mod tests {
             &root.join("http"),
             &client,
             &no_headers,
+            None,
             &cache,
             test_call_timeout(),
         )
@@ -750,6 +842,7 @@ mod tests {
         let verifier = LoadedVerifier {
             valid_if: ValidIf::parse(def.valid_if()).unwrap(),
             def,
+            mtls: None,
         };
 
         let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
@@ -767,6 +860,7 @@ mod tests {
             &root.join("http"),
             &client,
             &malicious_headers,
+            None,
             &cache,
             test_call_timeout(),
         )
@@ -819,6 +913,7 @@ mod tests {
             &root.join("http"),
             &client,
             &headers,
+            None,
             &VerifierCache::new(),
             test_call_timeout(),
         )
@@ -865,6 +960,7 @@ mod tests {
         let verifier = LoadedVerifier {
             valid_if: ValidIf::parse(def.valid_if()).unwrap(),
             def,
+            mtls: None,
         };
 
         let headers = headers_with("X-Api-Key", "good-key");
@@ -884,6 +980,7 @@ mod tests {
                 &root.join("http"),
                 &client,
                 &headers,
+                None,
                 &cache,
                 test_call_timeout(),
             )
@@ -953,6 +1050,7 @@ mod tests {
         let verifier = LoadedVerifier {
             valid_if: ValidIf::parse(def.valid_if()).unwrap(),
             def,
+            mtls: None,
         };
 
         let headers = headers_with("X-Api-Key", "good-key");
@@ -969,6 +1067,7 @@ mod tests {
                 &root.join("http"),
                 &client,
                 &headers,
+                None,
                 &cache,
                 tiny_call_timeout,
             )
@@ -1061,7 +1160,7 @@ mod tests {
         // so the task never actually hops to another OS thread mid-poll.
         let dispatch = tracing::Dispatch::new(subscriber);
         let guard = tracing::dispatcher::set_default(&dispatch);
-        let result = run_sql(&drivers, &root.join("sql"), "db", "verify.sql", &bound, Duration::from_secs(5)).await;
+        let result = run_sql(&drivers, &root.join("sql"), "db", "verify.sql", &bound, Duration::from_secs(5), false).await;
         drop(guard);
 
         assert!(result.is_ok(), "sanity check: the call itself should succeed so the log path really did run");
@@ -1079,3 +1178,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(test)]
+mod mtls_tests;

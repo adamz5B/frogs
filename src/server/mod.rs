@@ -3,6 +3,9 @@ pub mod pidfile;
 pub mod service;
 #[cfg(windows)]
 pub mod service_host;
+#[cfg(test)]
+pub(crate) mod test_pki;
+pub mod tls;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -207,7 +210,10 @@ async fn docs_ui_operations_handler(State(state): State<DocsUiState>) -> Respons
 /// elsewhere would already have failed loudly) or its verifier reads its
 /// check from somewhere other than a header (e.g. a body field, or
 /// `context.transactionId`) — the console then just shows "protected
-/// (scheme name)" with no specific input to render.
+/// (scheme name)" with no specific input to render. `clientCert` is true
+/// when the verifier needs the connection's client certificate (an `mtls`
+/// verifier, or any `cert.*` parameter) — presented by the browser/OS during
+/// the TLS handshake, so the console has no field for it.
 fn docs_ui_operation_json(op: &crate::openapi::Operation, security: &crate::security::SecurityConfig) -> serde_json::Value {
     let parameters: Vec<serde_json::Value> = op
         .parameters
@@ -223,7 +229,8 @@ fn docs_ui_operation_json(op: &crate::openapi::Operation, security: &crate::secu
             .get(scheme_name)
             .and_then(|v| v.def.parameters().iter().find(|p| p.from.starts_with("header.")))
             .map(|p| p.from.trim_start_matches("header.").to_string());
-        serde_json::json!({ "scheme": scheme_name, "header": header })
+        let client_cert = security.verifiers.get(scheme_name).is_some_and(|v| v.requires_client_cert());
+        serde_json::json!({ "scheme": scheme_name, "header": header, "clientCert": client_cert })
     });
 
     serde_json::json!({
@@ -1167,6 +1174,7 @@ mod tests {
                 security: Some("apiKeyAuth".to_string()),
             }],
             component_schemas: serde_json::Map::new(),
+            security_scheme_types: HashMap::new(),
         }
     }
 

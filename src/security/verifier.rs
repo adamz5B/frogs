@@ -2,9 +2,9 @@ use serde::Deserialize;
 
 /// A named parameter a verifier binds before running its `sql`/`http`
 /// source — same `name`/`from` shape as an endpoint source's parameters,
-/// except a verifier's own examples in the design doc only ever draw from
-/// `header.*` (an API key or bearer token), so that's the only prefix
-/// execution (Point 3) will need to support.
+/// except a verifier draws only from `header.*` (an API key or bearer
+/// token) or `cert.*` (the connection's validated client certificate — see
+/// `client_cert::CertField`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Parameter {
     pub name: String,
@@ -47,25 +47,74 @@ pub enum VerifierDef {
         #[serde(rename = "cacheTtlSeconds", default)]
         cache_ttl_seconds: Option<u64>,
     },
+    /// A datasource-free check of the connection's already-validated client
+    /// certificate: `validIf` is `cert.<field> = <value>` (see
+    /// `client_cert::MtlsCondition`). The fields below exist only so a file
+    /// that sets one of them (copy-paste from a sql/http verifier) is
+    /// rejected at load time by `SecurityConfig::load` instead of being
+    /// silently ignored — an `mtls` verifier has no connection, script,
+    /// request, parameters, or cache.
+    Mtls {
+        #[serde(rename = "validIf")]
+        valid_if: String,
+        #[serde(default)]
+        connection: Option<Box<serde_json::Value>>,
+        #[serde(default)]
+        script: Option<Box<serde_json::Value>>,
+        #[serde(default)]
+        request: Option<Box<serde_json::Value>>,
+        #[serde(default)]
+        parameters: Option<Box<serde_json::Value>>,
+        #[serde(rename = "cacheTtlSeconds", default)]
+        cache_ttl_seconds: Option<Box<serde_json::Value>>,
+    },
 }
 
 impl VerifierDef {
     pub fn valid_if(&self) -> &str {
         match self {
-            VerifierDef::Sql { valid_if, .. } | VerifierDef::Http { valid_if, .. } => valid_if,
+            VerifierDef::Sql { valid_if, .. } | VerifierDef::Http { valid_if, .. } | VerifierDef::Mtls { valid_if, .. } => valid_if,
         }
     }
 
     pub fn cache_ttl_seconds(&self) -> Option<u64> {
         match self {
             VerifierDef::Sql { cache_ttl_seconds, .. } | VerifierDef::Http { cache_ttl_seconds, .. } => *cache_ttl_seconds,
+            VerifierDef::Mtls { .. } => None,
         }
     }
 
     pub fn parameters(&self) -> &[Parameter] {
         match self {
             VerifierDef::Sql { parameters, .. } | VerifierDef::Http { parameters, .. } => parameters,
+            VerifierDef::Mtls { .. } => &[],
         }
+    }
+
+    /// The sql/http-only keys an `mtls` verifier file set anyway — empty for
+    /// every other verifier type.
+    pub fn forbidden_mtls_fields(&self) -> Vec<&'static str> {
+        let VerifierDef::Mtls {
+            connection,
+            script,
+            request,
+            parameters,
+            cache_ttl_seconds,
+            ..
+        } = self
+        else {
+            return Vec::new();
+        };
+        [
+            ("connection", connection.is_some()),
+            ("script", script.is_some()),
+            ("request", request.is_some()),
+            ("parameters", parameters.is_some()),
+            ("cacheTtlSeconds", cache_ttl_seconds.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, set)| set.then_some(name))
+        .collect()
     }
 }
 

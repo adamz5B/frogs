@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 /// server (not per route) so two endpoints protected by the *same* scheme
 /// share a cached result for the same credential instead of each paying
 /// their own round-trip. Keyed by whatever the caller builds the key as —
-/// see `verify::cache_key`, which folds in both the scheme name and the
-/// exact credential value(s) bound, so caching one caller's result can
-/// never leak into another caller's.
+/// see `verify::cache_key` (a `v2:`-prefixed SHA-256 over a length-prefixed
+/// encoding of the scheme name, a certificate-dependent verifier's client
+/// certificate fingerprint, and the exact credential value(s) bound), so
+/// caching one caller's result can never leak into another caller's.
 ///
 /// Only successful checks (valid *or* invalidated by `validIf`) are ever
 /// cached — a verifier's own datasource failing is never cached, since

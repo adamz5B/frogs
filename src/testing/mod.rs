@@ -10,3 +10,6 @@ pub mod validate;
 pub use report::ReportFormat;
 pub use schema::{Expectation, TestCase, TestFile, TestLoadError, TestRequest, load, save_to};
 pub use session::{LoadedTestFile, MockSession, ReportConfig};
+
+#[cfg(test)]
+mod mtls_tests;

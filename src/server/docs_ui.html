@@ -286,7 +286,12 @@
     if (op.security) {
       var secSection = document.createElement("section");
       secSection.innerHTML = "<h3>Security — " + escapeHtml(op.security.scheme) + "</h3>";
-      if (op.security.header) {
+      if (op.security.clientCert) {
+        var certHint = document.createElement("p");
+        certHint.className = "hint";
+        certHint.textContent = "This operation requires a client certificate (presented by your browser/OS during the TLS handshake, not settable here).";
+        secSection.appendChild(certHint);
+      } else if (op.security.header) {
         secSection.appendChild(fieldRow("security:header", op.security.header, false));
         var secHint = document.createElement("p");
         secHint.className = "hint";

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::Router;
 
-use crate::config::{Config, ManualTlsConfig, ServerConfig, TlsConfig, TlsMode};
+use crate::config::{Config, ServerConfig, TlsConfig, TlsMode};
 use crate::endpoint::mock::MockProvider;
 use crate::project::{MANIFEST_FILE, require_project_root};
 use crate::server::pidfile;
@@ -234,11 +234,11 @@ async fn run_both(root: &Path, shutdown: impl std::future::Future<Output = ()> +
             web_config.port, server_config.port
         );
     }
-    if web_config.tls.mode != TlsMode::Off {
+    if web_config.tls.mode != TlsMode::Off || web_config.tls.client_auth.is_some() {
         // Same authority split as `port` just above, for the same reason —
         // one listener, one TLS configuration.
         println!(
-            "note: webserve.json's own tls settings are ignored while serving both roles — config/server.json's \
+            "note: webserve.json's own tls settings (clientAuth included) are ignored while serving both roles — config/server.json's \
              tls settings are authoritative"
         );
     }
@@ -321,7 +321,34 @@ pub(crate) async fn assemble_api_router(
 ) -> io::Result<(Router, ServerConfig)> {
     let api_dir = crate::project::api_base(root);
     let debug_mode = config.server.debug_mode;
-    let errors = std::sync::Arc::new(config.errors);
+    // The client-certificate codes ship as runtime defaults (rather than
+    // only in a freshly generated `config/errors/core.json`, which is
+    // write-once) so a project generated before mTLS existed classifies
+    // them correctly too; a project that defines either keeps its own.
+    let mut errors = config.errors;
+    for code in ["auth.client_cert_missing", "auth.client_cert_expired"] {
+        errors.insert_if_absent(
+            code,
+            crate::errors::ErrorDefinition {
+                http_status: 401,
+                expose_detail: true,
+            },
+        );
+    }
+    let errors = std::sync::Arc::new(errors);
+    let client_identity_available = mock_provider.is_some() || config.server.tls.client_identity_enabled();
+    if config
+        .server
+        .tls
+        .client_auth
+        .as_ref()
+        .is_some_and(|c| c.mode == crate::config::ClientAuthMode::Required)
+        && (config.server.features.readyz_check || config.server.features.metrics || config.server.docs_ui.mode != crate::config::DocsUiMode::Off)
+    {
+        tracing::warn!(
+            "tls.clientAuth.mode is \"required\" while readyz/metrics/docsUi is enabled — load-balancer probes and browsers without a client certificate              can't even connect to those; use \"optional\" and let routes decide"
+        );
+    }
     let security = std::sync::Arc::new(config.security);
     let services = std::sync::Arc::new(config.services);
     let discovered_errors = std::sync::Arc::new(std::sync::Mutex::new(config.discovered_errors));
@@ -362,6 +389,7 @@ pub(crate) async fn assemble_api_router(
         openapi_document.as_deref(),
         mock_provider,
         config.server.effective_source_call_timeout_ms(),
+        client_identity_available,
     );
     let mut router = crate::server::router().merge(endpoint_router);
 
@@ -481,15 +509,12 @@ pub(crate) async fn serve(
     tls_base: &Path,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> io::Result<()> {
+    // Structure first (a `clientAuth` block over plain HTTP is an error, not
+    // an ignored setting), before anything is bound or written.
+    tls.validate_structure().map_err(|m| io::Error::new(io::ErrorKind::InvalidInput, m))?;
     match tls.mode {
         TlsMode::Off => serve_http(root, router, bind, port, shutdown).await,
-        TlsMode::Manual => {
-            let manual = tls
-                .manual
-                .as_ref()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "tls.mode is \"manual\" but tls.manual (certPath/keyPath) is missing"))?;
-            serve_https(root, router, bind, port, manual, tls_base, shutdown).await
-        }
+        TlsMode::Manual => serve_https(root, router, bind, port, tls, tls_base, shutdown).await,
     }
 }
 
@@ -524,27 +549,34 @@ async fn serve_http(root: &Path, router: Router, bind: IpAddr, port: u16, shutdo
     result
 }
 
-/// `manual.certPath`/`keyPath` resolve relative to `tls_base` — see
-/// `serve`'s own doc comment for which base each caller passes and why.
+/// `manual.certPath`/`keyPath` (and `clientAuth`'s `caPath`/`crlPaths`)
+/// resolve relative to `tls_base` — see `serve`'s own doc comment for which
+/// base each caller passes and why. The whole `ServerConfig` (every file
+/// read, every parse) is built before the port is bound or the pidfile is
+/// written, so any misconfiguration fails the process cleanly first.
 async fn serve_https(
     root: &Path,
     router: Router,
     bind: IpAddr,
     port: u16,
-    manual: &ManualTlsConfig,
+    tls: &TlsConfig,
     tls_base: &Path,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> io::Result<()> {
     let addr = SocketAddr::new(bind, port);
 
-    let cert_path = tls_base.join(&manual.cert_path);
-    let key_path = tls_base.join(&manual.key_path);
-    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path).await.map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("failed to load TLS cert/key ({}, {}): {e}", cert_path.display(), key_path.display()),
-        )
-    })?;
+    let built = crate::server::tls::build_server_config(tls, tls_base)?;
+    for warning in &built.warnings {
+        tracing::warn!("{warning}");
+    }
+    let client_auth = tls.client_auth.as_ref().filter(|c| c.mode != crate::config::ClientAuthMode::Off);
+    if let Some(client_auth) = client_auth {
+        crate::server::tls::warn_about_crl_freshness(&built.crl_next_updates, client_auth.effective_crl_policy() == crate::config::CrlPolicy::FailClosed);
+    }
+    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(built.config.clone());
+    let acceptor = crate::server::tls::ClientCertAcceptor::new(
+        axum_server::tls_rustls::RustlsAcceptor::new(rustls_config).handshake_timeout(crate::server::tls::TLS_HANDSHAKE_TIMEOUT),
+    );
 
     // A `std::net::TcpListener` (not tokio's), bound synchronously here so a
     // port-already-in-use failure surfaces as an immediate `?` — same
@@ -561,7 +593,8 @@ async fn serve_https(
     // thread, including a test's own client request waiting on it.
     let listener = std::net::TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
-    let server = axum_server::from_tcp_rustls(listener, rustls_config)?;
+    let server = axum_server::from_tcp(listener)?.acceptor(acceptor);
+    let crl_watch = client_auth.and_then(|_| crate::server::tls::spawn_crl_expiry_watch(&built.crl_next_updates));
 
     pidfile::write(
         root,
@@ -584,6 +617,9 @@ async fn serve_https(
         }
     };
 
+    if let Some(watch) = crl_watch {
+        watch.abort();
+    }
     pidfile::remove(root)?;
     result
 }
@@ -598,6 +634,7 @@ fn should_warn_about_discovered_errors(count: usize, threshold: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ManualTlsConfig;
 
     #[test]
     fn does_not_warn_below_the_threshold() {
@@ -675,6 +712,7 @@ mod tests {
         let tls = TlsConfig {
             mode: TlsMode::Manual,
             manual: None,
+            client_auth: None,
         };
         let router = Router::new();
 
@@ -701,6 +739,7 @@ mod tests {
                 cert_path: "does-not-exist-cert.pem".to_string(),
                 key_path: "does-not-exist-key.pem".to_string(),
             }),
+            client_auth: None,
         };
         let router = Router::new();
 
@@ -741,6 +780,7 @@ mod tests {
                 cert_path: "cert.pem".to_string(),
                 key_path: "key.pem".to_string(),
             }),
+            client_auth: None,
         };
         let port = free_port();
         let router = Router::new().route("/hello", axum::routing::get(|| async { "hi" }));
@@ -795,6 +835,7 @@ mod tests {
                 cert_path: "cert.pem".to_string(),
                 key_path: "key.pem".to_string(),
             }),
+            client_auth: None,
         };
         let port = free_port();
         let router = Router::new().route("/hello", axum::routing::get(|| async { "hi" }));
@@ -1291,3 +1332,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(test)]
+mod mtls_tests;

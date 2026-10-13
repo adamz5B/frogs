@@ -363,6 +363,7 @@ pub async fn record(cwd: &Path, path: &str, method: &str) -> io::Result<()> {
             body: Some(response_body),
         },
         save: HashMap::new(),
+        client_cert: None,
     });
 
     if let Err(e) = crate::testing::save_to(&test_file_path, &test_file) {
