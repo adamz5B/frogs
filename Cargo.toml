@@ -74,17 +74,24 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # MSSQL support (`mssql` feature, see `[features]` below) is architecturally
 # different from every other driver: no sqlx adapter exists for SQL Server,
 # so this is the one driver built on `tiberius` (the pure-Rust TDS protocol
-# implementation) directly, pooled via `deadpool-tiberius`. `tds73` selects
-# the modern TDS protocol revision (SQL Server 2008+, which is the only
-# range worth supporting); `rustls` keeps the same all-rustls TLS posture as
-# every other driver in this project (see `rustls`'s own dependency comment
-# above) instead of pulling in native-tls/OpenSSL. `tiberius`'s own `tokio`
-# feature is deliberately *not* enabled — confirmed against its Cargo.toml
-# that it only gates SQL Browser named-instance discovery
-# (`sql-browser-tokio`), which `deadpool-tiberius` doesn't use; it manages
-# its own `tokio::net::TcpStream` directly instead.
-tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "rustls", "chrono"], optional = true }
-deadpool-tiberius = { version = "0.1.9", default-features = false, features = ["rustls", "chrono", "tds73"], optional = true }
+# implementation) directly, pooled via `deadpool` with a small hand-written
+# `Manager` in `src/sql/mssql.rs`. `tds73` selects the modern TDS protocol
+# revision (SQL Server 2008+, which is the only range worth supporting);
+# `rustls` keeps the same all-rustls TLS posture as every other driver in
+# this project (see `rustls`'s own dependency comment above) instead of
+# pulling in native-tls/OpenSSL. `tiberius`'s own `tokio` feature is
+# deliberately *not* enabled — confirmed against its Cargo.toml that it only
+# gates SQL Browser named-instance discovery (`sql-browser-tokio`), which
+# isn't used; `mssql.rs` dials its own `tokio::net::TcpStream` directly and
+# adapts it to tiberius's futures-io traits via `tokio-util`'s `compat`.
+# `tiberius` must stay >= 0.13: 0.12.x pins `rustls 0.21` ->
+# `rustls-webpki 0.101.x`, which has no patched release for
+# GHSA-82j2-j2ch-gfr8 / GHSA-xgp8-3hg3-c2mh / GHSA-965h-392x-2mh5. That's
+# also why `deadpool-tiberius` was dropped — its latest release (0.1.9)
+# still pins `tiberius = "0.12"`.
+tiberius = { version = "0.13", default-features = false, features = ["tds73", "rustls", "chrono"], optional = true }
+deadpool = { version = "0.12", default-features = false, features = ["managed", "rt_tokio_1"], optional = true }
+tokio-util = { version = "0.7", default-features = false, features = ["compat"], optional = true }
 # Oracle support (`oracle` feature, see `[features]` below) is architecturally
 # the same shape as MSSQL above: no sqlx adapter exists for Oracle either, so
 # this is built on `oracle-rs` (a pure-Rust implementation of Oracle's TNS
@@ -159,9 +166,9 @@ default = ["postgres"]
 postgres = ["sqlx/postgres", "sqlx/tls-rustls"]
 # Opt-in, same all-rustls TLS posture as `postgres` above.
 mysql = ["sqlx/mysql", "sqlx/tls-rustls"]
-# Opt-in, not in `default` — pulls in `tiberius`/`deadpool-tiberius` instead
-# of an sqlx adapter (see those dependencies' own comment above for why).
-mssql = ["dep:tiberius", "dep:deadpool-tiberius"]
+# Opt-in, not in `default` — pulls in `tiberius`/`deadpool` instead of an
+# sqlx adapter (see those dependencies' own comment above for why).
+mssql = ["dep:tiberius", "dep:deadpool", "dep:tokio-util"]
 # Opt-in, not in `default` — pulls in `oracle-rs`/`deadpool-oracle` instead of
 # an sqlx adapter (see those dependencies' own comment above for why).
 oracle = ["dep:oracle-rs", "dep:deadpool-oracle"]

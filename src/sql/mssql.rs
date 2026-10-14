@@ -1,31 +1,74 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use deadpool::managed;
 use tiberius::ColumnType;
+use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use super::{SqlDriver, SqlError, SqlRow, SqlValue, sql_value_to_json};
 use crate::config::ConnectionConfig;
 
+type MssqlClient = tiberius::Client<Compat<tokio::net::TcpStream>>;
+
 pub struct MssqlDriver {
-    pool: deadpool_tiberius::Pool,
+    pool: managed::Pool<MssqlManager>,
 }
 
-/// Hand-written rather than `#[derive(Debug)]`: `deadpool_tiberius::Manager`
-/// (the pool's own type parameter) holds a `Box<dyn Fn(...)>` internally and
-/// has no `Debug` impl of its own, so `deadpool_tiberius::Pool` doesn't
-/// implement `Debug` either — required regardless, since `SqlDriver: Debug`.
+/// Hand-written rather than `#[derive(Debug)]`: the pool's `MssqlManager`
+/// holds a `tiberius::Config`, which carries the login password, so the pool
+/// is kept out of `Debug` output entirely — and a `Debug` impl is required
+/// regardless, since `SqlDriver: Debug`.
 impl std::fmt::Debug for MssqlDriver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MssqlDriver").finish_non_exhaustive()
     }
 }
 
+/// `deadpool` manager for raw `tiberius` clients. This used to come from the
+/// `deadpool-tiberius` crate, but its latest release (0.1.9) still pins
+/// `tiberius 0.12` -> `rustls 0.21` -> `rustls-webpki 0.101.x`, which has no
+/// patched release for GHSA-82j2-j2ch-gfr8/GHSA-xgp8-3hg3-c2mh/
+/// GHSA-965h-392x-2mh5. The same small amount of glue lives here instead:
+/// dial TCP, hand the stream to tiberius, and follow one `Routing` redirect
+/// (Azure SQL's gateway redirect) if the server sends one.
+struct MssqlManager {
+    config: tiberius::Config,
+}
+
+impl MssqlManager {
+    async fn dial(config: tiberius::Config) -> Result<MssqlClient, tiberius::error::Error> {
+        let tcp = tokio::net::TcpStream::connect(config.get_addr()).await?;
+        tcp.set_nodelay(true)?;
+        MssqlClient::connect(config, tcp.compat_write()).await
+    }
+}
+
+impl managed::Manager for MssqlManager {
+    type Type = MssqlClient;
+    type Error = tiberius::error::Error;
+
+    async fn create(&self) -> Result<MssqlClient, Self::Error> {
+        match Self::dial(self.config.clone()).await {
+            Err(tiberius::error::Error::Routing { host, port }) => {
+                let mut config = self.config.clone();
+                config.host(host);
+                config.port(port);
+                Self::dial(config).await
+            }
+            other => other,
+        }
+    }
+
+    async fn recycle(&self, client: &mut MssqlClient, _metrics: &managed::Metrics) -> managed::RecycleResult<Self::Error> {
+        client.simple_query("").await.map(|_| ()).map_err(managed::RecycleError::Backend)
+    }
+}
+
 /// Pure connection settings pulled out of `connections.json`, kept separate
-/// from `deadpool_tiberius::Manager` itself (unlike `postgres`/`mysql`'s own
+/// from `tiberius::Config` itself (unlike `postgres`/`mysql`'s own
 /// URL-string equivalent) so `build_connection_settings` is unit-testable
-/// without constructing a real `Manager`/`Pool` — `deadpool-tiberius`'s
-/// builder isn't URL-based, and there's no cheap way to build one without
-/// actually dialing a server.
+/// without constructing a real `MssqlManager`/`Pool` — `tiberius::Config` is
+/// field-based, not URL-based, and exposes no getters to assert against.
 struct MssqlConnectionSettings {
     host: String,
     port: u16,
@@ -37,7 +80,7 @@ struct MssqlConnectionSettings {
 /// Same shape/semantics as `postgres::build_connection_url`/
 /// `mysql::build_connection_url` — `host`/`port`/`user`/`passwordEnv` all
 /// default the same way — with one deliberate difference: a missing
-/// `database` is NOT a hard error here. `deadpool-tiberius` itself defaults
+/// `database` is NOT a hard error here. SQL Server itself defaults
 /// an unset database to `"master"`, which is a perfectly usable target for
 /// e.g. `frogs validate`'s connectivity check; forcing every project to name
 /// one up front the way Postgres/MySQL do buys nothing extra, since `master`
@@ -77,14 +120,15 @@ impl MssqlDriver {
     /// default), not a new or weaker one introduced specifically for MSSQL.
     pub async fn connect(config: &ConnectionConfig) -> Result<Self, SqlError> {
         let settings = build_connection_settings(config)?;
-        let pool = deadpool_tiberius::Manager::new()
-            .host(&settings.host)
-            .port(settings.port)
-            .database(&settings.database)
-            .basic_authentication(&settings.user, &settings.password)
+        let mut config = tiberius::Config::new();
+        config.host(&settings.host);
+        config.port(settings.port);
+        config.database(&settings.database);
+        config.authentication(tiberius::AuthMethod::sql_server(&settings.user, &settings.password));
+        config.trust_cert();
+        let pool = managed::Pool::builder(MssqlManager { config })
             .max_size(super::DEFAULT_POOL_MAX_CONNECTIONS as usize)
-            .trust_cert()
-            .create_pool()
+            .build()
             .map_err(|e| SqlError::ConnectionFailed(e.to_string()))?;
         Ok(Self { pool })
     }
@@ -402,8 +446,8 @@ mod tests {
 
     /// Builds a `ConnectionConfig` from discrete `MSSQL_TEST_*` env vars
     /// rather than one connection-string env var (unlike Postgres's/MySQL's
-    /// own `DATABASE_URL_TEST`/`DATABASE_URL_TEST_MYSQL`) — `deadpool-tiberius`'s
-    /// own builder is field-based, not URL-based, so there's no single
+    /// own `DATABASE_URL_TEST`/`DATABASE_URL_TEST_MYSQL`) — `tiberius::Config`
+    /// is field-based, not URL-based, so there's no single
     /// connection-string shape to hand it in the first place. Only the
     /// password is required to be set explicitly; every other field defaults
     /// the same way a real `connections.json` entry would (see
