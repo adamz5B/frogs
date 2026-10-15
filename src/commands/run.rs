@@ -274,10 +274,11 @@ async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
     let api_dir = crate::project::api_base(root);
     let config = Config::load_or_exit(&api_dir);
     println!(
-        "loaded config — debugMode={}, {} connection(s), {} error code(s)",
+        "loaded config — debugMode={}, {} connection(s), {} error code(s), strictOpenApi={}",
         config.server.debug_mode,
         config.connections.len(),
-        config.errors.len()
+        config.errors.len(),
+        config.server.strict_open_api()
     );
 
     // A log line, not a blocker — the server starts normally either way.
@@ -295,6 +296,10 @@ async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
         );
     }
 
+    // Before any connection is opened: a strict refusal must not have
+    // touched real infrastructure, let alone bound a port or written a pidfile.
+    let openapi_document = load_openapi_for_startup(root, &config.server)?;
+
     let drivers = match crate::sql::connect_all(&config.connections).await {
         Ok(drivers) => drivers,
         Err(err) => {
@@ -304,7 +309,57 @@ async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
     };
     println!("connected {} SQL data source(s)", drivers.len());
 
-    assemble_api_router(root, config, Arc::new(drivers), None).await
+    assemble_api_router(root, config, Arc::new(drivers), None, openapi_document).await
+}
+
+/// Loads `openapi.yaml` when something needs it — request validation, the
+/// docs UI, or `strictOpenApi` itself — and logs every issue it found. A
+/// load failure degrades to `None` with a warning, except under strict
+/// where it (and any strict-class issue) refuses to start.
+pub(crate) fn load_openapi_for_startup(root: &Path, server: &ServerConfig) -> io::Result<Option<Arc<crate::openapi::OpenApiDocument>>> {
+    let strict = server.strict_open_api();
+    if !(strict || server.features.request_validation || server.docs_ui.mode != crate::config::DocsUiMode::Off) {
+        return Ok(None);
+    }
+    match crate::openapi::load(&root.join(crate::project::MANIFEST_FILE)) {
+        Ok(doc) => {
+            let mut strict_findings = 0usize;
+            for issue in &doc.issues {
+                let is_strict = strict && issue.kind.is_strict_error();
+                if is_strict {
+                    strict_findings += 1;
+                    eprintln!("error: {}", issue.message);
+                    tracing::error!("{}", issue.message);
+                } else {
+                    tracing::warn!("{}", issue.message);
+                }
+            }
+            if strict_findings > 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{strict_findings} {} issue(s) found and \"strictOpenApi\" is true — refusing to start",
+                        crate::project::MANIFEST_FILE
+                    ),
+                ));
+            }
+            Ok(Some(Arc::new(doc)))
+        }
+        Err(e) if strict => {
+            eprintln!("error: failed to load {}: {e}", crate::project::MANIFEST_FILE);
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to load {}: {e} (\"strictOpenApi\" is true)", crate::project::MANIFEST_FILE),
+            ))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "failed to load {}: {e} — request validation is disabled and docs UI's operation list is empty for this run",
+                crate::project::MANIFEST_FILE
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Composes the fully-nested, middleware-wrapped API router from an
@@ -318,6 +373,7 @@ pub(crate) async fn assemble_api_router(
     config: Config,
     drivers: Arc<HashMap<String, Box<dyn SqlDriver>>>,
     mock_provider: Option<Arc<dyn MockProvider>>,
+    openapi_document: Option<Arc<crate::openapi::OpenApiDocument>>,
 ) -> io::Result<(Router, ServerConfig)> {
     let api_dir = crate::project::api_base(root);
     let debug_mode = config.server.debug_mode;
@@ -353,30 +409,6 @@ pub(crate) async fn assemble_api_router(
     let services = std::sync::Arc::new(config.services);
     let discovered_errors = std::sync::Arc::new(std::sync::Mutex::new(config.discovered_errors));
 
-    // Loaded whenever either `features.requestValidation` or `docsUi.mode`
-    // needs it — both are read-only consumers of the same parsed document,
-    // so one load serves both rather than each maintaining its own copy.
-    // `Arc`-wrapped so `docs_ui_router` can hold its own cheap clone
-    // alongside `build_router`'s borrow. A load failure degrades to "no
-    // route gets validation, docs UI's operation list is empty" with a
-    // warning, the same graceful-degradation posture `build_router` itself
-    // uses for a route whose operation can't be matched, rather than
-    // refusing to start the server over either concern.
-    let openapi_document: Option<std::sync::Arc<crate::openapi::OpenApiDocument>> =
-        if config.server.features.request_validation || config.server.docs_ui.mode != crate::config::DocsUiMode::Off {
-            match crate::openapi::load(&root.join(crate::project::MANIFEST_FILE)) {
-                Ok(doc) => Some(std::sync::Arc::new(doc)),
-                Err(e) => {
-                    tracing::warn!(
-                        "failed to load {}: {e} — request validation is disabled and docs UI's operation list is empty for this run",
-                        crate::project::MANIFEST_FILE
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
     let endpoint_router = crate::endpoint::build_router(
         &api_dir,
         drivers.clone(),
@@ -1335,3 +1367,178 @@ mod tests {
 
 #[cfg(test)]
 mod mtls_tests;
+
+#[cfg(test)]
+mod strict_open_api_startup_tests {
+    use super::*;
+
+    fn temp_project() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-run-m1-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Same shape as the other scratch projects in this file, but with a
+    /// caller-supplied spec and `server.json`.
+    fn scratch(server_json: &str, spec: Option<&str>) -> std::path::PathBuf {
+        let root = temp_project();
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(api_dir.join("config/errors")).unwrap();
+        std::fs::create_dir_all(api_dir.join("security")).unwrap();
+        std::fs::create_dir_all(api_dir.join("datasources/endpoints")).unwrap();
+        if let Some(spec) = spec {
+            std::fs::write(root.join("openapi.yaml"), spec).unwrap();
+        }
+        std::fs::write(api_dir.join("config/server.json"), server_json).unwrap();
+        std::fs::write(api_dir.join("config/errors/core.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("config/connections.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("security/schemes.json"), "{}").unwrap();
+        root
+    }
+
+    fn server(json: &str) -> ServerConfig {
+        serde_json::from_str(json).unwrap()
+    }
+
+    const CLEAN: &str = "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths:\n  /ping:\n    get:\n      operationId: ping\n      responses:\n        '200': { description: ok }\n";
+    const UNSAFE: &str = "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths:\n  /x/..:\n    get:\n      operationId: bad\n      responses:\n        '200': { description: ok }\n";
+    const OFF: &str = r#"{ "features": { "requestValidation": false } }"#;
+    const STRICT_OFF_FEATURES: &str = r#"{ "strictOpenApi": true, "features": { "requestValidation": false } }"#;
+
+    #[test]
+    fn strict_loads_the_spec_even_when_request_validation_and_docs_ui_are_off() {
+        let root = scratch(STRICT_OFF_FEATURES, Some(CLEAN));
+        let doc = load_openapi_for_startup(&root, &server(STRICT_OFF_FEATURES)).unwrap();
+        assert_eq!(doc.expect("strict must load the document").operations.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn non_strict_with_nothing_needing_the_spec_does_not_load_it() {
+        let root = scratch(OFF, Some(UNSAFE));
+        assert!(load_openapi_for_startup(&root, &server(OFF)).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn non_strict_with_issues_still_starts_and_hands_back_the_document() {
+        let root = scratch(r#"{ "features": { "requestValidation": true } }"#, Some(UNSAFE));
+        let doc = load_openapi_for_startup(&root, &server(r#"{ "features": { "requestValidation": true } }"#)).unwrap().expect("loaded");
+        assert!(doc.operations.is_empty());
+        assert!(!doc.issues.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn non_strict_with_a_missing_spec_degrades_to_none() {
+        let json = r#"{ "features": { "requestValidation": true } }"#;
+        let root = scratch(json, None);
+        assert!(load_openapi_for_startup(&root, &server(json)).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strict_with_a_missing_spec_is_a_refusal() {
+        let root = scratch(STRICT_OFF_FEATURES, None);
+        let err = load_openapi_for_startup(&root, &server(STRICT_OFF_FEATURES)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strict_with_an_unsafe_path_is_a_refusal_naming_the_issue_count() {
+        let root = scratch(STRICT_OFF_FEATURES, Some(UNSAFE));
+        let err = load_openapi_for_startup(&root, &server(STRICT_OFF_FEATURES)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("1 openapi.yaml issue(s)"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strict_treats_a_missing_version_as_a_refusal_but_not_served_operations_as_fine() {
+        let no_version = "info: { title: t, version: '1' }\npaths: {}\n";
+        let root = scratch(STRICT_OFF_FEATURES, Some(no_version));
+        assert!(load_openapi_for_startup(&root, &server(STRICT_OFF_FEATURES)).is_err());
+
+        let not_served = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /s:\n    query:\n      operationId: q\n      responses: { '200': { description: ok } }\n";
+        std::fs::write(root.join("openapi.yaml"), not_served).unwrap();
+        assert!(load_openapi_for_startup(&root, &server(STRICT_OFF_FEATURES)).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_strict_refusal_happens_before_any_port_or_pidfile_is_touched() {
+        let root = scratch(STRICT_OFF_FEATURES, Some(UNSAFE));
+        let err = build_api_router(&root).await.expect_err("strict + unsafe path must refuse");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(!root.join(".frogs/run.json").exists());
+        assert!(pidfile::read(&root).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_strict_refusal_happens_before_connections_are_opened() {
+        let root = scratch(STRICT_OFF_FEATURES, Some(UNSAFE));
+        std::fs::write(
+            root.join("api/config/connections.json"),
+            r#"{ "main": { "driver": "nosuchdriver", "url": "nowhere" } }"#,
+        )
+        .unwrap();
+        let err = build_api_router(&root).await.expect_err("must refuse");
+        assert!(err.to_string().contains("openapi.yaml"), "the spec refusal must win over the connection error: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_strict_project_with_a_clean_spec_builds_normally() {
+        let root = scratch(STRICT_OFF_FEATURES, Some(CLEAN));
+        assert!(build_api_router(&root).await.is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `/Cars` and `/cars` are ambiguous (generate sets both aside), but
+    /// `run` routes from disk and request validation must still apply, by
+    /// exact bytes, via `find_operation`'s fallback.
+    fn ambiguous_project(server_json: &str) -> std::path::PathBuf {
+        let spec = "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths:\n  /Cars:\n    get:\n      operationId: upper\n      parameters:\n        - { name: q, in: query, required: true, schema: { type: string } }\n      responses:\n        '200': { description: ok }\n  /cars:\n    get:\n      operationId: lower\n      parameters:\n        - { name: q, in: query, required: true, schema: { type: string } }\n      responses:\n        '200': { description: ok }\n";
+        let root = scratch(server_json, Some(spec));
+        let dir = root.join("api/datasources/endpoints/cars");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("endpoint.get.json"), r#"{ "operationId": "lower", "sources": {}, "response": {} }"#).unwrap();
+        std::fs::write(
+            root.join("api/config/errors/core.json"),
+            r#"{ "validation.missing_parameter": { "httpStatus": 400, "exposeDetail": true } }"#,
+        )
+        .unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn ambiguous_paths_still_get_request_validation_when_not_strict() {
+        let root = ambiguous_project(r#"{ "features": { "requestValidation": true } }"#);
+        let (router, _) = build_api_router(&root).await.expect("non-strict must start");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let missing = reqwest::get(format!("http://{addr}/cars")).await.unwrap();
+        assert_eq!(missing.status(), 400, "a missing required query parameter must be rejected, not fail open");
+        let ok = reqwest::get(format!("http://{addr}/cars?q=1")).await.unwrap();
+        assert_eq!(ok.status(), 200);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_paths_are_a_refusal_when_strict() {
+        let root = ambiguous_project(r#"{ "strictOpenApi": true }"#);
+        assert!(build_api_router(&root).await.is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

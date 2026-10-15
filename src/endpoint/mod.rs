@@ -1148,9 +1148,15 @@ fn routable_method(path: &Path) -> Option<&'static str> {
 /// way `url_path_for` converts a folder path, so the two naming
 /// conventions actually meet in the middle. `None` if nothing matches
 /// (a spec/filesystem drift this project otherwise tolerates — see
-/// `commands::generate`'s own orphaned-endpoint handling).
+/// `commands::generate`'s own orphaned-endpoint handling). `Operation.path`
+/// is the loader's normalised form (no trailing slash), and paths the loader
+/// set aside as case-ambiguous are still searched, by exact bytes, so an
+/// existing project that serves both `/Cars` and `/cars` keeps validating both.
 fn find_operation<'a>(doc: &'a crate::openapi::OpenApiDocument, url_path: &str, method: &str) -> Option<&'a Operation> {
-    doc.operations.iter().find(|op| op.method == method && axum_style_path(&op.path) == url_path)
+    doc.operations
+        .iter()
+        .chain(doc.ambiguous_operations.iter())
+        .find(|op| op.method == method && axum_style_path(&op.path) == url_path)
 }
 
 /// `{name}` -> `:name`, segment by segment — the same conversion

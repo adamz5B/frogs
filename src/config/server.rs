@@ -423,6 +423,12 @@ pub struct ServerConfig {
     /// URL-level separation from its static content if this is set.
     #[serde(default)]
     pub api_root: String,
+    /// When true, `generate`/`validate`/`run`/`test` refuse to proceed on any
+    /// openapi.yaml problem that would otherwise only be a warning or a
+    /// silently skipped path (unsafe/colliding paths, unrecognized version,
+    /// file-name case conflicts). Read at startup only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_open_api: Option<bool>,
 }
 
 impl Default for ServerConfig {
@@ -440,11 +446,21 @@ impl Default for ServerConfig {
             source_call_timeout_ms: default_source_call_timeout_ms(),
             port: 8080,
             api_root: String::new(),
+            strict_open_api: Some(false),
         }
     }
 }
 
 impl ServerConfig {
+    pub fn strict_open_api(&self) -> bool {
+        self.strict_open_api.unwrap_or(false)
+    }
+
+    #[allow(dead_code)] // Public accessor for later milestones; exercised by tests.
+    pub fn strict_open_api_explicit(&self) -> bool {
+        self.strict_open_api == Some(true)
+    }
+
     /// The one producer of a real source-call bound: `source_call_timeout_ms`
     /// clamped to `MAX_SOURCE_CALL_TIMEOUT_MS`, warning once if the file
     /// asked for more. Call this at startup/router-assembly time only (once
@@ -683,6 +699,44 @@ mod tests {
     fn effective_source_call_timeout_ms_treats_a_value_exactly_at_the_ceiling_as_not_over_it() {
         let config: ServerConfig = serde_json::from_str(&format!(r#"{{ "sourceCallTimeoutMs": {MAX_SOURCE_CALL_TIMEOUT_MS} }}"#)).unwrap();
         assert_eq!(config.effective_source_call_timeout_ms().get(), MAX_SOURCE_CALL_TIMEOUT_MS);
+    }
+}
+
+#[cfg(test)]
+mod strict_open_api_tests {
+    use super::*;
+
+    #[test]
+    fn the_default_config_serialises_with_a_visible_strict_open_api_false() {
+        let json = serde_json::to_string(&ServerConfig::default()).unwrap();
+        assert!(json.contains("\"strictOpenApi\":false"), "{json}");
+    }
+
+    #[test]
+    fn a_file_without_the_key_is_none_and_not_strict_and_not_explicit() {
+        let config: ServerConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.strict_open_api, None);
+        assert!(!config.strict_open_api());
+        assert!(!config.strict_open_api_explicit());
+        let reserialised = serde_json::to_string(&config).unwrap();
+        assert!(!reserialised.contains("strictOpenApi"), "an unset key stays unset: {reserialised}");
+    }
+
+    #[test]
+    fn true_round_trips_and_is_both_strict_and_explicit() {
+        let config: ServerConfig = serde_json::from_str(r#"{ "strictOpenApi": true }"#).unwrap();
+        assert!(config.strict_open_api());
+        assert!(config.strict_open_api_explicit());
+        let again: ServerConfig = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(again.strict_open_api, Some(true));
+    }
+
+    #[test]
+    fn an_explicit_false_is_not_strict() {
+        let config: ServerConfig = serde_json::from_str(r#"{ "strictOpenApi": false }"#).unwrap();
+        assert_eq!(config.strict_open_api, Some(false));
+        assert!(!config.strict_open_api());
+        assert!(!config.strict_open_api_explicit());
     }
 }
 

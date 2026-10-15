@@ -8,6 +8,7 @@
 
 - **Cargo-style CLI** (`frogs generate|run|stop|register|unregister|test|errors|drivers|validate|help`) — a project's root is just wherever you put an `openapi.yaml` and/or a web asset file, found by walking up like `cargo` finds `Cargo.toml`.
 - **`frogs generate`** turns `openapi.yaml` into stub + reference files per endpoint, with drift detection and backup-and-migrate on spec changes. Hand-edited stubs are never overwritten.
+- **Spec hardening**: `openapi.yaml` is version-checked and its paths are validated at load (traversal, case-only collisions, Windows-unsafe names are skipped and reported, and `frogs generate` exits 1 if any were). Set `"strictOpenApi": true` in `config/server.json` (default `false`) to make those problems fatal in `generate`/`validate`/`run`/`test` instead. A service registered with `frogs register` whose spec has strict errors will restart every 5s under the default `--restart-policy on-failure`; use `--restart-policy never` or fix the spec.
 - **Real SQL sources**: SQLite (always compiled in), Postgres (default), MySQL/MariaDB, MS SQL Server, and Oracle (all opt-in Cargo features), plus real HTTP sources with templating and auth.
 - **Response formatting**, a stable **error envelope** classified against a merged `config/errors/*.json` registry, and **endpoint security** via `sql`/`http` verifiers.
 - **Write operations** (POST/PUT/PATCH/DELETE) with body parameters and per-request transaction correlation.

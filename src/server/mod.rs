@@ -1175,6 +1175,7 @@ mod tests {
             }],
             component_schemas: serde_json::Map::new(),
             security_scheme_types: HashMap::new(),
+            ..Default::default()
         }
     }
 

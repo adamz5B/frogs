@@ -11,6 +11,7 @@ use crate::config::{Config, ServerConfig};
 use crate::endpoint::mock::{NO_MATCHING_CASE, RouteKey, SOURCE_NOT_MOCKED, UNKNOWN_SCENARIO};
 use crate::endpoint::{EndpointFile, MockOutcome, SourceDef, nested_many_parent};
 use crate::errors::ErrorDefinition;
+use crate::openapi::dir_index::{FileState, check_file, create_new_file};
 use crate::project::{MANIFEST_FILE, require_project_root};
 use crate::server::service;
 use crate::testing::{LoadedTestFile, MockSession, ReportConfig, ReportFormat};
@@ -126,6 +127,9 @@ pub(crate) async fn build_mock_router(root: &Path, opts: &TestServerOptions) -> 
     let api_root = crate::project::api_base(root);
     let mut config = Config::load_or_exit(&api_root);
     let endpoints_root = api_root.join("datasources/endpoints");
+    let strict = config.server.strict_open_api();
+    println!("strictOpenApi={strict}");
+    let openapi_document = crate::commands::run::load_openapi_for_startup(root, &config.server)?;
 
     // Harness-owned codes classify like any other — a project that
     // deliberately defines one of them in `config/errors/` keeps its own.
@@ -139,8 +143,24 @@ pub(crate) async fn build_mock_router(root: &Path, opts: &TestServerOptions) -> 
         );
     }
 
+    let (discovered, findings) = discover_test_files(&endpoints_root);
+    let strict_findings = findings.iter().filter(|f| f.strict_error).count();
+    for finding in &findings {
+        if strict && finding.strict_error {
+            eprintln!("error: {}", finding.message);
+        } else {
+            eprintln!("warning: {}", finding.message);
+        }
+    }
+    if strict && strict_findings > 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{strict_findings} problem(s) found in the test files and \"strictOpenApi\" is true — refusing to start"),
+        ));
+    }
+
     let mut files = Vec::new();
-    for (display_path, method, test_file_path, endpoint_file_path) in discover_test_files(&endpoints_root) {
+    for (display_path, method, test_file_path, endpoint_file_path) in discovered {
         let file = match crate::testing::load(&test_file_path) {
             Ok(file) => file,
             Err(e) => {
@@ -148,7 +168,7 @@ pub(crate) async fn build_mock_router(root: &Path, opts: &TestServerOptions) -> 
                 std::process::exit(1);
             }
         };
-        let endpoint = match read_endpoint_file(&endpoint_file_path) {
+        let endpoint = endpoint_file_path.and_then(|endpoint_file_path| match read_endpoint_file(&endpoint_file_path) {
             Ok(endpoint) => Some(endpoint),
             Err(message) => {
                 if endpoint_file_path.is_file() {
@@ -156,7 +176,7 @@ pub(crate) async fn build_mock_router(root: &Path, opts: &TestServerOptions) -> 
                 }
                 None
             }
-        };
+        });
         files.push(LoadedTestFile {
             route: RouteKey { method, path: display_path },
             path: test_file_path,
@@ -218,7 +238,7 @@ pub(crate) async fn build_mock_router(root: &Path, opts: &TestServerOptions) -> 
     }
 
     let provider: Arc<dyn crate::endpoint::mock::MockProvider> = session.clone();
-    let (router, server_config) = crate::commands::run::assemble_api_router(root, config, Arc::new(HashMap::new()), Some(provider)).await?;
+    let (router, server_config) = crate::commands::run::assemble_api_router(root, config, Arc::new(HashMap::new()), Some(provider), openapi_document).await?;
     // Merged last, at the absolute root: outside `apiRoot`, outside every
     // optional middleware layer (correlation, metrics, rate limiting, CORS)
     // — merging never retroactively shares layers, which is exactly what
@@ -242,13 +262,12 @@ pub async fn record(cwd: &Path, path: &str, method: &str) -> io::Result<()> {
     let api_root = crate::project::api_base(&root);
     let config = Config::load_or_exit(&api_root);
 
-    let drivers = match crate::sql::connect_all(&config.connections).await {
-        Ok(drivers) => drivers,
-        Err(err) => {
-            eprintln!("error: {err}");
-            std::process::exit(1);
-        }
-    };
+    // Everything below up to `connect_all` is pure filesystem work, done
+    // first so a strict refusal or a case-variant test file never costs a
+    // real connection.
+    if config.server.strict_open_api() {
+        crate::commands::run::load_openapi_for_startup(&root, &config.server)?;
+    }
 
     let sql_root = api_root.join("datasources/sql");
     let http_root = api_root.join("datasources/http");
@@ -267,6 +286,24 @@ pub async fn record(cwd: &Path, path: &str, method: &str) -> io::Result<()> {
         Ok(endpoint) => endpoint,
         Err(message) => {
             eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+    };
+
+    let test_file_dir = endpoint_file_path.parent().expect("a file always has a parent").to_path_buf();
+    let test_file_name = format!("endpoint.{method}.test.json");
+    let test_file_state = match check_file(&test_file_dir, &test_file_name) {
+        Ok(state) => state,
+        Err(e) => {
+            eprintln!("error: {test_file_name}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let drivers = match crate::sql::connect_all(&config.connections).await {
+        Ok(drivers) => drivers,
+        Err(err) => {
+            eprintln!("error: {err}");
             std::process::exit(1);
         }
     };
@@ -338,14 +375,16 @@ pub async fn record(cwd: &Path, path: &str, method: &str) -> io::Result<()> {
         }
     }
 
-    let test_file_path = endpoint_file_path.with_file_name(format!("endpoint.{method}.test.json"));
-    let mut test_file = match crate::testing::load(&test_file_path) {
-        Ok(file) => file,
-        Err(crate::testing::TestLoadError::Io(e)) if e.kind() == io::ErrorKind::NotFound => crate::testing::TestFile { cases: Vec::new() },
-        Err(e) => {
-            eprintln!("error: {}: {e}", test_file_path.display());
-            std::process::exit(1);
-        }
+    let test_file_path = test_file_dir.join(&test_file_name);
+    let mut test_file = match &test_file_state {
+        FileState::Absent => crate::testing::TestFile { cases: Vec::new() },
+        FileState::Present(existing) => match crate::testing::load(existing) {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("error: {}: {e}", test_file_path.display());
+                std::process::exit(1);
+            }
+        },
     };
 
     test_file.cases.push(crate::testing::TestCase {
@@ -366,7 +405,14 @@ pub async fn record(cwd: &Path, path: &str, method: &str) -> io::Result<()> {
         client_cert: None,
     });
 
-    if let Err(e) = crate::testing::save_to(&test_file_path, &test_file) {
+    let written = match test_file_state {
+        FileState::Present(existing) => crate::testing::save_to(&existing, &test_file),
+        FileState::Absent => {
+            let json = serde_json::to_string_pretty(&test_file).expect("TestFile always serializes");
+            create_new_file(&test_file_dir, &test_file_name, json.as_bytes()).map_err(io::Error::from)
+        }
+    };
+    if let Err(e) = written {
         eprintln!("error: failed to write {}: {e}", test_file_path.display());
         std::process::exit(1);
     }
@@ -439,12 +485,16 @@ fn collect_routes(root: &Path, dir: &Path, method: &str, out: &mut Vec<(String, 
     let target_name = format!("endpoint.{method}.json");
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else { continue };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             if path.file_name().and_then(|n| n.to_str()) == Some("_backups") {
                 continue;
             }
             collect_routes(root, &path, method, out);
-        } else if path.file_name().and_then(|n| n.to_str()) == Some(target_name.as_str()) {
+        } else if file_type.is_file() && path.file_name().and_then(|n| n.to_str()) == Some(target_name.as_str()) {
             out.push((display_path(root, &path), path.clone()));
         }
     }
@@ -455,28 +505,76 @@ fn read_endpoint_file(path: &Path) -> Result<EndpointFile, String> {
     serde_json::from_str(&contents).map_err(|e| format!("{}: invalid JSON: {e}", path.display()))
 }
 
-fn discover_test_files(root: &Path) -> Vec<(String, String, PathBuf, PathBuf)> {
-    let mut out = Vec::new();
-    walk(root, root, &mut out);
-    out
+/// A problem with the test-file tree itself (as opposed to one file's
+/// contents). `strict_error` ones refuse to start under `strictOpenApi`;
+/// otherwise they're printed as warnings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TestFileFinding {
+    pub strict_error: bool,
+    pub message: String,
 }
 
-fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String, PathBuf, PathBuf)>) {
+/// Every `endpoint.<method>.test.json` under `root`, paired with the sibling
+/// endpoint file it tests (`None` when that sibling can't safely be used) —
+/// plus findings about anything odd in the tree. Symlinked folders and files
+/// are reported, never followed.
+pub(crate) type DiscoveredTestFile = (String, String, PathBuf, Option<PathBuf>);
+
+pub(crate) fn discover_test_files(root: &Path) -> (Vec<DiscoveredTestFile>, Vec<TestFileFinding>) {
+    let mut out = Vec::new();
+    let mut findings = Vec::new();
+    walk(root, root, &mut out, &mut findings);
+    (out, findings)
+}
+
+fn walk(root: &Path, dir: &Path, out: &mut Vec<DiscoveredTestFile>, findings: &mut Vec<TestFileFinding>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else { continue };
+        if file_type.is_symlink() {
+            let relevant = path.is_dir() || test_file_method(&path).is_some();
+            if relevant {
+                findings.push(TestFileFinding {
+                    strict_error: true,
+                    message: format!("{} is a symbolic link or junction — not followed", path.display()),
+                });
+            }
+            continue;
+        }
+        if file_type.is_dir() {
             // `_backups/` holds history, not live config — never a test file.
             if path.file_name().and_then(|n| n.to_str()) == Some("_backups") {
                 continue;
             }
-            walk(root, &path, out);
+            walk(root, &path, out, findings);
         } else if let Some(method) = test_file_method(&path) {
+            if !crate::openapi::HTTP_METHODS.contains(&method.as_str()) {
+                findings.push(TestFileFinding {
+                    strict_error: true,
+                    message: format!(
+                        "{}: '{}' is not one of the lowercase HTTP method names (get, post, put, patch, delete, ...) the file name must use",
+                        path.display(),
+                        crate::openapi::untrusted(&method)
+                    ),
+                });
+            }
             let display_path = display_path(root, &path);
             // Sibling to the test file, same folder — the file the design
             // doc's "config lives next to what it configures" pattern says
             // this test file is testing.
-            let endpoint_file = path.parent().expect("a file always has a parent").join(format!("endpoint.{method}.json"));
+            let parent = path.parent().expect("a file always has a parent");
+            let endpoint_file = match check_file(parent, &format!("endpoint.{method}.json")) {
+                Ok(FileState::Present(p)) => Some(p),
+                Ok(FileState::Absent) => Some(parent.join(format!("endpoint.{method}.json"))),
+                Err(e) => {
+                    findings.push(TestFileFinding {
+                        strict_error: true,
+                        message: format!("{}: {e}", path.display()),
+                    });
+                    None
+                }
+            };
             out.push((display_path, method.to_string(), path.clone(), endpoint_file));
         }
     }
@@ -575,9 +673,11 @@ mod tests {
     #[test]
     fn discovers_test_files_and_their_sibling_endpoint_file() {
         let fixture = sample_endpoints_root();
-        let found = discover_test_files(fixture.path());
+        let (found, findings) = discover_test_files(fixture.path());
+        assert!(findings.is_empty());
         assert_eq!(found.len(), 1, "the fixture has exactly one .test.json file");
         let (display_path, method, test_file_path, endpoint_file_path) = &found[0];
+        let endpoint_file_path = endpoint_file_path.as_ref().unwrap();
         assert_eq!(display_path, "/cars/{vin}");
         assert_eq!(method, "get");
         assert!(test_file_path.ends_with("endpoint.get.test.json"));
@@ -1439,5 +1539,206 @@ mod tests {
         assert_eq!(status, 422, "{body}");
         assert_eq!(body["name"], NO_MATCHING_CASE);
         assert!(body.get("detail").is_none(), "the project said exposeDetail: false, so no detail: {body}");
+    }
+}
+
+#[cfg(test)]
+mod test_file_findings_tests {
+    use super::*;
+
+    fn temp_project() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-test-cmd-m1-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn case_insensitive_fs(dir: &Path) -> bool {
+        std::fs::write(dir.join("probe_a"), b"").unwrap();
+        let insensitive = dir.join("PROBE_A").exists();
+        std::fs::remove_file(dir.join("probe_a")).unwrap();
+        eprintln!("case-insensitive filesystem: {insensitive}");
+        insensitive
+    }
+
+    const TEST_FILE: &str = r#"{ "cases": [ { "name": "c", "request": {}, "mocks": {}, "expect": { "status": 200 } } ] }"#;
+    const STUB: &str = r#"{ "operationId": "x", "sources": {}, "response": {} }"#;
+
+    /// A complete scratch API project with one route `/things`.
+    fn project(server_json: &str) -> PathBuf {
+        let root = temp_project();
+        let api = root.join("api");
+        for dir in ["config/errors", "security", "datasources/endpoints/things"] {
+            std::fs::create_dir_all(api.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("openapi.yaml"), "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths: {}\n").unwrap();
+        std::fs::write(api.join("config/server.json"), server_json).unwrap();
+        std::fs::write(api.join("config/errors/core.json"), "{}").unwrap();
+        std::fs::write(api.join("config/connections.json"), "{}").unwrap();
+        std::fs::write(api.join("security/schemes.json"), "{}").unwrap();
+        std::fs::write(api.join("datasources/endpoints/things/endpoint.get.json"), STUB).unwrap();
+        root
+    }
+
+    fn opts() -> TestServerOptions {
+        TestServerOptions {
+            port: None,
+            bind: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            scenario: None,
+            report: ReportFormat::Text,
+            report_file: None,
+        }
+    }
+
+    #[test]
+    fn a_test_file_with_an_uppercase_method_beside_a_lowercase_stub_yields_a_bad_token_and_a_case_conflict_finding() {
+        let root = temp_project();
+        case_insensitive_fs(&root);
+        std::fs::write(root.join("endpoint.get.json"), STUB).unwrap();
+        std::fs::write(root.join("endpoint.GET.test.json"), TEST_FILE).unwrap();
+
+        let (files, findings) = discover_test_files(&root);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].3.is_none(), "an unusable sibling must not be handed on");
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert!(findings.iter().all(|f| f.strict_error));
+        assert!(findings.iter().any(|f| f.message.contains("lowercase HTTP method")));
+        assert!(findings.iter().any(|f| f.message.contains("rename or remove it by hand")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_test_file_with_a_made_up_method_token_is_a_bad_token_finding_but_still_discovered() {
+        let root = temp_project();
+        std::fs::write(root.join("endpoint.foo.json"), STUB).unwrap();
+        std::fs::write(root.join("endpoint.foo.test.json"), TEST_FILE).unwrap();
+        let (files, findings) = discover_test_files(&root);
+        assert_eq!(files.len(), 1);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].strict_error);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_clean_tree_with_a_lowercase_pair_has_no_findings() {
+        let root = temp_project();
+        std::fs::write(root.join("endpoint.post.json"), STUB).unwrap();
+        std::fs::write(root.join("endpoint.post.test.json"), TEST_FILE).unwrap();
+        let (files, findings) = discover_test_files(&root);
+        assert_eq!(files.len(), 1);
+        assert!(findings.is_empty(), "{findings:?}");
+        assert!(files[0].3.as_ref().unwrap().ends_with("endpoint.post.json"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_test_file_with_no_sibling_stub_still_carries_the_would_be_sibling_path() {
+        let root = temp_project();
+        std::fs::write(root.join("endpoint.get.test.json"), TEST_FILE).unwrap();
+        let (files, findings) = discover_test_files(&root);
+        assert!(findings.is_empty());
+        assert!(files[0].3.as_ref().unwrap().ends_with("endpoint.get.json"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn backups_folders_are_never_walked_for_test_files() {
+        let root = temp_project();
+        std::fs::create_dir_all(root.join("_backups")).unwrap();
+        std::fs::write(root.join("_backups/endpoint.get.test.json"), TEST_FILE).unwrap();
+        let (files, findings) = discover_test_files(&root);
+        assert!(files.is_empty());
+        assert!(findings.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_linked_folder_is_reported_as_a_strict_finding_and_never_descended_into() {
+        let root = temp_project();
+        let outside = temp_project();
+        std::fs::write(outside.join("endpoint.get.test.json"), TEST_FILE).unwrap();
+        let link = root.join("linked");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, &link).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&outside, &link).is_ok()
+            || std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(&outside)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+        if !linked {
+            eprintln!("skipping: cannot create a link here");
+        } else {
+            let (files, findings) = discover_test_files(&root);
+            assert!(files.is_empty(), "must not follow the link: {files:?}");
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert!(findings[0].strict_error);
+            let _ = std::fs::remove_dir(&link);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[tokio::test]
+    async fn a_bad_token_test_file_only_warns_when_not_strict() {
+        let root = project(r#"{ "features": { "requestValidation": false } }"#);
+        let dir = root.join("api/datasources/endpoints/things");
+        std::fs::write(dir.join("endpoint.foo.test.json"), TEST_FILE).unwrap();
+        let built = build_mock_router(&root, &opts()).await;
+        assert!(built.is_ok(), "{:?}", built.err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_bad_token_test_file_refuses_the_mock_server_under_strict() {
+        let root = project(r#"{ "strictOpenApi": true, "features": { "requestValidation": false } }"#);
+        let dir = root.join("api/datasources/endpoints/things");
+        std::fs::write(dir.join("endpoint.foo.test.json"), TEST_FILE).unwrap();
+        let err = build_mock_router(&root, &opts()).await.err().expect("strict + finding must refuse");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("1 problem(s)"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_case_variant_sibling_refuses_the_mock_server_under_strict_on_every_filesystem() {
+        let root = project(r#"{ "strictOpenApi": true, "features": { "requestValidation": false } }"#);
+        case_insensitive_fs(&root);
+        let dir = root.join("api/datasources/endpoints/things");
+        std::fs::write(dir.join("endpoint.GET.test.json"), TEST_FILE).unwrap();
+        assert!(build_mock_router(&root, &opts()).await.is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn strict_refuses_the_mock_server_over_an_unsafe_spec_path_before_assembling_anything() {
+        let root = project(r#"{ "strictOpenApi": true, "features": { "requestValidation": false } }"#);
+        std::fs::write(
+            root.join("openapi.yaml"),
+            "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths:\n  /a/..:\n    get:\n      operationId: x\n      responses: { '200': { description: ok } }\n",
+        )
+        .unwrap();
+        assert!(build_mock_router(&root, &opts()).await.is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_clean_strict_project_builds_the_mock_router() {
+        let root = project(r#"{ "strictOpenApi": true, "features": { "requestValidation": false } }"#);
+        let dir = root.join("api/datasources/endpoints/things");
+        std::fs::write(dir.join("endpoint.get.test.json"), TEST_FILE).unwrap();
+        let built = build_mock_router(&root, &opts()).await;
+        assert!(built.is_ok(), "{:?}", built.err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

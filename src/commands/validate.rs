@@ -61,10 +61,11 @@ async fn validate_api(root: &Path) -> usize {
     // describes them didn't even load.
     let config = Config::load_or_exit(&api_dir);
     println!(
-        "  config: OK ({} connection(s), {} error code(s), {} security scheme(s))",
+        "  config: OK ({} connection(s), {} error code(s), {} security scheme(s), strictOpenApi={})",
         config.connections.len(),
         config.errors.len(),
-        config.security.schemes.len()
+        config.security.schemes.len(),
+        config.server.strict_open_api()
     );
 
     // `frogs run` clamps this at startup rather than refusing to start (see
@@ -92,6 +93,12 @@ async fn validate_api(root: &Path) -> usize {
     match crate::openapi::load(&root.join(MANIFEST_FILE)) {
         Ok(doc) => {
             println!("  {MANIFEST_FILE}: OK ({} operation(s))", doc.operations.len());
+            problems += report_spec_issues(&doc, config.server.strict_open_api());
+            let plan = crate::commands::generate::plan_endpoint_files(&api_dir, &doc);
+            for error in &plan.errors {
+                println!("  error: {}", error.message);
+            }
+            problems += plan.errors.len();
             for op in &doc.operations {
                 let Some(scheme) = &op.security else { continue };
                 if doc.security_scheme_types.get(scheme).map(String::as_str) != Some("mutualTLS") {
@@ -150,6 +157,32 @@ async fn validate_api(root: &Path) -> usize {
         }
     }
 
+    problems
+}
+
+/// Prints a loaded spec's issues and returns how many count as problems:
+/// every dropped-path (`Severity::Error`) issue, every Windows-portability
+/// finding on any OS (even where the path was kept), and — under
+/// `strictOpenApi` — every strict-class issue. Everything else is a warning.
+fn report_spec_issues(doc: &crate::openapi::OpenApiDocument, strict: bool) -> usize {
+    let mut problems = 0usize;
+    let mut would_be_errors = 0usize;
+    for issue in &doc.issues {
+        let is_problem =
+            issue.severity == crate::openapi::Severity::Error || issue.kind == crate::openapi::IssueKind::WindowsPortability || (strict && issue.kind.is_strict_error());
+        if is_problem {
+            println!("  error: {}", issue.message);
+            problems += 1;
+        } else {
+            println!("  warning: {}", issue.message);
+            if issue.kind.is_strict_error() {
+                would_be_errors += 1;
+            }
+        }
+    }
+    if would_be_errors > 0 {
+        println!("  note: {would_be_errors} issue(s) would be errors with \"strictOpenApi\": true");
+    }
     problems
 }
 
@@ -426,3 +459,126 @@ mod tests {
 
 #[cfg(test)]
 mod mtls_tests;
+
+#[cfg(test)]
+mod spec_hardening_tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_project() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-validate-m1-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_spec(root: &Path, version_line: &str, paths: &[&str]) {
+        let mut yaml = format!("{version_line}info: {{ title: t, version: '1' }}\npaths:\n");
+        if paths.is_empty() {
+            yaml = format!("{version_line}info: {{ title: t, version: '1' }}\npaths: {{}}\n");
+        }
+        for (i, p) in paths.iter().enumerate() {
+            yaml.push_str(&format!("  '{p}':\n    get:\n      operationId: op{i}\n      responses:\n        '200': {{ description: ok }}\n"));
+        }
+        fs::write(root.join(MANIFEST_FILE), yaml).unwrap();
+    }
+
+    fn make_strict(root: &Path) {
+        fs::create_dir_all(root.join("api/config")).unwrap();
+        fs::write(root.join("api/config/server.json"), r#"{ "strictOpenApi": true }"#).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_path_with_a_colon_is_one_problem_on_every_os() {
+        let root = temp_project();
+        write_spec(&root, "openapi: 3.1.0\n", &["/items:batchGet"]);
+        assert_eq!(validate_api(&root).await, 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn case_only_colliding_paths_count_as_problems() {
+        let root = temp_project();
+        write_spec(&root, "openapi: 3.1.0\n", &["/Cars", "/cars"]);
+        assert!(validate_api(&root).await >= 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn an_unsafe_path_is_a_problem_even_without_strict() {
+        let root = temp_project();
+        write_spec(&root, "openapi: 3.1.0\n", &["/a/../b", "/fine"]);
+        assert_eq!(validate_api(&root).await, 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_missing_version_is_no_problem_normally_and_one_problem_under_strict() {
+        let lax = temp_project();
+        write_spec(&lax, "", &[]);
+        assert_eq!(validate_api(&lax).await, 0);
+
+        let strict = temp_project();
+        make_strict(&strict);
+        write_spec(&strict, "", &[]);
+        assert_eq!(validate_api(&strict).await, 1);
+        let _ = fs::remove_dir_all(&lax);
+        let _ = fs::remove_dir_all(&strict);
+    }
+
+    #[tokio::test]
+    async fn a_trailing_slash_is_a_warning_normally_and_a_problem_under_strict() {
+        let lax = temp_project();
+        write_spec(&lax, "openapi: 3.1.0\n", &["/cars/"]);
+        assert_eq!(validate_api(&lax).await, 0);
+
+        let strict = temp_project();
+        make_strict(&strict);
+        write_spec(&strict, "openapi: 3.1.0\n", &["/cars/"]);
+        assert_eq!(validate_api(&strict).await, 1);
+        let _ = fs::remove_dir_all(&lax);
+        let _ = fs::remove_dir_all(&strict);
+    }
+
+    #[tokio::test]
+    async fn not_served_operations_are_never_problems_even_under_strict() {
+        let root = temp_project();
+        make_strict(&root);
+        fs::write(
+            root.join(MANIFEST_FILE),
+            "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /s:\n    query:\n      operationId: q\n      responses: { '200': { description: ok } }\n",
+        )
+        .unwrap();
+        assert_eq!(validate_api(&root).await, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_case_variant_endpoint_folder_on_disk_is_a_problem_and_validate_writes_nothing() {
+        let root = temp_project();
+        write_spec(&root, "openapi: 3.1.0\n", &["/cars"]);
+        fs::create_dir_all(root.join("api/datasources/endpoints/Cars")).unwrap();
+        let before: Vec<_> = fs::read_dir(root.join("api/datasources/endpoints")).unwrap().map(|e| e.unwrap().file_name()).collect();
+
+        assert!(validate_api(&root).await >= 1);
+
+        let after: Vec<_> = fs::read_dir(root.join("api/datasources/endpoints")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(before, after);
+        assert_eq!(fs::read_dir(root.join("api/datasources/endpoints/Cars")).unwrap().count(), 0);
+        assert!(!root.join("api/datasources/components").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_clean_project_with_a_declared_version_still_reports_zero_problems() {
+        let root = temp_project();
+        write_spec(&root, "openapi: 3.0.3\n", &["/cars", "/cars/{vin}"]);
+        assert_eq!(validate_api(&root).await, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+}
