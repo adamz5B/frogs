@@ -63,6 +63,13 @@ fn collect_refs(schema: &Value, names: &mut HashSet<String>) {
             }
         }
     }
+    let has_one_of = obj.get("oneOf").is_some_and(Value::is_array) || obj.get("anyOf").is_some_and(Value::is_array);
+    if has_one_of && let Some(default) = obj.get("discriminator").and_then(|d| d.get("defaultMapping")).and_then(Value::as_str) {
+        names.insert(default.to_string());
+        if let Some(name) = default.strip_prefix("#/components/schemas/") {
+            names.insert(name.to_string());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -108,6 +115,29 @@ mod tests {
     #[test]
     fn no_refs_is_an_empty_set() {
         let schema = serde_json::json!({ "type": "string" });
+        assert!(referenced_component_names(&schema).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod m2_default_mapping_ref_tests {
+    use super::*;
+
+    #[test]
+    fn a_default_mapping_by_bare_name_is_collected_as_a_dependency() {
+        let schema = serde_json::json!({ "oneOf": [{ "type": "string" }], "discriminator": { "propertyName": "k", "defaultMapping": "Car" } });
+        assert!(referenced_component_names(&schema).contains("Car"));
+    }
+
+    #[test]
+    fn a_default_mapping_by_ref_form_collects_the_stripped_name() {
+        let schema = serde_json::json!({ "anyOf": [{ "type": "string" }], "discriminator": { "propertyName": "k", "defaultMapping": "#/components/schemas/Car" } });
+        assert!(referenced_component_names(&schema).contains("Car"));
+    }
+
+    #[test]
+    fn a_default_mapping_without_one_of_or_any_of_is_not_collected() {
+        let schema = serde_json::json!({ "type": "object", "discriminator": { "propertyName": "k", "defaultMapping": "Car" } });
         assert!(referenced_component_names(&schema).is_empty());
     }
 }

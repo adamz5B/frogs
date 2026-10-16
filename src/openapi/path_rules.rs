@@ -316,7 +316,22 @@ mod tests {
 
     #[test]
     fn windows_reserved_names_are_flagged_case_insensitively_and_ignoring_extensions() {
-        for name in ["CON", "con", "con.txt", "CON .txt", "CONIN$", "conout$", "COM\u{b9}", "COM\u{b2}", "LPT0", "lpt9", "NUL", "aux.json", "PRN", "COM0"] {
+        for name in [
+            "CON",
+            "con",
+            "con.txt",
+            "CON .txt",
+            "CONIN$",
+            "conout$",
+            "COM\u{b9}",
+            "COM\u{b2}",
+            "LPT0",
+            "lpt9",
+            "NUL",
+            "aux.json",
+            "PRN",
+            "COM0",
+        ] {
             assert!(windows_reserved(name), "{name:?} should be reserved");
         }
         for name in ["CONSOLE", "cars", "COM10", "LPT", "COMX", ""] {

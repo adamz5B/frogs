@@ -343,6 +343,26 @@ pub(crate) fn load_openapi_for_startup(root: &Path, server: &ServerConfig) -> io
                     ),
                 ));
             }
+            if strict {
+                let stream_files = crate::endpoint::reserved_stream_key_files(&crate::project::api_base(root).join("datasources/endpoints"));
+                if !stream_files.is_empty() {
+                    for file in &stream_files {
+                        let message = format!(
+                            "{}: \"stream\" is reserved for streaming responses, which this frogs version does not implement",
+                            file.display()
+                        );
+                        eprintln!("error: {message}");
+                        tracing::error!("{message}");
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{} endpoint file(s) use the reserved \"stream\" key and \"strictOpenApi\" is true — refusing to start",
+                            stream_files.len()
+                        ),
+                    ));
+                }
+            }
             Ok(Some(Arc::new(doc)))
         }
         Err(e) if strict => {
@@ -1406,8 +1426,10 @@ mod strict_open_api_startup_tests {
         serde_json::from_str(json).unwrap()
     }
 
-    const CLEAN: &str = "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths:\n  /ping:\n    get:\n      operationId: ping\n      responses:\n        '200': { description: ok }\n";
-    const UNSAFE: &str = "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths:\n  /x/..:\n    get:\n      operationId: bad\n      responses:\n        '200': { description: ok }\n";
+    const CLEAN: &str =
+        "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths:\n  /ping:\n    get:\n      operationId: ping\n      responses:\n        '200': { description: ok }\n";
+    const UNSAFE: &str =
+        "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths:\n  /x/..:\n    get:\n      operationId: bad\n      responses:\n        '200': { description: ok }\n";
     const OFF: &str = r#"{ "features": { "requestValidation": false } }"#;
     const STRICT_OFF_FEATURES: &str = r#"{ "strictOpenApi": true, "features": { "requestValidation": false } }"#;
 
@@ -1429,7 +1451,9 @@ mod strict_open_api_startup_tests {
     #[test]
     fn non_strict_with_issues_still_starts_and_hands_back_the_document() {
         let root = scratch(r#"{ "features": { "requestValidation": true } }"#, Some(UNSAFE));
-        let doc = load_openapi_for_startup(&root, &server(r#"{ "features": { "requestValidation": true } }"#)).unwrap().expect("loaded");
+        let doc = load_openapi_for_startup(&root, &server(r#"{ "features": { "requestValidation": true } }"#))
+            .unwrap()
+            .expect("loaded");
         assert!(doc.operations.is_empty());
         assert!(!doc.issues.is_empty());
         let _ = std::fs::remove_dir_all(&root);
@@ -1466,7 +1490,8 @@ mod strict_open_api_startup_tests {
         let root = scratch(STRICT_OFF_FEATURES, Some(no_version));
         assert!(load_openapi_for_startup(&root, &server(STRICT_OFF_FEATURES)).is_err());
 
-        let not_served = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /s:\n    query:\n      operationId: q\n      responses: { '200': { description: ok } }\n";
+        let not_served =
+            "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /s:\n    query:\n      operationId: q\n      responses: { '200': { description: ok } }\n";
         std::fs::write(root.join("openapi.yaml"), not_served).unwrap();
         assert!(load_openapi_for_startup(&root, &server(STRICT_OFF_FEATURES)).unwrap().is_some());
         let _ = std::fs::remove_dir_all(&root);
@@ -1539,6 +1564,95 @@ mod strict_open_api_startup_tests {
     async fn ambiguous_paths_are_a_refusal_when_strict() {
         let root = ambiguous_project(r#"{ "strictOpenApi": true }"#);
         assert!(build_api_router(&root).await.is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m2_strict_startup_tests {
+    use super::*;
+
+    fn scratch(server_json: &str, spec: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-run-m2-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(api_dir.join("config")).unwrap();
+        std::fs::create_dir_all(api_dir.join("datasources/endpoints/things")).unwrap();
+        std::fs::write(root.join("openapi.yaml"), spec).unwrap();
+        std::fs::write(api_dir.join("config/server.json"), server_json).unwrap();
+        root
+    }
+
+    fn write_endpoint(root: &std::path::Path, json: &str) {
+        std::fs::write(root.join("api/datasources/endpoints/things/endpoint.get.json"), json).unwrap();
+    }
+
+    fn server(json: &str) -> ServerConfig {
+        serde_json::from_str(json).unwrap()
+    }
+
+    const STRICT: &str = r#"{ "strictOpenApi": true }"#;
+    const LAX: &str = r#"{ "strictOpenApi": false, "features": { "requestValidation": true } }"#;
+    const CLEAN: &str = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /things:\n    get:\n      operationId: getThings\n      responses:\n        '200': { description: ok }\n";
+    const STREAM_FILE: &str = r#"{ "operationId": "getThings", "stream": null, "sources": {}, "response": {} }"#;
+    const NESTED_STREAM_ONLY: &str = r#"{ "operationId": "getThings", "sources": {}, "response": { "stream": "sources.a.b" } }"#;
+
+    #[test]
+    fn strict_with_a_top_level_stream_key_refuses_to_start_naming_the_reserved_key() {
+        let root = scratch(STRICT, CLEAN);
+        write_endpoint(&root, STREAM_FILE);
+        let err = load_openapi_for_startup(&root, &server(STRICT)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let message = err.to_string();
+        assert!(message.contains("1 endpoint file(s) use the reserved \"stream\" key"), "{message}");
+        assert!(message.contains("refusing to start"), "{message}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn non_strict_with_a_stream_key_still_starts() {
+        let root = scratch(LAX, CLEAN);
+        write_endpoint(&root, STREAM_FILE);
+        assert!(load_openapi_for_startup(&root, &server(LAX)).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strict_with_only_a_nested_stream_key_is_fine() {
+        let root = scratch(STRICT, CLEAN);
+        write_endpoint(&root, NESTED_STREAM_ONLY);
+        assert!(load_openapi_for_startup(&root, &server(STRICT)).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strict_with_only_w2_w3_w4_findings_starts_normally() {
+        let spec = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /things:\n    get:\n      operationId: getThings\n      security: [ { old: [] } ]\n      responses:\n        '200':\n          description: ok\n          content:\n            text/event-stream: {}\n  /u:\n    post:\n      operationId: u\n      requestBody:\n        content:\n          multipart/form-data: { schema: { type: object } }\n      responses:\n        '200': { description: ok }\ncomponents:\n  securitySchemes:\n    old: { type: apiKey, in: header, name: k, deprecated: true }\n";
+        let root = scratch(STRICT, spec);
+        let doc = load_openapi_for_startup(&root, &server(STRICT)).unwrap().expect("loaded");
+        assert!(doc.issues.len() >= 3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strict_with_an_unresolved_default_mapping_refuses_to_start_with_the_unchanged_message() {
+        let spec = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths: {}\ncomponents:\n  schemas:\n    V: { oneOf: [ { type: string } ], discriminator: { propertyName: k, defaultMapping: Nope } }\n";
+        let root = scratch(STRICT, spec);
+        let err = load_openapi_for_startup(&root, &server(STRICT)).unwrap_err();
+        assert_eq!(err.to_string(), "1 openapi.yaml issue(s) found and \"strictOpenApi\" is true — refusing to start");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strict_with_a_broken_media_type_ref_refuses_to_start() {
+        let spec = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /a:\n    get:\n      operationId: a\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { $ref: '#/components/mediaTypes/Missing' }\n";
+        let root = scratch(STRICT, spec);
+        assert!(load_openapi_for_startup(&root, &server(STRICT)).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -256,6 +256,7 @@ mod tests {
             request_body,
             response_status_codes: vec![200],
             security: None,
+            ..Default::default()
         }
     }
 
@@ -508,5 +509,81 @@ mod tests {
         let body = serde_json::json!({ "year": 2020.5 });
         let err = validate_request(&operation, &Map::new(), &HashMap::new(), &HashMap::new(), &HeaderMap::new(), &body).unwrap_err();
         assert_eq!(err.code, INVALID_TYPE);
+    }
+}
+
+#[cfg(test)]
+mod m2_media_type_ref_tests {
+    use super::*;
+
+    fn load_op(yaml: &str) -> (Operation, Map<String, Value>) {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "frogs-reqval-m2-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("openapi.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let doc = crate::openapi::load(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (doc.operations[0].clone(), doc.component_schemas.clone())
+    }
+
+    fn spec(media_types: &str, request_json_entry: &str) -> String {
+        format!(
+            "openapi: 3.2.0\ninfo: {{ title: t, version: '1' }}\ncomponents:\n  mediaTypes:\n{media_types}\n  schemas:\n    Owner: {{ type: object, required: [name], properties: {{ name: {{ type: string }} }} }}\npaths:\n  /cars:\n    post:\n      operationId: createCar\n      requestBody:\n        required: true\n        content:\n          application/json: {request_json_entry}\n      responses:\n        '200': {{ description: ok }}\n"
+        )
+    }
+
+    const CAR_BODY: &str = "    CarBody: { schema: { type: object, required: [vin], properties: { vin: { type: string }, year: { type: integer } } } }";
+
+    #[test]
+    fn a_body_declared_through_a_media_type_ref_rejects_a_wrong_typed_field() {
+        let (operation, comps) = load_op(&spec(CAR_BODY, "{ $ref: '#/components/mediaTypes/CarBody' }"));
+        let body = serde_json::json!({ "vin": "V1", "year": "nineteen" });
+        let err = validate_request(&operation, &comps, &HashMap::new(), &HashMap::new(), &HeaderMap::new(), &body).unwrap_err();
+        assert_eq!(err.code, INVALID_TYPE);
+    }
+
+    #[test]
+    fn a_body_declared_through_a_media_type_ref_rejects_a_missing_required_field() {
+        let (operation, comps) = load_op(&spec(CAR_BODY, "{ $ref: '#/components/mediaTypes/CarBody' }"));
+        let body = serde_json::json!({ "year": 1999 });
+        assert!(validate_request(&operation, &comps, &HashMap::new(), &HashMap::new(), &HeaderMap::new(), &body).is_err());
+    }
+
+    #[test]
+    fn a_body_declared_through_a_media_type_ref_accepts_a_valid_payload() {
+        let (operation, comps) = load_op(&spec(CAR_BODY, "{ $ref: '#/components/mediaTypes/CarBody' }"));
+        let body = serde_json::json!({ "vin": "V1", "year": 1999 });
+        assert!(validate_request(&operation, &comps, &HashMap::new(), &HashMap::new(), &HeaderMap::new(), &body).is_ok());
+    }
+
+    #[test]
+    fn an_unresolved_required_body_still_rejects_a_missing_body_but_accepts_any_present_one() {
+        let (operation, comps) = load_op(&spec(CAR_BODY, "{ $ref: '#/components/mediaTypes/Missing' }"));
+        assert!(operation.request_body_unresolved.is_some());
+        let missing = validate_request(&operation, &comps, &HashMap::new(), &HashMap::new(), &HeaderMap::new(), &Value::Null);
+        assert!(missing.is_err(), "presence of a required body is still enforced");
+        let any_shape = serde_json::json!({ "whatever": [1, 2, 3] });
+        assert!(validate_request(&operation, &comps, &HashMap::new(), &HashMap::new(), &HeaderMap::new(), &any_shape).is_ok());
+    }
+
+    #[test]
+    fn a_content_only_integer_parameter_is_now_type_checked() {
+        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  mediaTypes:\n    I: { schema: { type: integer } }\npaths:\n  /cars:\n    get:\n      operationId: l\n      parameters:\n        - { name: limit, in: query, content: { application/json: { $ref: '#/components/mediaTypes/I' } } }\n      responses:\n        '200': { description: ok }\n";
+        let (operation, comps) = load_op(yaml);
+        let bad = HashMap::from([("limit".to_string(), "abc".to_string())]);
+        assert_eq!(
+            validate_request(&operation, &comps, &HashMap::new(), &bad, &HeaderMap::new(), &Value::Null)
+                .unwrap_err()
+                .code,
+            INVALID_TYPE
+        );
+        let good = HashMap::from([("limit".to_string(), "5".to_string())]);
+        assert!(validate_request(&operation, &comps, &HashMap::new(), &good, &HeaderMap::new(), &Value::Null).is_ok());
     }
 }

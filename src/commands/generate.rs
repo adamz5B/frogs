@@ -9,7 +9,9 @@ use crate::openapi::dir_index::{
     DirIndex, DirState, EndpointFsError, EntryKind, FileState, Lookup, check_file, create_endpoint_dir, create_new_file, fold, rename_checked, resolve_endpoint_dir,
 };
 use crate::openapi::path_rules::is_single_normal_component;
-use crate::openapi::{LoadIssue, OpenApiDocument, Operation, Severity, content_hash, merge_stub_response, stub_from_descriptor, untrusted};
+use crate::openapi::{
+    LoadIssue, OpenApiDocument, Operation, ResponseMode, Severity, StreamSpec, content_hash, merge_stub_response, stub_from_descriptor, untrusted, walk_response_schema,
+};
 use crate::project::{MANIFEST_FILE, find_files_with_extensions, require_project_root};
 
 /// Files `generate --role web` scans the project root for (non-recursive —
@@ -852,15 +854,37 @@ fn validate_success_statuses(root: &Path, doc: &OpenApiDocument) -> Vec<String> 
     errors
 }
 
-fn build_reference_file(op: &Operation, hash: &str, response_descriptor: &Value) -> Value {
-    serde_json::json!({
+fn stream_reference(spec: &StreamSpec, components: &HashMap<String, Value>) -> Value {
+    let mut mode = serde_json::Map::new();
+    mode.insert("kind".to_string(), Value::String("stream".to_string()));
+    if let Some(status) = spec.status {
+        mode.insert("status".to_string(), Value::from(status));
+    }
+    mode.insert("mediaType".to_string(), Value::String(spec.media_type.clone()));
+    mode.insert(
+        "itemSchema".to_string(),
+        spec.item_schema.as_ref().map_or(Value::Null, |schema| walk_response_schema(schema, components)),
+    );
+    mode.insert("itemEncoding".to_string(), spec.item_encoding.clone().unwrap_or(Value::Null));
+    Value::Object(mode)
+}
+
+fn build_reference_file(op: &Operation, hash: &str, response_descriptor: &Value, components: &HashMap<String, Value>) -> Value {
+    let mut reference = serde_json::json!({
         "operationId": op.operation_id,
         "_hash": hash,
         "security": op.security,
         "request": op.request_sources(),
         "response": response_descriptor,
         "availableParameterSources": op.available_parameter_sources(),
-    })
+    });
+    if let ResponseMode::Stream(spec) = &op.response_mode {
+        reference["responseMode"] = stream_reference(spec, components);
+    }
+    if let Some(spec) = &op.request_stream {
+        reference["requestMode"] = stream_reference(spec, components);
+    }
+    reference
 }
 
 /// Only set here at *creation* time — an existing hand-edited stub's
@@ -871,13 +895,26 @@ fn build_reference_file(op: &Operation, hash: &str, response_descriptor: &Value)
 /// `sources` alone). The reference file above is what stays authoritative
 /// if the two ever disagree.
 fn build_stub_file(op: &Operation, reference_file_name: &str, response_descriptor: &Value) -> Value {
+    let mut todo = format!(
+        "See {reference_file_name} for available request/response fields. \
+         Fill in sources and map each response field to a source path."
+    );
+    if let ResponseMode::Stream(spec) = &op.response_mode {
+        todo.push_str(&format!(
+            " Note: openapi.yaml declares a streaming response ({}); this frogs version serves it as a single JSON response — see responseMode in {reference_file_name}.",
+            untrusted(&spec.media_type)
+        ));
+    }
+    if let Some(spec) = &op.request_stream {
+        todo.push_str(&format!(
+            " Note: openapi.yaml declares a streaming request body ({}); this frogs version only reads a single JSON request body — see requestMode in {reference_file_name}.",
+            untrusted(&spec.media_type)
+        ));
+    }
     let mut stub = serde_json::json!({
         "operationId": op.operation_id,
         "_generated": true,
-        "_todo": format!(
-            "See {reference_file_name} for available request/response fields. \
-             Fill in sources and map each response field to a source path."
-        ),
+        "_todo": todo,
         "sources": {},
         "response": stub_from_descriptor(response_descriptor),
     });
@@ -992,7 +1029,7 @@ fn write_one_endpoint(
     let dir = create_endpoint_dir_for(endpoints_root, &op.path)?;
     let response_descriptor = op.resolve_response(components).unwrap_or(Value::Null);
 
-    let reference = build_reference_file(op, &current_hash, &response_descriptor);
+    let reference = build_reference_file(op, &current_hash, &response_descriptor, components);
     let reference_bytes = serde_json::to_string_pretty(&reference).expect("always serializes");
     match &reference_state {
         FileState::Present(path) => std::fs::write(path, reference_bytes)?,
@@ -1782,7 +1819,13 @@ mod hardening_tests {
                 if entry.file_type().unwrap().is_dir() {
                     walk(base, &path, out);
                 } else {
-                    let rel = path.strip_prefix(base).unwrap().components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/");
+                    let rel = path
+                        .strip_prefix(base)
+                        .unwrap()
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/");
                     out.insert(rel, std::fs::read(&path).unwrap());
                 }
             }
@@ -1804,7 +1847,12 @@ mod hardening_tests {
         insensitive
     }
 
-    const SCAFFOLD: [&str; 4] = ["api/config/connections.json", "api/config/errors/core.json", "api/config/server.json", "api/security/schemes.json"];
+    const SCAFFOLD: [&str; 4] = [
+        "api/config/connections.json",
+        "api/config/errors/core.json",
+        "api/config/server.json",
+        "api/security/schemes.json",
+    ];
 
     // ---- G1: traversal never escapes ----
 
@@ -1817,7 +1865,13 @@ mod hardening_tests {
         let escape_c = format!("/{{x/../../../{marker}}}");
         let yaml = spec(
             "3.1.0",
-            &[("/fine", &["get"]), (&escape_a, &["get"]), (&escape_b, &["get"]), (&escape_c, &["get"]), ("/C:/x", &["get"])],
+            &[
+                ("/fine", &["get"]),
+                (&escape_a, &["get"]),
+                (&escape_b, &["get"]),
+                (&escape_c, &["get"]),
+                ("/C:/x", &["get"]),
+            ],
             "",
         );
         write_spec(&root, &yaml);
@@ -1950,7 +2004,13 @@ mod hardening_tests {
             &root,
             &spec(
                 "3.1.0",
-                &[("/", &["get"]), ("/ping", &["get"]), ("/cars", &["get", "post"]), ("/cars/{vin}", &["get"]), ("/_health", &["get"])],
+                &[
+                    ("/", &["get"]),
+                    ("/ping", &["get"]),
+                    ("/cars", &["get", "post"]),
+                    ("/cars/{vin}", &["get"]),
+                    ("/_health", &["get"]),
+                ],
                 "",
             ),
         );
@@ -1979,7 +2039,17 @@ mod hardening_tests {
 
         write_spec(
             &root,
-            &spec("3.1.0", &[("/", &["get"]), ("/ping", &["get"]), ("/cars", &["get"]), ("/cars/{vin}", &["get"]), ("/_health", &["get"])], ""),
+            &spec(
+                "3.1.0",
+                &[
+                    ("/", &["get"]),
+                    ("/ping", &["get"]),
+                    ("/cars", &["get"]),
+                    ("/cars/{vin}", &["get"]),
+                    ("/_health", &["get"]),
+                ],
+                "",
+            ),
         );
         let second = generate_api_inner(&root).unwrap();
         assert!(second.errors.is_empty(), "{:?}", second.errors);
@@ -1992,8 +2062,14 @@ mod hardening_tests {
 
         // Untouched endpoints are byte-identical and the orphan kept its content.
         let after = tree(&root);
-        assert_eq!(before["api/datasources/endpoints/ping/endpoint.get.json"], after["api/datasources/endpoints/ping/endpoint.get.json"]);
-        assert_eq!(before["api/datasources/endpoints/cars/endpoint.post.json"], after["api/datasources/endpoints/cars/_endpoint.post.json"]);
+        assert_eq!(
+            before["api/datasources/endpoints/ping/endpoint.get.json"],
+            after["api/datasources/endpoints/ping/endpoint.get.json"]
+        );
+        assert_eq!(
+            before["api/datasources/endpoints/cars/endpoint.post.json"],
+            after["api/datasources/endpoints/cars/_endpoint.post.json"]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2009,8 +2085,15 @@ mod hardening_tests {
 
         let outcome = generate_api_inner(&root).unwrap();
         assert!(!outcome.errors.is_empty());
-        assert!(outcome.errors.iter().any(|e| e.contains("Cars") && e.contains("rename or remove it by hand")), "{:?}", outcome.errors);
-        let entries: Vec<String> = std::fs::read_dir(&endpoints).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert!(
+            outcome.errors.iter().any(|e| e.contains("Cars") && e.contains("rename or remove it by hand")),
+            "{:?}",
+            outcome.errors
+        );
+        let entries: Vec<String> = std::fs::read_dir(&endpoints)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
         assert_eq!(entries, vec!["Cars".to_string()]);
         assert_eq!(std::fs::read_dir(endpoints.join("Cars")).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&root);
@@ -2042,7 +2125,10 @@ mod hardening_tests {
         assert!(!outcome.errors.is_empty());
         assert_eq!(std::fs::read_to_string(dir.join("endpoint.GET.json")).unwrap(), "HAND");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "nothing else written for the conflicted operation");
-        assert!(root.join("api/datasources/endpoints/ping/endpoint.get.json").is_file(), "other operations still generate");
+        assert!(
+            root.join("api/datasources/endpoints/ping/endpoint.get.json").is_file(),
+            "other operations still generate"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2092,7 +2178,9 @@ mod hardening_tests {
         let v32 = format!(
             "openapi: 3.2.0\ninfo: {{ title: t, version: 1 }}\npaths:\n{head}        - {{ name: raw, in: querystring, content: {{ application/x-www-form-urlencoded: {{ schema: {{ type: object }} }} }} }}\n{tail}components:\n  schemas:\n    Car:\n      type: object\n      discriminator: {{ propertyName: kind, defaultMapping: Car }}\n      xml: {{ nodeType: element }}\n      properties: {{ kind: {{ type: string }} }}\n"
         );
-        let v31 = format!("openapi: 3.1.0\ninfo: {{ title: t, version: 1 }}\npaths:\n{head}{tail}components:\n  schemas:\n    Car:\n      type: object\n      properties: {{ kind: {{ type: string }} }}\n");
+        let v31 = format!(
+            "openapi: 3.1.0\ninfo: {{ title: t, version: 1 }}\npaths:\n{head}{tail}components:\n  schemas:\n    Car:\n      type: object\n      properties: {{ kind: {{ type: string }} }}\n"
+        );
         let a = temp_project();
         write_spec(&a, &v32);
         let b = temp_project();
@@ -2213,6 +2301,202 @@ mod hardening_tests {
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
         // Remove the link itself before the recursive delete so cleanup never follows it.
         let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m2_generate_tests {
+    use super::*;
+
+    fn temp_project() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "frogs-generate-m2-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn make_strict(root: &Path) {
+        std::fs::create_dir_all(root.join("api/config")).unwrap();
+        std::fs::write(root.join("api/config/server.json"), r#"{ "strictOpenApi": true }"#).unwrap();
+    }
+
+    fn write_spec(root: &Path, yaml: &str) {
+        std::fs::write(root.join("openapi.yaml"), yaml).unwrap();
+    }
+
+    fn read_json(root: &Path, rel: &str) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(root.join("api/datasources/endpoints").join(rel)).unwrap()).unwrap()
+    }
+
+    const HEAD: &str = "openapi: 3.2.0\ninfo: { title: t, version: 1 }\n";
+
+    const STREAMING_SPEC: &str = "paths:\n  /events:\n    get:\n      operationId: events\n      responses:\n        '200':\n          description: ok\n          content:\n            text/event-stream:\n              itemSchema: { $ref: '#/components/schemas/Evt' }\n              itemEncoding: { contentType: text/plain }\ncomponents:\n  schemas:\n    Evt: { type: object, properties: { id: { type: integer } } }\n";
+
+    #[test]
+    fn a_streaming_response_gets_a_response_mode_in_the_reference_file_and_a_note_in_the_new_stub() {
+        let root = temp_project();
+        write_spec(&root, &format!("{HEAD}{STREAMING_SPEC}"));
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+
+        let reference = read_json(&root, "events/endpoint.get.reference.json");
+        let mode = &reference["responseMode"];
+        assert_eq!(mode["kind"], "stream");
+        assert_eq!(mode["status"], 200);
+        assert_eq!(mode["mediaType"], "text/event-stream");
+        assert_eq!(mode["itemEncoding"], serde_json::json!({ "contentType": "text/plain" }));
+        assert!(mode["itemSchema"].is_object(), "walked item schema: {mode}");
+        assert!(mode["itemSchema"].to_string().contains("integer"));
+        assert!(reference.get("requestMode").is_none());
+
+        let stub = read_json(&root, "events/endpoint.get.json");
+        let todo = stub["_todo"].as_str().unwrap();
+        assert!(todo.contains("declares a streaming response (text/event-stream)"), "{todo}");
+        assert!(todo.contains("responseMode in endpoint.get.reference.json"), "{todo}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_streaming_request_body_gets_a_request_mode_without_a_status() {
+        let root = temp_project();
+        let spec = "paths:\n  /ingest:\n    post:\n      operationId: ingest\n      requestBody:\n        content:\n          application/jsonl: { itemSchema: { type: object } }\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { schema: { type: string } }\n";
+        write_spec(&root, &format!("{HEAD}{spec}"));
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+
+        let reference = read_json(&root, "ingest/endpoint.post.reference.json");
+        assert!(reference.get("responseMode").is_none());
+        let mode = &reference["requestMode"];
+        assert_eq!(mode["kind"], "stream");
+        assert_eq!(mode["mediaType"], "application/jsonl");
+        assert!(mode.get("status").is_none());
+        let stub = read_json(&root, "ingest/endpoint.post.json");
+        assert!(stub["_todo"].as_str().unwrap().contains("requestMode in endpoint.post.reference.json"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_plain_json_endpoint_has_no_mode_keys_and_the_original_todo_text() {
+        let root = temp_project();
+        let spec = "paths:\n  /p:\n    get:\n      operationId: p\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { schema: { type: string } }\n";
+        write_spec(&root, &format!("{HEAD}{spec}"));
+        generate_api_inner(&root).unwrap();
+        let reference = read_json(&root, "p/endpoint.get.reference.json");
+        assert!(reference.get("responseMode").is_none() && reference.get("requestMode").is_none());
+        let stub = read_json(&root, "p/endpoint.get.json");
+        assert_eq!(
+            stub["_todo"],
+            "See endpoint.get.reference.json for available request/response fields. Fill in sources and map each response field to a source path."
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_existing_stubs_todo_is_untouched_when_the_operation_later_becomes_streaming() {
+        let root = temp_project();
+        let json_spec = "paths:\n  /events:\n    get:\n      operationId: events\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { schema: { type: string } }\n";
+        write_spec(&root, &format!("{HEAD}{json_spec}"));
+        generate_api_inner(&root).unwrap();
+        let before = read_json(&root, "events/endpoint.get.json")["_todo"].clone();
+
+        write_spec(&root, &format!("{HEAD}{STREAMING_SPEC}"));
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let after = read_json(&root, "events/endpoint.get.json")["_todo"].clone();
+        assert_eq!(before, after);
+        // ...but the (always regenerated) reference file now describes the stream.
+        assert_eq!(read_json(&root, "events/endpoint.get.reference.json")["responseMode"]["kind"], "stream");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    const BROKEN_MEDIA_REF: &str = "paths:\n  /a:\n    get:\n      operationId: a\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { $ref: '#/components/mediaTypes/Missing' }\n";
+    const BROKEN_DEFAULT_MAPPING: &str = "paths:\n  /a:\n    get:\n      operationId: a\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { schema: { $ref: '#/components/schemas/V' } }\ncomponents:\n  schemas:\n    V: { oneOf: [ { type: string } ], discriminator: { propertyName: k, defaultMapping: Nope } }\n";
+    const BROKEN_SECURITY: &str = "paths:\n  /a:\n    get:\n      operationId: a\n      security: [ { 'https://x/y': [] } ]\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { schema: { type: string } }\n";
+
+    #[test]
+    fn strict_mode_aborts_on_each_of_s9_s10_and_s11_before_writing_any_endpoint_file() {
+        for (label, body) in [("S9", BROKEN_MEDIA_REF), ("S10", BROKEN_DEFAULT_MAPPING), ("S11", BROKEN_SECURITY)] {
+            let root = temp_project();
+            make_strict(&root);
+            write_spec(&root, &format!("{HEAD}{body}"));
+            let outcome = generate_api_inner(&root).unwrap();
+            assert!(outcome.strict_aborted, "{label}");
+            assert!(!outcome.errors.is_empty(), "{label}");
+            assert!(!root.join("api/datasources").exists(), "{label}: nothing may be written");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn non_strict_s9_still_writes_everything_but_reports_an_error() {
+        let root = temp_project();
+        write_spec(&root, &format!("{HEAD}{BROKEN_MEDIA_REF}"));
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(!outcome.strict_aborted);
+        assert!(!outcome.errors.is_empty());
+        assert!(root.join("api/datasources/endpoints/a/endpoint.get.json").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn non_strict_s10_and_s11_are_warnings_only_so_errors_stay_empty() {
+        for body in [BROKEN_DEFAULT_MAPPING, BROKEN_SECURITY] {
+            let root = temp_project();
+            write_spec(&root, &format!("{HEAD}{body}"));
+            let outcome = generate_api_inner(&root).unwrap();
+            assert!(!outcome.strict_aborted);
+            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+            assert!(root.join("api/datasources/endpoints/a/endpoint.get.json").is_file());
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn w2_w3_and_w4_alone_are_neither_errors_nor_strict_aborts_even_under_strict() {
+        let root = temp_project();
+        make_strict(&root);
+        let spec = "paths:\n  /events:\n    get:\n      operationId: events\n      security: [ { old: [] } ]\n      responses:\n        '200':\n          description: ok\n          content:\n            text/event-stream: {}\n  /upload:\n    post:\n      operationId: upload\n      requestBody:\n        content:\n          multipart/form-data: { schema: { type: object } }\n      responses:\n        '200': { description: ok }\ncomponents:\n  securitySchemes:\n    old: { type: apiKey, in: header, name: k, deprecated: true }\n";
+        write_spec(&root, &format!("{HEAD}{spec}"));
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(!outcome.strict_aborted);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(root.join("api/datasources/endpoints/events/endpoint.get.json").is_file());
+        assert!(root.join("api/datasources/endpoints/upload/endpoint.post.json").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn default_mapping_spec(target: &str) -> String {
+        format!(
+            "{HEAD}paths:\n  /v:\n    get:\n      operationId: v\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: {{ schema: {{ $ref: '#/components/schemas/Vehicle' }} }}\ncomponents:\n  schemas:\n    Car: {{ type: object, properties: {{ vin: {{ type: string }} }} }}\n    Truck: {{ type: object, properties: {{ axles: {{ type: integer }} }} }}\n    Vehicle: {{ oneOf: [ {{ $ref: '#/components/schemas/Car' }}, {{ $ref: '#/components/schemas/Truck' }} ], discriminator: {{ propertyName: kind, defaultMapping: {target} }} }}\n"
+        )
+    }
+
+    #[test]
+    fn a_default_mapping_end_to_end_yields_a_nested_object_stub_and_changing_the_target_regenerates() {
+        let root = temp_project();
+        write_spec(&root, &default_mapping_spec("Car"));
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let stub = read_json(&root, "v/endpoint.get.json");
+        assert_eq!(stub["response"], serde_json::json!({ "vin": null }));
+        let reference = read_json(&root, "v/endpoint.get.reference.json");
+        assert_eq!(reference["response"]["$component"], "Car");
+        assert!(reference["response"]["$oneOf"].as_str().unwrap().starts_with("oneOf<"));
+
+        write_spec(&root, &default_mapping_spec("Truck"));
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let reference = read_json(&root, "v/endpoint.get.reference.json");
+        assert_eq!(reference["response"]["$component"], "Truck");
+        assert_eq!(reference["response"]["axles"], "integer");
+        let stub = read_json(&root, "v/endpoint.get.json");
+        assert_eq!(stub["response"], serde_json::json!({ "axles": null }));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

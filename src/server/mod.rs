@@ -183,7 +183,12 @@ async fn docs_ui_operations_handler(State(state): State<DocsUiState>) -> Respons
     let operations: Vec<serde_json::Value> = state
         .openapi_document
         .as_ref()
-        .map(|doc| doc.operations.iter().map(|op| docs_ui_operation_json(op, &state.security)).collect())
+        .map(|doc| {
+            doc.operations
+                .iter()
+                .map(|op| docs_ui_operation_json(op, &state.security, &doc.deprecated_security_schemes))
+                .collect()
+        })
         .unwrap_or_default();
     let component_schemas = state
         .openapi_document
@@ -214,7 +219,11 @@ async fn docs_ui_operations_handler(State(state): State<DocsUiState>) -> Respons
 /// when the verifier needs the connection's client certificate (an `mtls`
 /// verifier, or any `cert.*` parameter) — presented by the browser/OS during
 /// the TLS handshake, so the console has no field for it.
-fn docs_ui_operation_json(op: &crate::openapi::Operation, security: &crate::security::SecurityConfig) -> serde_json::Value {
+fn docs_ui_operation_json(
+    op: &crate::openapi::Operation,
+    security: &crate::security::SecurityConfig,
+    deprecated: &std::collections::HashSet<String>,
+) -> serde_json::Value {
     let parameters: Vec<serde_json::Value> = op
         .parameters
         .iter()
@@ -230,10 +239,14 @@ fn docs_ui_operation_json(op: &crate::openapi::Operation, security: &crate::secu
             .and_then(|v| v.def.parameters().iter().find(|p| p.from.starts_with("header.")))
             .map(|p| p.from.trim_start_matches("header.").to_string());
         let client_cert = security.verifiers.get(scheme_name).is_some_and(|v| v.requires_client_cert());
-        serde_json::json!({ "scheme": scheme_name, "header": header, "clientCert": client_cert })
+        let mut info = serde_json::json!({ "scheme": scheme_name, "header": header, "clientCert": client_cert });
+        if deprecated.contains(scheme_name) {
+            info["deprecated"] = serde_json::Value::Bool(true);
+        }
+        info
     });
 
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "method": op.method.to_uppercase(),
         "path": op.path,
         "operationId": op.operation_id,
@@ -241,7 +254,11 @@ fn docs_ui_operation_json(op: &crate::openapi::Operation, security: &crate::secu
         "requestBody": request_body,
         "successStatusCodes": op.response_status_codes,
         "security": security_info,
-    })
+    });
+    if matches!(op.response_mode, crate::openapi::ResponseMode::Stream(_)) {
+        out["streaming"] = serde_json::Value::Bool(true);
+    }
+    out
 }
 
 /// Restricts `/docs` to the real TCP peer being loopback, for
@@ -1172,6 +1189,7 @@ mod tests {
                 request_body: None,
                 response_status_codes: vec![200],
                 security: Some("apiKeyAuth".to_string()),
+                ..Default::default()
             }],
             component_schemas: serde_json::Map::new(),
             security_scheme_types: HashMap::new(),
@@ -1252,5 +1270,88 @@ mod tests {
         let addr = spawn(docs_ui_router(crate::config::DocsUiMode::Localhost, "docs", doc, security, vec![])).await;
         let response = reqwest::get(format!("http://{addr}/docs/endpoints.json")).await.unwrap();
         assert_eq!(response.status(), 403, "endpoints.json must be behind the same gate as the console page itself");
+    }
+}
+
+#[cfg(test)]
+mod m2_docs_ui_tests {
+    use super::*;
+    use crate::openapi::{Operation, ResponseMode, StreamSpec};
+    use std::collections::HashSet;
+
+    fn op(security: Option<&str>, mode: ResponseMode) -> Operation {
+        Operation {
+            path: "/a".to_string(),
+            method: "get".to_string(),
+            operation_id: "a".to_string(),
+            response_status_codes: vec![200],
+            security: security.map(str::to_string),
+            response_mode: mode,
+            ..Default::default()
+        }
+    }
+
+    fn stream() -> ResponseMode {
+        ResponseMode::Stream(StreamSpec {
+            status: Some(200),
+            media_type: "text/event-stream".to_string(),
+            item_schema: None,
+            item_encoding: None,
+        })
+    }
+
+    #[test]
+    fn security_deprecated_is_present_only_for_a_deprecated_scheme() {
+        let security = crate::security::SecurityConfig::default();
+        let deprecated = HashSet::from(["old".to_string()]);
+
+        let old = docs_ui_operation_json(&op(Some("old"), ResponseMode::Single), &security, &deprecated);
+        assert_eq!(old["security"]["scheme"], "old");
+        assert_eq!(old["security"]["deprecated"], true);
+
+        let fresh = docs_ui_operation_json(&op(Some("fresh"), ResponseMode::Single), &security, &deprecated);
+        assert!(fresh["security"].get("deprecated").is_none(), "{fresh}");
+
+        let none = docs_ui_operation_json(&op(None, ResponseMode::Single), &security, &deprecated);
+        assert!(none["security"].is_null());
+    }
+
+    #[test]
+    fn streaming_true_is_present_only_for_a_stream_operation() {
+        let security = crate::security::SecurityConfig::default();
+        let streaming = docs_ui_operation_json(&op(None, stream()), &security, &HashSet::new());
+        assert_eq!(streaming["streaming"], true);
+        let single = docs_ui_operation_json(&op(None, ResponseMode::Single), &security, &HashSet::new());
+        assert!(single.get("streaming").is_none(), "{single}");
+    }
+
+    #[test]
+    fn the_request_body_schema_in_the_payload_is_the_dereferenced_media_type_schema() {
+        let dir = std::env::temp_dir().join(format!(
+            "frogs-server-m2-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("openapi.yaml");
+        std::fs::write(
+            &path,
+            "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  mediaTypes:\n    B: { schema: { type: object, required: [vin] } }\npaths:\n  /cars:\n    post:\n      operationId: c\n      requestBody:\n        required: true\n        content:\n          application/json: { $ref: '#/components/mediaTypes/B' }\n      responses:\n        '200': { description: ok }\n",
+        )
+        .unwrap();
+        let doc = crate::openapi::load(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let json = docs_ui_operation_json(&doc.operations[0], &crate::security::SecurityConfig::default(), &doc.deprecated_security_schemes);
+        assert_eq!(json["requestBody"]["schema"]["type"], "object");
+        assert_eq!(json["requestBody"]["required"], true);
+    }
+
+    #[test]
+    fn the_docs_page_pills_are_fixed_text_set_via_text_content_never_interpolated() {
+        assert!(DOCS_UI_HTML.contains(r#"deprecatedPill.textContent = "deprecated";"#));
+        assert!(DOCS_UI_HTML.contains(r#"streamingPill.textContent = "streaming (served as single JSON)";"#));
+        // The pills are only ever driven by strict-boolean flags, not by spec text.
+        assert!(DOCS_UI_HTML.contains("op.streaming === true"));
+        assert!(DOCS_UI_HTML.contains("op.security.deprecated === true"));
     }
 }

@@ -146,6 +146,20 @@ async fn validate_api(root: &Path) -> usize {
     }
     problems += endpoint_problems.len();
 
+    let strict = config.server.strict_open_api();
+    for path in crate::endpoint::reserved_stream_key_files(&endpoints_root) {
+        let message = format!(
+            "{}: \"stream\" is reserved for streaming responses, which this frogs version does not implement — serving a single JSON response",
+            path.display()
+        );
+        if strict {
+            println!("    - {message}");
+            problems += 1;
+        } else {
+            warn(&message);
+        }
+    }
+
     for script_path in sql_script_files(&api_dir.join("datasources/sql")) {
         let Ok(contents) = std::fs::read_to_string(&script_path) else { continue };
         for name in crate::sql::truncated_placeholder_names(&contents) {
@@ -483,7 +497,9 @@ mod spec_hardening_tests {
             yaml = format!("{version_line}info: {{ title: t, version: '1' }}\npaths: {{}}\n");
         }
         for (i, p) in paths.iter().enumerate() {
-            yaml.push_str(&format!("  '{p}':\n    get:\n      operationId: op{i}\n      responses:\n        '200': {{ description: ok }}\n"));
+            yaml.push_str(&format!(
+                "  '{p}':\n    get:\n      operationId: op{i}\n      responses:\n        '200': {{ description: ok }}\n"
+            ));
         }
         fs::write(root.join(MANIFEST_FILE), yaml).unwrap();
     }
@@ -563,11 +579,17 @@ mod spec_hardening_tests {
         let root = temp_project();
         write_spec(&root, "openapi: 3.1.0\n", &["/cars"]);
         fs::create_dir_all(root.join("api/datasources/endpoints/Cars")).unwrap();
-        let before: Vec<_> = fs::read_dir(root.join("api/datasources/endpoints")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        let before: Vec<_> = fs::read_dir(root.join("api/datasources/endpoints"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
 
         assert!(validate_api(&root).await >= 1);
 
-        let after: Vec<_> = fs::read_dir(root.join("api/datasources/endpoints")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        let after: Vec<_> = fs::read_dir(root.join("api/datasources/endpoints"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
         assert_eq!(before, after);
         assert_eq!(fs::read_dir(root.join("api/datasources/endpoints/Cars")).unwrap().count(), 0);
         assert!(!root.join("api/datasources/components").exists());
@@ -579,6 +601,94 @@ mod spec_hardening_tests {
         let root = temp_project();
         write_spec(&root, "openapi: 3.0.3\n", &["/cars", "/cars/{vin}"]);
         assert_eq!(validate_api(&root).await, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m2_validate_tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_project() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-validate-m2-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_spec_body(root: &Path, body: &str) {
+        fs::write(root.join(MANIFEST_FILE), format!("openapi: 3.2.0\ninfo: {{ title: t, version: '1' }}\n{body}")).unwrap();
+    }
+
+    fn make_strict(root: &Path) {
+        fs::create_dir_all(root.join("api/config")).unwrap();
+        fs::write(root.join("api/config/server.json"), r#"{ "strictOpenApi": true }"#).unwrap();
+    }
+
+    const S9: &str = "paths:\n  /a:\n    get:\n      operationId: a\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { $ref: '#/components/mediaTypes/Missing' }\n";
+    const S10: &str = "paths: {}\ncomponents:\n  schemas:\n    V: { oneOf: [ { type: string } ], discriminator: { propertyName: k, defaultMapping: Nope } }\n";
+    const S11: &str = "paths:\n  /a:\n    get:\n      operationId: a\n      security: [ { 'https://x/y': [] } ]\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { schema: { type: string } }\n";
+
+    #[test]
+    fn report_spec_issues_counts_s9_always_but_s10_and_s11_only_under_strict() {
+        for (body, always) in [(S9, true), (S10, false), (S11, false)] {
+            let root = temp_project();
+            write_spec_body(&root, body);
+            let doc = crate::openapi::load(&root.join(MANIFEST_FILE)).unwrap();
+            assert_eq!(report_spec_issues(&doc, false), usize::from(always), "{body}");
+            assert_eq!(report_spec_issues(&doc, true), 1, "{body}");
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn w2_w3_and_w4_are_never_problems_even_under_strict() {
+        let root = temp_project();
+        write_spec_body(
+            &root,
+            "paths:\n  /e:\n    get:\n      operationId: e\n      security: [ { old: [] } ]\n      responses:\n        '200':\n          description: ok\n          content:\n            text/event-stream: {}\n  /u:\n    post:\n      operationId: u\n      requestBody:\n        content:\n          multipart/form-data: { schema: { type: object } }\n      responses:\n        '200': { description: ok }\ncomponents:\n  securitySchemes:\n    old: { type: apiKey, in: header, name: k, deprecated: true }\n",
+        );
+        let doc = crate::openapi::load(&root.join(MANIFEST_FILE)).unwrap();
+        assert!(doc.issues.len() >= 3);
+        assert_eq!(report_spec_issues(&doc, true), 0);
+        assert_eq!(report_spec_issues(&doc, false), 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn project_with_stream_key_file(strict: bool) -> PathBuf {
+        let root = temp_project();
+        write_spec_body(&root, "paths: {}\n");
+        if strict {
+            make_strict(&root);
+        } else {
+            fs::create_dir_all(root.join("api/config")).unwrap();
+        }
+        fs::create_dir_all(root.join("api/datasources/endpoints/things")).unwrap();
+        fs::write(
+            root.join("api/datasources/endpoints/things/endpoint.get.json"),
+            r#"{ "operationId": "getThings", "stream": {}, "sources": {}, "response": {} }"#,
+        )
+        .unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn a_reserved_stream_key_file_is_only_a_warning_when_not_strict() {
+        let root = project_with_stream_key_file(false);
+        assert_eq!(validate_api(&root).await, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_reserved_stream_key_file_is_a_problem_under_strict() {
+        let root = project_with_stream_key_file(true);
+        assert_eq!(validate_api(&root).await, 1);
         let _ = fs::remove_dir_all(&root);
     }
 }

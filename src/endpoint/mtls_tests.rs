@@ -601,6 +601,7 @@ fn mocked_state(verifier: &str, provider: Arc<dyn MockProvider>) -> RouteState {
         component_schemas: Arc::new(Map::new()),
         source_call_timeout_ms: NonZeroU64::new(5_000).unwrap(),
         mock_provider: Some(provider),
+        response_mode: crate::openapi::ResponseMode::Single,
     }
 }
 

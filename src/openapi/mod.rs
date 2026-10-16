@@ -5,7 +5,7 @@ mod fs_os_tests;
 pub mod path_rules;
 mod schema_walk;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 
@@ -57,7 +57,7 @@ pub struct RequestBodySchema {
 /// non-2xx responses and non-JSON bodies aren't tracked yet. Likewise,
 /// `requestBody` isn't tracked — every reference file's `request.body` is
 /// `null` for now, matching write support (Phase 4) not existing yet.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Operation {
     pub path: String,
     pub method: String,
@@ -84,6 +84,47 @@ pub struct Operation {
     /// scheme keys within one object as AND) is out of scope for v1,
     /// matching `EndpointFile.security`'s own single-scheme simplification.
     pub security: Option<String>,
+    /// Every scheme name any requirement object of this operation's
+    /// effective `security:` mentions (after reference resolution), deduped,
+    /// in spec order — `security` above is only the first of these.
+    pub declared_security_schemes: Vec<String>,
+    /// Streaming is detected but not served: the endpoint is still one JSON
+    /// response, this just records what the spec asked for.
+    pub response_mode: ResponseMode,
+    pub request_stream: Option<StreamSpec>,
+    /// Why the `application/json` request body schema couldn't be resolved,
+    /// in which case `request_body` holds a permissive `{}` schema (so
+    /// `required` is still enforced) and shape validation is effectively off.
+    pub request_body_unresolved: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum ResponseMode {
+    #[default]
+    Single,
+    Stream(StreamSpec),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamSpec {
+    /// `Some` for a response stream, `None` for a request stream.
+    pub status: Option<u16>,
+    pub media_type: String,
+    pub item_schema: Option<Value>,
+    pub item_encoding: Option<Value>,
+}
+
+impl StreamSpec {
+    fn raw_json(&self) -> Value {
+        let mut obj = Map::new();
+        if let Some(status) = self.status {
+            obj.insert("status".to_string(), Value::from(status));
+        }
+        obj.insert("mediaType".to_string(), Value::String(self.media_type.clone()));
+        obj.insert("itemSchema".to_string(), self.item_schema.clone().unwrap_or(Value::Null));
+        obj.insert("itemEncoding".to_string(), self.item_encoding.clone().unwrap_or(Value::Null));
+        Value::Object(obj)
+    }
 }
 
 impl Operation {
@@ -101,7 +142,18 @@ impl Operation {
     /// separately via `referenced_components`. Empty-string hash for an
     /// operation with no response schema at all.
     pub fn response_schema_hash(&self) -> String {
-        content_hash(self.response_schema.as_ref().unwrap_or(&Value::Null))
+        if self.response_mode == ResponseMode::Single && self.request_stream.is_none() {
+            return content_hash(self.response_schema.as_ref().unwrap_or(&Value::Null));
+        }
+        let response_mode = match &self.response_mode {
+            ResponseMode::Single => Value::Null,
+            ResponseMode::Stream(spec) => spec.raw_json(),
+        };
+        content_hash(&serde_json::json!({
+            "responseSchema": self.response_schema.clone().unwrap_or(Value::Null),
+            "responseMode": response_mode,
+            "requestMode": self.request_stream.as_ref().map_or(Value::Null, StreamSpec::raw_json),
+        }))
     }
 
     /// Every named component this operation's response schema references,
@@ -110,7 +162,18 @@ impl Operation {
     /// detection can check "does this endpoint depend on a component that
     /// changed" without first walking the whole schema.
     pub fn referenced_components(&self) -> std::collections::HashSet<String> {
-        self.response_schema.as_ref().map(referenced_component_names).unwrap_or_default()
+        let mut names: HashSet<String> = self.response_schema.as_ref().map(referenced_component_names).unwrap_or_default();
+        let streams = [
+            match &self.response_mode {
+                ResponseMode::Single => None,
+                ResponseMode::Stream(spec) => Some(spec),
+            },
+            self.request_stream.as_ref(),
+        ];
+        for item_schema in streams.into_iter().flatten().filter_map(|spec| spec.item_schema.as_ref()) {
+            names.extend(referenced_component_names(item_schema));
+        }
+        names
     }
 
     /// Checks a hand-authored endpoint file's `successStatus` (if it
@@ -159,38 +222,221 @@ impl Operation {
     }
 }
 
+const MAX_MEDIA_TYPE_REF_HOPS: usize = 8;
+const MEDIA_TYPE_REF_PREFIX: &str = "#/components/mediaTypes/";
+const SCHEMA_REF_PREFIX: &str = "#/components/schemas/";
+const SECURITY_SCHEME_REF_PREFIX: &str = "#/components/securitySchemes/";
+
+#[derive(Debug, PartialEq, Eq)]
+enum MediaRefError {
+    Cycle,
+    TooLong,
+    UnknownName(String),
+    WrongKind,
+    Unsupported(String),
+    NonStringRef,
+    NotAnObject,
+}
+
+impl fmt::Display for MediaRefError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MediaRefError::Cycle => write!(f, "cycle"),
+            MediaRefError::TooLong => write!(f, "chain longer than {MAX_MEDIA_TYPE_REF_HOPS} hops"),
+            MediaRefError::UnknownName(name) => write!(f, "unknown media type '{}'", untrusted(name)),
+            MediaRefError::WrongKind => write!(f, "a #/components/schemas/ reference where a media type belongs"),
+            MediaRefError::Unsupported(r) => write!(f, "unsupported reference form '{}' (external references are never fetched)", untrusted(r)),
+            MediaRefError::NonStringRef => write!(f, "$ref is not a string"),
+            MediaRefError::NotAnObject => write!(f, "reference target is not an object"),
+        }
+    }
+}
+
+/// Follows a Media Type Object's `$ref` chain through `components.mediaTypes`
+/// only — never the filesystem or network. A non-object entry is `Ok(None)`
+/// (nothing to read, nothing to report), matching how such an entry was
+/// already ignored before references were supported.
+fn resolve_media_type<'a>(entry: &'a Value, media_types: &'a Map<String, Value>) -> Result<Option<&'a Map<String, Value>>, MediaRefError> {
+    let mut current = entry;
+    let mut hops = 0usize;
+    let mut visited: HashSet<&str> = HashSet::new();
+    loop {
+        let Some(obj) = current.as_object() else {
+            return if hops == 0 { Ok(None) } else { Err(MediaRefError::NotAnObject) };
+        };
+        let Some(reference) = obj.get("$ref") else {
+            return Ok(Some(obj));
+        };
+        let Some(reference) = reference.as_str() else {
+            return Err(MediaRefError::NonStringRef);
+        };
+        if reference.starts_with(SCHEMA_REF_PREFIX) {
+            return Err(MediaRefError::WrongKind);
+        }
+        let Some(name) = reference.strip_prefix(MEDIA_TYPE_REF_PREFIX) else {
+            return Err(MediaRefError::Unsupported(reference.to_string()));
+        };
+        if !visited.insert(name) {
+            return Err(MediaRefError::Cycle);
+        }
+        hops += 1;
+        if hops > MAX_MEDIA_TYPE_REF_HOPS {
+            return Err(MediaRefError::TooLong);
+        }
+        current = media_types.get(name).ok_or_else(|| MediaRefError::UnknownName(name.to_string()))?;
+    }
+}
+
+type ResolvedSecurity = (Option<String>, Vec<String>);
+
+struct OpCtx<'a> {
+    media_types: &'a Map<String, Value>,
+    scheme_names: &'a Map<String, Value>,
+    document_security: Option<&'a ResolvedSecurity>,
+}
+
+fn media_ref_issue(message: String) -> LoadIssue {
+    LoadIssue::new(IssueKind::MediaTypeRefUnresolved, Severity::Error, message)
+}
+
 /// Extracts `name`/`in`/`required`/`schema.type` from an operation's
-/// `parameters` array.
-fn extract_parameters(operation: &Map<String, Value>) -> Vec<ParameterInfo> {
+/// `parameters` array. A parameter with no `schema` but exactly one `content`
+/// entry takes its type from that entry's schema.
+fn extract_parameters(operation: &Map<String, Value>, ctx: &OpCtx, label: &str, issues: &mut Vec<LoadIssue>) -> Vec<ParameterInfo> {
     let Some(parameters) = operation.get("parameters").and_then(Value::as_array) else {
         return Vec::new();
     };
-    parameters
-        .iter()
-        .filter_map(|param| {
-            let name = param.get("name")?.as_str()?;
-            let location = param.get("in")?.as_str()?;
-            let required = param.get("required").and_then(Value::as_bool).unwrap_or(false);
-            let schema_type = param.get("schema").and_then(|s| s.get("type")).and_then(Value::as_str).map(str::to_string);
-            Some(ParameterInfo {
-                name: name.to_string(),
-                location: location.to_string(),
-                required,
-                schema_type,
-            })
-        })
-        .collect()
+    let mut out = Vec::new();
+    for param in parameters {
+        let (Some(name), Some(location)) = (param.get("name").and_then(Value::as_str), param.get("in").and_then(Value::as_str)) else {
+            continue;
+        };
+        let required = param.get("required").and_then(Value::as_bool).unwrap_or(false);
+        let schema_type = match param.get("schema") {
+            Some(schema) => schema.get("type").and_then(Value::as_str).map(str::to_string),
+            None => match param.get("content").and_then(Value::as_object) {
+                Some(content) if content.len() == 1 => {
+                    let (media, entry) = content.iter().next().expect("len checked");
+                    match resolve_media_type(entry, ctx.media_types) {
+                        Ok(Some(obj)) => obj.get("schema").and_then(|s| s.get("type")).and_then(Value::as_str).map(str::to_string),
+                        Ok(None) => None,
+                        Err(e) => {
+                            issues.push(media_ref_issue(format!(
+                                "{label}: parameter '{}' content '{}': media type $ref unresolved ({e}) — type check skipped",
+                                untrusted(name),
+                                untrusted(media)
+                            )));
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            },
+        };
+        out.push(ParameterInfo {
+            name: name.to_string(),
+            location: location.to_string(),
+            required,
+            schema_type,
+        });
+    }
+    out
 }
 
-/// This operation's `requestBody.content.application/json.schema`, if it
-/// declares one at all — `None` for an operation with no `requestBody`, or
-/// one that declares a body but not a JSON content type (nothing else is
-/// validated).
-fn extract_request_body(operation: &Map<String, Value>) -> Option<RequestBodySchema> {
-    let request_body = operation.get("requestBody")?.as_object()?;
-    let schema = request_body.get("content")?.get("application/json")?.get("schema")?.clone();
+fn is_streaming_entry(media_key: &str, entry: &Map<String, Value>) -> bool {
+    let key = media_key.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "text/event-stream" | "application/jsonl" | "application/x-ndjson" | "application/json-seq"
+    ) || key.ends_with("+json-seq")
+        || (key.starts_with("multipart/") && ["itemSchema", "itemEncoding", "prefixEncoding"].iter().any(|k| entry.contains_key(*k)))
+        || entry.contains_key("itemSchema")
+}
+
+fn stream_spec(status: Option<u16>, media_key: &str, entry: &Map<String, Value>) -> StreamSpec {
+    StreamSpec {
+        status,
+        media_type: media_key.to_string(),
+        item_schema: entry.get("itemSchema").cloned(),
+        item_encoding: entry.get("itemEncoding").cloned(),
+    }
+}
+
+/// This operation's `requestBody.content.application/json.schema`, plus the
+/// reasons it may be unusable: an unresolvable `application/json` entry keeps
+/// a permissive `{}` schema (so `required: true` is still enforced) and
+/// records why; a body with no JSON entry is either a streaming request
+/// (W2) or just non-JSON (W3).
+fn extract_request_body(
+    operation: &Map<String, Value>,
+    ctx: &OpCtx,
+    label: &str,
+    issues: &mut Vec<LoadIssue>,
+) -> (Option<RequestBodySchema>, Option<String>, Option<StreamSpec>) {
+    let Some(request_body) = operation.get("requestBody").and_then(Value::as_object) else {
+        return (None, None, None);
+    };
+    let Some(content) = request_body.get("content").and_then(Value::as_object) else {
+        return (None, None, None);
+    };
     let required = request_body.get("required").and_then(Value::as_bool).unwrap_or(false);
-    Some(RequestBodySchema { required, schema })
+
+    if let Some(entry) = content.get("application/json") {
+        return match resolve_media_type(entry, ctx.media_types) {
+            Ok(Some(obj)) => (obj.get("schema").cloned().map(|schema| RequestBodySchema { required, schema }), None, None),
+            Ok(None) => (None, None, None),
+            Err(e) => {
+                issues.push(media_ref_issue(format!(
+                    "{label}: request body schema unresolved ({e}) — body validation skipped for this route"
+                )));
+                (
+                    Some(RequestBodySchema {
+                        required,
+                        schema: Value::Object(Map::new()),
+                    }),
+                    Some(e.to_string()),
+                    None,
+                )
+            }
+        };
+    }
+
+    for (media, entry) in content {
+        match resolve_media_type(entry, ctx.media_types) {
+            Ok(Some(obj)) if is_streaming_entry(media, obj) => {
+                issues.push(LoadIssue::new(
+                    IssueKind::StreamingDeclared,
+                    Severity::Warning,
+                    format!(
+                        "{label} declares a streaming request body ({}); frogs only reads a single JSON request body — body validation is skipped for this route",
+                        untrusted(media)
+                    ),
+                ));
+                return (None, None, Some(stream_spec(None, media, obj)));
+            }
+            Ok(_) => {}
+            Err(e) => issues.push(media_ref_issue(format!(
+                "{label}: request body content '{}': media type $ref unresolved ({e}) — entry ignored",
+                untrusted(media)
+            ))),
+        }
+    }
+
+    if !content.is_empty() {
+        let mut keys: Vec<String> = content.keys().take(5).map(|k| untrusted(k)).collect();
+        if content.len() > 5 {
+            keys.push("…".to_string());
+        }
+        issues.push(LoadIssue::new(
+            IssueKind::NonJsonRequestBody,
+            Severity::Warning,
+            format!(
+                "{label} declares a request body with only non-JSON content ({}); frogs only reads application/json bodies — the body is not validated and sources see it as null",
+                keys.join(", ")
+            ),
+        ));
+    }
+    (None, None, None)
 }
 
 /// Every numeric key of an operation's `responses` object — `default` and
@@ -204,46 +450,150 @@ fn declared_response_codes(operation: &Map<String, Value>) -> Vec<u16> {
     responses.keys().filter_map(|status| status.parse().ok()).collect()
 }
 
-/// Resolves which security scheme (if any) guards one operation: its own
-/// `security:` if it declares one at all (even an explicit empty array,
-/// which per the OpenAPI spec means "no security" and deliberately opts
-/// out of any document-level default rather than inheriting it), otherwise
-/// the document's top-level default.
-fn operation_security(operation: &Map<String, Value>, document_default: Option<&Value>) -> Option<String> {
-    let security = operation.get("security").or(document_default)?;
-    first_scheme_name(security)
-}
+/// The first `2xx` response's `application/json` schema (media-type `$ref`s
+/// followed), or — when no `2xx` has one — the first streaming `2xx` content
+/// entry, which frogs still serves as a single JSON response. A `2xx` with no
+/// `content` at all (e.g. a bodyless `204`) is skipped in favor of the next
+/// candidate, not treated as "nothing found."
+fn extract_response(operation: &Map<String, Value>, ctx: &OpCtx, label: &str, issues: &mut Vec<LoadIssue>) -> (Option<Value>, ResponseMode) {
+    let Some(responses) = operation.get("responses").and_then(Value::as_object) else {
+        return (None, ResponseMode::Single);
+    };
+    let success = || responses.iter().filter(|(status, _)| status.starts_with('2'));
 
-/// The first scheme name of the first non-empty requirement object in a
-/// `security:` array — see `Operation::security`'s doc comment for why
-/// this collapses OpenAPI's fuller OR/AND grammar down to a single name.
-fn first_scheme_name(security: &Value) -> Option<String> {
-    security
-        .as_array()?
-        .iter()
-        .find_map(|requirement| requirement.as_object().and_then(|obj| obj.keys().next().cloned()))
-}
-
-/// The first `2xx` response's `application/json` schema on an operation
-/// object, e.g. `paths./cars.get`. A `2xx` response with no `content` at
-/// all (e.g. cars-demo's `404`, which is never a match here anyway since
-/// it isn't `2xx` — but the same would apply to a bodyless `204`) is
-/// skipped in favor of the next candidate, not treated as "nothing found."
-fn success_response_schema(operation: &Map<String, Value>) -> Option<Value> {
-    let responses = operation.get("responses")?.as_object()?;
-    for (status, response) in responses {
-        if !status.starts_with('2') {
+    for (status, response) in success() {
+        let Some(entry) = response.get("content").and_then(|c| c.get("application/json")) else {
             continue;
-        }
-        let schema = response
-            .get("content")
-            .and_then(|content| content.get("application/json"))
-            .and_then(|json| json.get("schema"));
-        if let Some(schema) = schema {
-            return Some(schema.clone());
+        };
+        match resolve_media_type(entry, ctx.media_types) {
+            Ok(Some(obj)) => {
+                if let Some(schema) = obj.get("schema") {
+                    return (Some(schema.clone()), ResponseMode::Single);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => issues.push(media_ref_issue(format!(
+                "{label}: response {} content 'application/json': media type $ref unresolved ({e}) — treated as having no schema",
+                untrusted(status)
+            ))),
         }
     }
-    None
+
+    for (status, response) in success() {
+        let Some(content) = response.get("content").and_then(Value::as_object) else {
+            continue;
+        };
+        for (media, entry) in content {
+            match resolve_media_type(entry, ctx.media_types) {
+                Ok(Some(obj)) if is_streaming_entry(media, obj) => {
+                    issues.push(LoadIssue::new(
+                        IssueKind::StreamingDeclared,
+                        Severity::Warning,
+                        format!(
+                            "{label} declares a streaming response ({}); frogs does not serve streaming responses — this endpoint will be generated as a single JSON response",
+                            untrusted(media)
+                        ),
+                    ));
+                    let code = status.parse::<u16>().ok().or(Some(200));
+                    return (None, ResponseMode::Stream(stream_spec(code, media, obj)));
+                }
+                Ok(_) => {}
+                Err(e) if media != "application/json" => issues.push(media_ref_issue(format!(
+                    "{label}: response {} content '{}': media type $ref unresolved ({e}) — treated as having no schema",
+                    untrusted(status),
+                    untrusted(media)
+                ))),
+                Err(_) => {}
+            }
+        }
+    }
+    (None, ResponseMode::Single)
+}
+
+/// Maps one `security:` requirement key to a `securitySchemes` name. `None`
+/// means the key can never name a scheme (a URI, a non-matching pointer) and
+/// is kept verbatim by the caller with a warning — it then fails closed at
+/// route registration since no verifier can carry that name.
+fn resolve_scheme_key(key: &str, scheme_names: &Map<String, Value>) -> Option<String> {
+    if scheme_names.contains_key(key) {
+        return Some(key.to_string());
+    }
+    if let Some(name) = key.strip_prefix(SECURITY_SCHEME_REF_PREFIX) {
+        return scheme_names.contains_key(name).then(|| name.to_string());
+    }
+    schema_walk::is_name_shaped(key).then(|| key.to_string())
+}
+
+/// `(first, all)` for a `security:` value: `first` is the first key of the
+/// first non-empty requirement object (see `Operation::security` for why it
+/// collapses to one name); `all` is every key of every requirement, deduped.
+fn resolve_security(value: &Value, scheme_names: &Map<String, Value>, context: &str, issues: &mut Vec<LoadIssue>) -> ResolvedSecurity {
+    let mut first = None;
+    let mut all: Vec<String> = Vec::new();
+    let Some(requirements) = value.as_array() else {
+        return (None, all);
+    };
+    for requirement in requirements {
+        let Some(obj) = requirement.as_object() else { continue };
+        for key in obj.keys() {
+            let resolved = resolve_scheme_key(key, scheme_names).unwrap_or_else(|| {
+                issues.push(LoadIssue::new(
+                    IssueKind::SecurityRequirementUnresolved,
+                    Severity::Warning,
+                    format!(
+                        "{context}: security requirement {} is not a securitySchemes name or a resolvable #/components/securitySchemes/<Name> reference — kept verbatim; the route stays refused unless security/schemes.json defines exactly that name",
+                        untrusted(key)
+                    ),
+                ));
+                key.clone()
+            });
+            if first.is_none() {
+                first = Some(resolved.clone());
+            }
+            if !all.contains(&resolved) {
+                all.push(resolved);
+            }
+        }
+    }
+    (first, all)
+}
+
+const MAX_DEFAULT_MAPPING_SCAN_DEPTH: usize = 32;
+
+/// Flags `discriminator.defaultMapping` values that name nothing frogs can
+/// resolve. Never follows `$ref`s, so it is linear in the schema's own size.
+fn scan_default_mappings(schema: &Value, components: &Map<String, Value>, label: &str, issues: &mut Vec<LoadIssue>, depth: usize) {
+    if depth > MAX_DEFAULT_MAPPING_SCAN_DEPTH {
+        return;
+    }
+    let Some(obj) = schema.as_object() else { return };
+    if let schema_walk::DefaultMapping::Unresolved(reason) = schema_walk::default_mapping_target(obj, |n| components.contains_key(n)) {
+        let value = obj
+            .get("discriminator")
+            .and_then(|d| d.get("defaultMapping"))
+            .map(|v| v.as_str().map(untrusted).unwrap_or_else(|| untrusted(&v.to_string())))
+            .unwrap_or_default();
+        issues.push(LoadIssue::new(
+            IssueKind::DefaultMappingUnresolved,
+            Severity::Warning,
+            format!("{label}: discriminator.defaultMapping {value} {reason} — the oneOf is left unresolved"),
+        ));
+    }
+    if let Some(props) = obj.get("properties").and_then(Value::as_object) {
+        for prop in props.values() {
+            scan_default_mappings(prop, components, label, issues, depth + 1);
+        }
+    }
+    if let Some(items) = obj.get("items") {
+        scan_default_mappings(items, components, label, issues, depth + 1);
+    }
+    for key in ["allOf", "oneOf", "anyOf"] {
+        if let Some(variants) = obj.get(key).and_then(Value::as_array) {
+            for variant in variants {
+                scan_default_mappings(variant, components, label, issues, depth + 1);
+            }
+        }
+    }
 }
 
 /// What the top-level `openapi:` field says, classified without regexes.
@@ -280,12 +630,33 @@ pub enum IssueKind {
     TrailingSlashNormalised,
     TrailingSlashCollision,
     UnsafeComponentName,
+    MediaTypeRefUnresolved,
+    DefaultMappingUnresolved,
+    SecurityRequirementUnresolved,
+    StreamingDeclared,
+    NonJsonRequestBody,
+    DeprecatedSecurityScheme,
 }
 
 impl IssueKind {
     /// Whether `strictOpenApi: true` turns this kind into a refusal.
     pub fn is_strict_error(&self) -> bool {
-        !matches!(self, IssueKind::NotServed)
+        match self {
+            IssueKind::NotServed | IssueKind::StreamingDeclared | IssueKind::NonJsonRequestBody | IssueKind::DeprecatedSecurityScheme => false,
+            IssueKind::VersionMissing
+            | IssueKind::VersionUnrecognized
+            | IssueKind::Swagger2
+            | IssueKind::VersionNewer
+            | IssueKind::UnsafePath
+            | IssueKind::WindowsPortability
+            | IssueKind::CaseOnlyPathCollision
+            | IssueKind::TrailingSlashNormalised
+            | IssueKind::TrailingSlashCollision
+            | IssueKind::UnsafeComponentName
+            | IssueKind::MediaTypeRefUnresolved
+            | IssueKind::DefaultMappingUnresolved
+            | IssueKind::SecurityRequirementUnresolved => true,
+        }
     }
 }
 
@@ -329,9 +700,39 @@ pub struct OpenApiDocument {
     pub skipped_paths: BTreeSet<String>,
     /// `components/schemas` names that can't safely be a cache file name.
     pub unwritable_components: BTreeSet<String>,
+    /// `components/securitySchemes` names whose `deprecated` is JSON `true`.
+    pub deprecated_security_schemes: HashSet<String>,
 }
 
 impl OpenApiDocument {
+    /// One message per deprecated scheme some operation (served or ambiguous)
+    /// still uses, sorted by scheme name. Informational only — never affects
+    /// routing.
+    pub fn deprecated_scheme_warnings(&self) -> Vec<String> {
+        let mut names: Vec<&String> = self.deprecated_security_schemes.iter().collect();
+        names.sort();
+        let mut out = Vec::new();
+        for name in names {
+            let mut users: Vec<String> = Vec::new();
+            for op in self.operations.iter().chain(&self.ambiguous_operations) {
+                if op.declared_security_schemes.contains(name) {
+                    let user = format!("{} {}", op.method.to_uppercase(), untrusted(&op.path));
+                    if !users.contains(&user) {
+                        users.push(user);
+                    }
+                }
+            }
+            if !users.is_empty() {
+                out.push(format!(
+                    "security scheme '{}' is marked deprecated in openapi.yaml (used by: {})",
+                    untrusted(name),
+                    users.join(", ")
+                ));
+            }
+        }
+        out
+    }
+
     /// Resolves every named component in `components/schemas` into one
     /// type descriptor each — Phase 0 of the design doc's two-phase
     /// generation algorithm. See `SchemaWalker` for how each descriptor is
@@ -444,7 +845,7 @@ fn detect_version(doc: &Value, issues: &mut Vec<LoadIssue>) -> SpecVersion {
     version
 }
 
-fn parse_operations(path: &str, item: &Map<String, Value>, document_security: Option<&Value>) -> Result<Vec<Operation>, OpenApiError> {
+fn parse_operations(path: &str, item: &Map<String, Value>, ctx: &OpCtx, issues: &mut Vec<LoadIssue>) -> Result<Vec<Operation>, OpenApiError> {
     let mut operations = Vec::new();
     for method in HTTP_METHODS {
         let Some(operation_obj) = item.get(*method).and_then(Value::as_object) else {
@@ -457,15 +858,27 @@ fn parse_operations(path: &str, item: &Map<String, Value>, document_security: Op
                 path: path.to_string(),
                 method: method.to_string(),
             })?;
+        let label = format!("{} {}", method.to_uppercase(), untrusted(path));
+        let parameters = extract_parameters(operation_obj, ctx, &label, issues);
+        let (request_body, request_body_unresolved, request_stream) = extract_request_body(operation_obj, ctx, &label, issues);
+        let (response_schema, response_mode) = extract_response(operation_obj, ctx, &label, issues);
+        let (security, declared_security_schemes) = match operation_obj.get("security") {
+            Some(value) => resolve_security(value, ctx.scheme_names, &label, issues),
+            None => ctx.document_security.cloned().unwrap_or_default(),
+        };
         operations.push(Operation {
             path: path.to_string(),
             method: method.to_string(),
             operation_id: operation_id.to_string(),
-            response_schema: success_response_schema(operation_obj),
-            parameters: extract_parameters(operation_obj),
-            request_body: extract_request_body(operation_obj),
+            response_schema,
+            parameters,
+            request_body,
             response_status_codes: declared_response_codes(operation_obj),
-            security: operation_security(operation_obj, document_security),
+            security,
+            declared_security_schemes,
+            response_mode,
+            request_stream,
+            request_body_unresolved,
         });
     }
     Ok(operations)
@@ -513,7 +926,18 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy) -> Result
 
     let mut issues = Vec::new();
     let spec_version = detect_version(&doc, &mut issues);
-    let document_security = doc.get("security");
+    let empty = Map::new();
+    let components_obj = doc.get("components");
+    let media_types = components_obj.and_then(|c| c.get("mediaTypes")).and_then(Value::as_object).unwrap_or(&empty);
+    let scheme_names = components_obj.and_then(|c| c.get("securitySchemes")).and_then(Value::as_object).unwrap_or(&empty);
+    let document_security = doc
+        .get("security")
+        .map(|value| resolve_security(value, scheme_names, "top-level security", &mut issues));
+    let ctx = OpCtx {
+        media_types,
+        scheme_names,
+        document_security: document_security.as_ref(),
+    };
 
     let mut skipped_paths = BTreeSet::new();
     let mut accepted: Vec<(String, &Map<String, Value>)> = Vec::new();
@@ -590,7 +1014,7 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy) -> Result
     let mut operations = Vec::new();
     let mut ambiguous_operations = Vec::new();
     for (i, (normalized, item)) in accepted.iter().enumerate() {
-        let parsed = parse_operations(normalized, item, document_security)?;
+        let parsed = parse_operations(normalized, item, &ctx, &mut issues)?;
         not_served_issues(normalized, item, &mut issues);
         if ambiguous_indexes.contains(&i) {
             ambiguous_operations.extend(parsed);
@@ -621,19 +1045,17 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy) -> Result
         }
     }
 
-    let security_scheme_types = doc
-        .get("components")
-        .and_then(|components| components.get("securitySchemes"))
-        .and_then(Value::as_object)
-        .map(|schemes| {
-            schemes
-                .iter()
-                .filter_map(|(name, scheme)| Some((name.clone(), scheme.get("type")?.as_str()?.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
+    let security_scheme_types = scheme_names
+        .iter()
+        .filter_map(|(name, scheme)| Some((name.clone(), scheme.get("type")?.as_str()?.to_string())))
+        .collect();
+    let deprecated_security_schemes = scheme_names
+        .iter()
+        .filter(|(_, scheme)| scheme.get("deprecated") == Some(&Value::Bool(true)))
+        .map(|(name, _)| name.clone())
+        .collect();
 
-    Ok(OpenApiDocument {
+    let mut document = OpenApiDocument {
         operations,
         component_schemas,
         security_scheme_types,
@@ -643,12 +1065,76 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy) -> Result
         ambiguous_operations,
         skipped_paths,
         unwritable_components,
-    })
+        deprecated_security_schemes,
+    };
+
+    let mut mapping_issues = Vec::new();
+    for (name, schema) in &document.component_schemas {
+        scan_default_mappings(
+            schema,
+            &document.component_schemas,
+            &format!("components/schemas/{}", untrusted(name)),
+            &mut mapping_issues,
+            0,
+        );
+    }
+    for op in document.operations.iter().chain(&document.ambiguous_operations) {
+        let label = format!("{} {}", op.method.to_uppercase(), untrusted(&op.path));
+        let response_stream = match &op.response_mode {
+            ResponseMode::Single => None,
+            ResponseMode::Stream(spec) => spec.item_schema.as_ref(),
+        };
+        let scans: [(&str, Option<&Value>); 4] = [
+            ("response", op.response_schema.as_ref()),
+            ("request body", op.request_body.as_ref().map(|b| &b.schema)),
+            ("response stream item schema", response_stream),
+            ("request stream item schema", op.request_stream.as_ref().and_then(|spec| spec.item_schema.as_ref())),
+        ];
+        for (what, schema) in scans {
+            if let Some(schema) = schema {
+                scan_default_mappings(schema, &document.component_schemas, &format!("{label} {what}"), &mut mapping_issues, 0);
+            }
+        }
+    }
+    document.issues.extend(mapping_issues);
+
+    for message in document.deprecated_scheme_warnings() {
+        document.issues.push(LoadIssue::new(IssueKind::DeprecatedSecurityScheme, Severity::Warning, message));
+    }
+    Ok(document)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn extract_parameters(operation: &Map<String, Value>) -> Vec<ParameterInfo> {
+        let empty = Map::new();
+        let ctx = OpCtx {
+            media_types: &empty,
+            scheme_names: &empty,
+            document_security: None,
+        };
+        super::extract_parameters(operation, &ctx, "test", &mut Vec::new())
+    }
+
+    fn extract_request_body(operation: &Map<String, Value>) -> Option<RequestBodySchema> {
+        let empty = Map::new();
+        let ctx = OpCtx {
+            media_types: &empty,
+            scheme_names: &empty,
+            document_security: None,
+        };
+        super::extract_request_body(operation, &ctx, "test", &mut Vec::new()).0
+    }
+
+    fn operation_security(operation: &Map<String, Value>, document_default: Option<&Value>) -> Option<String> {
+        let empty = Map::new();
+        operation
+            .get("security")
+            .or(document_default)
+            .and_then(|value| resolve_security(value, &empty, "test", &mut Vec::new()).0)
+    }
 
     #[test]
     fn enumerates_a_specs_operations() {
@@ -743,6 +1229,7 @@ mod tests {
                     request_body: None,
                     response_status_codes: vec![200],
                     security: None,
+                    ..Default::default()
                 },
                 Operation {
                     path: "/cars".to_string(),
@@ -753,6 +1240,7 @@ mod tests {
                     request_body: None,
                     response_status_codes: vec![201],
                     security: None,
+                    ..Default::default()
                 },
                 Operation {
                     path: "/cars/{vin}".to_string(),
@@ -768,6 +1256,8 @@ mod tests {
                     request_body: None,
                     response_status_codes: vec![200, 404],
                     security: Some("apiKeyAuth".to_string()),
+                    declared_security_schemes: vec!["apiKeyAuth".to_string()],
+                    ..Default::default()
                 },
             ]
         );
@@ -803,6 +1293,7 @@ mod tests {
             request_body: None,
             response_status_codes: vec![200],
             security: None,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -933,7 +1424,7 @@ mod tests {
             parameters: Vec::new(),
             request_body: None,
             response_status_codes: codes,
-            security: None,
+            ..Default::default()
         }
     }
 
@@ -1062,7 +1553,9 @@ mod load_hardening_tests {
     fn spec_with_paths(paths: &[&str]) -> String {
         let mut yaml = "openapi: 3.1.0\ninfo: { title: t, version: 1 }\npaths:\n".to_string();
         for (i, p) in paths.iter().enumerate() {
-            yaml.push_str(&format!("  '{p}':\n    get:\n      operationId: op{i}\n      responses:\n        '200': {{ description: ok }}\n"));
+            yaml.push_str(&format!(
+                "  '{p}':\n    get:\n      operationId: op{i}\n      responses:\n        '200': {{ description: ok }}\n"
+            ));
         }
         yaml
     }
@@ -1183,14 +1676,16 @@ info: {{ title: t, version: 1, summary: s }}
       properties: {{ kind: {{ type: string }} }}
 "
         );
-        let v31 = format!("openapi: 3.1.0
+        let v31 = format!(
+            "openapi: 3.1.0
 info: {{ title: t, version: 1 }}
 {TWIN_PATHS_HEAD}{TWIN_PATHS_TAIL}components:
   schemas:
     Car:
       type: object
       properties: {{ kind: {{ type: string }} }}
-");
+"
+        );
         let a = load_yaml(&v32);
         let b = load_yaml(&v31);
         assert!(a.issues.is_empty(), "{:?}", a.issues);
@@ -1206,7 +1701,10 @@ info: {{ title: t, version: 1 }}
                 .collect()
         };
         assert_eq!(served(&a), served(&b));
-        assert!(a.operations[0].parameters.iter().any(|p| p.location == "querystring"), "querystring params are still collected");
+        assert!(
+            a.operations[0].parameters.iter().any(|p| p.location == "querystring"),
+            "querystring params are still collected"
+        );
         assert_eq!(a.operations[0].response_schema_hash(), b.operations[0].response_schema_hash());
     }
 
@@ -1270,7 +1768,12 @@ info: {{ title: t, version: 1 }}
             assert!(doc.skipped_paths.contains("/cars/"));
             let collisions = doc.issues.iter().filter(|i| i.kind == IssueKind::TrailingSlashCollision).count();
             assert_eq!(collisions, 1, "{order:?}");
-            assert!(doc.issues.iter().filter(|i| i.kind == IssueKind::TrailingSlashCollision).all(|i| i.severity == Severity::Error));
+            assert!(
+                doc.issues
+                    .iter()
+                    .filter(|i| i.kind == IssueKind::TrailingSlashCollision)
+                    .all(|i| i.severity == Severity::Error)
+            );
             assert!(doc.ambiguous.is_empty());
         }
     }
@@ -1299,7 +1802,10 @@ info: {{ title: t, version: 1 }}
         let doc = load_yaml(&spec_with_paths(&["/ok", "/a/../../escape", "/x/_backups", "/a//b"]));
         assert_eq!(doc.operations.iter().map(|o| o.path.as_str()).collect::<Vec<_>>(), vec!["/ok"]);
         assert_eq!(doc.skipped_paths.len(), 3);
-        assert_eq!(doc.issues.iter().filter(|i| i.kind == IssueKind::UnsafePath && i.severity == Severity::Error).count(), 3);
+        assert_eq!(
+            doc.issues.iter().filter(|i| i.kind == IssueKind::UnsafePath && i.severity == Severity::Error).count(),
+            3
+        );
     }
 
     #[test]
@@ -1313,10 +1819,7 @@ info: {{ title: t, version: 1 }}
     #[test]
     fn a_missing_operation_id_in_a_kept_path_is_still_a_load_error() {
         let yaml = "openapi: 3.1.0\ninfo: { title: t, version: 1 }\npaths:\n  /fine:\n    get:\n      responses: { '200': { description: ok } }\n";
-        assert!(matches!(
-            load_yaml_with(yaml, PortabilityPolicy::Warn),
-            Err(OpenApiError::MissingOperationId { .. })
-        ));
+        assert!(matches!(load_yaml_with(yaml, PortabilityPolicy::Warn), Err(OpenApiError::MissingOperationId { .. })));
     }
 
     #[test]
@@ -1332,7 +1835,8 @@ info: {{ title: t, version: 1 }}
 
     #[test]
     fn an_unsafe_component_name_stays_resolvable_but_is_marked_unwritable() {
-        let yaml = "openapi: 3.1.0\ninfo: { title: t, version: 1 }\npaths: {}\ncomponents:\n  schemas:\n    '../../x':\n      type: object\n    Fine:\n      type: object\n";
+        let yaml =
+            "openapi: 3.1.0\ninfo: { title: t, version: 1 }\npaths: {}\ncomponents:\n  schemas:\n    '../../x':\n      type: object\n    Fine:\n      type: object\n";
         let doc = load_yaml(yaml);
         assert!(doc.component_schemas.contains_key("../../x"));
         assert!(doc.component_schemas.contains_key("Fine"));
@@ -1364,5 +1868,681 @@ info: {{ title: t, version: 1 }}
         assert_eq!(first.issues, second.issues);
         assert!(first.issues[0].message.contains("/b"));
         assert!(first.issues[1].message.contains("/a"));
+    }
+}
+
+#[cfg(test)]
+mod m2_schema_and_security_tests {
+    use super::*;
+
+    fn tempdir() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "frogs-openapi-m2-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn load_yaml(yaml: &str) -> OpenApiDocument {
+        let dir = tempdir();
+        let path = dir.join("openapi.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let result = load_with_policy(&path, PortabilityPolicy::Warn).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    /// Builds a 3.2 spec: `components_yaml` is spliced under `components:`,
+    /// `paths_yaml` under `paths:` (both must be pre-indented by 2 spaces).
+    fn spec(components_yaml: &str, paths_yaml: &str) -> String {
+        format!("openapi: 3.2.0\ninfo: {{ title: t, version: 1 }}\ncomponents:\n{components_yaml}\npaths:\n{paths_yaml}\n")
+    }
+
+    fn get_with_200_content(content: &str) -> String {
+        format!("  /a:\n    get:\n      operationId: a\n      responses:\n        '200':\n          description: ok\n          content:\n{content}\n")
+    }
+
+    fn issues_of(doc: &OpenApiDocument, kind: IssueKind) -> Vec<&LoadIssue> {
+        doc.issues.iter().filter(|i| i.kind == kind).collect()
+    }
+
+    const JSON_SCHEMA_STRING: &str = "{ schema: { type: string } }";
+
+    fn media_chain(len: usize) -> String {
+        // entry -> M0 -> ... -> M{len} (the last is the real object): len + 1 $ref hops.
+        let mut s = String::from("  mediaTypes:\n");
+        for i in 0..len {
+            s.push_str(&format!("    M{i}: {{ $ref: '#/components/mediaTypes/M{}' }}\n", i + 1));
+        }
+        s.push_str(&format!("    M{len}: {JSON_SCHEMA_STRING}\n"));
+        s
+    }
+
+    // ---------------------------------------------------------------- S9
+
+    #[test]
+    fn a_direct_media_type_ref_in_a_response_supplies_the_response_schema() {
+        let doc = load_yaml(&spec(
+            "  mediaTypes:\n    Car: { schema: { type: object, properties: { vin: { type: string } } } }",
+            &get_with_200_content("            application/json: { $ref: '#/components/mediaTypes/Car' }"),
+        ));
+        assert!(doc.issues.is_empty(), "{:?}", doc.issues);
+        assert_eq!(doc.operations[0].response_schema.as_ref().unwrap()["properties"]["vin"]["type"], "string");
+    }
+
+    #[test]
+    fn a_two_hop_media_type_ref_chain_resolves() {
+        let doc = load_yaml(&spec(
+            &media_chain(2),
+            &get_with_200_content("            application/json: { $ref: '#/components/mediaTypes/M0' }"),
+        ));
+        assert!(doc.issues.is_empty(), "{:?}", doc.issues);
+        assert!(doc.operations[0].response_schema.is_some());
+    }
+
+    #[test]
+    fn a_media_type_chain_of_exactly_eight_hops_resolves_and_nine_is_rejected() {
+        let ok = load_yaml(&spec(
+            &media_chain(7),
+            &get_with_200_content("            application/json: { $ref: '#/components/mediaTypes/M0' }"),
+        ));
+        assert!(ok.issues.is_empty(), "{:?}", ok.issues);
+        assert!(ok.operations[0].response_schema.is_some());
+
+        let too_long = load_yaml(&spec(
+            &media_chain(8),
+            &get_with_200_content("            application/json: { $ref: '#/components/mediaTypes/M0' }"),
+        ));
+        let s9 = issues_of(&too_long, IssueKind::MediaTypeRefUnresolved);
+        assert_eq!(s9.len(), 1, "{:?}", too_long.issues);
+        assert_eq!(s9[0].severity, Severity::Error);
+        assert!(s9[0].message.contains("chain longer than 8 hops"), "{}", s9[0].message);
+        assert!(too_long.operations[0].response_schema.is_none());
+    }
+
+    #[test]
+    fn self_referencing_and_mutually_referencing_media_types_report_a_cycle_without_hanging() {
+        let selfref = load_yaml(&spec(
+            "  mediaTypes:\n    A: { $ref: '#/components/mediaTypes/A' }",
+            &get_with_200_content("            application/json: { $ref: '#/components/mediaTypes/A' }"),
+        ));
+        let s9 = issues_of(&selfref, IssueKind::MediaTypeRefUnresolved);
+        assert_eq!(s9.len(), 1);
+        assert!(s9[0].message.contains("cycle"), "{}", s9[0].message);
+
+        let pair = load_yaml(&spec(
+            "  mediaTypes:\n    A: { $ref: '#/components/mediaTypes/B' }\n    B: { $ref: '#/components/mediaTypes/A' }",
+            &get_with_200_content("            application/json: { $ref: '#/components/mediaTypes/A' }"),
+        ));
+        let s9 = issues_of(&pair, IssueKind::MediaTypeRefUnresolved);
+        assert_eq!(s9.len(), 1);
+        assert!(s9[0].message.contains("cycle"), "{}", s9[0].message);
+    }
+
+    #[test]
+    fn each_unresolvable_media_type_ref_form_is_an_s9_error_and_leaves_no_response_schema() {
+        let cases: &[(&str, &str)] = &[
+            ("'#/components/mediaTypes/Missing'", "unknown media type 'Missing'"),
+            ("./x.yaml", "unsupported reference form"),
+            ("'https://h/x#/components/mediaTypes/A'", "unsupported reference form"),
+            ("'#/components/schemas/Car'", "a #/components/schemas/ reference where a media type belongs"),
+            ("42", "$ref is not a string"),
+        ];
+        for (reference, expected) in cases {
+            let doc = load_yaml(&spec(
+                "  mediaTypes:\n    A: { schema: { type: string } }\n  schemas:\n    Car: { type: object }",
+                &get_with_200_content(&format!("            application/json: {{ $ref: {reference} }}")),
+            ));
+            let s9 = issues_of(&doc, IssueKind::MediaTypeRefUnresolved);
+            assert_eq!(s9.len(), 1, "{reference}: {:?}", doc.issues);
+            assert_eq!(s9[0].severity, Severity::Error, "{reference}");
+            assert!(s9[0].message.contains(expected), "{reference}: {}", s9[0].message);
+            assert!(s9[0].message.contains("treated as having no schema"), "{reference}: {}", s9[0].message);
+            assert!(doc.operations[0].response_schema.is_none(), "{reference}");
+        }
+    }
+
+    #[test]
+    fn a_media_type_ref_whose_target_is_not_an_object_is_reported() {
+        let doc = load_yaml(&spec(
+            "  mediaTypes:\n    A: 5",
+            &get_with_200_content("            application/json: { $ref: '#/components/mediaTypes/A' }"),
+        ));
+        let s9 = issues_of(&doc, IssueKind::MediaTypeRefUnresolved);
+        assert_eq!(s9.len(), 1);
+        assert!(s9[0].message.contains("reference target is not an object"), "{}", s9[0].message);
+    }
+
+    #[test]
+    fn a_media_type_ref_with_a_sibling_schema_uses_the_ref_target_not_the_sibling() {
+        let doc = load_yaml(&spec(
+            "  mediaTypes:\n    A: { schema: { type: integer } }",
+            &get_with_200_content("            application/json: { $ref: '#/components/mediaTypes/A', schema: { type: string } }"),
+        ));
+        assert_eq!(doc.operations[0].response_schema.as_ref().unwrap()["type"], "integer");
+    }
+
+    #[test]
+    fn an_unresolvable_200_json_entry_is_reported_once_and_a_good_201_supplies_the_schema() {
+        let paths = "  /a:\n    post:\n      operationId: a\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { $ref: '#/components/mediaTypes/Missing' }\n        '201':\n          description: created\n          content:\n            application/json: { schema: { type: integer } }\n";
+        let doc = load_yaml(&spec("  mediaTypes:\n    A: { schema: { type: string } }", paths));
+        assert_eq!(issues_of(&doc, IssueKind::MediaTypeRefUnresolved).len(), 1, "{:?}", doc.issues);
+        assert_eq!(doc.operations[0].response_schema.as_ref().unwrap()["type"], "integer");
+    }
+
+    #[test]
+    fn an_unresolvable_non_json_entry_next_to_a_good_json_entry_is_never_dereferenced() {
+        let doc = load_yaml(&spec(
+            "  mediaTypes:\n    A: { schema: { type: string } }",
+            &get_with_200_content(
+                "            application/json: { $ref: '#/components/mediaTypes/A' }\n            application/xml: { $ref: '#/components/mediaTypes/Missing' }",
+            ),
+        ));
+        assert!(doc.issues.is_empty(), "{:?}", doc.issues);
+    }
+
+    #[test]
+    fn a_broken_media_type_in_a_non_2xx_response_or_unused_component_is_never_reported() {
+        let paths = "  /a:\n    get:\n      operationId: a\n      responses:\n        '200': { description: ok }\n        '404':\n          description: no\n          content:\n            application/json: { $ref: '#/components/mediaTypes/Missing' }\n";
+        let doc = load_yaml(&spec("  mediaTypes:\n    Unused: { $ref: '#/components/mediaTypes/Nope' }", paths));
+        assert!(doc.issues.is_empty(), "{:?}", doc.issues);
+    }
+
+    #[test]
+    fn a_request_body_media_type_ref_populates_request_body() {
+        let paths = "  /a:\n    post:\n      operationId: a\n      requestBody:\n        required: true\n        content:\n          application/json: { $ref: '#/components/mediaTypes/B' }\n      responses:\n        '200': { description: ok }\n";
+        let doc = load_yaml(&spec("  mediaTypes:\n    B: { schema: { type: object, required: [x] } }", paths));
+        let body = doc.operations[0].request_body.as_ref().unwrap();
+        assert!(body.required);
+        assert_eq!(body.schema["type"], "object");
+        assert!(doc.operations[0].request_body_unresolved.is_none());
+        assert!(doc.issues.is_empty(), "{:?}", doc.issues);
+    }
+
+    #[test]
+    fn an_unresolved_request_body_keeps_a_permissive_schema_so_required_is_still_enforced_and_reports_s9() {
+        let paths = "  /a:\n    post:\n      operationId: a\n      requestBody:\n        required: true\n        content:\n          application/json: { $ref: '#/components/mediaTypes/Missing' }\n      responses:\n        '200': { description: ok }\n";
+        let doc = load_yaml(&spec("  mediaTypes:\n    B: { schema: { type: object } }", paths));
+        let op = &doc.operations[0];
+        let body = op.request_body.as_ref().expect("amended A15: Some");
+        assert!(body.required);
+        assert_eq!(body.schema, serde_json::json!({}));
+        assert!(op.request_body_unresolved.is_some());
+        let s9 = issues_of(&doc, IssueKind::MediaTypeRefUnresolved);
+        assert_eq!(s9.len(), 1, "{:?}", doc.issues);
+        assert_eq!(s9[0].severity, Severity::Error);
+        assert_eq!(
+            s9[0].message,
+            format!(
+                "POST /a: request body schema unresolved ({}) — body validation skipped for this route",
+                op.request_body_unresolved.as_ref().unwrap()
+            )
+        );
+        assert!(s9[0].message.contains("unknown media type 'Missing'"));
+    }
+
+    #[test]
+    fn a_request_body_json_entry_without_a_schema_gives_no_request_body() {
+        let paths = "  /a:\n    post:\n      operationId: a\n      requestBody:\n        content:\n          application/json: {}\n      responses:\n        '200': { description: ok }\n";
+        let doc = load_yaml(&spec("  schemas: {}", paths));
+        assert!(doc.operations[0].request_body.is_none());
+    }
+
+    #[test]
+    fn parameter_content_by_ref_and_inline_both_supply_schema_type() {
+        let paths = "  /a:\n    get:\n      operationId: a\n      parameters:\n        - { name: n, in: query, content: { application/json: { $ref: '#/components/mediaTypes/I' } } }\n        - { name: m, in: query, content: { application/json: { schema: { type: boolean } } } }\n      responses:\n        '200': { description: ok }\n";
+        let doc = load_yaml(&spec("  mediaTypes:\n    I: { schema: { type: integer } }", paths));
+        assert!(doc.issues.is_empty(), "{:?}", doc.issues);
+        let ps = &doc.operations[0].parameters;
+        assert_eq!(ps[0].schema_type.as_deref(), Some("integer"));
+        assert_eq!(ps[1].schema_type.as_deref(), Some("boolean"));
+    }
+
+    #[test]
+    fn parameter_content_with_zero_or_two_entries_or_an_explicit_schema_is_handled_without_issue() {
+        let paths = "  /a:\n    get:\n      operationId: a\n      parameters:\n        - { name: zero, in: query, content: {} }\n        - { name: two, in: query, content: { application/json: { schema: { type: integer } }, text/plain: { schema: { type: string } } } }\n        - { name: both, in: query, schema: { type: string }, content: { application/json: { schema: { type: integer } } } }\n      responses:\n        '200': { description: ok }\n";
+        let doc = load_yaml(&spec("  schemas: {}", paths));
+        assert!(doc.issues.is_empty(), "{:?}", doc.issues);
+        let ps = &doc.operations[0].parameters;
+        assert_eq!(ps[0].schema_type, None);
+        assert_eq!(ps[1].schema_type, None);
+        assert_eq!(ps[2].schema_type.as_deref(), Some("string"));
+    }
+
+    #[test]
+    fn an_unresolvable_parameter_content_ref_reports_s9_and_skips_the_type() {
+        let paths = "  /a:\n    get:\n      operationId: a\n      parameters:\n        - { name: n, in: query, content: { application/json: { $ref: '#/components/mediaTypes/Missing' } } }\n      responses:\n        '200': { description: ok }\n";
+        let doc = load_yaml(&spec("  schemas: {}", paths));
+        let s9 = issues_of(&doc, IssueKind::MediaTypeRefUnresolved);
+        assert_eq!(s9.len(), 1, "{:?}", doc.issues);
+        assert!(s9[0].message.contains("parameter 'n'"), "{}", s9[0].message);
+        assert!(s9[0].message.contains("type check skipped"), "{}", s9[0].message);
+        assert_eq!(doc.operations[0].parameters[0].schema_type, None);
+    }
+
+    #[test]
+    fn control_characters_in_a_media_type_ref_are_escaped_in_the_issue_message() {
+        let doc = load_yaml(&spec(
+            "  schemas: {}",
+            &get_with_200_content("            application/json: { $ref: \"evil\\e[31mred\\nline\" }"),
+        ));
+        let s9 = issues_of(&doc, IssueKind::MediaTypeRefUnresolved);
+        assert_eq!(s9.len(), 1);
+        assert!(!s9[0].message.contains('\u{1b}'));
+        assert!(!s9[0].message.contains('\n'));
+    }
+
+    #[test]
+    fn the_response_hash_changes_when_the_referenced_media_type_schema_changes() {
+        let build = |ty: &str| {
+            load_yaml(&spec(
+                &format!("  mediaTypes:\n    Car: {{ schema: {{ type: {ty} }} }}"),
+                &get_with_200_content("            application/json: { $ref: '#/components/mediaTypes/Car' }"),
+            ))
+        };
+        assert_ne!(
+            build("string").operations[0].response_schema_hash(),
+            build("integer").operations[0].response_schema_hash()
+        );
+    }
+
+    // ---------------------------------------------------------- Streaming
+
+    fn response_stream_doc(media_line: &str) -> OpenApiDocument {
+        load_yaml(&spec("  schemas: {}", &get_with_200_content(&format!("            {media_line}"))))
+    }
+
+    #[test]
+    fn each_streaming_media_type_is_detected_with_a_w2_warning_and_no_response_schema() {
+        for media in [
+            "text/event-stream",
+            "application/jsonl",
+            "application/x-ndjson",
+            "application/json-seq",
+            "application/geo+json-seq",
+        ] {
+            let doc = response_stream_doc(&format!("{media}: {{ itemSchema: {{ type: string }} }}"));
+            let op = &doc.operations[0];
+            match &op.response_mode {
+                ResponseMode::Stream(spec) => {
+                    assert_eq!(spec.media_type, media);
+                    assert_eq!(spec.status, Some(200));
+                    assert_eq!(spec.item_schema, Some(serde_json::json!({ "type": "string" })));
+                }
+                ResponseMode::Single => panic!("{media} not detected"),
+            }
+            let w2 = issues_of(&doc, IssueKind::StreamingDeclared);
+            assert_eq!(w2.len(), 1, "{media}");
+            assert_eq!(w2[0].severity, Severity::Warning);
+            assert!(w2[0].message.starts_with("GET /a declares a streaming response ("), "{}", w2[0].message);
+            assert!(
+                w2[0].message.contains("served") || w2[0].message.contains("single JSON response"),
+                "{}",
+                w2[0].message
+            );
+        }
+    }
+
+    #[test]
+    fn a_streaming_entry_with_no_item_schema_still_records_none_for_it() {
+        let doc = response_stream_doc("text/event-stream: {}");
+        let ResponseMode::Stream(spec) = &doc.operations[0].response_mode else {
+            panic!("expected stream")
+        };
+        assert_eq!(spec.item_schema, None);
+        assert_eq!(spec.item_encoding, None);
+    }
+
+    #[test]
+    fn multipart_is_streaming_only_with_an_item_schema_item_encoding_or_prefix_encoding() {
+        for key in ["itemSchema: { type: string }", "itemEncoding: { contentType: text/plain }", "prefixEncoding: []"] {
+            let doc = response_stream_doc(&format!("multipart/mixed: {{ {key} }}"));
+            assert!(matches!(doc.operations[0].response_mode, ResponseMode::Stream(_)), "{key}");
+        }
+        let doc = response_stream_doc("multipart/mixed: { schema: { type: object } }");
+        assert!(matches!(doc.operations[0].response_mode, ResponseMode::Single));
+        assert!(issues_of(&doc, IssueKind::StreamingDeclared).is_empty());
+    }
+
+    #[test]
+    fn a_bare_item_schema_on_any_media_type_makes_it_streaming() {
+        let doc = response_stream_doc("application/octet-stream: { itemSchema: { type: string } }");
+        assert!(matches!(doc.operations[0].response_mode, ResponseMode::Stream(_)));
+    }
+
+    #[test]
+    fn streaming_media_keys_are_matched_case_insensitively_ignoring_parameters() {
+        let doc = response_stream_doc("'Text/Event-Stream; charset=utf-8': {}");
+        let ResponseMode::Stream(spec) = &doc.operations[0].response_mode else {
+            panic!("expected stream")
+        };
+        assert_eq!(spec.media_type, "Text/Event-Stream; charset=utf-8", "media type is kept verbatim");
+    }
+
+    #[test]
+    fn a_json_success_response_beats_a_streaming_one_and_raises_no_w2() {
+        let paths = "  /a:\n    get:\n      operationId: a\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { schema: { type: string } }\n        '206':\n          description: part\n          content:\n            text/event-stream: {}\n";
+        let doc = load_yaml(&spec("  schemas: {}", paths));
+        assert!(matches!(doc.operations[0].response_mode, ResponseMode::Single));
+        assert!(doc.operations[0].response_schema.is_some());
+        assert!(issues_of(&doc, IssueKind::StreamingDeclared).is_empty());
+    }
+
+    #[test]
+    fn a_pattern_success_key_streaming_response_reports_status_200() {
+        let paths =
+            "  /a:\n    get:\n      operationId: a\n      responses:\n        2XX:\n          description: ok\n          content:\n            text/event-stream: {}\n";
+        let doc = load_yaml(&spec("  schemas: {}", paths));
+        let ResponseMode::Stream(spec) = &doc.operations[0].response_mode else {
+            panic!("expected stream")
+        };
+        assert_eq!(spec.status, Some(200));
+    }
+
+    fn request_body_doc(content: &str) -> OpenApiDocument {
+        let paths =
+            format!("  /a:\n    post:\n      operationId: a\n      requestBody:\n        content:\n{content}\n      responses:\n        '200': {{ description: ok }}\n");
+        load_yaml(&spec("  schemas: {}", &paths))
+    }
+
+    #[test]
+    fn a_jsonl_request_body_is_a_request_stream_with_w2_and_without_w3() {
+        let doc = request_body_doc("          application/jsonl: { itemSchema: { type: object } }");
+        let op = &doc.operations[0];
+        let spec = op.request_stream.as_ref().expect("request stream");
+        assert_eq!(spec.status, None);
+        assert_eq!(spec.media_type, "application/jsonl");
+        assert!(op.request_body.is_none());
+        let w2 = issues_of(&doc, IssueKind::StreamingDeclared);
+        assert_eq!(w2.len(), 1);
+        assert!(
+            w2[0].message.starts_with("POST /a declares a streaming request body (application/jsonl)"),
+            "{}",
+            w2[0].message
+        );
+        assert!(issues_of(&doc, IssueKind::NonJsonRequestBody).is_empty());
+    }
+
+    #[test]
+    fn a_non_streaming_non_json_request_body_raises_w3_with_the_documented_text() {
+        let doc = request_body_doc("          multipart/form-data: { schema: { type: object } }");
+        assert!(doc.operations[0].request_stream.is_none());
+        let w3 = issues_of(&doc, IssueKind::NonJsonRequestBody);
+        assert_eq!(w3.len(), 1);
+        assert_eq!(w3[0].severity, Severity::Warning);
+        assert_eq!(
+            w3[0].message,
+            "POST /a declares a request body with only non-JSON content (multipart/form-data); frogs only reads application/json bodies — the body is not validated and sources see it as null"
+        );
+        assert!(issues_of(&doc, IssueKind::StreamingDeclared).is_empty());
+    }
+
+    #[test]
+    fn w3_lists_at_most_five_media_types_then_an_ellipsis() {
+        let doc = request_body_doc("          a/1: {}\n          a/2: {}\n          a/3: {}\n          a/4: {}\n          a/5: {}\n          a/6: {}");
+        let w3 = issues_of(&doc, IssueKind::NonJsonRequestBody);
+        assert_eq!(w3.len(), 1);
+        assert!(w3[0].message.contains("a/1, a/2, a/3, a/4, a/5, …"), "{}", w3[0].message);
+        assert!(!w3[0].message.contains("a/6"));
+    }
+
+    #[test]
+    fn a_request_body_with_json_plus_jsonl_is_neither_stream_nor_non_json() {
+        let doc = request_body_doc("          application/json: { schema: { type: object } }\n          application/jsonl: { itemSchema: { type: object } }");
+        assert!(doc.operations[0].request_stream.is_none());
+        assert!(doc.operations[0].request_body.is_some());
+        assert!(doc.issues.is_empty(), "{:?}", doc.issues);
+    }
+
+    #[test]
+    fn a_plus_json_media_type_is_not_treated_as_json() {
+        let doc = request_body_doc("          application/vnd.api+json: { schema: { type: object } }");
+        assert!(doc.operations[0].request_body.is_none());
+        assert_eq!(issues_of(&doc, IssueKind::NonJsonRequestBody).len(), 1);
+    }
+
+    #[test]
+    fn the_hash_of_a_single_response_is_the_plain_schema_hash_and_changes_with_stream_item_schema() {
+        let single = load_yaml(&spec(
+            "  schemas: {}",
+            &get_with_200_content("            application/json: { schema: { type: string } }"),
+        ));
+        assert_eq!(single.operations[0].response_schema_hash(), content_hash(&serde_json::json!({ "type": "string" })));
+
+        let none = load_yaml(&spec(
+            "  schemas: {}",
+            "  /a:\n    get:\n      operationId: a\n      responses:\n        '200': { description: ok }\n",
+        ));
+        assert_eq!(none.operations[0].response_schema_hash(), content_hash(&Value::Null));
+
+        let h = |item: &str| response_stream_doc(&format!("text/event-stream: {{ itemSchema: {{ type: {item} }} }}")).operations[0].response_schema_hash();
+        assert_ne!(h("string"), h("integer"));
+        assert_ne!(h("string"), single.operations[0].response_schema_hash());
+    }
+
+    #[test]
+    fn referenced_components_includes_refs_inside_stream_item_schemas() {
+        let doc = load_yaml(&spec(
+            "  schemas:\n    Evt: { type: object }\n    In: { type: object }",
+            "  /a:\n    post:\n      operationId: a\n      requestBody:\n        content:\n          application/jsonl: { itemSchema: { $ref: '#/components/schemas/In' } }\n      responses:\n        '200':\n          description: ok\n          content:\n            text/event-stream: { itemSchema: { $ref: '#/components/schemas/Evt' } }\n",
+        ));
+        let refs = doc.operations[0].referenced_components();
+        assert!(refs.contains("Evt") && refs.contains("In"), "{refs:?}");
+    }
+
+    // ----------------------------------------------------------------- S10
+
+    #[test]
+    fn s10_fires_for_unknown_and_foreign_default_mapping_targets_and_not_for_resolvable_ones() {
+        let one_of = |dm: &str| format!("    V: {{ oneOf: [ {{ type: string }} ], discriminator: {{ propertyName: k, defaultMapping: {dm} }} }}");
+        let components = |dm: &str| format!("  schemas:\n    Car: {{ type: object }}\n{}", one_of(dm));
+        for bad in ["Nope", "'#/components/schemas/Nope'", "'https://x/y'", "'../other.yaml#/Car'", "5"] {
+            let doc = load_yaml(&spec(
+                &components(bad),
+                "  /a:\n    get:\n      operationId: a\n      responses:\n        '200': { description: ok }\n",
+            ));
+            let s10 = issues_of(&doc, IssueKind::DefaultMappingUnresolved);
+            assert_eq!(s10.len(), 1, "{bad}: {:?}", doc.issues);
+            assert_eq!(s10[0].severity, Severity::Warning);
+            assert!(s10[0].message.contains("components/schemas/V"), "{}", s10[0].message);
+            assert!(s10[0].message.contains("the oneOf is left unresolved"), "{}", s10[0].message);
+        }
+        for good in ["Car", "'#/components/schemas/Car'"] {
+            let doc = load_yaml(&spec(
+                &components(good),
+                "  /a:\n    get:\n      operationId: a\n      responses:\n        '200': { description: ok }\n",
+            ));
+            assert!(doc.issues.is_empty(), "{good}: {:?}", doc.issues);
+        }
+    }
+
+    #[test]
+    fn s10_also_scans_operation_response_schemas_and_ignores_default_mapping_without_one_of() {
+        let paths = get_with_200_content(
+            "            application/json:\n              schema: { oneOf: [ { type: string } ], discriminator: { propertyName: k, defaultMapping: Nope } }",
+        );
+        let doc = load_yaml(&spec("  schemas: {}", &paths));
+        assert_eq!(issues_of(&doc, IssueKind::DefaultMappingUnresolved).len(), 1, "{:?}", doc.issues);
+
+        let paths =
+            get_with_200_content("            application/json:\n              schema: { type: object, discriminator: { propertyName: k, defaultMapping: Nope } }");
+        let doc = load_yaml(&spec("  schemas: {}", &paths));
+        assert!(doc.issues.is_empty(), "{:?}", doc.issues);
+    }
+
+    // ----------------------------------------------------------- Strictness
+
+    #[test]
+    fn strict_error_classification_covers_the_m2_kinds() {
+        assert!(IssueKind::MediaTypeRefUnresolved.is_strict_error());
+        assert!(IssueKind::DefaultMappingUnresolved.is_strict_error());
+        assert!(IssueKind::SecurityRequirementUnresolved.is_strict_error());
+        assert!(!IssueKind::StreamingDeclared.is_strict_error());
+        assert!(!IssueKind::NonJsonRequestBody.is_strict_error());
+        assert!(!IssueKind::DeprecatedSecurityScheme.is_strict_error());
+        assert!(!IssueKind::NotServed.is_strict_error());
+    }
+
+    // ------------------------------------------------------------------ W4
+
+    fn security_doc(schemes_yaml: &str, paths_yaml: &str, top_level: &str) -> OpenApiDocument {
+        let yaml = format!("openapi: 3.2.0\ninfo: {{ title: t, version: 1 }}\n{top_level}components:\n  securitySchemes:\n{schemes_yaml}\npaths:\n{paths_yaml}\n");
+        load_yaml(&yaml)
+    }
+
+    fn op_with_security(path: &str, id: &str, security: &str) -> String {
+        format!("  {path}:\n    get:\n      operationId: {id}\n      security: {security}\n      responses:\n        '200': {{ description: ok }}\n")
+    }
+
+    #[test]
+    fn a_deprecated_scheme_in_use_raises_w4_with_the_exact_text_and_deduped_users() {
+        let paths = format!(
+            "{}{}",
+            op_with_security("/b", "b", "[ { old: [] }, { old: [] } ]"),
+            op_with_security("/a", "a", "[ { old: [] } ]")
+        );
+        let doc = security_doc("    old: { type: apiKey, in: header, name: k, deprecated: true }", &paths, "");
+        let w4 = issues_of(&doc, IssueKind::DeprecatedSecurityScheme);
+        assert_eq!(w4.len(), 1);
+        assert_eq!(w4[0].severity, Severity::Warning);
+        assert_eq!(w4[0].message, "security scheme 'old' is marked deprecated in openapi.yaml (used by: GET /b, GET /a)");
+        assert_eq!(doc.deprecated_security_schemes, HashSet::from(["old".to_string()]));
+    }
+
+    #[test]
+    fn deprecated_scheme_warnings_are_sorted_by_scheme_name() {
+        let paths = format!(
+            "{}{}",
+            op_with_security("/a", "a", "[ { zed: [] } ]"),
+            op_with_security("/b", "b", "[ { alpha: [] } ]")
+        );
+        let doc = security_doc(
+            "    zed: { type: apiKey, in: header, name: k, deprecated: true }\n    alpha: { type: apiKey, in: header, name: k, deprecated: true }",
+            &paths,
+            "",
+        );
+        let msgs = doc.deprecated_scheme_warnings();
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[0].contains("'alpha'") && msgs[1].contains("'zed'"), "{msgs:?}");
+    }
+
+    #[test]
+    fn a_deprecated_scheme_nobody_uses_or_a_string_true_raises_nothing() {
+        let paths = op_with_security("/a", "a", "[ { other: [] } ]");
+        let doc = security_doc(
+            "    unused: { type: apiKey, in: header, name: k, deprecated: true }\n    other: { type: apiKey, in: header, name: k, deprecated: 'true' }",
+            &paths,
+            "",
+        );
+        assert!(issues_of(&doc, IssueKind::DeprecatedSecurityScheme).is_empty(), "{:?}", doc.issues);
+        assert!(!doc.deprecated_security_schemes.contains("other"));
+    }
+
+    #[test]
+    fn a_deprecated_scheme_used_only_as_the_second_key_of_an_and_requirement_is_still_reported() {
+        let paths = op_with_security("/a", "a", "[ { fresh: [], old: [] } ]");
+        let doc = security_doc(
+            "    fresh: { type: apiKey, in: header, name: k }\n    old: { type: apiKey, in: header, name: k, deprecated: true }",
+            &paths,
+            "",
+        );
+        let w4 = issues_of(&doc, IssueKind::DeprecatedSecurityScheme);
+        assert_eq!(w4.len(), 1, "{:?}", doc.issues);
+        assert!(w4[0].message.contains("'old'"));
+        assert_eq!(doc.operations[0].security.as_deref(), Some("fresh"));
+        assert_eq!(doc.operations[0].declared_security_schemes, vec!["fresh".to_string(), "old".to_string()]);
+    }
+
+    #[test]
+    fn a_deprecated_scheme_inherited_from_top_level_security_is_reported_for_the_inheriting_operation() {
+        let paths = "  /a:\n    get:\n      operationId: a\n      responses:\n        '200': { description: ok }\n";
+        let doc = security_doc(
+            "    old: { type: apiKey, in: header, name: k, deprecated: true }",
+            paths,
+            "security: [ { old: [] } ]\n",
+        );
+        let w4 = issues_of(&doc, IssueKind::DeprecatedSecurityScheme);
+        assert_eq!(w4.len(), 1, "{:?}", doc.issues);
+        assert!(w4[0].message.contains("GET /a"));
+    }
+
+    // ------------------------------------------------------------------ S11
+
+    const KEYS_SCHEME: &str = "    keyA: { type: apiKey, in: header, name: k }";
+
+    #[test]
+    fn security_requirement_names_resolve_exact_ref_and_plain_undeclared_forms_without_issues() {
+        let paths = format!(
+            "{}{}{}",
+            op_with_security("/a", "a", "[ { keyA: [] } ]"),
+            op_with_security("/b", "b", "[ { '#/components/securitySchemes/keyA': [] } ]"),
+            op_with_security("/c", "c", "[ { undeclaredPlain: [] } ]"),
+        );
+        let doc = security_doc(KEYS_SCHEME, &paths, "");
+        assert!(doc.issues.is_empty(), "{:?}", doc.issues);
+        let sec = |p: &str| doc.operations.iter().find(|o| o.path == p).unwrap().security.clone();
+        assert_eq!(sec("/a").as_deref(), Some("keyA"));
+        assert_eq!(sec("/b").as_deref(), Some("keyA"));
+        assert_eq!(sec("/c").as_deref(), Some("undeclaredPlain"));
+    }
+
+    #[test]
+    fn an_unknown_scheme_ref_or_a_uri_is_kept_verbatim_with_an_s11_warning() {
+        let paths = format!(
+            "{}{}",
+            op_with_security("/a", "a", "[ { '#/components/securitySchemes/Nope': [] } ]"),
+            op_with_security("/b", "b", "[ { 'https://x/y': [] } ]"),
+        );
+        let doc = security_doc(KEYS_SCHEME, &paths, "");
+        let s11 = issues_of(&doc, IssueKind::SecurityRequirementUnresolved);
+        assert_eq!(s11.len(), 2, "{:?}", doc.issues);
+        assert!(s11.iter().all(|i| i.severity == Severity::Warning));
+        assert!(s11[0].message.starts_with("GET /a: security requirement "), "{}", s11[0].message);
+        assert!(s11[0].message.contains("kept verbatim"));
+        let sec = |p: &str| doc.operations.iter().find(|o| o.path == p).unwrap().security.clone();
+        assert_eq!(sec("/a").as_deref(), Some("#/components/securitySchemes/Nope"));
+        assert_eq!(sec("/b").as_deref(), Some("https://x/y"));
+    }
+
+    #[test]
+    fn a_bad_top_level_security_inherited_by_three_operations_raises_exactly_one_s11() {
+        let no_security = |path: &str, id: &str| {
+            format!(
+                "  {path}:
+    get:
+      operationId: {id}
+      responses:
+        '200': {{ description: ok }}
+"
+            )
+        };
+        let paths = format!("{}{}{}", no_security("/a", "a"), no_security("/b", "b"), no_security("/c", "c"));
+        let doc = security_doc(KEYS_SCHEME, &paths, "security: [ { 'https://x/y': [] } ]\n");
+        assert_eq!(doc.operations.len(), 3);
+        let s11 = issues_of(&doc, IssueKind::SecurityRequirementUnresolved);
+        assert_eq!(s11.len(), 1, "{:?}", doc.issues);
+        assert!(s11[0].message.starts_with("top-level security: "), "{}", s11[0].message);
+        assert!(doc.operations.iter().all(|o| o.security.as_deref() == Some("https://x/y")));
+    }
+
+    #[test]
+    fn an_explicit_empty_security_list_opts_out_of_the_top_level_default() {
+        let paths = op_with_security("/a", "a", "[]");
+        let doc = security_doc(KEYS_SCHEME, &paths, "security: [ { keyA: [] } ]\n");
+        assert_eq!(doc.operations[0].security, None);
+        assert!(doc.operations[0].declared_security_schemes.is_empty());
+    }
+
+    #[test]
+    fn security_scheme_names_with_control_characters_are_escaped_in_the_s11_message() {
+        let paths = op_with_security("/a", "a", "[ { \"bad\\u001b[31m name\": [] } ]");
+        let doc = security_doc(KEYS_SCHEME, &paths, "");
+        let s11 = issues_of(&doc, IssueKind::SecurityRequirementUnresolved);
+        assert_eq!(s11.len(), 1, "{:?}", doc.issues);
+        assert!(!s11[0].message.contains('\u{1b}'));
     }
 }

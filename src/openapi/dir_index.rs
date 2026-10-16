@@ -405,10 +405,16 @@ mod tests {
         let endpoints = root.join("endpoints");
         fs::create_dir_all(&endpoints).unwrap();
         fs::write(endpoints.join("cars"), b"x").unwrap();
-        assert!(matches!(resolve_endpoint_dir(&endpoints, &["cars"]).unwrap_err(), EndpointFsError::NotADirectory { .. }));
+        assert!(matches!(
+            resolve_endpoint_dir(&endpoints, &["cars"]).unwrap_err(),
+            EndpointFsError::NotADirectory { .. }
+        ));
         let file_root = root.join("file_root");
         fs::write(&file_root, b"x").unwrap();
-        assert!(matches!(resolve_endpoint_dir(&file_root, &["cars"]).unwrap_err(), EndpointFsError::NotADirectory { .. }));
+        assert!(matches!(
+            resolve_endpoint_dir(&file_root, &["cars"]).unwrap_err(),
+            EndpointFsError::NotADirectory { .. }
+        ));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -452,7 +458,10 @@ mod tests {
             }
             other => panic!("expected CaseConflict, got {other:?}"),
         }
-        assert!(err.to_string().starts_with("endpoint.purge.json exists where endpoint.PURGE.json is needed — rename or remove it by hand"));
+        assert!(
+            err.to_string()
+                .starts_with("endpoint.purge.json exists where endpoint.PURGE.json is needed — rename or remove it by hand")
+        );
         assert!(err.is_strict_error());
         let _ = fs::remove_dir_all(&root);
     }

@@ -19,7 +19,7 @@ use axum::{Json, Router};
 
 use crate::config::ConnectionConfig;
 use crate::errors::{DiscoveredErrors, ErrorRegistry};
-use crate::openapi::Operation;
+use crate::openapi::{Operation, ResponseMode};
 use crate::security::{ClientCertIdentity, SecurityConfig, VerifierCache};
 use crate::server::RequestId;
 use crate::sql::SqlDriver;
@@ -94,6 +94,25 @@ struct RouteState {
     /// (see `mock::MockProvider`). `frogs run` always passes `None`, so its
     /// request path is byte-for-byte the pre-mock-server one.
     mock_provider: Option<Arc<dyn MockProvider>>,
+    /// Copied from the matched `openapi.yaml` operation (`Single` when there
+    /// is none). Only ever a seam today: every mode is served as one JSON
+    /// response.
+    response_mode: ResponseMode,
+}
+
+/// Whether an endpoint file declares the top-level `"stream"` key, which is
+/// reserved for streaming support this version doesn't have. Presence is
+/// enough (a `null` value counts); nested `stream` keys don't.
+pub(crate) fn has_reserved_stream_key(contents: &str) -> bool {
+    serde_json::from_str::<Value>(contents).is_ok_and(|v| v.as_object().is_some_and(|obj| obj.contains_key("stream")))
+}
+
+pub(crate) fn reserved_stream_key_files(endpoints_root: &Path) -> Vec<PathBuf> {
+    discover_endpoint_files(endpoints_root)
+        .into_iter()
+        .filter(|(_, _, file_path)| std::fs::read_to_string(file_path).is_ok_and(|contents| has_reserved_stream_key(&contents)))
+        .map(|(_, _, file_path)| file_path)
+        .collect()
 }
 
 /// Scans `datasources/endpoints/` for `endpoint.<method>.json` files (one
@@ -204,6 +223,13 @@ pub fn build_router(
             endpoint.operation_id
         );
 
+        if has_reserved_stream_key(&contents) {
+            tracing::warn!(
+                "{}: \"stream\" is reserved for streaming responses, which this frogs version does not implement — serving a single JSON response",
+                file_path.display()
+            );
+        }
+
         let operation = openapi_document.and_then(|doc| find_operation(doc, &url_path, &method));
         if openapi_document.is_some() && operation.is_none() {
             tracing::warn!(
@@ -211,6 +237,22 @@ pub fn build_router(
                 file_path.display()
             );
         }
+        if let Some(op) = operation {
+            if let ResponseMode::Stream(spec) = &op.response_mode {
+                tracing::warn!(
+                    "{} {url_path}: declares a streaming response ({}); frogs does not serve streaming responses — serving a single JSON response",
+                    method.to_uppercase(),
+                    crate::openapi::untrusted(&spec.media_type)
+                );
+            }
+            if let Some(reason) = &op.request_body_unresolved {
+                tracing::warn!(
+                    "{} {url_path}: request body schema unresolved ({reason}) — body validation skipped for this route",
+                    method.to_uppercase()
+                );
+            }
+        }
+        let response_mode = operation.map(|op| op.response_mode.clone()).unwrap_or_default();
 
         // Each route gets its own `RouteState` baked in via `with_state` —
         // this is what lets one shared `handle_request` function serve
@@ -237,6 +279,7 @@ pub fn build_router(
             component_schemas: component_schemas.clone(),
             source_call_timeout_ms,
             mock_provider: mock_provider.clone(),
+            response_mode,
         });
         // Read back out before `state` moves into `.with_state` below —
         // this endpoint's own `rateLimit`, if it declared one, gets its own
@@ -552,6 +595,22 @@ async fn handle_request(
     let transaction_id = transaction_id.map(|Extension(RequestId(id))| id).unwrap_or_default();
     let client_cert = client_cert.map(|Extension(identity)| identity);
 
+    match &state.response_mode {
+        ResponseMode::Single => respond_single(&state, &headers, client_cert.as_deref(), &path_params, &query_params, &body, &transaction_id).await,
+        // The seam for a future stream executor; today a declared stream is still one JSON response.
+        ResponseMode::Stream(_) => respond_single(&state, &headers, client_cert.as_deref(), &path_params, &query_params, &body, &transaction_id).await,
+    }
+}
+
+async fn respond_single(
+    state: &RouteState,
+    headers: &HeaderMap,
+    client_cert: Option<&ClientCertIdentity>,
+    path_params: &HashMap<String, String>,
+    query_params: &HashMap<String, String>,
+    body: &Value,
+    transaction_id: &str,
+) -> Response {
     let (http_status, response_body) = match &state.mock_provider {
         None => {
             resolve_request(
@@ -567,12 +626,12 @@ async fn handle_request(
                 &state.discovered_errors_path,
                 state.debug_mode,
                 &state.verifier_cache,
-                &headers,
-                client_cert.as_deref(),
-                &path_params,
-                &query_params,
-                &body,
-                &transaction_id,
+                headers,
+                client_cert,
+                path_params,
+                query_params,
+                body,
+                transaction_id,
                 &HashMap::new(),
                 state.operation.as_ref(),
                 &state.component_schemas,
@@ -580,19 +639,7 @@ async fn handle_request(
             )
             .await
         }
-        Some(provider) => {
-            handle_mocked(
-                &state,
-                provider.as_ref(),
-                &headers,
-                client_cert.as_deref(),
-                &path_params,
-                &query_params,
-                &body,
-                &transaction_id,
-            )
-            .await
-        }
+        Some(provider) => handle_mocked(state, provider.as_ref(), headers, client_cert, path_params, query_params, body, transaction_id).await,
     };
 
     let status = StatusCode::from_u16(http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1378,6 +1425,7 @@ mod tests {
             component_schemas: Arc::new(Map::new()),
             source_call_timeout_ms: test_call_timeout(),
             mock_provider: None,
+            response_mode: ResponseMode::Single,
         });
 
         let router = Router::new().route("/secret", get(handle_request)).with_state(state);
@@ -2731,6 +2779,7 @@ mod tests {
                 request_body: None,
                 response_status_codes: vec![200],
                 security: None,
+                ..Default::default()
             }
         }
 
@@ -3609,3 +3658,159 @@ mod tests {
 
 #[cfg(test)]
 mod mtls_tests;
+
+#[cfg(test)]
+mod m2_tests {
+    use super::*;
+
+    fn temp_root() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-endpoint-m2-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_endpoint(root: &Path, dir: &str, method: &str, json: &str) {
+        let d = root.join("datasources/endpoints").join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(format!("endpoint.{method}.json")), json).unwrap();
+    }
+
+    async fn serve(root: &Path, doc: Option<&crate::openapi::OpenApiDocument>) -> String {
+        let errors = Arc::new(ErrorRegistry::load(&root.join("does-not-exist")).unwrap());
+        let router = build_router(
+            root,
+            Arc::new(HashMap::new()),
+            &HashMap::new(),
+            errors,
+            Arc::new(SecurityConfig::default()),
+            Arc::new(HashMap::new()),
+            Arc::new(Mutex::new(DiscoveredErrors::default())),
+            false,
+            doc,
+            None,
+            NonZeroU64::new(5_000).unwrap(),
+            false,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn has_reserved_stream_key_matches_only_a_top_level_stream_member() {
+        let cases: &[(&str, bool)] = &[
+            (r#"{"stream":{}}"#, true),
+            (r#"{"stream":null}"#, true),
+            (r#"{"stream":"x"}"#, true),
+            (r#"{"operationId":"a","response":{"stream":"sources.a.b"}}"#, false),
+            (r#"{"sources":{"stream":{}}}"#, false),
+            (r#"{"Stream":{}}"#, false),
+            ("{ not json", false),
+            ("[]", false),
+            ("", false),
+        ];
+        for (json, expected) in cases {
+            assert_eq!(has_reserved_stream_key(json), *expected, "{json}");
+        }
+    }
+
+    #[test]
+    fn reserved_stream_key_files_lists_exactly_the_files_with_a_top_level_stream_key() {
+        let root = temp_root();
+        write_endpoint(&root, "a", "get", r#"{ "operationId": "a", "stream": {}, "sources": {}, "response": {} }"#);
+        write_endpoint(&root, "b", "get", r#"{ "operationId": "b", "sources": {}, "response": { "stream": "sources.x.y" } }"#);
+        write_endpoint(&root, "c", "post", r#"{ "operationId": "c", "stream": null, "sources": {}, "response": {} }"#);
+        let mut files = reserved_stream_key_files(&root.join("datasources/endpoints"));
+        files.sort();
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert!(files[0].ends_with("a/endpoint.get.json") || files[0].to_string_lossy().contains('a'));
+        assert!(
+            files
+                .iter()
+                .all(|f| !f.to_string_lossy().contains(&format!("{}b{}", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR)))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_endpoint_file_with_a_top_level_stream_key_still_deserializes() {
+        let parsed: Result<EndpointFile, _> = serde_json::from_str(r#"{ "operationId": "a", "stream": { "anything": 1 }, "sources": {}, "response": {} }"#);
+        assert!(parsed.is_ok(), "{:?}", parsed.err());
+    }
+
+    #[tokio::test]
+    async fn a_stream_keyed_endpoint_is_still_registered_and_served_as_one_json_response() {
+        let root = temp_root();
+        write_endpoint(
+            &root,
+            "things",
+            "get",
+            r#"{ "operationId": "getThings", "stream": {}, "sources": {}, "response": {} }"#,
+        );
+        let base = serve(&root, None).await;
+        let resp = reqwest::get(format!("{base}/things")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_route_for_a_streaming_operation_serves_the_same_json_as_a_non_streaming_one() {
+        let root = temp_root();
+        std::fs::write(
+            root.join("openapi.yaml"),
+            "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /events:\n    get:\n      operationId: events\n      responses:\n        '200':\n          description: ok\n          content:\n            text/event-stream: { itemSchema: { type: string } }\n  /plain:\n    get:\n      operationId: plain\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { schema: { type: object } }\n",
+        )
+        .unwrap();
+        let doc = crate::openapi::load(&root.join("openapi.yaml")).unwrap();
+        assert!(matches!(
+            doc.operations.iter().find(|o| o.path == "/events").unwrap().response_mode,
+            ResponseMode::Stream(_)
+        ));
+
+        let literal = r#"{ "operationId": "x", "sources": {}, "response": {} }"#;
+        write_endpoint(&root, "events", "get", literal);
+        write_endpoint(&root, "plain", "get", literal);
+        let base = serve(&root, Some(&doc)).await;
+
+        let streaming = reqwest::get(format!("{base}/events")).await.unwrap();
+        let plain = reqwest::get(format!("{base}/plain")).await.unwrap();
+        assert_eq!(streaming.status(), 200);
+        assert_eq!(plain.status(), 200);
+        assert_eq!(streaming.headers().get("content-type"), plain.headers().get("content-type"));
+        assert!(streaming.headers().get("content-type").unwrap().to_str().unwrap().starts_with("application/json"));
+        assert_eq!(streaming.text().await.unwrap(), plain.text().await.unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_route_whose_security_names_an_unresolvable_scheme_is_never_registered() {
+        let root = temp_root();
+        write_endpoint(
+            &root,
+            "ref",
+            "get",
+            r##"{ "operationId": "a", "security": "#/components/securitySchemes/Nope", "sources": {}, "response": {} }"##,
+        );
+        write_endpoint(
+            &root,
+            "uri",
+            "get",
+            r#"{ "operationId": "b", "security": "https://x/y", "sources": {}, "response": {} }"#,
+        );
+        write_endpoint(&root, "open", "get", r#"{ "operationId": "c", "sources": {}, "response": {} }"#);
+        let base = serve(&root, None).await;
+        assert_eq!(reqwest::get(format!("{base}/ref")).await.unwrap().status(), 404);
+        assert_eq!(reqwest::get(format!("{base}/uri")).await.unwrap().status(), 404);
+        assert_eq!(reqwest::get(format!("{base}/open")).await.unwrap().status(), 200);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

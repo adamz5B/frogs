@@ -168,6 +168,17 @@
     margin-left: 10px;
     vertical-align: middle;
   }
+  .deprecated-pill, .streaming-pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+    color: white;
+    background: var(--put);
+    margin-left: 10px;
+    vertical-align: middle;
+  }
   .source-card {
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -274,6 +285,12 @@
     var h2 = document.createElement("h2");
     h2.innerHTML = '<span class="method-badge method-' + op.method.toLowerCase() + '">' + escapeHtml(op.method) + "</span>" + escapeHtml(op.path) +
       (summary && summary.generated ? '<span class="generated-pill">stub — not yet implemented</span>' : "");
+    if (op.streaming === true) {
+      var streamingPill = document.createElement("span");
+      streamingPill.className = "streaming-pill";
+      streamingPill.textContent = "streaming (served as single JSON)";
+      h2.appendChild(streamingPill);
+    }
     main.appendChild(h2);
 
     var opId = document.createElement("div");
@@ -286,6 +303,12 @@
     if (op.security) {
       var secSection = document.createElement("section");
       secSection.innerHTML = "<h3>Security — " + escapeHtml(op.security.scheme) + "</h3>";
+      if (op.security.deprecated === true) {
+        var deprecatedPill = document.createElement("span");
+        deprecatedPill.className = "deprecated-pill";
+        deprecatedPill.textContent = "deprecated";
+        secSection.firstChild.appendChild(deprecatedPill);
+      }
       if (op.security.clientCert) {
         var certHint = document.createElement("p");
         certHint.className = "hint";

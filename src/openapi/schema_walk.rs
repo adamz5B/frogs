@@ -7,6 +7,61 @@ use serde_json::{Map, Value};
 /// subtree rather than guessing or recursing forever.
 const MAX_DEPTH: usize = 10;
 
+/// Descriptor keys the walker adds itself, as opposed to real schema
+/// properties — an explicit list (never "starts with `$`") so a spec property
+/// that happens to be named e.g. `$type` is never mistaken for metadata.
+const METADATA_KEYS: &[&str] = &["$component", "$oneOf"];
+
+/// Component names are matched by a hand-written check, not a regex.
+pub(crate) fn is_name_shaped(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+pub(crate) enum DefaultMapping<'a> {
+    Absent,
+    Target(&'a str),
+    Unresolved(&'static str),
+}
+
+/// What a `oneOf`/`anyOf` schema's `discriminator.defaultMapping` points at.
+/// Only a local component name or `#/components/schemas/<Name>` is ever
+/// accepted; nothing is fetched.
+pub(crate) fn default_mapping_target<'a>(obj: &'a Map<String, Value>, is_component: impl Fn(&str) -> bool) -> DefaultMapping<'a> {
+    let has_variants = obj.get("oneOf").is_some_and(Value::is_array) || obj.get("anyOf").is_some_and(Value::is_array);
+    if !has_variants {
+        return DefaultMapping::Absent;
+    }
+    let Some(value) = obj.get("discriminator").and_then(|d| d.get("defaultMapping")) else {
+        return DefaultMapping::Absent;
+    };
+    let Some(text) = value.as_str() else {
+        return DefaultMapping::Unresolved("is not a string");
+    };
+    if is_component(text) {
+        return DefaultMapping::Target(text);
+    }
+    if let Some(name) = text.strip_prefix("#/components/schemas/") {
+        return if is_component(name) {
+            DefaultMapping::Target(name)
+        } else {
+            DefaultMapping::Unresolved("names no component in components/schemas")
+        };
+    }
+    if is_name_shaped(text) {
+        DefaultMapping::Unresolved("names no component in components/schemas")
+    } else {
+        DefaultMapping::Unresolved("is not a component name or #/components/schemas/<Name> reference (external references are never fetched)")
+    }
+}
+
+fn annotate_default(name: &str, rendered: String, target_fields: Map<String, Value>) -> Value {
+    let mut out = Map::new();
+    out.insert("$component".to_string(), Value::String(name.to_string()));
+    out.insert("$oneOf".to_string(), Value::String(rendered));
+    out.extend(target_fields.into_iter().filter(|(key, _)| !METADATA_KEYS.contains(&key.as_str())));
+    Value::Object(out)
+}
+
 /// Walks `components/schemas` (and, later, an endpoint's own response
 /// schema — same algorithm either way) producing one JSON *type descriptor*
 /// per schema node: nested objects become nested descriptors, a `$ref` to a
@@ -73,7 +128,7 @@ impl<'a> SchemaWalker<'a> {
         }
 
         if let Some(variants) = obj.get("oneOf").or_else(|| obj.get("anyOf")).and_then(Value::as_array) {
-            return self.walk_one_of(variants, in_progress, depth);
+            return self.walk_one_of(obj, variants, in_progress, depth);
         }
 
         if let Some(props) = obj.get("properties").and_then(Value::as_object) {
@@ -128,9 +183,19 @@ impl<'a> SchemaWalker<'a> {
     /// variant's own descriptor is rendered compactly into one
     /// `"oneOf<A, B>"` string; picking a stub value from the first variant
     /// is the stub-generation milestone's job, not this one's.
-    fn walk_one_of(&self, variants: &[Value], in_progress: &mut HashSet<String>, depth: usize) -> Value {
+    ///
+    /// The one exception: a `discriminator.defaultMapping` naming a component
+    /// resolves to that component's shape (annotated with `$component`/
+    /// `$oneOf`), since the spec itself says which variant to assume.
+    fn walk_one_of(&self, obj: &Map<String, Value>, variants: &[Value], in_progress: &mut HashSet<String>, depth: usize) -> Value {
         let rendered: Vec<String> = variants.iter().map(|variant| render_compact(&self.walk(variant, in_progress, depth + 1))).collect();
-        Value::String(format!("oneOf<{}>", rendered.join(", ")))
+        let rendered = format!("oneOf<{}>", rendered.join(", "));
+        if let DefaultMapping::Target(name) = default_mapping_target(obj, |n| self.components.contains_key(n))
+            && let Value::Object(fields) = self.walk_named(name, in_progress, depth + 1)
+        {
+            return annotate_default(name, rendered, fields);
+        }
+        Value::String(rendered)
     }
 }
 
@@ -201,7 +266,13 @@ fn walk_response_schema_at(schema: &Value, cache: &HashMap<String, Value>, depth
             .iter()
             .map(|variant| render_compact(&walk_response_schema_at(variant, cache, depth + 1)))
             .collect();
-        return Value::String(format!("oneOf<{}>", rendered.join(", ")));
+        let rendered = format!("oneOf<{}>", rendered.join(", "));
+        if let DefaultMapping::Target(name) = default_mapping_target(obj, |n| cache.contains_key(n))
+            && let Some(Value::Object(fields)) = cache.get(name)
+        {
+            return annotate_default(name, rendered, fields.clone());
+        }
+        return Value::String(rendered);
     }
 
     if let Some(props) = obj.get("properties").and_then(Value::as_object) {
@@ -236,7 +307,7 @@ fn walk_response_schema_at(schema: &Value, cache: &HashMap<String, Value>, depth
 /// stub) value through the walk itself, since every case but one is a pure
 /// function of the descriptor alone:
 /// - primitive / `"map"` / marker string (cycle, unknown ref, depth guard) → `null`
-/// - object (optionally `$component`-annotated) → nested stub, `$component` dropped
+/// - object (optionally `$component`/`$oneOf`-annotated) → nested stub, metadata keys dropped
 /// - `{"type":"array","items":...}` → `{"type":"array","source":null,"items":null}`
 ///   (the design doc's own array-stub example never recurses into `items`
 ///   for the stub, only the reference keeps the item shape)
@@ -249,7 +320,9 @@ fn walk_response_schema_at(schema: &Value, cache: &HashMap<String, Value>, depth
 /// variant is itself a primitive already produces the same `null` either
 /// way (the doc's own worked example is exactly this case), the gap only
 /// matters when the first variant is an object — worth a `_todo` note when
-/// that happens, not worth a bigger refactor for yet.
+/// that happens, not worth a bigger refactor for yet. The exception is a
+/// `oneOf` with a resolvable `discriminator.defaultMapping`: its descriptor is
+/// the default component's object shape, so the stub becomes that nested object.
 pub fn stub_from_descriptor(descriptor: &Value) -> Value {
     match descriptor {
         Value::Object(fields) => {
@@ -258,7 +331,7 @@ pub fn stub_from_descriptor(descriptor: &Value) -> Value {
             }
             let nested = fields
                 .iter()
-                .filter(|(key, _)| *key != "$component")
+                .filter(|(key, _)| !METADATA_KEYS.contains(&key.as_str()))
                 .map(|(key, value)| (key.clone(), stub_from_descriptor(value)));
             Value::Object(nested.collect())
         }
@@ -329,6 +402,7 @@ fn is_mapping(value: &Value) -> bool {
     }
 }
 
+// Metadata keys (`METADATA_KEYS`) never appear in a stub, so they need no special handling here.
 fn is_structural_object(value: &Value) -> bool {
     match value {
         Value::Null => true,
@@ -343,7 +417,7 @@ fn render_compact(value: &Value) -> String {
         Value::Object(fields) => {
             let parts: Vec<String> = fields
                 .iter()
-                .filter(|(k, _)| *k != "$component")
+                .filter(|(k, _)| !METADATA_KEYS.contains(&k.as_str()))
                 .map(|(k, v)| format!("{k}: {}", render_compact(v)))
                 .collect();
             format!("object{{{}}}", parts.join(", "))
@@ -708,5 +782,168 @@ mod tests {
         let old = serde_json::json!({});
         let fresh = serde_json::json!({ "vin": null });
         assert_eq!(merge_stub_response(&old, &fresh), serde_json::json!({ "vin": null }));
+    }
+}
+
+#[cfg(test)]
+mod m2_default_mapping_tests {
+    use super::*;
+
+    fn components(json: &str) -> Map<String, Value> {
+        serde_json::from_str::<Value>(json).unwrap().as_object().unwrap().clone()
+    }
+
+    const TWO_CARS: &str = r##"{
+        "Car": { "type": "object", "properties": { "vin": { "type": "string" } } },
+        "Truck": { "type": "object", "properties": { "axles": { "type": "integer" } } },
+        "Vehicle": { "oneOf": [ { "$ref": "#/components/schemas/Car" }, { "$ref": "#/components/schemas/Truck" } ], "discriminator": { "propertyName": "kind", "defaultMapping": "DEFAULT" } }
+    }"##;
+
+    fn with_default(default: &str) -> Map<String, Value> {
+        components(&TWO_CARS.replace("DEFAULT", default))
+    }
+
+    #[test]
+    fn a_default_mapping_by_bare_name_annotates_with_component_then_one_of_then_target_fields_in_that_order() {
+        let comps = with_default("Car");
+        let resolved = SchemaWalker::new(&comps).resolve_components();
+        let vehicle = resolved["Vehicle"].as_object().unwrap();
+        let keys: Vec<&str> = vehicle.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["$component", "$oneOf", "vin"]);
+        assert_eq!(vehicle["$component"], "Car");
+        assert!(vehicle["$oneOf"].as_str().unwrap().starts_with("oneOf<"));
+        assert_eq!(vehicle["vin"], "string");
+    }
+
+    #[test]
+    fn a_default_mapping_by_schema_ref_form_resolves_the_same_as_the_bare_name() {
+        let by_name = with_default("Truck");
+        let by_ref = with_default("#/components/schemas/Truck");
+        assert_eq!(
+            SchemaWalker::new(&by_name).resolve_components()["Vehicle"],
+            SchemaWalker::new(&by_ref).resolve_components()["Vehicle"]
+        );
+    }
+
+    #[test]
+    fn phase_one_walk_of_an_inline_one_of_with_default_mapping_annotates_identically() {
+        let comps = with_default("Car");
+        let cache = SchemaWalker::new(&comps).resolve_components();
+        let inline = serde_json::json!({
+            "oneOf": [ { "$ref": "#/components/schemas/Car" }, { "$ref": "#/components/schemas/Truck" } ],
+            "discriminator": { "propertyName": "kind", "defaultMapping": "#/components/schemas/Car" }
+        });
+        let out = walk_response_schema(&inline, &cache);
+        let keys: Vec<&str> = out.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys[0], "$component");
+        assert_eq!(keys[1], "$oneOf");
+        assert_eq!(out["$component"], "Car");
+        assert_eq!(out["vin"], "string");
+    }
+
+    #[test]
+    fn a_default_mapping_naming_an_unknown_component_keeps_the_plain_one_of_string() {
+        let comps = with_default("Nope");
+        let resolved = SchemaWalker::new(&comps).resolve_components();
+        assert!(resolved["Vehicle"].is_string());
+        assert!(resolved["Vehicle"].as_str().unwrap().starts_with("oneOf<"));
+    }
+
+    #[test]
+    fn a_default_mapping_to_a_primitive_component_keeps_the_plain_one_of_string() {
+        let comps = components(
+            r##"{ "Name": { "type": "string" },
+                  "U": { "oneOf": [ { "type": "string" }, { "type": "integer" } ], "discriminator": { "propertyName": "k", "defaultMapping": "Name" } } }"##,
+        );
+        let resolved = SchemaWalker::new(&comps).resolve_components();
+        assert_eq!(resolved["U"], serde_json::json!("oneOf<string, integer>"));
+    }
+
+    #[test]
+    fn a_default_mapping_that_points_back_at_its_own_component_terminates_with_the_plain_string() {
+        let comps = components(r##"{ "Loop": { "oneOf": [ { "type": "string" } ], "discriminator": { "propertyName": "k", "defaultMapping": "Loop" } } }"##);
+        let resolved = SchemaWalker::new(&comps).resolve_components();
+        assert!(resolved["Loop"].is_string());
+    }
+
+    #[test]
+    fn mutually_recursive_default_mappings_terminate() {
+        let comps = components(
+            r##"{
+                "A": { "oneOf": [ { "type": "string" } ], "discriminator": { "propertyName": "k", "defaultMapping": "B" } },
+                "B": { "oneOf": [ { "type": "string" } ], "discriminator": { "propertyName": "k", "defaultMapping": "A" } }
+            }"##,
+        );
+        let resolved = SchemaWalker::new(&comps).resolve_components();
+        assert!(resolved.contains_key("A") && resolved.contains_key("B"));
+    }
+
+    #[test]
+    fn without_a_default_mapping_the_output_is_exactly_the_old_flagged_string() {
+        let plain = TWO_CARS.replace(r#", "defaultMapping": "DEFAULT""#, "");
+        let comps = components(&plain);
+        let resolved = SchemaWalker::new(&comps).resolve_components();
+        assert!(resolved["Vehicle"].is_string());
+        assert!(!resolved["Vehicle"].as_str().unwrap().contains('$'));
+    }
+
+    #[test]
+    fn a_default_mapping_on_a_schema_without_one_of_or_any_of_is_ignored() {
+        let comps = components(
+            r##"{ "Car": { "type": "object", "properties": { "vin": { "type": "string" } } },
+                  "X": { "type": "object", "properties": { "a": { "type": "string" } }, "discriminator": { "propertyName": "k", "defaultMapping": "Car" } } }"##,
+        );
+        let resolved = SchemaWalker::new(&comps).resolve_components();
+        assert_eq!(resolved["X"], serde_json::json!({ "a": "string" }));
+    }
+
+    #[test]
+    fn stub_of_an_annotated_descriptor_is_a_nested_null_object_without_metadata_keys() {
+        let comps = with_default("Car");
+        let resolved = SchemaWalker::new(&comps).resolve_components();
+        let stub = stub_from_descriptor(&resolved["Vehicle"]);
+        assert_eq!(stub, serde_json::json!({ "vin": null }));
+    }
+
+    #[test]
+    fn a_real_property_named_dollar_type_survives_stub_and_render() {
+        let comps = components(r##"{ "W": { "type": "object", "properties": { "$type": { "type": "string" }, "x": { "type": "integer" } } } }"##);
+        let resolved = SchemaWalker::new(&comps).resolve_components();
+        let stub = stub_from_descriptor(&resolved["W"]);
+        assert_eq!(stub, serde_json::json!({ "$type": null, "x": null }));
+        assert_eq!(render_compact(&resolved["W"]), "object{$type: string, x: integer}");
+    }
+
+    #[test]
+    fn render_compact_of_an_annotated_variant_omits_both_metadata_keys() {
+        let annotated = serde_json::json!({ "$component": "Car", "$oneOf": "oneOf<a>", "vin": "string" });
+        assert_eq!(render_compact(&annotated), "object{vin: string}");
+    }
+
+    #[test]
+    fn default_mapping_target_classifies_each_form() {
+        let is_c = |n: &str| n == "Car";
+        let obj = |dm: Value| {
+            serde_json::json!({ "oneOf": [], "discriminator": { "defaultMapping": dm } })
+                .as_object()
+                .unwrap()
+                .clone()
+        };
+        assert!(matches!(default_mapping_target(&obj(serde_json::json!("Car")), is_c), DefaultMapping::Target("Car")));
+        assert!(matches!(
+            default_mapping_target(&obj(serde_json::json!("#/components/schemas/Car")), is_c),
+            DefaultMapping::Target("Car")
+        ));
+        assert!(matches!(default_mapping_target(&obj(serde_json::json!("Nope")), is_c), DefaultMapping::Unresolved(_)));
+        assert!(matches!(
+            default_mapping_target(&obj(serde_json::json!("https://x/y")), is_c),
+            DefaultMapping::Unresolved(_)
+        ));
+        assert!(matches!(
+            default_mapping_target(&obj(serde_json::json!(5)), is_c),
+            DefaultMapping::Unresolved("is not a string")
+        ));
+        let no_variants = serde_json::json!({ "discriminator": { "defaultMapping": "Car" } }).as_object().unwrap().clone();
+        assert!(matches!(default_mapping_target(&no_variants, is_c), DefaultMapping::Absent));
     }
 }
