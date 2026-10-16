@@ -68,6 +68,15 @@ async fn validate_api(root: &Path) -> usize {
         config.server.strict_open_api()
     );
 
+    match crate::commands::run::method_case_notice(&config.server) {
+        None => println!("  method case: exact (caseSensitiveMethods: true)"),
+        Some((tracing::Level::WARN, message)) => {
+            println!("  method case: case-insensitive (default)");
+            warn(&message);
+        }
+        Some((_, _)) => println!("  method case: case-insensitive (caseSensitiveMethods: false)"),
+    }
+
     // `frogs run` clamps this at startup rather than refusing to start (see
     // `ServerConfig::effective_source_call_timeout_ms`) — reported here so
     // it's visible without a live run.
@@ -90,7 +99,7 @@ async fn validate_api(root: &Path) -> usize {
         );
     }
 
-    match crate::openapi::load(&root.join(MANIFEST_FILE)) {
+    match crate::openapi::load(&root.join(MANIFEST_FILE), config.server.openapi_load_options()) {
         Ok(doc) => {
             println!("  {MANIFEST_FILE}: OK ({} operation(s))", doc.operations.len());
             problems += report_spec_issues(&doc, config.server.strict_open_api());
@@ -99,6 +108,25 @@ async fn validate_api(root: &Path) -> usize {
                 println!("  error: {}", error.message);
             }
             problems += plan.errors.len();
+            for message in &plan.non_canonical {
+                if config.server.strict_open_api() {
+                    println!("  error: {message}");
+                    problems += 1;
+                } else {
+                    warn(message);
+                }
+            }
+            let security = crate::endpoint::security_check(&api_dir.join("datasources/endpoints"), &doc);
+            for mismatch in &security.mismatches {
+                println!("  error: {}", mismatch.message());
+            }
+            problems += security.mismatches.len();
+            for stricter in &security.stricter {
+                warn(&stricter.message());
+            }
+            for file in &security.unmatched {
+                warn(&crate::endpoint::unmatched_security_message(file));
+            }
             for op in &doc.operations {
                 let Some(scheme) = &op.security else { continue };
                 if doc.security_scheme_types.get(scheme).map(String::as_str) != Some("mutualTLS") {
@@ -110,8 +138,7 @@ async fn validate_api(root: &Path) -> usize {
                     println!(
                         "  {MANIFEST_FILE}: {} {} uses the mutualTLS scheme '{scheme}', but its verifier never looks at the client certificate \
                          (use an mtls verifier or a cert.* parameter)",
-                        op.method.to_uppercase(),
-                        op.path
+                        op.http_method, op.path
                     );
                     problems += 1;
                 }
@@ -640,7 +667,7 @@ mod m2_validate_tests {
         for (body, always) in [(S9, true), (S10, false), (S11, false)] {
             let root = temp_project();
             write_spec_body(&root, body);
-            let doc = crate::openapi::load(&root.join(MANIFEST_FILE)).unwrap();
+            let doc = crate::openapi::load(&root.join(MANIFEST_FILE), crate::openapi::LoadOptions::default()).unwrap();
             assert_eq!(report_spec_issues(&doc, false), usize::from(always), "{body}");
             assert_eq!(report_spec_issues(&doc, true), 1, "{body}");
             let _ = fs::remove_dir_all(&root);
@@ -654,7 +681,7 @@ mod m2_validate_tests {
             &root,
             "paths:\n  /e:\n    get:\n      operationId: e\n      security: [ { old: [] } ]\n      responses:\n        '200':\n          description: ok\n          content:\n            text/event-stream: {}\n  /u:\n    post:\n      operationId: u\n      requestBody:\n        content:\n          multipart/form-data: { schema: { type: object } }\n      responses:\n        '200': { description: ok }\ncomponents:\n  securitySchemes:\n    old: { type: apiKey, in: header, name: k, deprecated: true }\n",
         );
-        let doc = crate::openapi::load(&root.join(MANIFEST_FILE)).unwrap();
+        let doc = crate::openapi::load(&root.join(MANIFEST_FILE), crate::openapi::LoadOptions::default()).unwrap();
         assert!(doc.issues.len() >= 3);
         assert_eq!(report_spec_issues(&doc, true), 0);
         assert_eq!(report_spec_issues(&doc, false), 0);
@@ -689,6 +716,153 @@ mod m2_validate_tests {
     async fn a_reserved_stream_key_file_is_a_problem_under_strict() {
         let root = project_with_stream_key_file(true);
         assert_eq!(validate_api(&root).await, 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m2_7_validate_security_tests {
+    use super::*;
+    use std::fs;
+
+    fn project(server_json: &str, endpoint: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-validate-m27-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(root.join("api/config")).unwrap();
+        fs::create_dir_all(root.join("api/datasources/endpoints/things")).unwrap();
+        fs::write(root.join("api/config/server.json"), server_json).unwrap();
+        fs::write(root.join("api/datasources/endpoints/things/endpoint.get.json"), endpoint).unwrap();
+        root
+    }
+
+    fn write_spec(root: &Path, security_line: &str) {
+        fs::write(
+            root.join(MANIFEST_FILE),
+            format!("openapi: 3.2.0\ninfo: {{ title: t, version: '1' }}\npaths:\n  /things:\n    get:\n      operationId: getThings\n{security_line}      responses:\n        '200': {{ description: ok }}\n"),
+        )
+        .unwrap();
+    }
+
+    const UNPROTECTED: &str = r#"{ "operationId": "getThings", "sources": {}, "response": {} }"#;
+    const PROTECTED_B: &str = r#"{ "operationId": "getThings", "security": "b", "sources": {}, "response": {} }"#;
+
+    #[tokio::test]
+    async fn a_security_mismatch_is_a_problem_even_with_strict_off() {
+        let root = project("{}", UNPROTECTED);
+        write_spec(&root, "      security: [ { a: [] } ]\n");
+        assert!(validate_api(&root).await >= 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn stricter_files_and_unmatched_files_are_warnings_not_problems() {
+        let root = project("{}", PROTECTED_B);
+        // spec declares no security for /things; the file adds one (stricter). Scheme b is
+        // undefined in schemes.json, so subtract that known, separate problem.
+        write_spec(&root, "");
+        let baseline_endpoint_problem = validate_api(&root).await;
+        fs::write(root.join("api/datasources/endpoints/things/endpoint.get.json"), UNPROTECTED).unwrap();
+        let clean = validate_api(&root).await;
+        assert_eq!(clean, 0, "an open route with an open spec is clean");
+        assert!(baseline_endpoint_problem <= 1, "stricter adds at most the unrelated unknown-scheme problem");
+
+        fs::create_dir_all(root.join("api/datasources/endpoints/ghost")).unwrap();
+        fs::write(root.join("api/datasources/endpoints/ghost/endpoint.get.json"), UNPROTECTED).unwrap();
+        assert_eq!(validate_api(&root).await, 0, "an unmatched file is only a warning");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_collapsed_and_requirement_is_a_warning_only() {
+        let root = project("{}", UNPROTECTED);
+        fs::write(
+            root.join(MANIFEST_FILE),
+            "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    a: { type: apiKey, in: header, name: k }\n    b: { type: apiKey, in: header, name: k2 }\npaths:\n  /other:\n    get:\n      operationId: o\n      security: [ { a: [], b: [] } ]\n      responses:\n        '200': { description: ok }\n  /things:\n    get:\n      operationId: getThings\n      responses:\n        '200': { description: ok }\n",
+        )
+        .unwrap();
+        assert_eq!(validate_api(&root).await, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn validate_reports_the_same_skip_for_an_unresolvable_scheme_that_build_router_applies() {
+        // Parity: a file whose scheme isn't in security/schemes.json is a validate problem
+        // (build_router refuses to register it), independent of the spec check.
+        let root = project("{}", PROTECTED_B);
+        fs::write(root.join(MANIFEST_FILE), "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths: {}\n").unwrap();
+        assert!(validate_api(&root).await >= 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m3_validate_tests {
+    use super::*;
+    use std::fs;
+
+    fn project(server_json: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-validate-m3-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(root.join("api/config")).unwrap();
+        fs::create_dir_all(root.join("api/datasources/endpoints/things")).unwrap();
+        fs::write(root.join("api/config/server.json"), server_json).unwrap();
+        fs::write(
+            root.join(MANIFEST_FILE),
+            "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /things:\n    get:\n      operationId: getThings\n      responses:\n        '200': { description: ok }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("api/datasources/endpoints/things/endpoint.get.json"),
+            r#"{ "operationId": "getThings", "sources": {}, "response": {} }"#,
+        )
+        .unwrap();
+        root
+    }
+
+    fn add_non_canonical(root: &Path) {
+        let dir = root.join("api/datasources/endpoints/other");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("endpoint.GET.json"), r#"{ "operationId": "o", "sources": {}, "response": {} }"#).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_missing_case_sensitive_methods_key_is_never_counted_as_a_problem() {
+        for server in ["{}", r#"{ "caseSensitiveMethods": false }"#, r#"{ "caseSensitiveMethods": true }"#, r#"{ "strictOpenApi": true }"#] {
+            let root = project(server);
+            assert_eq!(validate_api(&root).await, 0, "{server}");
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_canonical_stub_name_is_a_warning_normally_and_a_problem_under_strict() {
+        let root = project("{}");
+        add_non_canonical(&root);
+        assert_eq!(validate_api(&root).await, 0, "warning only");
+        fs::write(root.join("api/config/server.json"), r#"{ "strictOpenApi": true }"#).unwrap();
+        assert_eq!(validate_api(&root).await, 1, "one problem per non-canonical file under strict");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_query_operation_in_a_3_1_spec_is_a_problem_only_under_strict() {
+        let root = project("{}");
+        let spec = "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths:\n  /things:\n    query:\n      operationId: q\n      responses:\n        '200': { description: ok }\n";
+        fs::write(root.join(MANIFEST_FILE), spec).unwrap();
+        fs::write(root.join("api/datasources/endpoints/things/endpoint.get.json"), r#"{ "operationId": "q", "sources": {}, "response": {} }"#).unwrap();
+        assert_eq!(validate_api(&root).await, 0);
+        fs::write(root.join("api/config/server.json"), r#"{ "strictOpenApi": true }"#).unwrap();
+        assert!(validate_api(&root).await >= 1);
         let _ = fs::remove_dir_all(&root);
     }
 }

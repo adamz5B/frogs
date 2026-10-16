@@ -261,7 +261,7 @@ impl MockProvider for MockSession {
                 let detail = format!(
                     "no case in {} matched {} {} under scenario {} ({considered} case(s) considered)",
                     test_file_display(route),
-                    route.method.to_uppercase(),
+                    crate::openapi::method_token::display_token(&route.method),
                     route.path,
                     scenario.name.as_deref().unwrap_or("<baseline>")
                 );

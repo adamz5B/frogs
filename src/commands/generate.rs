@@ -115,14 +115,15 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
 
     let config = Config::load_or_exit(&api_root);
     println!(
-        "loaded config — debugMode={}, {} connection(s), {} error code(s), strictOpenApi={}",
+        "loaded config — debugMode={}, {} connection(s), {} error code(s), strictOpenApi={}, caseSensitiveMethods={}",
         config.server.debug_mode,
         config.connections.len(),
         config.errors.len(),
-        config.server.strict_open_api()
+        config.server.strict_open_api(),
+        config.server.case_sensitive_methods()
     );
 
-    let doc = match crate::openapi::load(&root.join(MANIFEST_FILE)) {
+    let doc = match crate::openapi::load(&root.join(MANIFEST_FILE), config.server.openapi_load_options()) {
         Ok(doc) => doc,
         Err(err) => {
             eprintln!("error: {err}");
@@ -132,7 +133,7 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
 
     println!("found {} operation(s) in {}:", doc.operations.len(), MANIFEST_FILE);
     for op in &doc.operations {
-        println!("  {} {} -> {}", op.method.to_uppercase(), op.path, op.operation_id);
+        println!("  {} {} -> {}", op.http_method, op.path, op.operation_id);
     }
     print_issues(&doc.issues);
 
@@ -141,7 +142,11 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
         eprintln!("error: {}", error.message);
     }
 
-    let strict_findings = doc.issues.iter().filter(|i| i.kind.is_strict_error()).count() + plan.errors.iter().filter(|e| e.strict).count();
+    for message in &plan.non_canonical {
+        eprintln!("warning: {message}");
+    }
+
+    let strict_findings = doc.issues.iter().filter(|i| i.kind.is_strict_error()).count() + plan.errors.iter().filter(|e| e.strict).count() + plan.non_canonical.len();
     if strict_findings > 0 {
         if config.server.strict_open_api() {
             eprintln!(
@@ -181,8 +186,9 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
     let restored = restore_orphaned_endpoints(&api_root, &doc, &plan.skip, &mut file_errors)?;
     for (path, method) in &restored {
         println!(
-            "  restoring {} {path} (was orphaned) — will run through the normal migration flow below",
-            method.to_uppercase()
+            "  restoring {} {} (was orphaned) — will run through the normal migration flow below",
+            crate::openapi::method_token::display_token(method),
+            untrusted(path)
         );
     }
 
@@ -206,9 +212,10 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
     let orphaned = mark_orphaned_endpoints(&api_root, &doc, &plan.rejected_paths, &mut file_errors)?;
     for (path, method) in &orphaned {
         println!(
-            "  {} {path} no longer in {MANIFEST_FILE} — prefixed with _ (never deleted; restores automatically \
+            "  {} {} no longer in {MANIFEST_FILE} — prefixed with _ (never deleted; restores automatically \
              if it comes back)",
-            method.to_uppercase()
+            crate::openapi::method_token::display_token(method),
+            untrusted(path)
         );
     }
 
@@ -232,6 +239,19 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
             validation_errors.len()
         );
         outcome.errors.extend(validation_errors);
+    }
+
+    let security = crate::endpoint::security_check(&api_root.join("datasources/endpoints"), &doc);
+    for mismatch in &security.mismatches {
+        let message = mismatch.message();
+        eprintln!("error: {message}");
+        outcome.errors.push(message);
+    }
+    for file in &security.unmatched {
+        eprintln!("warning: {}", crate::endpoint::unmatched_security_message(file));
+    }
+    if !security.mismatches.is_empty() || !security.unmatched.is_empty() {
+        println!("note: generate never changes an existing endpoint file's \"security\" — edit it by hand");
     }
 
     Ok(outcome)
@@ -584,6 +604,9 @@ pub(crate) struct Plan {
     pub errors: Vec<PlanError>,
     pub skip: HashSet<(String, String)>,
     pub rejected_paths: BTreeSet<String>,
+    /// Non-canonical fixed-method stub names (`endpoint.GET.json`): never
+    /// routed or renamed. A warning, and a problem only under `strictOpenApi`.
+    pub non_canonical: Vec<String>,
 }
 
 /// A read-only pass over everything `generate` would write to: finds case
@@ -595,6 +618,11 @@ pub(crate) fn plan_endpoint_files(api_root: &Path, doc: &OpenApiDocument) -> Pla
     let mut plan = Plan::default();
     let mut claimed: HashMap<String, String> = HashMap::new();
     let mut handled: HashSet<&str> = HashSet::new();
+
+    plan.non_canonical = crate::endpoint::non_canonical_method_files(&endpoints_root)
+        .into_iter()
+        .map(|(file, canonical)| format!("{} is not served; rename it to endpoint.{canonical}.json", untrusted(&file.display().to_string())))
+        .collect();
 
     for op in &doc.operations {
         let path = op.path.as_str();
@@ -686,7 +714,7 @@ pub(crate) fn plan_endpoint_files(api_root: &Path, doc: &OpenApiDocument) -> Pla
                 if let Err(e) = check_file(&dir, name) {
                     plan.errors.push(PlanError {
                         strict: e.is_strict_error(),
-                        message: format!("{} {}: {e}", op.method.to_uppercase(), untrusted(&op.path)),
+                        message: format!("{} {}: {e}", op.http_method, untrusted(&op.path)),
                     });
                     plan.skip.insert((op.path.clone(), op.method.clone()));
                     break;
@@ -698,7 +726,7 @@ pub(crate) fn plan_endpoint_files(api_root: &Path, doc: &OpenApiDocument) -> Pla
 }
 
 fn describe_ops(ops: &[&Operation]) -> String {
-    ops.iter().map(|o| o.method.to_uppercase()).collect::<Vec<_>>().join("/")
+    ops.iter().map(|o| o.http_method.clone()).collect::<Vec<_>>().join("/")
 }
 
 /// Finds every currently-*active* `endpoint.<method>.json` file under
@@ -763,7 +791,7 @@ fn restore_orphaned_endpoints(root: &Path, doc: &OpenApiDocument, skip: &HashSet
             Ok(DirState::Exists(dir)) => dir,
             Ok(DirState::WillCreate(_)) => continue,
             Err(e) => {
-                errors.push(format!("{} {}: {e}", op.method.to_uppercase(), untrusted(&op.path)));
+                errors.push(format!("{} {}: {e}", op.http_method, untrusted(&op.path)));
                 continue;
             }
         };
@@ -783,7 +811,7 @@ fn restore_orphaned_endpoints(root: &Path, doc: &OpenApiDocument, skip: &HashSet
         match outcome {
             Ok(true) => restored.push((op.path.clone(), op.method.clone())),
             Ok(false) => {}
-            Err(e) => errors.push(format!("{} {}: {e}", op.method.to_uppercase(), untrusted(&op.path))),
+            Err(e) => errors.push(format!("{} {}: {e}", op.http_method, untrusted(&op.path))),
         }
     }
     Ok(restored)
@@ -812,6 +840,9 @@ fn mark_orphaned_endpoints(root: &Path, doc: &OpenApiDocument, rejected_paths: &
         if active.contains(&(folded_path.clone(), fold(&method))) || protected.contains(&folded_path) {
             continue;
         }
+        if crate::openapi::method_token::fixed_case_variant(&method).is_some() {
+            continue;
+        }
 
         let dir = stub_path.parent().expect("a file always has a parent").to_path_buf();
         let outcome = (|| -> Result<(), EndpointFsError> {
@@ -824,7 +855,7 @@ fn mark_orphaned_endpoints(root: &Path, doc: &OpenApiDocument, rejected_paths: &
         })();
         match outcome {
             Ok(()) => orphaned.push((path, method)),
-            Err(e) => errors.push(format!("{} {}: {e}", method.to_uppercase(), untrusted(&path))),
+            Err(e) => errors.push(format!("{} {}: {e}", crate::openapi::method_token::display_token(&method), untrusted(&path))),
         }
     }
     Ok(orphaned)
@@ -974,7 +1005,7 @@ fn write_endpoint_files(
         ) {
             Ok(()) => {}
             Err(EndpointFsError::Io(e)) => return Err(e),
-            Err(e) => errors.push(format!("{} {}: {e}", op.method.to_uppercase(), untrusted(&op.path))),
+            Err(e) => errors.push(format!("{} {}: {e}", op.http_method, untrusted(&op.path))),
         }
     }
 
@@ -1149,7 +1180,7 @@ mod tests {
     fn doc_from_yaml(yaml: &str) -> OpenApiDocument {
         let dir = temp_project();
         std::fs::write(dir.join("openapi.yaml"), yaml).unwrap();
-        let doc = crate::openapi::load(&dir.join("openapi.yaml")).unwrap();
+        let doc = crate::openapi::load(&dir.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         doc
     }
@@ -1895,7 +1926,7 @@ mod hardening_tests {
         let root = temp_project();
         write_spec(&root, &spec("3.1.0", &[("/fine", &["get"])], ""));
         let dir = temp_project();
-        let mut doc = crate::openapi::load(&root.join("openapi.yaml")).unwrap();
+        let mut doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
         for bad in ["/../../escape", "/a/./b", "/a//b", "/a\\b", "/a/../b", "/x\u{0}y"] {
             doc.operations[0].path = bad.to_string();
 
@@ -2205,7 +2236,7 @@ mod hardening_tests {
     fn the_claim_check_skips_a_later_path_that_folds_onto_an_earlier_one_even_when_the_loader_was_bypassed() {
         let root = temp_project();
         write_spec(&root, &spec("3.1.0", &[("/first", &["get"]), ("/second", &["get"])], ""));
-        let mut doc = crate::openapi::load(&root.join("openapi.yaml")).unwrap();
+        let mut doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
         doc.operations[0].path = "/Cars".to_string();
         doc.operations[1].path = "/cars".to_string();
 
@@ -2497,6 +2528,221 @@ mod m2_generate_tests {
         assert_eq!(reference["response"]["axles"], "integer");
         let stub = read_json(&root, "v/endpoint.get.json");
         assert_eq!(stub["response"], serde_json::json!({ "axles": null }));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m2_7_generate_security_tests {
+    use super::*;
+
+    fn temp_project() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "frogs-generate-m27-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn spec(security: &str) -> String {
+        format!(
+            "openapi: 3.2.0\ninfo: {{ title: t, version: 1 }}\ncomponents:\n  securitySchemes:\n    a: {{ type: apiKey, in: header, name: k }}\n    b: {{ type: apiKey, in: header, name: k2 }}\npaths:\n  /p:\n    get:\n      operationId: p\n      security: {security}\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: {{ schema: {{ type: string }} }}\n"
+        )
+    }
+
+    #[test]
+    fn a_fresh_generate_bakes_security_so_the_post_write_check_finds_no_mismatch() {
+        for security in ["[ { a: [] } ]", "[ { a: [] }, { b: [] } ]", "[ { a: [], b: [] } ]"] {
+            let root = temp_project();
+            std::fs::write(root.join("openapi.yaml"), spec(security)).unwrap();
+            let outcome = generate_api_inner(&root).unwrap();
+            assert!(outcome.errors.is_empty(), "{security}: {:?}", outcome.errors);
+            let stub = std::fs::read_to_string(root.join("api/datasources/endpoints/p/endpoint.get.json")).unwrap();
+            assert!(stub.contains("\"security\": \"a\""), "{stub}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn a_hand_edited_stub_with_security_removed_fails_generate_and_is_left_byte_identical() {
+        let root = temp_project();
+        std::fs::write(root.join("openapi.yaml"), spec("[ { a: [] } ]")).unwrap();
+        generate_api_inner(&root).unwrap();
+        let stub_path = root.join("api/datasources/endpoints/p/endpoint.get.json");
+        let mut stub: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&stub_path).unwrap()).unwrap();
+        stub.as_object_mut().unwrap().remove("security");
+        let edited = serde_json::to_string_pretty(&stub).unwrap();
+        std::fs::write(&stub_path, &edited).unwrap();
+
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(!outcome.strict_aborted);
+        assert!(
+            outcome.errors.iter().any(|e| e.contains("openapi.yaml requires security ('a')")),
+            "{:?}",
+            outcome.errors
+        );
+        assert_eq!(
+            std::fs::read_to_string(&stub_path).unwrap(),
+            edited,
+            "generate never rewrites an existing stub's security"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stub_with_a_different_scheme_than_the_spec_allows_fails_generate() {
+        let root = temp_project();
+        std::fs::write(root.join("openapi.yaml"), spec("[ { a: [] } ]")).unwrap();
+        generate_api_inner(&root).unwrap();
+        let stub_path = root.join("api/datasources/endpoints/p/endpoint.get.json");
+        let text = std::fs::read_to_string(&stub_path).unwrap().replace("\"security\": \"a\"", "\"security\": \"b\"");
+        std::fs::write(&stub_path, text).unwrap();
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.iter().any(|e| e.contains("not one openapi.yaml allows")), "{:?}", outcome.errors);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m3_generate_tests {
+    use super::*;
+
+    fn temp_project() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "frogs-generate-m3-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    const WITH_QUERY: &str = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /things:\n    get:\n      operationId: getThings\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { schema: { type: object, properties: { id: { type: string } } } }\n    query:\n      operationId: queryThings\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { schema: { type: object, properties: { id: { type: string } } } }\n";
+    const WITHOUT_QUERY: &str = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /things:\n    get:\n      operationId: getThings\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { schema: { type: object, properties: { id: { type: string } } } }\n";
+
+    fn endpoints(root: &Path) -> PathBuf {
+        root.join("api/datasources/endpoints/things")
+    }
+
+    #[test]
+    fn a_query_operation_generates_a_stub_and_a_reference_file_named_with_the_lowercase_token() {
+        let root = temp_project();
+        std::fs::write(root.join("openapi.yaml"), WITH_QUERY).unwrap();
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let dir = endpoints(&root);
+        assert!(dir.join("endpoint.query.json").is_file());
+        assert!(dir.join("endpoint.query.reference.json").is_file());
+        assert!(dir.join("endpoint.get.json").is_file());
+        let stub = std::fs::read_to_string(dir.join("endpoint.query.json")).unwrap();
+        assert!(stub.contains("queryThings"), "{stub}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_hand_edited_query_stub_is_never_overwritten_by_a_second_generate() {
+        let root = temp_project();
+        std::fs::write(root.join("openapi.yaml"), WITH_QUERY).unwrap();
+        generate_api_inner(&root).unwrap();
+        let stub_path = endpoints(&root).join("endpoint.query.json");
+        let mut edited = std::fs::read_to_string(&stub_path).unwrap();
+        edited.push_str("\n\n");
+        std::fs::write(&stub_path, &edited).unwrap();
+        generate_api_inner(&root).unwrap();
+        assert_eq!(std::fs::read_to_string(&stub_path).unwrap(), edited);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removing_a_query_operation_orphans_its_files_and_putting_it_back_restores_them() {
+        let root = temp_project();
+        std::fs::write(root.join("openapi.yaml"), WITH_QUERY).unwrap();
+        generate_api_inner(&root).unwrap();
+        let dir = endpoints(&root);
+
+        std::fs::write(root.join("openapi.yaml"), WITHOUT_QUERY).unwrap();
+        generate_api_inner(&root).unwrap();
+        assert!(!dir.join("endpoint.query.json").exists());
+        assert!(dir.join("_endpoint.query.json").is_file(), "orphaned in place, never deleted");
+        assert!(dir.join("endpoint.get.json").is_file(), "the get operation is untouched");
+
+        std::fs::write(root.join("openapi.yaml"), WITH_QUERY).unwrap();
+        generate_api_inner(&root).unwrap();
+        assert!(dir.join("endpoint.query.json").is_file(), "restored");
+        assert!(!dir.join("_endpoint.query.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn write_non_canonical(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join("api/datasources/endpoints/gone");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, r#"{ "operationId": "gone", "sources": {}, "response": {} }"#).unwrap();
+        path
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_non_canonical_stub_name_is_never_renamed_as_an_orphan_and_is_only_a_warning_outside_strict() {
+        let root = temp_project();
+        std::fs::write(root.join("openapi.yaml"), WITHOUT_QUERY).unwrap();
+        write_non_canonical(&root, "endpoint.GET.json");
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(!outcome.strict_aborted);
+        assert!(outcome.errors.is_empty(), "S12 must not count toward outcome.errors: {:?}", outcome.errors);
+        assert_eq!(names_in(&root.join("api/datasources/endpoints/gone")), ["endpoint.GET.json"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_ordinary_lowercase_stub_for_a_removed_path_is_still_orphaned_beside_a_non_canonical_one() {
+        let root = temp_project();
+        std::fs::write(root.join("openapi.yaml"), WITHOUT_QUERY).unwrap();
+        write_non_canonical(&root, "endpoint.Query.json");
+        std::fs::write(
+            root.join("api/datasources/endpoints/gone/endpoint.get.json"),
+            r#"{ "operationId": "gone", "sources": {}, "response": {} }"#,
+        )
+        .unwrap();
+        generate_api_inner(&root).unwrap();
+        assert_eq!(names_in(&root.join("api/datasources/endpoints/gone")), ["_endpoint.get.json", "endpoint.Query.json"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn under_strict_a_non_canonical_stub_name_refuses_generate_before_any_write() {
+        let root = temp_project();
+        std::fs::write(root.join("openapi.yaml"), WITHOUT_QUERY).unwrap();
+        std::fs::create_dir_all(root.join("api/config")).unwrap();
+        std::fs::write(root.join("api/config/server.json"), r#"{ "strictOpenApi": true }"#).unwrap();
+        write_non_canonical(&root, "endpoint.GET.json");
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.strict_aborted, "{:?}", outcome.errors);
+        assert!(!endpoints(&root).join("endpoint.get.json").exists(), "nothing may be written under a strict refusal");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plan_endpoint_files_collects_non_canonical_names_with_the_canonical_spelling() {
+        let root = temp_project();
+        std::fs::write(root.join("openapi.yaml"), WITHOUT_QUERY).unwrap();
+        write_non_canonical(&root, "endpoint.Query.json");
+        let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
+        let plan = plan_endpoint_files(&root.join("api"), &doc);
+        assert_eq!(plan.non_canonical.len(), 1, "{:?}", plan.non_canonical);
+        assert!(plan.non_canonical[0].contains("rename it to endpoint.query.json"), "{}", plan.non_canonical[0]);
+        assert!(plan.errors.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

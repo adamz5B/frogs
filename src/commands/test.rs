@@ -86,7 +86,17 @@ pub async fn run(cwd: &Path, opts: TestServerOptions) -> io::Result<()> {
     let port = opts.port.unwrap_or(server_config.port);
     tracing::info!(port, tls_mode = ?server_config.tls.mode, scenario = ?opts.scenario, "frogs test starting");
     let api_dir = crate::project::api_base(&root);
-    let result = crate::commands::run::serve(&root, router, opts.bind, port, &server_config.tls, &api_dir, shutdown_signal()).await;
+    let result = crate::commands::run::serve(
+        &root,
+        router,
+        opts.bind,
+        port,
+        &server_config.tls,
+        &api_dir,
+        server_config.case_sensitive_methods(),
+        shutdown_signal(),
+    )
+    .await;
 
     let summary = session.finish();
     println!("{}", crate::testing::report::render_summary_line(&summary));
@@ -128,7 +138,8 @@ pub(crate) async fn build_mock_router(root: &Path, opts: &TestServerOptions) -> 
     let mut config = Config::load_or_exit(&api_root);
     let endpoints_root = api_root.join("datasources/endpoints");
     let strict = config.server.strict_open_api();
-    println!("strictOpenApi={strict}");
+    println!("strictOpenApi={strict}, caseSensitiveMethods={}", config.server.case_sensitive_methods());
+    crate::commands::run::announce_method_case(&config.server);
     let openapi_document = crate::commands::run::load_openapi_for_startup(root, &config.server)?;
 
     // Harness-owned codes classify like any other — a project that
@@ -200,7 +211,7 @@ pub(crate) async fn build_mock_router(root: &Path, opts: &TestServerOptions) -> 
     for loaded in &files {
         tracing::info!(
             "{} {} <- {} ({} case(s))",
-            loaded.route.method.to_uppercase(),
+            crate::openapi::method_token::display_token(&loaded.route.method),
             loaded.route.path,
             loaded.path.display(),
             loaded.file.cases.len()
@@ -258,6 +269,18 @@ pub(crate) async fn build_mock_router(root: &Path, opts: &TestServerOptions) -> 
 /// human still needs to review the recorded case, trim its `expect` down
 /// to what actually matters, and give it a meaningful name.
 pub async fn record(cwd: &Path, path: &str, method: &str) -> io::Result<()> {
+    // Allowlist-parsed before any file name is built from it, so an argument
+    // like `get.reference` can never match a sibling `.reference.json`.
+    let method = method.to_ascii_lowercase();
+    if crate::openapi::method_token::parse_file_token(&method).is_none() {
+        eprintln!(
+            "error: '{}' is not an HTTP method frogs knows ({})",
+            crate::openapi::untrusted(&method),
+            crate::openapi::method_token::FIXED_FIELDS.join(", ")
+        );
+        std::process::exit(1);
+    }
+
     let root = require_project_root(cwd);
     let api_root = crate::project::api_base(&root);
     let config = Config::load_or_exit(&api_root);
@@ -265,16 +288,13 @@ pub async fn record(cwd: &Path, path: &str, method: &str) -> io::Result<()> {
     // Everything below up to `connect_all` is pure filesystem work, done
     // first so a strict refusal or a case-variant test file never costs a
     // real connection.
-    if config.server.strict_open_api() {
-        crate::commands::run::load_openapi_for_startup(&root, &config.server)?;
-    }
+    crate::commands::run::load_openapi_for_startup(&root, &config.server)?;
 
     let sql_root = api_root.join("datasources/sql");
     let http_root = api_root.join("datasources/http");
     let endpoints_root = api_root.join("datasources/endpoints");
     let http_client = reqwest::Client::new();
 
-    let method = method.to_lowercase();
     let (request_path, query_params) = split_path_and_query(path);
 
     let Some((endpoint_file_path, path_params)) = find_endpoint_file(&endpoints_root, &request_path, &method) else {
@@ -548,17 +568,29 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<DiscoveredTestFile>, findings: &m
                 continue;
             }
             walk(root, &path, out, findings);
-        } else if let Some(method) = test_file_method(&path) {
-            if !crate::openapi::HTTP_METHODS.contains(&method.as_str()) {
-                findings.push(TestFileFinding {
-                    strict_error: true,
-                    message: format!(
-                        "{}: '{}' is not one of the lowercase HTTP method names (get, post, put, patch, delete, ...) the file name must use",
-                        path.display(),
-                        crate::openapi::untrusted(&method)
-                    ),
-                });
-            }
+        } else if let Some(parsed) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(crate::openapi::method_token::parse_test_file_token)
+        {
+            let method = match parsed {
+                Ok(token) => token.wire().to_ascii_lowercase(),
+                Err(raw) => {
+                    let hint = match crate::openapi::method_token::fixed_case_variant(&raw) {
+                        Some(canonical) => format!(" — rename it to endpoint.{canonical}.test.json"),
+                        None => String::new(),
+                    };
+                    findings.push(TestFileFinding {
+                        strict_error: true,
+                        message: format!(
+                            "{}: '{}' is not one of the lowercase HTTP method names (get, post, put, patch, delete, query, ...) the file name must use{hint}; the file is ignored",
+                            path.display(),
+                            crate::openapi::untrusted(&raw)
+                        ),
+                    });
+                    continue;
+                }
+            };
             let display_path = display_path(root, &path);
             // Sibling to the test file, same folder — the file the design
             // doc's "config lives next to what it configures" pattern says
@@ -1111,13 +1143,14 @@ mod tests {
     /// the base URL plus the session, so a test can both hit routes and
     /// read the verdicts the session recorded.
     async fn serve_mock(project: &MockProject, opts: TestServerOptions) -> (String, Arc<MockSession>) {
-        let (router, session, _) = build_mock_router(&project.root, &opts)
+        let (router, session, server_config) = build_mock_router(&project.root, &opts)
             .await
             .expect("the mock router must build without touching any infrastructure");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let case_sensitive = server_config.case_sensitive_methods();
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(listener, crate::server::served_service(router, case_sensitive)).await.unwrap();
         });
         (format!("http://{addr}"), session)
     }
@@ -1603,22 +1636,20 @@ mod test_file_findings_tests {
         std::fs::write(root.join("endpoint.GET.test.json"), TEST_FILE).unwrap();
 
         let (files, findings) = discover_test_files(&root);
-        assert_eq!(files.len(), 1);
-        assert!(files[0].3.is_none(), "an unusable sibling must not be handed on");
-        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert!(files.is_empty(), "a non-canonical test file is excluded from the corpus");
+        assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(findings.iter().all(|f| f.strict_error));
         assert!(findings.iter().any(|f| f.message.contains("lowercase HTTP method")));
-        assert!(findings.iter().any(|f| f.message.contains("rename or remove it by hand")));
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn a_test_file_with_a_made_up_method_token_is_a_bad_token_finding_but_still_discovered() {
+    fn a_test_file_with_a_made_up_method_token_is_a_bad_token_finding_and_is_excluded() {
         let root = temp_project();
         std::fs::write(root.join("endpoint.foo.json"), STUB).unwrap();
         std::fs::write(root.join("endpoint.foo.test.json"), TEST_FILE).unwrap();
         let (files, findings) = discover_test_files(&root);
-        assert_eq!(files.len(), 1);
+        assert!(files.is_empty(), "a non-canonical test file is excluded from the corpus");
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(findings[0].strict_error);
         let _ = std::fs::remove_dir_all(&root);
@@ -1739,6 +1770,158 @@ mod test_file_findings_tests {
         std::fs::write(dir.join("endpoint.get.test.json"), TEST_FILE).unwrap();
         let built = build_mock_router(&root, &opts()).await;
         assert!(built.is_ok(), "{:?}", built.err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m3_tests {
+    use super::*;
+
+    fn temp_project() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-commands-test-m3-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn opts() -> TestServerOptions {
+        TestServerOptions {
+            port: None,
+            bind: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            scenario: None,
+            report: ReportFormat::Text,
+            report_file: None,
+        }
+    }
+
+    const ENDPOINT: &str = r#"{
+        "operationId": "findCar",
+        "sources": { "car": { "type": "sql", "connection": "db", "script": "car.sql", "cardinality": "one" } },
+        "response": { "maker": "sources.car.maker" }
+    }"#;
+    const TEST_FILE: &str = r#"{ "cases": [ { "name": "happy", "request": { "body": { "q": 1 } }, "mocks": { "car": { "maker": "Honda" } }, "expect": { "status": 200, "body": { "maker": "Honda" } } } ] }"#;
+
+    /// An API project with one route `/cars` whose endpoint/test file names carry `token`.
+    fn project(server_json: &str, token: &str) -> PathBuf {
+        let root = temp_project();
+        let api = root.join("api");
+        for dir in ["config/errors", "security", "datasources/sql/db", "datasources/endpoints/cars"] {
+            std::fs::create_dir_all(api.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("openapi.yaml"), "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths: {}\n").unwrap();
+        std::fs::write(api.join("config/server.json"), server_json).unwrap();
+        std::fs::write(api.join("config/errors/core.json"), "{}").unwrap();
+        std::fs::write(api.join("config/connections.json"), r#"{ "db": { "driver": "sqlite", "database": "/does/not/exist/db.sqlite" } }"#).unwrap();
+        std::fs::write(api.join("security/schemes.json"), "{}").unwrap();
+        std::fs::write(api.join("datasources/sql/db/car.sql"), "SELECT 'REAL' AS maker;").unwrap();
+        std::fs::write(api.join(format!("datasources/endpoints/cars/endpoint.{token}.json")), ENDPOINT).unwrap();
+        std::fs::write(api.join(format!("datasources/endpoints/cars/endpoint.{token}.test.json")), TEST_FILE).unwrap();
+        root
+    }
+
+    async fn serve_mock(root: &Path) -> std::net::SocketAddr {
+        let (router, _session, server_config) = build_mock_router(root, &opts()).await.expect("mock router builds");
+        crate::server::spawn_served(router, server_config.case_sensitive_methods()).await
+    }
+
+    #[tokio::test]
+    async fn the_mock_server_serves_a_query_endpoint_with_its_mocked_source() {
+        let root = project(r#"{ "features": { "requestValidation": false } }"#, "query");
+        let addr = serve_mock(&root).await;
+        let response = reqwest::Client::new()
+            .request(reqwest::Method::from_bytes(b"QUERY").unwrap(), format!("http://{addr}/cars"))
+            .json(&serde_json::json!({ "q": 1 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.json::<serde_json::Value>().await.unwrap()["maker"], "Honda");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_mock_server_serves_a_lowercase_get_as_get_unless_methods_are_case_sensitive() {
+        for (flag, expected) in [("false", 200), ("true", 405)] {
+            let root = project(&format!(r#"{{ "features": {{ "requestValidation": false }}, "caseSensitiveMethods": {flag} }}"#), "get");
+            std::fs::write(root.join("api/datasources/endpoints/cars/endpoint.get.test.json"), TEST_FILE.replace(r#""request": { "body": { "q": 1 } }"#, r#""request": {}"#)).unwrap();
+            let addr = serve_mock(&root).await;
+            let (line, _, _, _) = crate::server::raw_request(addr, b"get /cars HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await;
+            assert!(line.contains(&format!(" {expected} ")), "caseSensitiveMethods={flag}: {line}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn a_non_canonical_test_file_name_names_the_canonical_spelling_and_mentions_query() {
+        let root = temp_project();
+        std::fs::write(root.join("endpoint.Query.test.json"), TEST_FILE).unwrap();
+        std::fs::write(root.join("endpoint.get.json"), ENDPOINT).unwrap();
+        std::fs::write(root.join("endpoint.get.test.json"), TEST_FILE).unwrap();
+        let (files, findings) = discover_test_files(&root);
+        assert_eq!(files.len(), 1, "only the canonical file stays in the corpus");
+        assert_eq!(files[0].1, "get");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].strict_error);
+        assert!(findings[0].message.contains("rename it to endpoint.query.test.json"), "{}", findings[0].message);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_canonical_query_test_file_is_discovered_with_the_query_token_and_no_finding() {
+        let root = temp_project();
+        std::fs::write(root.join("endpoint.query.json"), ENDPOINT).unwrap();
+        std::fs::write(root.join("endpoint.query.test.json"), TEST_FILE).unwrap();
+        let (files, findings) = discover_test_files(&root);
+        assert!(findings.is_empty(), "{findings:?}");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].1, "query");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_non_canonical_test_file_is_a_warning_normally_and_a_refusal_under_strict() {
+        let root = project(r#"{ "features": { "requestValidation": false } }"#, "get");
+        std::fs::write(root.join("api/datasources/endpoints/cars/endpoint.Post.test.json"), TEST_FILE).unwrap();
+        assert!(build_mock_router(&root, &opts()).await.is_ok(), "warned, excluded, still starts");
+        std::fs::write(
+            root.join("api/config/server.json"),
+            r#"{ "strictOpenApi": true, "features": { "requestValidation": false } }"#,
+        )
+        .unwrap();
+        let err = build_mock_router(&root, &opts()).await.err().expect("strict refuses");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn record_with_an_uppercase_query_argument_writes_endpoint_query_test_json() {
+        let root = temp_project();
+        let api = root.join("api");
+        for dir in ["config/errors", "security", "datasources/sql/db", "datasources/endpoints/things"] {
+            std::fs::create_dir_all(api.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("openapi.yaml"), "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths: {}\n").unwrap();
+        std::fs::write(api.join("config/server.json"), r#"{ "features": { "requestValidation": false } }"#).unwrap();
+        std::fs::write(api.join("config/errors/core.json"), "{}").unwrap();
+        std::fs::write(api.join("config/connections.json"), r#"{ "db": { "driver": "sqlite", "database": ":memory:" } }"#).unwrap();
+        std::fs::write(api.join("security/schemes.json"), "{}").unwrap();
+        std::fs::write(api.join("datasources/sql/db/q.sql"), "SELECT 'Honda' AS maker").unwrap();
+        std::fs::write(
+            api.join("datasources/endpoints/things/endpoint.query.json"),
+            r#"{ "operationId": "q", "sources": { "car": { "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "one" } }, "response": { "maker": "sources.car.maker" } }"#,
+        )
+        .unwrap();
+        record(&root, "/things", "QUERY").await.expect("record succeeds");
+        let written = api.join("datasources/endpoints/things/endpoint.query.test.json");
+        assert!(written.is_file(), "endpoint.query.test.json must be written");
+        let contents = std::fs::read_to_string(&written).unwrap();
+        assert!(contents.contains("Honda"), "{contents}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

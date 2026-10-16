@@ -2,6 +2,7 @@ mod change_detection;
 pub mod dir_index;
 #[cfg(test)]
 mod fs_os_tests;
+pub mod method_token;
 pub mod path_rules;
 mod schema_walk;
 
@@ -15,9 +16,14 @@ pub use change_detection::{content_hash, referenced_component_names};
 pub use path_rules::{PortabilityPolicy, untrusted};
 pub use schema_walk::{SchemaWalker, merge_stub_response, stub_from_descriptor, walk_response_schema};
 
-/// The HTTP methods OpenAPI's Path Item Object recognizes as operations —
-/// any other key under a path (`parameters`, `summary`, ...) is ignored.
-pub(crate) const HTTP_METHODS: &[&str] = &["get", "put", "post", "delete", "options", "head", "patch", "trace"];
+use method_token::FIXED_FIELDS;
+
+/// Caller-supplied loader settings (the loader itself never reads config).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoadOptions {
+    #[allow(dead_code)] // M4: additionalOperations classification
+    pub case_sensitive_methods: bool,
+}
 
 /// One `in: query|path|header|cookie` parameter declared on an operation.
 /// `cookie` is parsed (so it isn't silently dropped) but not surfaced in
@@ -60,7 +66,11 @@ pub struct RequestBodySchema {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Operation {
     pub path: String,
+    /// The file token (`get`, `query`, ...) — what names the endpoint file.
     pub method: String,
+    /// The method sent on the wire (`GET`, `QUERY`, ...). Always taken from the
+    /// constant field table, never from spec text.
+    pub http_method: String,
     pub operation_id: String,
     pub response_schema: Option<Value>,
     pub parameters: Vec<ParameterInfo>,
@@ -88,6 +98,11 @@ pub struct Operation {
     /// effective `security:` mentions (after reference resolution), deduped,
     /// in spec order — `security` above is only the first of these.
     pub declared_security_schemes: Vec<String>,
+    /// One inner list per requirement object of the effective `security:`
+    /// (spec order, keys resolved), so route/stub agreement can be checked
+    /// against what the spec actually allows rather than the collapsed first
+    /// name. Empty outer list: no security required.
+    pub security_alternatives: Vec<Vec<String>>,
     /// Streaming is detected but not served: the endpoint is still one JSON
     /// response, this just records what the spec asked for.
     pub response_mode: ResponseMode,
@@ -189,7 +204,7 @@ impl Operation {
         }
         Err(format!(
             "{} {}: successStatus {success_status} is not among the response codes declared in openapi.yaml ({})",
-            self.method.to_uppercase(),
+            self.http_method,
             self.path,
             self.response_status_codes.iter().map(u16::to_string).collect::<Vec<_>>().join(", ")
         ))
@@ -287,7 +302,7 @@ fn resolve_media_type<'a>(entry: &'a Value, media_types: &'a Map<String, Value>)
     }
 }
 
-type ResolvedSecurity = (Option<String>, Vec<String>);
+type ResolvedSecurity = (Option<String>, Vec<String>, Vec<Vec<String>>);
 
 struct OpCtx<'a> {
     media_types: &'a Map<String, Value>,
@@ -530,11 +545,13 @@ fn resolve_scheme_key(key: &str, scheme_names: &Map<String, Value>) -> Option<St
 fn resolve_security(value: &Value, scheme_names: &Map<String, Value>, context: &str, issues: &mut Vec<LoadIssue>) -> ResolvedSecurity {
     let mut first = None;
     let mut all: Vec<String> = Vec::new();
+    let mut alternatives: Vec<Vec<String>> = Vec::new();
     let Some(requirements) = value.as_array() else {
-        return (None, all);
+        return (None, all, alternatives);
     };
     for requirement in requirements {
         let Some(obj) = requirement.as_object() else { continue };
+        let mut alternative: Vec<String> = Vec::new();
         for key in obj.keys() {
             let resolved = resolve_scheme_key(key, scheme_names).unwrap_or_else(|| {
                 issues.push(LoadIssue::new(
@@ -551,11 +568,24 @@ fn resolve_security(value: &Value, scheme_names: &Map<String, Value>, context: &
                 first = Some(resolved.clone());
             }
             if !all.contains(&resolved) {
-                all.push(resolved);
+                all.push(resolved.clone());
             }
+            alternative.push(resolved);
         }
+        if alternative.len() > 1 {
+            issues.push(LoadIssue::new(
+                IssueKind::SecurityRequirementCollapsed,
+                Severity::Warning,
+                format!(
+                    "{context}: security requirement combines schemes ({}); frogs enforces only '{}'",
+                    alternative.iter().map(|k| format!("'{}'", untrusted(k))).collect::<Vec<_>>().join(", "),
+                    untrusted(&alternative[0])
+                ),
+            ));
+        }
+        alternatives.push(alternative);
     }
-    (first, all)
+    (first, all, alternatives)
 }
 
 const MAX_DEFAULT_MAPPING_SCAN_DEPTH: usize = 32;
@@ -622,8 +652,10 @@ pub enum IssueKind {
     VersionUnrecognized,
     Swagger2,
     VersionNewer,
-    /// Interim: `query`/`additionalOperations` are loaded but not served yet.
+    /// Interim: `additionalOperations` is loaded but not served yet.
     NotServed,
+    /// A 3.0/3.1 document uses an operation field introduced in 3.2.
+    OperationNeedsNewerVersion,
     UnsafePath,
     WindowsPortability,
     CaseOnlyPathCollision,
@@ -636,17 +668,23 @@ pub enum IssueKind {
     StreamingDeclared,
     NonJsonRequestBody,
     DeprecatedSecurityScheme,
+    SecurityRequirementCollapsed,
 }
 
 impl IssueKind {
     /// Whether `strictOpenApi: true` turns this kind into a refusal.
     pub fn is_strict_error(&self) -> bool {
         match self {
-            IssueKind::NotServed | IssueKind::StreamingDeclared | IssueKind::NonJsonRequestBody | IssueKind::DeprecatedSecurityScheme => false,
+            IssueKind::NotServed
+            | IssueKind::StreamingDeclared
+            | IssueKind::NonJsonRequestBody
+            | IssueKind::DeprecatedSecurityScheme
+            | IssueKind::SecurityRequirementCollapsed => false,
             IssueKind::VersionMissing
             | IssueKind::VersionUnrecognized
             | IssueKind::Swagger2
             | IssueKind::VersionNewer
+            | IssueKind::OperationNeedsNewerVersion
             | IssueKind::UnsafePath
             | IssueKind::WindowsPortability
             | IssueKind::CaseOnlyPathCollision
@@ -716,7 +754,7 @@ impl OpenApiDocument {
             let mut users: Vec<String> = Vec::new();
             for op in self.operations.iter().chain(&self.ambiguous_operations) {
                 if op.declared_security_schemes.contains(name) {
-                    let user = format!("{} {}", op.method.to_uppercase(), untrusted(&op.path));
+                    let user = format!("{} {}", op.http_method, untrusted(&op.path));
                     if !users.contains(&user) {
                         users.push(user);
                     }
@@ -762,7 +800,7 @@ impl fmt::Display for OpenApiError {
             OpenApiError::Io(e) => write!(f, "failed to read openapi.yaml: {e}"),
             OpenApiError::Parse(e) => write!(f, "failed to parse openapi.yaml: {e}"),
             OpenApiError::MissingOperationId { path, method } => {
-                write!(f, "{} {path} has no operationId", method.to_uppercase())
+                write!(f, "{} {} has no operationId", method_token::display_token(method), untrusted(path))
             }
         }
     }
@@ -776,8 +814,8 @@ impl std::error::Error for OpenApiError {}
 /// design doc's recursive schema walk (`$ref`/`allOf`/`oneOf`/arrays/free-
 /// form maps) is naturally a walk over a loosely-typed schema tree, which a
 /// generic `Value` fits more directly than a rigid struct hierarchy would.
-pub fn load(path: &Path) -> Result<OpenApiDocument, OpenApiError> {
-    load_with_policy(path, PortabilityPolicy::for_host())
+pub fn load(path: &Path, options: LoadOptions) -> Result<OpenApiDocument, OpenApiError> {
+    load_with_policy(path, PortabilityPolicy::for_host(), options)
 }
 
 fn classify_version(raw: &str) -> SpecVersion {
@@ -845,10 +883,10 @@ fn detect_version(doc: &Value, issues: &mut Vec<LoadIssue>) -> SpecVersion {
     version
 }
 
-fn parse_operations(path: &str, item: &Map<String, Value>, ctx: &OpCtx, issues: &mut Vec<LoadIssue>) -> Result<Vec<Operation>, OpenApiError> {
+fn parse_operations(path: &str, item: &Map<String, Value>, ctx: &OpCtx, spec_version: &SpecVersion, issues: &mut Vec<LoadIssue>) -> Result<Vec<Operation>, OpenApiError> {
     let mut operations = Vec::new();
-    for method in HTTP_METHODS {
-        let Some(operation_obj) = item.get(*method).and_then(Value::as_object) else {
+    for method in FIXED_FIELDS {
+        let Some(operation_obj) = item.get(method).and_then(Value::as_object) else {
             continue;
         };
         let operation_id = operation_obj
@@ -858,17 +896,35 @@ fn parse_operations(path: &str, item: &Map<String, Value>, ctx: &OpCtx, issues: 
                 path: path.to_string(),
                 method: method.to_string(),
             })?;
-        let label = format!("{} {}", method.to_uppercase(), untrusted(path));
+        let http_method = method.to_ascii_uppercase();
+        let label = format!("{http_method} {}", untrusted(path));
+        if method == "query" && matches!(spec_version, SpecVersion::V3_0 | SpecVersion::V3_1) {
+            let declared = match spec_version {
+                SpecVersion::V3_0 => "3.0",
+                _ => "3.1",
+            };
+            issues.push(LoadIssue::new(
+                IssueKind::OperationNeedsNewerVersion,
+                Severity::Warning,
+                format!(
+                    "QUERY {} (operationId {}) uses the `query` operation field from OpenAPI 3.2, but this document declares openapi {} — served anyway; declare openapi: 3.2.0",
+                    untrusted(path),
+                    untrusted(operation_id),
+                    declared
+                ),
+            ));
+        }
         let parameters = extract_parameters(operation_obj, ctx, &label, issues);
         let (request_body, request_body_unresolved, request_stream) = extract_request_body(operation_obj, ctx, &label, issues);
         let (response_schema, response_mode) = extract_response(operation_obj, ctx, &label, issues);
-        let (security, declared_security_schemes) = match operation_obj.get("security") {
+        let (security, declared_security_schemes, security_alternatives) = match operation_obj.get("security") {
             Some(value) => resolve_security(value, ctx.scheme_names, &label, issues),
             None => ctx.document_security.cloned().unwrap_or_default(),
         };
         operations.push(Operation {
             path: path.to_string(),
             method: method.to_string(),
+            http_method,
             operation_id: operation_id.to_string(),
             response_schema,
             parameters,
@@ -876,6 +932,7 @@ fn parse_operations(path: &str, item: &Map<String, Value>, ctx: &OpCtx, issues: 
             response_status_codes: declared_response_codes(operation_obj),
             security,
             declared_security_schemes,
+            security_alternatives,
             response_mode,
             request_stream,
             request_body_unresolved,
@@ -902,9 +959,6 @@ fn not_served_issue(method: &str, path: &str, operation: &Value) -> LoadIssue {
 }
 
 fn not_served_issues(path: &str, item: &Map<String, Value>, issues: &mut Vec<LoadIssue>) {
-    if let Some(query) = item.get("query") {
-        issues.push(not_served_issue("QUERY", path, query));
-    }
     match item.get("additionalOperations") {
         None => {}
         Some(Value::Object(additional)) => {
@@ -920,7 +974,7 @@ fn not_served_issues(path: &str, item: &Map<String, Value>, issues: &mut Vec<Loa
     }
 }
 
-pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy) -> Result<OpenApiDocument, OpenApiError> {
+pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, _options: LoadOptions) -> Result<OpenApiDocument, OpenApiError> {
     let contents = std::fs::read_to_string(path).map_err(OpenApiError::Io)?;
     let doc: Value = serde_yaml::from_str(&contents).map_err(OpenApiError::Parse)?;
 
@@ -1014,7 +1068,7 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy) -> Result
     let mut operations = Vec::new();
     let mut ambiguous_operations = Vec::new();
     for (i, (normalized, item)) in accepted.iter().enumerate() {
-        let parsed = parse_operations(normalized, item, &ctx, &mut issues)?;
+        let parsed = parse_operations(normalized, item, &ctx, &spec_version, &mut issues)?;
         not_served_issues(normalized, item, &mut issues);
         if ambiguous_indexes.contains(&i) {
             ambiguous_operations.extend(parsed);
@@ -1079,7 +1133,7 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy) -> Result
         );
     }
     for op in document.operations.iter().chain(&document.ambiguous_operations) {
-        let label = format!("{} {}", op.method.to_uppercase(), untrusted(&op.path));
+        let label = format!("{} {}", op.http_method, untrusted(&op.path));
         let response_stream = match &op.response_mode {
             ResponseMode::Single => None,
             ResponseMode::Stream(spec) => spec.item_schema.as_ref(),
@@ -1200,7 +1254,7 @@ mod tests {
         )
         .unwrap();
 
-        let doc = load(&spec_path).expect("fixture should parse cleanly");
+        let doc = load(&spec_path, LoadOptions::default()).expect("fixture should parse cleanly");
         let _ = std::fs::remove_dir_all(&dir);
 
         let car_with_price_ref = Some(serde_json::json!({ "$ref": "#/components/schemas/CarWithPrice" }));
@@ -1210,6 +1264,7 @@ mod tests {
                 Operation {
                     path: "/cars".to_string(),
                     method: "get".to_string(),
+                    http_method: "GET".to_string(),
                     operation_id: "getCarInfo".to_string(),
                     response_schema: car_with_price_ref.clone(),
                     parameters: vec![
@@ -1234,6 +1289,7 @@ mod tests {
                 Operation {
                     path: "/cars".to_string(),
                     method: "post".to_string(),
+                    http_method: "POST".to_string(),
                     operation_id: "createCar".to_string(),
                     response_schema: car_with_price_ref.clone(),
                     parameters: vec![],
@@ -1245,6 +1301,7 @@ mod tests {
                 Operation {
                     path: "/cars/{vin}".to_string(),
                     method: "get".to_string(),
+                    http_method: "GET".to_string(),
                     operation_id: "getCarByVin".to_string(),
                     response_schema: car_with_price_ref,
                     parameters: vec![ParameterInfo {
@@ -1257,6 +1314,7 @@ mod tests {
                     response_status_codes: vec![200, 404],
                     security: Some("apiKeyAuth".to_string()),
                     declared_security_schemes: vec!["apiKeyAuth".to_string()],
+                    security_alternatives: vec![vec!["apiKeyAuth".to_string()]],
                     ..Default::default()
                 },
             ]
@@ -1268,6 +1326,7 @@ mod tests {
         let op = Operation {
             path: "/things/{id}".to_string(),
             method: "get".to_string(),
+            http_method: "GET".to_string(),
             operation_id: "test".to_string(),
             response_schema: None,
             parameters: vec![
@@ -1392,7 +1451,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = load(&spec_path).expect_err("a path with no operationId should fail to load");
+        let err = load(&spec_path, LoadOptions::default()).expect_err("a path with no operationId should fail to load");
         assert!(matches!(err, OpenApiError::MissingOperationId { .. }));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1409,7 +1468,7 @@ mod tests {
         let spec_path = dir.join("openapi.yaml");
         std::fs::write(&spec_path, "paths: [this, is, not, a, map").unwrap();
 
-        let err = load(&spec_path).expect_err("malformed YAML should fail to parse");
+        let err = load(&spec_path, LoadOptions::default()).expect_err("malformed YAML should fail to parse");
         assert!(matches!(err, OpenApiError::Parse(_)));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1419,6 +1478,7 @@ mod tests {
         Operation {
             path: "/cars".to_string(),
             method: "post".to_string(),
+            http_method: "POST".to_string(),
             operation_id: "createCar".to_string(),
             response_schema: None,
             parameters: Vec::new(),
@@ -1529,7 +1589,7 @@ mod load_hardening_tests {
         let dir = tempdir();
         let path = dir.join("openapi.yaml");
         std::fs::write(&path, yaml).unwrap();
-        let result = load_with_policy(&path, policy);
+        let result = load_with_policy(&path, policy, LoadOptions::default());
         let _ = std::fs::remove_dir_all(&dir);
         result
     }
@@ -1709,17 +1769,16 @@ info: {{ title: t, version: 1 }}
     }
 
     #[test]
-    fn query_and_additional_operations_are_loaded_as_not_served_warnings_only() {
+    fn additional_operations_are_loaded_as_not_served_warnings_only_and_query_is_served() {
         let yaml = "openapi: 3.2.0\ninfo: { title: t, version: 1 }\npaths:\n  /search:\n    get:\n      operationId: s\n      responses: { '200': { description: ok } }\n    query:\n      operationId: q\n      responses: { '200': { description: ok } }\n    additionalOperations:\n      PURGE:\n        operationId: purge\n        responses: { '200': { description: ok } }\n      LINK:\n        responses: { '200': { description: ok } }\n";
         let doc = load_yaml(yaml);
-        assert_eq!(doc.operations.len(), 1, "only the get is a served operation");
+        assert_eq!(doc.operations.len(), 2, "the get and the query are served operations");
         let not_served: Vec<&LoadIssue> = doc.issues.iter().filter(|i| i.kind == IssueKind::NotServed).collect();
-        assert_eq!(not_served.len(), 3, "{:?}", doc.issues);
+        assert_eq!(not_served.len(), 2, "{:?}", doc.issues);
         assert!(not_served.iter().all(|i| i.severity == Severity::Warning));
-        assert!(not_served.iter().any(|i| i.message.starts_with("QUERY /search (operationId q)")));
         assert!(not_served.iter().any(|i| i.message.starts_with("PURGE /search (operationId purge)")));
         assert!(not_served.iter().any(|i| i.message.starts_with("LINK /search (operationId <none>)")));
-        assert_eq!(doc.issues.len(), 3);
+        assert_eq!(doc.issues.len(), 2);
     }
 
     #[test]
@@ -1856,7 +1915,7 @@ info: {{ title: t, version: 1 }}
     fn malformed_yaml_and_a_missing_file_are_load_errors() {
         assert!(matches!(load_yaml_with("paths: [unclosed", PortabilityPolicy::Warn), Err(OpenApiError::Parse(_))));
         let dir = tempdir();
-        assert!(matches!(load(&dir.join("nope.yaml")), Err(OpenApiError::Io(_))));
+        assert!(matches!(load(&dir.join("nope.yaml"), LoadOptions::default()), Err(OpenApiError::Io(_))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1891,7 +1950,7 @@ mod m2_schema_and_security_tests {
         let dir = tempdir();
         let path = dir.join("openapi.yaml");
         std::fs::write(&path, yaml).unwrap();
-        let result = load_with_policy(&path, PortabilityPolicy::Warn).unwrap();
+        let result = load_with_policy(&path, PortabilityPolicy::Warn, LoadOptions::default()).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         result
     }
@@ -2544,5 +2603,210 @@ mod m2_schema_and_security_tests {
         let s11 = issues_of(&doc, IssueKind::SecurityRequirementUnresolved);
         assert_eq!(s11.len(), 1, "{:?}", doc.issues);
         assert!(!s11[0].message.contains('\u{1b}'));
+    }
+}
+
+#[cfg(test)]
+mod m2_7_security_alternatives_tests {
+    use super::*;
+
+    fn load_yaml(yaml: &str) -> OpenApiDocument {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "frogs-openapi-m27-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("openapi.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let doc = load_with_policy(&path, PortabilityPolicy::Warn, LoadOptions::default()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        doc
+    }
+
+    fn doc_with(top: &str, op_security_line: &str) -> OpenApiDocument {
+        load_yaml(&format!(
+            "openapi: 3.2.0\ninfo: {{ title: t, version: 1 }}\n{top}components:\n  securitySchemes:\n    a: {{ type: apiKey, in: header, name: k }}\n    b: {{ type: apiKey, in: header, name: k2 }}\n    c: {{ type: apiKey, in: header, name: k3 }}\npaths:\n  /p:\n    get:\n      operationId: p\n{op_security_line}      responses:\n        '200': {{ description: ok }}\n"
+        ))
+    }
+
+    fn alts(doc: &OpenApiDocument) -> Vec<Vec<String>> {
+        doc.operations[0].security_alternatives.clone()
+    }
+
+    fn v(items: &[&[&str]]) -> Vec<Vec<String>> {
+        items.iter().map(|alt| alt.iter().map(|s| s.to_string()).collect()).collect()
+    }
+
+    fn collapsed(doc: &OpenApiDocument) -> Vec<&LoadIssue> {
+        doc.issues.iter().filter(|i| i.kind == IssueKind::SecurityRequirementCollapsed).collect()
+    }
+
+    #[test]
+    fn an_operations_own_requirement_objects_become_one_inner_list_each_in_spec_order() {
+        let doc = doc_with("", "      security: [ { a: [] }, { c: [], b: [] } ]\n");
+        assert_eq!(alts(&doc), v(&[&["a"], &["c", "b"]]));
+        assert_eq!(doc.operations[0].security.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn an_operation_without_security_inherits_the_document_default() {
+        let doc = doc_with("security: [ { b: [] } ]\n", "");
+        assert_eq!(alts(&doc), v(&[&["b"]]));
+    }
+
+    #[test]
+    fn an_explicit_empty_security_list_gives_no_alternatives_even_with_a_document_default() {
+        let doc = doc_with("security: [ { b: [] } ]\n", "      security: []\n");
+        assert!(alts(&doc).is_empty());
+    }
+
+    #[test]
+    fn an_empty_requirement_object_is_an_empty_inner_list() {
+        let doc = doc_with("", "      security: [ {}, { a: [] } ]\n");
+        assert_eq!(alts(&doc), v(&[&[], &["a"]]));
+    }
+
+    #[test]
+    fn scheme_ref_keys_are_resolved_to_names_and_unresolvable_ones_kept_verbatim_with_s11() {
+        let doc = doc_with("", "      security: [ { '#/components/securitySchemes/a': [] }, { 'https://x/y': [] } ]\n");
+        assert_eq!(alts(&doc), v(&[&["a"], &["https://x/y"]]));
+        assert_eq!(doc.issues.iter().filter(|i| i.kind == IssueKind::SecurityRequirementUnresolved).count(), 1);
+    }
+
+    #[test]
+    fn a_multi_key_requirement_object_raises_one_non_strict_collapse_warning_naming_the_enforced_scheme() {
+        let doc = doc_with("", "      security: [ { a: [], b: [] }, { c: [] } ]\n");
+        let issues = collapsed(&doc);
+        assert_eq!(issues.len(), 1, "{:?}", doc.issues);
+        assert_eq!(issues[0].severity, Severity::Warning);
+        assert!(!issues[0].kind.is_strict_error());
+        assert_eq!(issues[0].message, "GET /p: security requirement combines schemes ('a', 'b'); frogs enforces only 'a'");
+    }
+
+    #[test]
+    fn two_multi_key_objects_raise_two_warnings_and_single_key_objects_none() {
+        let doc = doc_with("", "      security: [ { a: [], b: [] }, { b: [], c: [] }, { a: [] } ]\n");
+        assert_eq!(collapsed(&doc).len(), 2);
+        let doc = doc_with("", "      security: [ { a: [] }, { b: [] } ]\n");
+        assert!(collapsed(&doc).is_empty());
+    }
+
+    #[test]
+    fn a_collapsed_document_default_is_reported_once_as_top_level_security_however_many_ops_inherit_it() {
+        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: 1 }\nsecurity: [ { a: [], b: [] } ]\ncomponents:\n  securitySchemes:\n    a: { type: apiKey, in: header, name: k }\n    b: { type: apiKey, in: header, name: k2 }\npaths:\n  /p:\n    get:\n      operationId: p\n      responses:\n        '200': { description: ok }\n  /q:\n    get:\n      operationId: q\n      responses:\n        '200': { description: ok }\n";
+        let doc = load_yaml(yaml);
+        let issues = collapsed(&doc);
+        assert_eq!(issues.len(), 1, "{:?}", doc.issues);
+        assert!(issues[0].message.starts_with("top-level security: "), "{}", issues[0].message);
+        assert!(doc.operations.iter().all(|o| o.security_alternatives == v(&[&["a", "b"]])));
+    }
+}
+
+#[cfg(test)]
+mod m3_query_tests {
+    use super::*;
+
+    fn tempdir() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "frogs-openapi-m3-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn load_yaml(yaml: &str) -> Result<OpenApiDocument, OpenApiError> {
+        let dir = tempdir();
+        let path = dir.join("openapi.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let result = load(&path, LoadOptions::default());
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    fn spec(version_line: &str) -> String {
+        format!(
+            "{version_line}info: {{ title: t, version: '1' }}\npaths:\n  /things:\n    get:\n      operationId: getThings\n      responses: {{ '200': {{ description: ok }} }}\n    query:\n      operationId: queryThings\n      responses: {{ '200': {{ description: ok }} }}\n"
+        )
+    }
+
+    fn newer_version_issues(doc: &OpenApiDocument) -> Vec<&LoadIssue> {
+        doc.issues.iter().filter(|i| i.kind == IssueKind::OperationNeedsNewerVersion).collect()
+    }
+
+    #[test]
+    fn a_3_2_spec_loads_a_query_operation_with_token_and_wire_method_and_no_issue() {
+        let doc = load_yaml(&spec("openapi: 3.2.0\n")).unwrap();
+        let q = doc.operations.iter().find(|o| o.operation_id == "queryThings").unwrap();
+        assert_eq!(q.method, "query");
+        assert_eq!(q.http_method, "QUERY");
+        let g = doc.operations.iter().find(|o| o.operation_id == "getThings").unwrap();
+        assert_eq!((g.method.as_str(), g.http_method.as_str()), ("get", "GET"));
+        assert!(doc.issues.is_empty(), "{:?}", doc.issues);
+    }
+
+    #[test]
+    fn query_on_a_3_0_or_3_1_document_raises_exactly_one_strict_warning_each() {
+        for version in ["3.0.3", "3.1.0"] {
+            let doc = load_yaml(&spec(&format!("openapi: {version}\n"))).unwrap();
+            assert!(doc.operations.iter().any(|o| o.http_method == "QUERY"), "still served: {version}");
+            let found = newer_version_issues(&doc);
+            assert_eq!(found.len(), 1, "{version}: {:?}", doc.issues);
+            assert_eq!(found[0].severity, Severity::Warning);
+            assert!(found[0].kind.is_strict_error());
+            assert!(found[0].message.contains("QUERY /things (operationId queryThings)"), "{}", found[0].message);
+            assert!(found[0].message.contains(&format!("openapi {}", &version[..3])), "{}", found[0].message);
+        }
+    }
+
+    #[test]
+    fn a_missing_version_gets_only_the_missing_version_issue_not_the_query_one() {
+        let doc = load_yaml(&spec("")).unwrap();
+        assert!(newer_version_issues(&doc).is_empty(), "{:?}", doc.issues);
+        assert!(doc.issues.iter().any(|i| i.kind == IssueKind::VersionMissing));
+    }
+
+    #[test]
+    fn a_query_operation_without_an_operation_id_is_the_same_hard_error_as_any_other_method() {
+        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /things:\n    query:\n      responses: { '200': { description: ok } }\n";
+        match load_yaml(yaml) {
+            Err(OpenApiError::MissingOperationId { path, method }) => {
+                assert_eq!(path, "/things");
+                assert_eq!(method, "query");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_is_no_longer_reported_as_not_served_but_additional_operations_still_are() {
+        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /things:\n    query:\n      operationId: q\n      responses: { '200': { description: ok } }\n    additionalOperations:\n      PURGE:\n        operationId: p\n        responses: { '200': { description: ok } }\n";
+        let doc = load_yaml(yaml).unwrap();
+        let not_served: Vec<_> = doc.issues.iter().filter(|i| i.kind == IssueKind::NotServed).collect();
+        assert_eq!(not_served.len(), 1, "{:?}", doc.issues);
+        assert!(!not_served[0].message.to_lowercase().contains("query"), "{}", not_served[0].message);
+    }
+
+    #[test]
+    fn operation_order_for_a_spec_without_query_follows_the_historical_field_order() {
+        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /a:\n    patch: { operationId: pa, responses: { '200': { description: ok } } }\n    delete: { operationId: de, responses: { '200': { description: ok } } }\n    post: { operationId: po, responses: { '200': { description: ok } } }\n    get: { operationId: ge, responses: { '200': { description: ok } } }\n    put: { operationId: pu, responses: { '200': { description: ok } } }\n";
+        let doc = load_yaml(yaml).unwrap();
+        let order: Vec<_> = doc.operations.iter().map(|o| o.method.as_str()).collect();
+        assert_eq!(order, ["get", "put", "post", "delete", "patch"]);
+    }
+
+    #[test]
+    fn the_http_method_of_every_operation_comes_from_the_constant_table() {
+        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /a:\n    get: { operationId: g, responses: { '200': { description: ok } } }\n    trace: { operationId: t, responses: { '200': { description: ok } } }\n    head: { operationId: h, responses: { '200': { description: ok } } }\n";
+        let doc = load_yaml(yaml).unwrap();
+        for op in &doc.operations {
+            assert_eq!(op.http_method, op.method.to_ascii_uppercase());
+        }
     }
 }

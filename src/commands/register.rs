@@ -24,6 +24,11 @@ pub fn run(
 ) -> io::Result<()> {
     let root = require_project_root(cwd);
 
+    if let Err(e) = crate::commands::run::precheck_security_for_service(&root) {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+
     #[cfg(windows)]
     {
         let resolved_account = service::windows_svc::resolve_account(account);

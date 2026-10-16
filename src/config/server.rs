@@ -429,6 +429,11 @@ pub struct ServerConfig {
     /// file-name case conflicts). Read at startup only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict_open_api: Option<bool>,
+    /// When true, HTTP request method names are matched exactly as RFC 9110
+    /// says (`DELETE`, never `delete`). Unset or false matches them
+    /// case-insensitively. Read at startup only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_sensitive_methods: Option<bool>,
 }
 
 impl Default for ServerConfig {
@@ -447,6 +452,7 @@ impl Default for ServerConfig {
             port: 8080,
             api_root: String::new(),
             strict_open_api: Some(false),
+            case_sensitive_methods: Some(false),
         }
     }
 }
@@ -459,6 +465,23 @@ impl ServerConfig {
     #[allow(dead_code)] // Public accessor for later milestones; exercised by tests.
     pub fn strict_open_api_explicit(&self) -> bool {
         self.strict_open_api == Some(true)
+    }
+
+    pub fn case_sensitive_methods(&self) -> bool {
+        self.case_sensitive_methods.unwrap_or(false)
+    }
+
+    /// Whether the key is present at all (either value) — unlike
+    /// `strict_open_api_explicit`, which only reports `true`, because the
+    /// method-case notice differs between "never decided" and "chose false".
+    pub fn case_sensitive_methods_explicit(&self) -> bool {
+        self.case_sensitive_methods.is_some()
+    }
+
+    pub fn openapi_load_options(&self) -> crate::openapi::LoadOptions {
+        crate::openapi::LoadOptions {
+            case_sensitive_methods: self.case_sensitive_methods(),
+        }
     }
 
     /// The one producer of a real source-call bound: `source_call_timeout_ms`

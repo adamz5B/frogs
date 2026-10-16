@@ -40,7 +40,7 @@ fn endpoint_summary_json(url_path: &str, method: &str, endpoint: &EndpointFile) 
     let sources: Value = Value::Object(endpoint.sources.iter().map(|(name, def)| (name.clone(), source_def_json(def))).collect());
 
     json!({
-        "method": method.to_uppercase(),
+        "method": crate::openapi::method_token::display_token(method),
         // Matches `openapi::Operation::path`'s own `{name}` convention (not
         // `discover_endpoint_files`'s axum-style `:name`) so the console
         // can line this entry up with its `/docs/operations.json`

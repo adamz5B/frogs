@@ -26,6 +26,7 @@ struct Harness {
     api_dir: std::path::PathBuf,
     pki: Pki,
     port: u16,
+    case_sensitive: bool,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<io::Result<()>>>,
 }
@@ -43,6 +44,7 @@ impl Harness {
             api_dir,
             pki,
             port: free_port(),
+            case_sensitive: false,
             stop: None,
             task: None,
         }
@@ -63,9 +65,9 @@ impl Harness {
     async fn start(&mut self, router: Router, tls: TlsConfig) {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         self.stop = Some(tx);
-        let (root, api_dir, port) = (self.root.clone(), self.api_dir.clone(), self.port);
+        let (root, api_dir, port, case_sensitive) = (self.root.clone(), self.api_dir.clone(), self.port, self.case_sensitive);
         self.task = Some(tokio::spawn(async move {
-            serve(&root, router, IpAddr::V4(Ipv4Addr::LOCALHOST), port, &tls, &api_dir, async {
+            serve(&root, router, IpAddr::V4(Ipv4Addr::LOCALHOST), port, &tls, &api_dir, case_sensitive, async {
                 let _ = rx.await;
             })
             .await
@@ -134,6 +136,7 @@ impl Harness {
             self.port,
             tls,
             &self.api_dir,
+            false,
             std::future::pending::<()>(),
         )
         .await;
@@ -923,4 +926,71 @@ async fn spoofed_headers_over_plain_http_never_create_an_identity_in_the_echo_ro
         .await
         .unwrap();
     assert_eq!(response.json::<serde_json::Value>().await.unwrap(), serde_json::json!({ "anonymous": true }));
+}
+
+// ---------------------------------------------------------------------
+// QUERY over mTLS through the real serve() wrapper
+// ---------------------------------------------------------------------
+
+async fn start_query_api(h: &mut Harness, client_auth: &str) {
+    write_api_project(h, client_auth, MTLS_ORDERS, serde_json::json!({}));
+    std::fs::write(
+        h.api_dir.join("datasources/endpoints/protected/endpoint.query.json"),
+        r#"{ "operationId": "queryProtected", "security": "certAuth", "sources": {}, "response": {} }"#,
+    )
+    .unwrap();
+    start_api(h).await;
+}
+
+async fn send_method(h: &Harness, spec: Option<&LeafSpec>, method: &str, path: &str) -> Result<(u16, String), reqwest::Error> {
+    let pem = spec.map(|s| h.leaf(s).identity_pem());
+    let client = h.client(pem.as_deref());
+    let response = client
+        .request(reqwest::Method::from_bytes(method.as_bytes()).unwrap(), format!("https://localhost:{}{path}", h.port))
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    Ok((status, response.text().await?))
+}
+
+#[tokio::test]
+async fn a_query_request_over_required_mtls_accepts_the_allowed_san_and_rejects_another() {
+    let mut h = Harness::new();
+    start_query_api(&mut h, REQUIRED).await;
+    assert_eq!(send_method(&h, Some(&LeafSpec::valid()), "QUERY", "/protected").await.unwrap().0, 200);
+
+    let other = LeafSpec {
+        dns: vec!["a.svc.example".into(), "b.svc.example".into()],
+        ..LeafSpec::valid()
+    };
+    let (status, body) = send_method(&h, Some(&other), "QUERY", "/protected").await.unwrap();
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(json(&body)["name"], "auth.invalid_credentials");
+}
+
+#[tokio::test]
+async fn a_query_request_with_no_certificate_under_optional_mtls_is_client_cert_missing() {
+    let mut h = Harness::new();
+    start_query_api(&mut h, OPTIONAL).await;
+    let (status, body) = send_method(&h, None, "QUERY", "/protected").await.unwrap();
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(json(&body)["name"], "auth.client_cert_missing");
+}
+
+#[tokio::test]
+async fn a_lowercase_query_is_accepted_over_mtls_when_matching_is_case_insensitive_and_refused_when_exact() {
+    let mut h = Harness::new();
+    start_query_api(&mut h, REQUIRED).await;
+    assert_eq!(
+        send_method(&h, Some(&LeafSpec::valid()), "query", "/protected").await.unwrap().0,
+        200,
+        "the identity extension must survive the normalizer"
+    );
+    drop(h);
+
+    let mut exact = Harness::new();
+    exact.case_sensitive = true;
+    start_query_api(&mut exact, REQUIRED).await;
+    assert_eq!(send_method(&exact, Some(&LeafSpec::valid()), "query", "/protected").await.unwrap().0, 405);
+    assert_eq!(send_method(&exact, Some(&LeafSpec::valid()), "QUERY", "/protected").await.unwrap().0, 200);
 }

@@ -250,6 +250,7 @@ mod tests {
         Operation {
             path: "/test".to_string(),
             method: "post".to_string(),
+            http_method: "POST".to_string(),
             operation_id: "test".to_string(),
             response_schema: None,
             parameters,
@@ -527,7 +528,7 @@ mod m2_media_type_ref_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("openapi.yaml");
         std::fs::write(&path, yaml).unwrap();
-        let doc = crate::openapi::load(&path).unwrap();
+        let doc = crate::openapi::load(&path, crate::openapi::LoadOptions::default()).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         (doc.operations[0].clone(), doc.component_schemas.clone())
     }

@@ -11,7 +11,7 @@ fn load_spec(yaml: &str) -> crate::openapi::OpenApiDocument {
     let dir = temp_dir("generate-spec");
     let path = dir.join("openapi.yaml");
     std::fs::write(&path, yaml).unwrap();
-    crate::openapi::load(&path).unwrap()
+    crate::openapi::load(&path, crate::openapi::LoadOptions::default()).unwrap()
 }
 
 fn security_defining(name: &str) -> SecurityConfig {

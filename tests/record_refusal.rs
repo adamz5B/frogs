@@ -85,3 +85,52 @@ fn recording_under_strict_refuses_an_unsafe_spec_before_connecting() {
     assert!(!root.join("api/datasources/endpoints/things/endpoint.get.test.json").exists());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn recording_refuses_a_security_mismatch_even_with_strict_off_before_connecting() {
+    let root = project("{}");
+    std::fs::write(
+        root.join("openapi.yaml"),
+        "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    a: { type: apiKey, in: header, name: k }\npaths:\n  /things:\n    get:\n      operationId: x\n      security: [ { a: [] } ]\n      responses: { '200': { description: ok } }\n",
+    )
+    .unwrap();
+    let out = record(&root);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("openapi.yaml requires security ('a')"), "stderr was: {stderr}");
+    assert!(!stderr.to_lowercase().contains("nosuchdriver"), "the connect step ran first: {stderr}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn record_with(root: &std::path::Path, method: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_frogs"))
+        .args(["test", "record", "/things", method])
+        .current_dir(root)
+        .output()
+        .expect("the frogs binary should run")
+}
+
+#[test]
+fn recording_with_a_dotted_or_unknown_method_argument_exits_1_before_connecting() {
+    let root = project("{}");
+    for bad in ["get.reference", "purge", "", "../get", "g\u{1b}[31met"] {
+        let out = record_with(&root, bad);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{bad:?}: {stderr}");
+        assert!(stderr.contains("is not an HTTP method frogs knows (get, put, post, delete, options, head, patch, trace, query)"), "{bad:?}: {stderr}");
+        assert!(!stderr.contains('\u{1b}'), "the argument must be sanitised before it is echoed: {stderr:?}");
+        assert!(!stderr.to_lowercase().contains("nosuchdriver"), "the connect step ran: {stderr}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recording_accepts_any_case_of_a_known_method_past_the_allowlist() {
+    let root = project("{}");
+    for ok in ["QUERY", "Get", "get"] {
+        let out = record_with(&root, ok);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("is not an HTTP method frogs knows"), "{ok}: {stderr}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

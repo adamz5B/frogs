@@ -19,6 +19,7 @@
     --put: #d98d1a;
     --patch: #8a4fd6;
     --delete: #d0393e;
+    --query: #0f8fa8;
     --ok: #1a9e6b;
     --err: #d0393e;
   }
@@ -75,12 +76,14 @@
     min-width: 46px;
     text-align: center;
     flex-shrink: 0;
+    background: var(--muted);
   }
   .method-get { background: var(--get); }
   .method-post { background: var(--post); }
   .method-put { background: var(--put); }
   .method-patch { background: var(--patch); }
   .method-delete { background: var(--delete); }
+  .method-query { background: var(--query); }
   .op-path {
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     overflow: hidden;
@@ -263,7 +266,7 @@
       var item = document.createElement("div");
       item.className = "op-item";
       item.innerHTML =
-        '<span class="method-badge method-' + op.method.toLowerCase() + '">' + escapeHtml(op.method) + "</span>" +
+        '<span class="method-badge method-' + op.method.toLowerCase().replace(/[^a-z0-9-]/g, "") + '">' + escapeHtml(op.method) + "</span>" +
         '<span class="op-path">' + escapeHtml(op.path) + "</span>";
       item.addEventListener("click", function () { selectOp(i); });
       list.appendChild(item);
@@ -283,7 +286,7 @@
     var summary = state.endpointsByKey[op.method + " " + op.path];
 
     var h2 = document.createElement("h2");
-    h2.innerHTML = '<span class="method-badge method-' + op.method.toLowerCase() + '">' + escapeHtml(op.method) + "</span>" + escapeHtml(op.path) +
+    h2.innerHTML = '<span class="method-badge method-' + op.method.toLowerCase().replace(/[^a-z0-9-]/g, "") + '">' + escapeHtml(op.method) + "</span>" + escapeHtml(op.path) +
       (summary && summary.generated ? '<span class="generated-pill">stub — not yet implemented</span>' : "");
     if (op.streaming === true) {
       var streamingPill = document.createElement("span");
@@ -357,8 +360,22 @@
 
     var tryButton = document.createElement("button");
     tryButton.textContent = "Try it out";
-    tryButton.addEventListener("click", function () { runTryItOut(op, byLocation); });
-    main.appendChild(tryButton);
+    var m = op.method;
+    var u = m.toUpperCase();
+    var cannotSend =
+      ["CONNECT", "TRACE", "TRACK"].indexOf(u) >= 0 ||
+      (["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"].indexOf(u) >= 0 && m !== u);
+    if (cannotSend) {
+      tryButton.disabled = true;
+      var why = document.createElement("span");
+      why.className = "hint";
+      why.textContent = " this method can't be sent exactly from a browser";
+      main.appendChild(tryButton);
+      main.appendChild(why);
+    } else {
+      tryButton.addEventListener("click", function () { runTryItOut(op, byLocation); });
+      main.appendChild(tryButton);
+    }
 
     var responseSection = document.createElement("section");
     responseSection.id = "response-section";

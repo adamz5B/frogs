@@ -156,7 +156,7 @@ pub fn render_text_line(entry: &Entry) -> String {
         "#{:04} {} {} {} [scenario: {}]",
         entry.sequence,
         entry.timestamp.format("%H:%M:%S%.3f"),
-        entry.method.to_uppercase(),
+        crate::openapi::method_token::display_token(&entry.method),
         ascii_only(&entry.path),
         ascii_only(&scenario_display(entry))
     );
@@ -255,7 +255,7 @@ fn entry_json(entry: &Entry) -> Value {
     serde_json::json!({
         "sequence": entry.sequence,
         "timestamp": entry.timestamp.to_rfc3339(),
-        "method": entry.method.to_uppercase(),
+        "method": crate::openapi::method_token::display_token(&entry.method),
         "path": entry.path,
         "requestId": entry.request_id,
         "scenario": entry.scenario,
@@ -279,7 +279,10 @@ fn entry_json(entry: &Entry) -> Value {
 pub fn render_junit(report: &Report) -> String {
     let mut suites: BTreeMap<String, Vec<&Entry>> = BTreeMap::new();
     for entry in &report.entries {
-        suites.entry(format!("{} {}", entry.method.to_uppercase(), entry.path)).or_default().push(entry);
+        suites
+            .entry(format!("{} {}", crate::openapi::method_token::display_token(&entry.method), entry.path))
+            .or_default()
+            .push(entry);
     }
     let overall = summary(&report.entries);
 
