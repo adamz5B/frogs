@@ -8,6 +8,7 @@ use crate::config::{Config, ServerConfig};
 use crate::openapi::dir_index::{
     DirIndex, DirState, EndpointFsError, EntryKind, FileState, Lookup, check_file, create_endpoint_dir, create_new_file, fold, rename_checked, resolve_endpoint_dir,
 };
+use crate::openapi::method_token::{self, MethodCase, TokenStatus};
 use crate::openapi::path_rules::is_single_normal_component;
 use crate::openapi::{
     LoadIssue, OpenApiDocument, Operation, ResponseMode, Severity, StreamSpec, content_hash, merge_stub_response, stub_from_descriptor, untrusted, walk_response_schema,
@@ -142,11 +143,14 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
         eprintln!("error: {}", error.message);
     }
 
-    for message in &plan.non_canonical {
+    for message in plan.invalid_tokens.iter().chain(&plan.wrong_mode) {
         eprintln!("warning: {message}");
     }
 
-    let strict_findings = doc.issues.iter().filter(|i| i.kind.is_strict_error()).count() + plan.errors.iter().filter(|e| e.strict).count() + plan.non_canonical.len();
+    let strict_findings = doc.issues.iter().filter(|i| i.kind.is_strict_error()).count()
+        + plan.errors.iter().filter(|e| e.strict).count()
+        + plan.invalid_tokens.len()
+        + plan.wrong_mode.len();
     if strict_findings > 0 {
         if config.server.strict_open_api() {
             eprintln!(
@@ -209,7 +213,7 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
         summary.skipped, summary.created, summary.migrated, summary.drift_warned
     );
 
-    let orphaned = mark_orphaned_endpoints(&api_root, &doc, &plan.rejected_paths, &mut file_errors)?;
+    let orphaned = mark_orphaned_endpoints(&api_root, &doc, &plan.rejected_paths, &plan.protected_files, &mut file_errors)?;
     for (path, method) in &orphaned {
         println!(
             "  {} {} no longer in {MANIFEST_FILE} — prefixed with _ (never deleted; restores automatically \
@@ -244,6 +248,11 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
     let security = crate::endpoint::security_check(&api_root.join("datasources/endpoints"), &doc);
     for mismatch in &security.mismatches {
         let message = mismatch.message();
+        eprintln!("error: {message}");
+        outcome.errors.push(message);
+    }
+    for file in &security.ambiguous {
+        let message = file.message();
         eprintln!("error: {message}");
         outcome.errors.push(message);
     }
@@ -604,9 +613,16 @@ pub(crate) struct Plan {
     pub errors: Vec<PlanError>,
     pub skip: HashSet<(String, String)>,
     pub rejected_paths: BTreeSet<String>,
-    /// Non-canonical fixed-method stub names (`endpoint.GET.json`): never
-    /// routed or renamed. A warning, and a problem only under `strictOpenApi`.
-    pub non_canonical: Vec<String>,
+    /// Stub names that are not a canonical method token (`endpoint.GET.json`,
+    /// `endpoint.purge.json`): never routed or renamed. A warning, and a problem
+    /// only under `strictOpenApi`.
+    pub invalid_tokens: Vec<String>,
+    /// Stub files valid only under the other `caseSensitiveMethods` setting
+    /// that no spec operation competes for: left alone, always a `validate` problem.
+    pub wrong_mode: Vec<String>,
+    /// `(folded path, token)` of files `generate` must never orphan: case-only
+    /// mismatches with a spec operation, and methods the loader set aside.
+    pub protected_files: HashSet<(String, String)>,
 }
 
 /// A read-only pass over everything `generate` would write to: finds case
@@ -619,10 +635,23 @@ pub(crate) fn plan_endpoint_files(api_root: &Path, doc: &OpenApiDocument) -> Pla
     let mut claimed: HashMap<String, String> = HashMap::new();
     let mut handled: HashSet<&str> = HashSet::new();
 
-    plan.non_canonical = crate::endpoint::non_canonical_method_files(&endpoints_root)
-        .into_iter()
-        .map(|(file, canonical)| format!("{} is not served; rename it to endpoint.{canonical}.json", untrusted(&file.display().to_string())))
+    let mode = doc.method_case;
+    let findings = crate::endpoint::method_file_findings(&endpoints_root, mode);
+    plan.invalid_tokens = findings
+        .iter()
+        .filter(|f| matches!(f.kind, crate::endpoint::MethodFileKind::NonCanonical { .. }))
+        .map(|f| f.message(mode))
         .collect();
+    let mut mismatch_files: HashSet<PathBuf> = HashSet::new();
+
+    for (path, token) in doc.ambiguous_methods.keys() {
+        plan.skip.insert((path.clone(), token.clone()));
+        plan.protected_files.insert((fold(path), token.clone()));
+    }
+    // Only orphan protection: a genuine fixed operation with the same token is still written.
+    for (path, token) in &doc.protected_methods {
+        plan.protected_files.insert((fold(path), token.clone()));
+    }
 
     for op in &doc.operations {
         let path = op.path.as_str();
@@ -703,6 +732,8 @@ pub(crate) fn plan_endpoint_files(api_root: &Path, doc: &OpenApiDocument) -> Pla
             continue;
         }
 
+        case_mismatch_pass(&dir, path, &ops_here, mode, &mut plan, &mut mismatch_files);
+
         for op in ops_here {
             let names = [
                 format!("endpoint.{}.json", op.method),
@@ -722,7 +753,92 @@ pub(crate) fn plan_endpoint_files(api_root: &Path, doc: &OpenApiDocument) -> Pla
             }
         }
     }
+    plan.wrong_mode = findings
+        .iter()
+        .filter(|f| matches!(f.kind, crate::endpoint::MethodFileKind::WrongMode { .. }) && !mismatch_files.contains(&f.file))
+        .map(|f| f.message(mode))
+        .collect();
     plan
+}
+
+/// Compares, for one spec path, the operations in the spec with the stub files on
+/// disk without regard to method case. A spec operation with no file of its own
+/// whose method matches an unclaimed file only by case is a mismatch: nothing is
+/// written, orphaned or renamed for it, and generate reports it as a strict error.
+fn case_mismatch_pass(dir: &Path, path: &str, ops: &[&Operation], mode: MethodCase, plan: &mut Plan, mismatch_files: &mut HashSet<PathBuf>) {
+    let Ok(index) = DirIndex::read(dir) else { return };
+    struct OnDisk {
+        file_name: String,
+        token: String,
+        wire: String,
+        served: bool,
+    }
+    let mut files: Vec<OnDisk> = Vec::new();
+    let mut names: HashSet<&str> = HashSet::new();
+    for (name, kind) in index.entries() {
+        if kind != EntryKind::File {
+            continue;
+        }
+        names.insert(name);
+        let Some(token) = method_token::stub_file_token(name) else { continue };
+        match method_token::parse_file_token(token, mode) {
+            TokenStatus::Valid(t) => files.push(OnDisk {
+                file_name: name.to_string(),
+                token: token.to_string(),
+                wire: t.wire().into_owned(),
+                served: true,
+            }),
+            TokenStatus::WrongMode { wire } => files.push(OnDisk {
+                file_name: name.to_string(),
+                token: token.to_string(),
+                wire,
+                served: false,
+            }),
+            TokenStatus::Invalid => {}
+        }
+    }
+    let claimed = |file: &OnDisk| ops.iter().any(|o| o.method == file.token);
+    for op in ops {
+        if names.contains(format!("endpoint.{}.json", op.method).as_str()) {
+            continue;
+        }
+        let candidates: Vec<&OnDisk> = files
+            .iter()
+            .filter(|f| !claimed(f) && f.wire.eq_ignore_ascii_case(&op.http_method) && f.wire != op.http_method)
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        let listed = candidates
+            .iter()
+            .map(|f| format!("{} (method '{}')", untrusted(&f.file_name), untrusted(&f.wire)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let head = format!(
+            "{listed} vs openapi.yaml's '{}' on {} under caseSensitiveMethods={}",
+            untrusted(&op.http_method),
+            untrusted(path),
+            mode.case_sensitive()
+        );
+        let still_served: Vec<&&OnDisk> = candidates.iter().filter(|f| f.served).collect();
+        let message = if still_served.is_empty() {
+            format!("{head} — rename the file to endpoint.{}.json by hand to keep your mappings", op.method)
+        } else {
+            let old = still_served.iter().map(|f| untrusted(&f.wire)).collect::<Vec<_>>().join("/");
+            format!(
+                "{head} — the OLD route {old} {} is STILL BEING SERVED by `frogs run` from this file until you rename it; requests sending '{}' get 405. Rename it to endpoint.{}.json by hand to move your mappings.",
+                untrusted(path),
+                untrusted(&op.http_method),
+                op.method
+            )
+        };
+        plan.errors.push(PlanError { strict: true, message });
+        plan.skip.insert((op.path.clone(), op.method.clone()));
+        for file in candidates {
+            plan.protected_files.insert((fold(path), file.token.clone()));
+            mismatch_files.insert(dir.join(&file.file_name));
+        }
+    }
 }
 
 fn describe_ops(ops: &[&Operation]) -> String {
@@ -734,13 +850,13 @@ fn describe_ops(ops: &[&Operation]) -> String {
 /// underscore-prefixed), paired with the (path, method) it represents.
 /// Symlinked folders and stub files are reported in `problems` rather than
 /// followed.
-fn discover_active_endpoint_files(endpoints_root: &Path, problems: &mut Vec<String>) -> Vec<(String, String, PathBuf)> {
+fn discover_active_endpoint_files(endpoints_root: &Path, mode: MethodCase, problems: &mut Vec<String>) -> Vec<(String, String, PathBuf)> {
     let mut found = Vec::new();
-    walk_active_endpoint_files(endpoints_root, endpoints_root, &mut found, problems);
+    walk_active_endpoint_files(endpoints_root, endpoints_root, mode, &mut found, problems);
     found
 }
 
-fn walk_active_endpoint_files(root: &Path, dir: &Path, out: &mut Vec<(String, String, PathBuf)>, problems: &mut Vec<String>) {
+fn walk_active_endpoint_files(root: &Path, dir: &Path, mode: MethodCase, out: &mut Vec<(String, String, PathBuf)>, problems: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -759,15 +875,14 @@ fn walk_active_endpoint_files(root: &Path, dir: &Path, out: &mut Vec<(String, St
             if name == "_backups" {
                 continue;
             }
-            walk_active_endpoint_files(root, &path, out, problems);
-        } else if let Some(method) = name.strip_prefix("endpoint.").and_then(|n| n.strip_suffix(".json")) {
-            // A real HTTP method (`get`, `post`, ...) never contains a dot —
-            // this excludes `.reference.json` and `.test.json` siblings
-            // (whose "method" segment would be `get.reference`/`get.test`
-            // after stripping), which aren't stub files at all.
-            if !method.contains('.') {
-                out.push((path_for_endpoint_dir(root, dir), method.to_string(), path.clone()));
-            }
+            walk_active_endpoint_files(root, &path, mode, out, problems);
+        } else if let Some(token_text) = method_token::stub_file_token(&name)
+            && let TokenStatus::Valid(token) = method_token::parse_file_token(token_text, mode)
+        {
+            // Only a canonical token valid in this mode counts: that also excludes
+            // `.reference.json`/`.test.json` siblings, and `WrongMode`/`Invalid` names
+            // are never orphan candidates.
+            out.push((path_for_endpoint_dir(root, dir), token.file_token().into_owned(), path.clone()));
         }
     }
 }
@@ -823,9 +938,15 @@ fn restore_orphaned_endpoints(root: &Path, doc: &OpenApiDocument, skip: &HashSet
 /// exactly where it is. Comparison is by case-folded name, and anything
 /// belonging to a path the loader or preflight set aside (ambiguous,
 /// unsafe, claim-rejected) is left alone.
-fn mark_orphaned_endpoints(root: &Path, doc: &OpenApiDocument, rejected_paths: &BTreeSet<String>, errors: &mut Vec<String>) -> io::Result<Vec<(String, String)>> {
+fn mark_orphaned_endpoints(
+    root: &Path,
+    doc: &OpenApiDocument,
+    rejected_paths: &BTreeSet<String>,
+    protected_files: &HashSet<(String, String)>,
+    errors: &mut Vec<String>,
+) -> io::Result<Vec<(String, String)>> {
     let endpoints_root = root.join("datasources/endpoints");
-    let active: HashSet<(String, String)> = doc.operations.iter().map(|op| (fold(&op.path), fold(&op.method))).collect();
+    let active: HashSet<(String, String)> = doc.operations.iter().map(|op| (fold(&op.path), op.method.clone())).collect();
     let protected: HashSet<String> = doc
         .ambiguous
         .iter()
@@ -835,12 +956,10 @@ fn mark_orphaned_endpoints(root: &Path, doc: &OpenApiDocument, rejected_paths: &
         .collect();
 
     let mut orphaned = Vec::new();
-    for (path, method, stub_path) in discover_active_endpoint_files(&endpoints_root, errors) {
+    for (path, method, stub_path) in discover_active_endpoint_files(&endpoints_root, doc.method_case, errors) {
         let folded_path = fold(&path);
-        if active.contains(&(folded_path.clone(), fold(&method))) || protected.contains(&folded_path) {
-            continue;
-        }
-        if crate::openapi::method_token::fixed_case_variant(&method).is_some() {
+        let key = (folded_path, method.clone());
+        if active.contains(&key) || protected.contains(&key.0) || protected_files.contains(&key) {
             continue;
         }
 
@@ -1481,7 +1600,7 @@ mod tests {
         let dir = root.join("datasources/endpoints/ping");
         std::fs::write(dir.join("endpoint.get.test.json"), r#"{ "cases": [] }"#).unwrap();
 
-        let orphaned = mark_orphaned_endpoints(&root, &doc, &BTreeSet::new(), &mut Vec::new()).unwrap();
+        let orphaned = mark_orphaned_endpoints(&root, &doc, &BTreeSet::new(), &HashSet::new(), &mut Vec::new()).unwrap();
         assert!(orphaned.is_empty(), "a .test.json sibling must not be treated as its own endpoint file");
         assert!(dir.join("endpoint.get.test.json").is_file(), "the test file itself must be untouched");
 
@@ -1498,7 +1617,7 @@ mod tests {
         // /ping no longer exists in the new spec.
         let doc_v2 = doc_from_yaml("openapi: 3.0.3\ninfo: { title: t, version: 0.1.0 }\npaths: {}\n");
 
-        let orphaned = mark_orphaned_endpoints(&root, &doc_v2, &BTreeSet::new(), &mut Vec::new()).unwrap();
+        let orphaned = mark_orphaned_endpoints(&root, &doc_v2, &BTreeSet::new(), &HashSet::new(), &mut Vec::new()).unwrap();
         assert_eq!(orphaned, vec![("/ping".to_string(), "get".to_string())]);
 
         let dir = root.join("datasources/endpoints/ping");
@@ -1522,7 +1641,7 @@ mod tests {
         std::fs::write(&stub_path, r#"{ "operationId": "ping", "sources": { "x": 1 }, "response": "sources.x.value" }"#).unwrap();
 
         let empty_doc = doc_from_yaml("openapi: 3.0.3\ninfo: { title: t, version: 0.1.0 }\npaths: {}\n");
-        mark_orphaned_endpoints(&root, &empty_doc, &BTreeSet::new(), &mut Vec::new()).unwrap();
+        mark_orphaned_endpoints(&root, &empty_doc, &BTreeSet::new(), &HashSet::new(), &mut Vec::new()).unwrap();
         assert!(!stub_path.exists());
 
         // /ping comes back, with a schema change (string -> object) at the
@@ -1561,7 +1680,7 @@ mod tests {
         write_endpoint_files(&root, &doc, &components, &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut Vec::new()).unwrap();
 
         let empty_doc = doc_from_yaml("openapi: 3.0.3\ninfo: { title: t, version: 0.1.0 }\npaths: {}\n");
-        mark_orphaned_endpoints(&root, &empty_doc, &BTreeSet::new(), &mut Vec::new()).unwrap();
+        mark_orphaned_endpoints(&root, &empty_doc, &BTreeSet::new(), &HashSet::new(), &mut Vec::new()).unwrap();
 
         // Same `doc` as before -- nothing about /ping's schema changed.
         let restored = restore_orphaned_endpoints(&root, &doc, &HashSet::new(), &mut Vec::new()).unwrap();
@@ -1911,12 +2030,55 @@ mod hardening_tests {
         assert!(!outcome.errors.is_empty(), "skipped paths must make generate fail");
         assert!(!outcome.strict_aborted);
 
+        // `/C:/x` has no traversal; it is only Windows-unsafe. The loader skips
+        // it on Windows and keeps it (with a warning) elsewhere, so ask the same
+        // policy the loader uses rather than branching on the OS here.
+        let windows_names_kept = crate::openapi::path_rules::PortabilityPolicy::for_host() == crate::openapi::path_rules::PortabilityPolicy::Warn;
+        let endpoints = root.join("api").join("datasources").join("endpoints");
+
+        let mut saw_fine = false;
+        let mut saw_drive_like = false;
         for (name, _) in tree(&root) {
             if name == "openapi.yaml" || SCAFFOLD.contains(&name.as_str()) {
                 continue;
             }
-            assert!(name.starts_with("api/datasources/endpoints/fine/"), "unexpected file {name}");
+            if name.starts_with("api/datasources/endpoints/fine/") {
+                saw_fine = true;
+                continue;
+            }
+            if windows_names_kept && name.starts_with("api/datasources/endpoints/C:/x/") {
+                saw_drive_like = true;
+                continue;
+            }
+            panic!("unexpected file {name}");
         }
+        assert!(saw_fine, "the safe path must still be generated");
+
+        if windows_names_kept {
+            // Kept, but only as a plain folder literally named `C:` inside the
+            // endpoints tree — never a drive, link or anything outside it.
+            // (Joining "C:" is only safe here: on Windows it would be a drive prefix.)
+            assert!(saw_drive_like, "/C:/x is kept with a warning on this host, so its stub must exist");
+            let drive_like = endpoints.join("C:");
+            let meta = std::fs::symlink_metadata(&drive_like).unwrap();
+            assert!(meta.is_dir() && !meta.file_type().is_symlink(), "C: must be a real directory");
+            let real = std::fs::canonicalize(drive_like.join("x").join("endpoint.get.json")).unwrap();
+            assert!(
+                real.starts_with(std::fs::canonicalize(&endpoints).unwrap()),
+                "{} is outside the endpoints folder",
+                real.display()
+            );
+        } else {
+            assert!(!saw_drive_like);
+            // List the folder rather than probing a joined path: `join("C:")`
+            // would point at the real drive here.
+            let names: Vec<String> = std::fs::read_dir(&endpoints)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(names, ["fine"], "only the safe path may get a folder where Windows names are skipped");
+        }
+
         assert!(!std::env::temp_dir().join(&marker).exists(), "something escaped the project");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2688,7 +2850,10 @@ mod m3_generate_tests {
     }
 
     fn names_in(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
         names.sort();
         names
     }
@@ -2740,9 +2905,591 @@ mod m3_generate_tests {
         write_non_canonical(&root, "endpoint.Query.json");
         let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
         let plan = plan_endpoint_files(&root.join("api"), &doc);
-        assert_eq!(plan.non_canonical.len(), 1, "{:?}", plan.non_canonical);
-        assert!(plan.non_canonical[0].contains("rename it to endpoint.query.json"), "{}", plan.non_canonical[0]);
+        assert_eq!(plan.invalid_tokens.len(), 1, "{:?}", plan.invalid_tokens);
+        assert!(plan.invalid_tokens[0].contains("rename it to endpoint.query.json"), "{}", plan.invalid_tokens[0]);
         assert!(plan.errors.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m4_generate_tests {
+    use super::*;
+
+    fn temp_project() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "frogs-generate-m4-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    const RESPONSES: &str = "responses:\n        '200':\n          description: ok\n          content:\n            application/json: { schema: { type: object, properties: { id: { type: string } } } }\n";
+
+    fn fixed_op(field: &str, id: &str) -> String {
+        format!("    {field}:\n      operationId: {id}\n      {RESPONSES}")
+    }
+
+    fn additional(entries: &[(&str, &str)]) -> String {
+        let mut out = String::from("    additionalOperations:\n");
+        for (key, id) in entries {
+            out.push_str(&format!(
+                "      '{key}':\n        operationId: {id}\n        responses:\n          '200':\n            description: ok\n            content:\n              application/json: {{ schema: {{ type: object, properties: {{ id: {{ type: string }} }} }} }}\n"
+            ));
+        }
+        out
+    }
+
+    fn spec_x(body: &str) -> String {
+        format!("openapi: 3.2.0\ninfo: {{ title: t, version: '1' }}\npaths:\n  /x:\n{body}")
+    }
+
+    fn project(spec: &str, server_json: &str) -> PathBuf {
+        let root = temp_project();
+        std::fs::write(root.join("openapi.yaml"), spec).unwrap();
+        std::fs::create_dir_all(root.join("api/config")).unwrap();
+        std::fs::write(root.join("api/config/server.json"), server_json).unwrap();
+        root
+    }
+
+    const EXACT: &str = r#"{ "caseSensitiveMethods": true }"#;
+    const DEFAULT: &str = r#"{ "caseSensitiveMethods": false }"#;
+    const EXACT_STRICT: &str = r#"{ "caseSensitiveMethods": true, "strictOpenApi": true }"#;
+    const DEFAULT_STRICT: &str = r#"{ "caseSensitiveMethods": false, "strictOpenApi": true }"#;
+
+    fn dir_x(root: &Path) -> PathBuf {
+        root.join("api/datasources/endpoints/x")
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|rd| rd.map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    const STUB: &str = r#"{ "operationId": "hand", "sources": {}, "response": {}, "note": "hand edited" }"#;
+
+    fn put_stub(root: &Path, file: &str) -> PathBuf {
+        let dir = dir_x(root);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(file);
+        std::fs::write(&path, STUB).unwrap();
+        path
+    }
+
+    #[test]
+    fn query_and_link_operations_get_stub_and_reference_files_named_by_their_file_tokens() {
+        let root = project(&spec_x(&(fixed_op("query", "q") + &additional(&[("LINK", "l")]))), DEFAULT);
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(
+            names_in(&dir_x(&root)),
+            [
+                "endpoint.LINK.json",
+                "endpoint.LINK.reference.json",
+                "endpoint.query.json",
+                "endpoint.query.reference.json"
+            ]
+        );
+        let stub = std::fs::read_to_string(dir_x(&root).join("endpoint.LINK.json")).unwrap();
+        assert!(stub.contains("\"operationId\": \"l\""), "{stub}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exact_mode_writes_escaped_file_names_for_lowercase_and_mixed_case_methods_with_a_w1_only_run_succeeding() {
+        let root = project(&spec_x(&additional(&[("purge", "p"), ("Purge", "pp")])), EXACT);
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.is_empty(), "W1 warnings must not be errors: {:?}", outcome.errors);
+        assert_eq!(
+            names_in(&dir_x(&root)),
+            [
+                "endpoint.~_50urge.json",
+                "endpoint.~_50urge.reference.json",
+                "endpoint.~purge.json",
+                "endpoint.~purge.reference.json"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_lowercase_purge_stub_where_purge_uppercase_is_needed_is_a_case_conflict_and_nothing_is_written() {
+        let root = project(&spec_x(&additional(&[("purge", "p")])), DEFAULT);
+        let existing = put_stub(&root, "endpoint.purge.json");
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(!outcome.errors.is_empty(), "a case conflict must fail generate");
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .any(|e| e.contains("endpoint.purge.json exists where endpoint.PURGE.json is needed")),
+            "{:?}",
+            outcome.errors
+        );
+        assert_eq!(names_in(&dir_x(&root)), ["endpoint.purge.json"], "nothing may be created, renamed or orphaned");
+        assert_eq!(std::fs::read_to_string(existing).unwrap(), STUB);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn switching_from_default_to_exact_with_an_old_upper_stub_reports_that_the_old_route_is_still_served_and_touches_nothing() {
+        let root = project(&spec_x(&additional(&[("purge", "p")])), EXACT);
+        let existing = put_stub(&root, "endpoint.PURGE.json");
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(!outcome.strict_aborted);
+        let message = outcome
+            .errors
+            .iter()
+            .find(|e| e.contains("STILL BEING SERVED"))
+            .unwrap_or_else(|| panic!("{:?}", outcome.errors));
+        assert!(
+            message.contains("endpoint.PURGE.json (method 'PURGE') vs openapi.yaml's 'purge' on /x under caseSensitiveMethods=true"),
+            "{message}"
+        );
+        assert!(message.contains("requests sending 'purge' get 405"), "{message}");
+        assert!(message.contains("endpoint.~purge.json"), "{message}");
+        assert_eq!(names_in(&dir_x(&root)), ["endpoint.PURGE.json"], "no stub, no reference, no orphan, no rename");
+        assert_eq!(std::fs::read_to_string(existing).unwrap(), STUB);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn switching_from_exact_to_default_with_an_old_tilde_stub_reports_the_rename_hint_and_touches_nothing() {
+        let root = project(&spec_x(&additional(&[("purge", "p")])), DEFAULT);
+        let existing = put_stub(&root, "endpoint.~purge.json");
+        let outcome = generate_api_inner(&root).unwrap();
+        let message = outcome
+            .errors
+            .iter()
+            .find(|e| e.contains("rename the file to endpoint.PURGE.json by hand"))
+            .unwrap_or_else(|| panic!("{:?}", outcome.errors));
+        assert!(
+            message.contains("endpoint.~purge.json (method 'purge') vs openapi.yaml's 'PURGE' on /x under caseSensitiveMethods=false"),
+            "{message}"
+        );
+        assert!(!message.contains("STILL BEING SERVED"), "the old file is not served in this mode: {message}");
+        assert_eq!(names_in(&dir_x(&root)), ["endpoint.~purge.json"]);
+        assert_eq!(std::fs::read_to_string(existing).unwrap(), STUB);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn under_strict_a_mode_switch_mismatch_refuses_generate_before_any_write() {
+        for (server, spec_key, stale) in [(EXACT_STRICT, "purge", "endpoint.PURGE.json"), (DEFAULT_STRICT, "purge", "endpoint.~purge.json")] {
+            let root = project(&spec_x(&(fixed_op("get", "g") + &additional(&[(spec_key, "p")]))), server);
+            put_stub(&root, stale);
+            let outcome = generate_api_inner(&root).unwrap();
+            assert!(outcome.strict_aborted, "{server}: {:?}", outcome.errors);
+            assert_eq!(names_in(&dir_x(&root)), [stale], "{server}: nothing generated, not even the unrelated get");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn duplicate_case_variant_keys_write_nothing_leave_the_existing_stub_byte_identical_and_fail_generate() {
+        let root = project(&spec_x(&additional(&[("purge", "a"), ("PURGE", "b")])), DEFAULT);
+        let existing = put_stub(&root, "endpoint.PURGE.json");
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(!outcome.errors.is_empty(), "the S4 issue is an error");
+        assert!(outcome.errors.iter().any(|e| e.contains("'purge'") && e.contains("'PURGE'")), "{:?}", outcome.errors);
+        assert_eq!(names_in(&dir_x(&root)), ["endpoint.PURGE.json"], "not orphaned, no reference, nothing new");
+        assert_eq!(std::fs::read_to_string(existing).unwrap(), STUB);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn duplicate_case_variant_keys_with_no_existing_file_create_nothing_for_that_method() {
+        let root = project(&spec_x(&(additional(&[("purge", "a"), ("PURGE", "b"), ("LINK", "l")]))), DEFAULT);
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(!outcome.errors.is_empty());
+        assert_eq!(names_in(&dir_x(&root)), ["endpoint.LINK.json", "endpoint.LINK.reference.json"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_fixed_name_collision_key_leaves_an_existing_get_stub_unorphaned() {
+        let root = project(&spec_x(&additional(&[("get", "g")])), DEFAULT);
+        let existing = put_stub(&root, "endpoint.get.json");
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(!outcome.errors.is_empty(), "the S4 issue is an error");
+        assert_eq!(names_in(&dir_x(&root)), ["endpoint.get.json"], "protected from orphaning");
+        assert_eq!(std::fs::read_to_string(existing).unwrap(), STUB);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_genuine_get_operation_is_still_generated_when_an_additional_key_collides_with_it() {
+        let root = project(&spec_x(&(fixed_op("get", "g") + &additional(&[("get", "dup")]))), DEFAULT);
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(!outcome.errors.is_empty(), "the colliding key is still an error");
+        let stub = std::fs::read_to_string(dir_x(&root).join("endpoint.get.json")).unwrap();
+        assert!(stub.contains("\"operationId\": \"g\""), "{stub}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_wrong_mode_file_with_no_counterpart_is_a_warning_left_alone_and_a_plan_entry() {
+        let root = project("openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths: {}\n", DEFAULT);
+        let existing = put_stub(&root, "endpoint.~purge.json");
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(!outcome.strict_aborted);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(names_in(&dir_x(&root)), ["endpoint.~purge.json"], "never orphaned");
+        assert_eq!(std::fs::read_to_string(existing).unwrap(), STUB);
+        let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
+        let plan = plan_endpoint_files(&root.join("api"), &doc);
+        assert_eq!(plan.wrong_mode.len(), 1, "{:?}", plan.wrong_mode);
+        assert!(
+            plan.wrong_mode[0].contains("case-distinct") && plan.wrong_mode[0].contains("caseSensitiveMethods is false"),
+            "{}",
+            plan.wrong_mode[0]
+        );
+        assert!(plan.invalid_tokens.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn under_strict_a_wrong_mode_file_with_no_counterpart_refuses_generate_and_generates_nothing_else() {
+        let root = project(&spec_x(&fixed_op("get", "g")), DEFAULT_STRICT);
+        let other = root.join("api/datasources/endpoints/other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("endpoint.~purge.json"), STUB).unwrap();
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.strict_aborted);
+        assert!(!dir_x(&root).exists(), "nothing generated under a strict refusal");
+        assert_eq!(names_in(&other), ["endpoint.~purge.json"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invalid_token_files_such_as_endpoint_get_upper_and_mixed_are_never_orphaned_or_restored() {
+        let root = project("openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths: {}\n", DEFAULT);
+        // One folder per spelling so the fixture stays unique after case folding on every OS.
+        for (folder, file) in [
+            ("g1", "endpoint.GET.json"),
+            ("g2", "endpoint.Get.json"),
+            ("g3", "endpoint.purge.json"),
+            ("g4", "endpoint.~_47_45_54.json"),
+        ] {
+            let dir = root.join("api/datasources/endpoints").join(folder);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(file), STUB).unwrap();
+            // and an orphaned twin that must not be restored even when the spec asks for the method
+            std::fs::write(dir.join(format!("_{file}")), STUB).unwrap();
+        }
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        for (folder, file) in [
+            ("g1", "endpoint.GET.json"),
+            ("g2", "endpoint.Get.json"),
+            ("g3", "endpoint.purge.json"),
+            ("g4", "endpoint.~_47_45_54.json"),
+        ] {
+            let dir = root.join("api/datasources/endpoints").join(folder);
+            assert_eq!(names_in(&dir), [format!("_{file}"), file.to_string()], "{folder}");
+        }
+
+        // The spec now declares get on /g1, but the orphan twin `_endpoint.GET.json` blocks the name: nothing is restored or created.
+        let spec = "openapi: 3.2.0
+info: { title: t, version: '1' }
+paths:
+  /g1:
+    get:
+      operationId: g1
+      responses: { '200': { description: ok } }
+";
+        std::fs::write(root.join("openapi.yaml"), spec).unwrap();
+        let dir = root.join("api/datasources/endpoints/g1");
+        std::fs::remove_file(dir.join("endpoint.GET.json")).unwrap();
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .any(|e| e.contains("_endpoint.GET.json exists where _endpoint.get.json is needed")),
+            "{:?}",
+            outcome.errors
+        );
+        assert_eq!(names_in(&dir), ["_endpoint.GET.json"], "the invalid orphan twin is neither restored nor renamed");
+        assert_eq!(std::fs::read_to_string(dir.join("_endpoint.GET.json")).unwrap(), STUB);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn round_trip(spec_key_lines: &str, server_json: &str, expected_files: &[&str]) {
+        let root = project(&spec_x(spec_key_lines), server_json);
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let dir = dir_x(&root);
+        let stub_name = expected_files[0];
+        assert!(dir.join(stub_name).is_file(), "{:?}", names_in(&dir));
+        let original: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(stub_name)).unwrap()).unwrap();
+        // remove the path from the spec
+        std::fs::write(root.join("openapi.yaml"), "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths: {}\n").unwrap();
+        generate_api_inner(&root).unwrap();
+        assert!(!dir.join(stub_name).exists(), "{stub_name} should be orphaned: {:?}", names_in(&dir));
+        assert!(dir.join(format!("_{stub_name}")).is_file(), "{:?}", names_in(&dir));
+        // and bring it back
+        std::fs::write(root.join("openapi.yaml"), spec_x(spec_key_lines)).unwrap();
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(!dir.join(format!("_{stub_name}")).exists(), "{:?}", names_in(&dir));
+        let restored: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(stub_name)).unwrap()).unwrap();
+        assert_eq!(restored, original, "the restored stub is the orphaned one");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn orphan_then_restore_round_trips_link_in_default_mode() {
+        round_trip(&additional(&[("LINK", "l")]), DEFAULT, &["endpoint.LINK.json"]);
+    }
+
+    #[test]
+    fn orphan_then_restore_round_trips_query_and_get_in_both_modes() {
+        for server in [DEFAULT, EXACT] {
+            round_trip(&fixed_op("query", "q"), server, &["endpoint.query.json"]);
+            round_trip(&fixed_op("get", "g"), server, &["endpoint.get.json"]);
+        }
+    }
+
+    #[test]
+    fn orphan_then_restore_round_trips_tilde_and_escaped_tokens_in_exact_mode() {
+        round_trip(&additional(&[("purge", "p")]), EXACT, &["endpoint.~purge.json"]);
+        round_trip(&additional(&[("Purge", "p")]), EXACT, &["endpoint.~_50urge.json"]);
+        round_trip(&additional(&[("get", "g")]), EXACT, &["endpoint.~get.json"]);
+        round_trip(&additional(&[("X.Y", "xy")]), DEFAULT, &["endpoint.~_58_2e_59.json"]);
+    }
+
+    #[test]
+    fn a_stub_generated_under_exact_mode_is_neither_orphaned_nor_renamed_when_the_mode_flips_to_default() {
+        // generated under exact, mode flipped to default: ~purge is WrongMode, PURGE is a brand-new method.
+        let root = project(&spec_x(&additional(&[("purge", "p")])), EXACT);
+        generate_api_inner(&root).unwrap();
+        let dir = dir_x(&root);
+        std::fs::write(root.join("api/config/server.json"), DEFAULT).unwrap();
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(
+            outcome.errors.iter().any(|e| e.contains("rename the file to endpoint.PURGE.json by hand")),
+            "{:?}",
+            outcome.errors
+        );
+        assert!(dir.join("endpoint.~purge.json").is_file());
+        assert!(!dir.join("endpoint.PURGE.json").exists());
+        assert!(!dir.join("_endpoint.~purge.json").exists(), "a wrong-mode file is never orphaned");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stale_get_stub_with_a_spec_declaring_only_an_exact_mode_lowercase_get_is_a_strict_mismatch_and_is_left_alone() {
+        let root = project(&spec_x(&additional(&[("get", "lower")])), EXACT);
+        let existing = put_stub(&root, "endpoint.get.json");
+        let outcome = generate_api_inner(&root).unwrap();
+        let message = outcome
+            .errors
+            .iter()
+            .find(|e| e.contains("endpoint.get.json (method 'GET')"))
+            .unwrap_or_else(|| panic!("{:?}", outcome.errors));
+        assert!(message.contains("vs openapi.yaml's 'get' on /x under caseSensitiveMethods=true"), "{message}");
+        assert!(message.contains("STILL BEING SERVED"), "{message}");
+        assert!(message.contains("endpoint.~get.json"), "{message}");
+        assert_eq!(names_in(&dir_x(&root)), ["endpoint.get.json"], "nothing created, nothing orphaned");
+        assert_eq!(std::fs::read_to_string(existing).unwrap(), STUB);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_genuine_get_and_a_lowercase_get_in_exact_mode_each_get_their_own_stub_without_any_mismatch() {
+        let root = project(&spec_x(&(fixed_op("get", "upper") + &additional(&[("get", "lower")]))), EXACT);
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(
+            names_in(&dir_x(&root)),
+            [
+                "endpoint.get.json",
+                "endpoint.get.reference.json",
+                "endpoint.~get.json",
+                "endpoint.~get.reference.json"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- round 2 ----
+
+    fn tree_names(root: &Path) -> Vec<String> {
+        fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, base, out);
+                } else {
+                    out.push(path.strip_prefix(base).unwrap().to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&root.join("api"), root, &mut out);
+        out.sort();
+        out
+    }
+
+    fn fs_is_case_sensitive(dir: &Path) -> bool {
+        let probe = dir.join("case_probe_a");
+        std::fs::write(&probe, b"").unwrap();
+        let sensitive = !dir.join("CASE_PROBE_A").exists();
+        std::fs::remove_file(&probe).unwrap();
+        sensitive
+    }
+
+    #[test]
+    fn golden_file_tree_for_extension_methods_in_exact_mode_is_identical_on_every_os() {
+        let root = project(
+            &spec_x(&(fixed_op("query", "q") + &additional(&[("LINK", "l"), ("purge", "p"), ("x.y", "xy")]))),
+            EXACT,
+        );
+        let first = generate_api_inner(&root).unwrap();
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        let run1 = [
+            "api/config/connections.json",
+            "api/config/errors/core.json",
+            "api/config/server.json",
+            "api/datasources/endpoints/x/endpoint.LINK.json",
+            "api/datasources/endpoints/x/endpoint.LINK.reference.json",
+            "api/datasources/endpoints/x/endpoint.query.json",
+            "api/datasources/endpoints/x/endpoint.query.reference.json",
+            "api/datasources/endpoints/x/endpoint.~purge.json",
+            "api/datasources/endpoints/x/endpoint.~purge.reference.json",
+            "api/datasources/endpoints/x/endpoint.~x_2ey.json",
+            "api/datasources/endpoints/x/endpoint.~x_2ey.reference.json",
+            "api/security/schemes.json",
+        ];
+        assert_eq!(tree_names(&root), run1.to_vec());
+
+        // Content is byte-for-byte stable too: LF line endings only, and the exact stub text.
+        for name in run1 {
+            let bytes = std::fs::read(root.join(name)).unwrap();
+            assert!(!bytes.contains(&b'\r'), "{name} contains a CR");
+        }
+        let link = std::fs::read_to_string(root.join("api/datasources/endpoints/x/endpoint.LINK.json")).unwrap();
+        assert_eq!(
+            link,
+            "{\n  \"operationId\": \"l\",\n  \"_generated\": true,\n  \"_todo\": \"See endpoint.LINK.reference.json for available request/response fields. Fill in sources and map each response field to a source path.\",\n  \"sources\": {},\n  \"response\": {\n    \"id\": null\n  }\n}"
+        );
+        let escaped = std::fs::read_to_string(root.join("api/datasources/endpoints/x/endpoint.~x_2ey.json")).unwrap();
+        assert!(escaped.contains("See endpoint.~x_2ey.reference.json"), "{escaped}");
+
+        // Dropping `purge` orphans exactly its two files, in place.
+        std::fs::write(
+            root.join("openapi.yaml"),
+            spec_x(&(fixed_op("query", "q") + &additional(&[("LINK", "l"), ("x.y", "xy")]))),
+        )
+        .unwrap();
+        let second = generate_api_inner(&root).unwrap();
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        let mut run2: Vec<&str> = run1.iter().copied().filter(|n| !n.contains("~purge")).collect();
+        run2.push("api/datasources/endpoints/x/_endpoint.~purge.json");
+        run2.push("api/datasources/endpoints/x/_endpoint.~purge.reference.json");
+        run2.sort();
+        assert_eq!(tree_names(&root), run2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn golden_file_tree_for_the_same_spec_in_default_mode_uses_uppercase_and_escaped_tokens() {
+        let root = project(&spec_x(&additional(&[("link", "l"), ("x.y", "xy")])), DEFAULT);
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let names = tree_names(&root);
+        for expected in [
+            "api/datasources/endpoints/x/endpoint.LINK.json",
+            "api/datasources/endpoints/x/endpoint.LINK.reference.json",
+            "api/datasources/endpoints/x/endpoint.~_58_2e_59.json",
+            "api/datasources/endpoints/x/endpoint.~_58_2e_59.reference.json",
+        ] {
+            assert!(names.contains(&expected.to_string()), "{expected} missing from {names:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn coexisting_purge_files_in_default_mode_leave_both_untouched_and_generate_neither_orphans_nor_renames() {
+        let root = project(&spec_x(&additional(&[("purge", "p")])), DEFAULT);
+        if !fs_is_case_sensitive(&root) {
+            eprintln!("skipping: case-insensitive filesystem, endpoint.purge.json and endpoint.PURGE.json cannot coexist");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        put_stub(&root, "endpoint.PURGE.json");
+        put_stub(&root, "endpoint.purge.json");
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let names = names_in(&dir_x(&root));
+        assert!(
+            names.contains(&"endpoint.PURGE.json".to_string()) && names.contains(&"endpoint.purge.json".to_string()),
+            "{names:?}"
+        );
+        // `_backups/` is generate's own migration backup folder, not an orphan.
+        assert!(!names.iter().any(|n| n.starts_with("_endpoint.")), "nothing orphaned: {names:?}");
+        assert!(!names.iter().any(|n| n.contains('~')), "nothing created for another mode: {names:?}");
+        // The canonical stub may be migrated (it has no recorded hash); the
+        // non-canonical twin is never served, so it must never be touched.
+        assert_eq!(std::fs::read_to_string(dir_x(&root).join("endpoint.purge.json")).unwrap(), STUB);
+        assert!(!names.contains(&"endpoint.purge.reference.json".to_string()), "{names:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn coexisting_get_and_upper_get_files_are_both_left_alone_when_the_spec_still_declares_get() {
+        let root = project(&spec_x(&fixed_op("get", "g")), DEFAULT);
+        if !fs_is_case_sensitive(&root) {
+            eprintln!("skipping: case-insensitive filesystem, endpoint.get.json and endpoint.GET.json cannot coexist");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        put_stub(&root, "endpoint.get.json");
+        put_stub(&root, "endpoint.GET.json");
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let names = names_in(&dir_x(&root));
+        assert!(
+            names.contains(&"endpoint.get.json".to_string()) && names.contains(&"endpoint.GET.json".to_string()),
+            "{names:?}"
+        );
+        // `_backups/` is generate's own migration backup folder, not an orphan.
+        assert!(!names.iter().any(|n| n.starts_with("_endpoint.")), "{names:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir_x(&root).join("endpoint.GET.json")).unwrap(),
+            STUB,
+            "the non-canonical twin is never touched"
+        );
+        assert!(!names.contains(&"endpoint.GET.reference.json".to_string()), "{names:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn orphan_twins_differing_only_in_case_restore_only_the_canonical_one() {
+        let root = project(&spec_x(&fixed_op("get", "g")), DEFAULT);
+        if !fs_is_case_sensitive(&root) {
+            eprintln!("skipping: case-insensitive filesystem, _endpoint.GET.json and _endpoint.get.json cannot coexist");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        put_stub(&root, "_endpoint.get.json");
+        put_stub(&root, "_endpoint.GET.json");
+        let outcome = generate_api_inner(&root).unwrap();
+        let names = names_in(&dir_x(&root));
+        eprintln!("errors={:?} names={names:?}", outcome.errors);
+        assert!(names.contains(&"endpoint.get.json".to_string()), "the canonical orphan is restored: {names:?}");
+        assert!(names.contains(&"_endpoint.GET.json".to_string()), "the invalid twin is never touched: {names:?}");
+        assert!(!names.contains(&"_endpoint.get.json".to_string()), "{names:?}");
+        assert!(!names.contains(&"endpoint.GET.json".to_string()), "{names:?}");
+        assert_eq!(std::fs::read_to_string(dir_x(&root).join("_endpoint.GET.json")).unwrap(), STUB);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -19,7 +19,7 @@ use axum::{Json, Router};
 
 use crate::config::ConnectionConfig;
 use crate::errors::{DiscoveredErrors, ErrorRegistry};
-use crate::openapi::method_token;
+use crate::openapi::method_token::{self, MethodCase, TokenStatus};
 use crate::openapi::{Operation, ResponseMode};
 use crate::security::{ClientCertIdentity, SecurityConfig, VerifierCache};
 use crate::server::RequestId;
@@ -103,8 +103,8 @@ pub(crate) fn has_reserved_stream_key(contents: &str) -> bool {
     serde_json::from_str::<Value>(contents).is_ok_and(|v| v.as_object().is_some_and(|obj| obj.contains_key("stream")))
 }
 
-pub(crate) fn reserved_stream_key_files(endpoints_root: &Path) -> Vec<PathBuf> {
-    discover_endpoint_files(endpoints_root)
+pub(crate) fn reserved_stream_key_files(endpoints_root: &Path, mode: MethodCase) -> Vec<PathBuf> {
+    discover_endpoint_files(endpoints_root, mode)
         .into_iter()
         .filter(|(_, _, file_path)| std::fs::read_to_string(file_path).is_ok_and(|contents| has_reserved_stream_key(&contents)))
         .map(|(_, _, file_path)| file_path)
@@ -149,6 +149,9 @@ pub fn build_router(
     // it could never succeed, and "no certificate required" must never be
     // what an unreachable cert-dependent route silently degrades to.
     client_identity_available: bool,
+    // Must agree with how `openapi_document` (if any) was loaded; the caller
+    // (`commands::run::assemble_api_router`) refuses a mismatch.
+    method_case: MethodCase,
 ) -> Router {
     let sql_root = project_root.join("datasources/sql");
     let http_root = project_root.join("datasources/http");
@@ -160,16 +163,13 @@ pub fn build_router(
     let verifier_cache = Arc::new(VerifierCache::new());
     let component_schemas = Arc::new(openapi_document.map(|doc| doc.component_schemas.clone()).unwrap_or_default());
 
-    for (file_path, canonical) in non_canonical_method_files(&endpoints_root) {
-        tracing::warn!(
-            "{} is not served; rename it to endpoint.{canonical}.json",
-            crate::openapi::untrusted(&file_path.display().to_string())
-        );
+    for finding in method_file_findings(&endpoints_root, method_case) {
+        tracing::warn!("{}", finding.message(method_case));
     }
 
     let mut by_path: BTreeMap<String, PathRoutes> = BTreeMap::new();
-    for (url_path, method, file_path) in discover_endpoint_files(&endpoints_root) {
-        let Some(token) = method_token::parse_file_token(&method) else {
+    for (url_path, method, file_path) in discover_endpoint_files(&endpoints_root, method_case) {
+        let TokenStatus::Valid(token) = method_token::parse_file_token(&method, method_case) else {
             tracing::warn!("skipping {}: not a method frogs routes", file_path.display());
             continue;
         };
@@ -408,8 +408,9 @@ pub(crate) fn validate_endpoint_files(
     security: &SecurityConfig,
     connections: &HashMap<String, ConnectionConfig>,
     client_identity_available: bool,
+    mode: MethodCase,
 ) -> (usize, Vec<String>) {
-    let discovered = discover_endpoint_files(endpoints_root);
+    let discovered = discover_endpoint_files(endpoints_root, mode);
     let count = discovered.len();
     let mut problems = Vec::new();
 
@@ -1239,13 +1240,13 @@ fn record_discovered_error(discovered_errors: &Mutex<DiscoveredErrors>, path: &P
     }
 }
 
-pub(crate) fn discover_endpoint_files(root: &Path) -> Vec<(String, String, PathBuf)> {
+pub(crate) fn discover_endpoint_files(root: &Path, mode: MethodCase) -> Vec<(String, String, PathBuf)> {
     let mut out = Vec::new();
-    walk(root, root, &mut out);
+    walk(root, root, mode, &mut out);
     out
 }
 
-fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String, PathBuf)>) {
+fn walk(root: &Path, dir: &Path, mode: MethodCase, out: &mut Vec<(String, String, PathBuf)>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1254,8 +1255,8 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String, PathBuf)>) {
             if path.file_name().and_then(|n| n.to_str()) == Some("_backups") {
                 continue;
             }
-            walk(root, &path, out);
-        } else if let Some(method) = routable_method(&path)
+            walk(root, &path, mode, out);
+        } else if let Some(method) = routable_method(&path, mode)
             && let Some(url_path) = url_path_for(root, &path)
         {
             out.push((url_path, method, path.clone()));
@@ -1263,42 +1264,89 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String, PathBuf)>) {
     }
 }
 
-/// The file token of an `endpoint.<method>.json` file, if it's one of
-/// `method_token::ROUTABLE_FIXED` byte-for-byte — `None` for a
-/// `.reference.json`/`.test.json` sibling (whose "method" segment would
-/// contain a `.`), an underscore-prefixed orphaned file, a case variant like
-/// `endpoint.GET.json`, or a currently-unrouted method like `options`/`head`/`trace`.
-fn routable_method(path: &Path) -> Option<String> {
+/// The file token of an `endpoint.<token>.json` file whose token is valid and
+/// routable under `mode` — `None` for a `.reference.json`/`.test.json`
+/// sibling (whose token segment would contain a `.`), an underscore-prefixed
+/// orphaned file, a non-canonical or wrong-mode extension token, a case
+/// variant like `endpoint.GET.json`, or a currently-unrouted method like
+/// `options`/`head`/`trace`.
+fn routable_method(path: &Path, mode: MethodCase) -> Option<String> {
     let name = path.file_name()?.to_str()?;
-    let token = method_token::parse_file_token(method_token::stub_file_token(name)?)?;
-    method_token::is_routable(&token).then(|| name["endpoint.".len()..name.len() - ".json".len()].to_string())
+    let token_text = method_token::stub_file_token(name)?;
+    let TokenStatus::Valid(token) = method_token::parse_file_token(token_text, mode) else {
+        return None;
+    };
+    method_token::is_routable(&token).then(|| token_text.to_string())
 }
 
-/// `endpoint.<token>.json` files whose token is a non-canonical spelling of a
-/// fixed method (`endpoint.GET.json`, `endpoint.Query.json`): never routed and
-/// never renamed, only reported. Uses `DirEntry::file_type`, so links are not followed.
-pub(crate) fn non_canonical_method_files(endpoints_root: &Path) -> Vec<(PathBuf, &'static str)> {
+pub(crate) enum MethodFileKind {
+    /// Not a canonical token for any method: never served.
+    NonCanonical { hint: Option<String> },
+    /// A canonical token that only means a method under the other `caseSensitiveMethods` setting.
+    WrongMode { wire: String },
+}
+
+#[allow(dead_code)] // url_path/token are part of the finding for callers that group by route
+pub(crate) struct MethodFileFinding {
+    pub file: PathBuf,
+    pub url_path: String,
+    pub token: String,
+    pub kind: MethodFileKind,
+}
+
+impl MethodFileFinding {
+    pub(crate) fn message(&self, mode: MethodCase) -> String {
+        let file = crate::openapi::untrusted(&self.file.display().to_string());
+        match &self.kind {
+            MethodFileKind::NonCanonical { hint: Some(hint) } => format!("{file} is not served; rename it to endpoint.{hint}.json"),
+            MethodFileKind::NonCanonical { hint: None } => format!("{file} is not served: its name is not a canonical method token"),
+            MethodFileKind::WrongMode { wire } => format!(
+                "skipping {file}: method '{}' is case-distinct, but caseSensitiveMethods is {} — this file was generated under the other setting",
+                crate::openapi::method_token::untrusted_short(wire),
+                mode.case_sensitive()
+            ),
+        }
+    }
+}
+
+/// `endpoint.<token>.json` files under `endpoints_root` that are never served
+/// although they look like endpoint files: a token that is not canonical
+/// (`endpoint.GET.json`, `endpoint.purge.json`) or that is valid only under the
+/// other `caseSensitiveMethods` setting. Never renamed, only reported. Uses
+/// `DirEntry::file_type`, so links are not followed.
+pub(crate) fn method_file_findings(endpoints_root: &Path, mode: MethodCase) -> Vec<MethodFileFinding> {
     let mut out = Vec::new();
-    walk_non_canonical(endpoints_root, &mut out);
-    out.sort();
+    walk_method_files(endpoints_root, endpoints_root, mode, &mut out);
+    out.sort_by(|a, b| a.file.cmp(&b.file));
     out
 }
 
-fn walk_non_canonical(dir: &Path, out: &mut Vec<(PathBuf, &'static str)>) {
+fn walk_method_files(root: &Path, dir: &Path, mode: MethodCase, out: &mut Vec<MethodFileFinding>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let Ok(file_type) = entry.file_type() else { continue };
         let path = entry.path();
         if file_type.is_dir() {
             if path.file_name().and_then(|n| n.to_str()) != Some("_backups") {
-                walk_non_canonical(&path, out);
+                walk_method_files(root, &path, mode, out);
             }
         } else if file_type.is_file()
             && let Some(name) = path.file_name().and_then(|n| n.to_str())
             && let Some(token) = method_token::stub_file_token(name)
-            && let Some(canonical) = method_token::fixed_case_variant(token)
         {
-            out.push((path.clone(), canonical));
+            let kind = match method_token::parse_file_token(token, mode) {
+                TokenStatus::Valid(_) => continue,
+                TokenStatus::WrongMode { wire } => MethodFileKind::WrongMode { wire },
+                TokenStatus::Invalid => MethodFileKind::NonCanonical {
+                    hint: method_token::canonical_hint(token, mode),
+                },
+            };
+            out.push(MethodFileFinding {
+                url_path: url_path_for(root, &path).unwrap_or_default(),
+                token: token.to_string(),
+                file: path.clone(),
+                kind,
+            });
         }
     }
 }
@@ -1366,6 +1414,28 @@ impl SecurityMismatch {
     }
 }
 
+/// A routable-looking endpoint file whose `(path, token)` the spec declares through
+/// `additionalOperations` keys that differ only in case — none of them is served.
+pub(crate) struct AmbiguousMethodFile {
+    pub method: String,
+    pub url_path: String,
+    pub file: PathBuf,
+    pub spellings: Vec<String>,
+}
+
+impl AmbiguousMethodFile {
+    pub(crate) fn message(&self) -> String {
+        use crate::openapi::{method_token::untrusted_short, untrusted};
+        format!(
+            "{}: openapi.yaml declares {} on {} more than once with keys differing only in case ({}) — not served; fix openapi.yaml",
+            untrusted(&self.file.display().to_string()),
+            method_token::display_token(&self.method),
+            untrusted(&self.url_path),
+            self.spellings.iter().map(|k| format!("'{}'", untrusted_short(k))).collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
 /// An endpoint file that declares security the spec doesn't ask for.
 pub(crate) struct SecurityStricter {
     pub method: String,
@@ -1392,6 +1462,7 @@ pub(crate) struct SecurityCheck {
     pub mismatches: Vec<SecurityMismatch>,
     pub stricter: Vec<SecurityStricter>,
     pub unmatched: Vec<PathBuf>,
+    pub ambiguous: Vec<AmbiguousMethodFile>,
 }
 
 pub(crate) fn unmatched_security_message(file: &Path) -> String {
@@ -1434,13 +1505,27 @@ fn acceptable_schemes(op: &Operation) -> Option<Vec<String>> {
 /// connections.
 pub(crate) fn security_check(endpoints_root: &Path, doc: &crate::openapi::OpenApiDocument) -> SecurityCheck {
     let mut check = SecurityCheck::default();
-    for (url_path, method, file) in discover_endpoint_files(endpoints_root) {
+    for (url_path, method, file) in discover_endpoint_files(endpoints_root, doc.method_case) {
         let Ok(contents) = std::fs::read_to_string(&file) else { continue };
         let Ok(endpoint) = serde_json::from_str::<EndpointFile>(&contents) else { continue };
         let stub = endpoint.security;
 
-        let mut matched: Vec<&Operation> = find_operation(doc, &url_path, &method).into_iter().collect();
+        let mut matched: Vec<&Operation> = doc
+            .operations
+            .iter()
+            .chain(doc.ambiguous_operations.iter())
+            .filter(|op| op.method == method && axum_style_path(&op.path) == url_path)
+            .collect();
         if matched.is_empty() {
+            if let Some(spellings) = ambiguous_spellings(doc, &url_path, &method) {
+                check.ambiguous.push(AmbiguousMethodFile {
+                    method,
+                    url_path,
+                    file,
+                    spellings: spellings.clone(),
+                });
+                continue;
+            }
             let key = match_key(&url_path);
             matched = doc
                 .operations
@@ -1476,6 +1561,15 @@ pub(crate) fn security_check(endpoints_root: &Path, doc: &crate::openapi::OpenAp
         }
     }
     check
+}
+
+/// The case-only-duplicate spellings the spec declares for this file's path and token, if any.
+fn ambiguous_spellings<'a>(doc: &'a crate::openapi::OpenApiDocument, url_path: &str, token: &str) -> Option<&'a Vec<String>> {
+    let key = match_key(url_path);
+    doc.ambiguous_methods
+        .iter()
+        .find(|((path, t), _)| t == token && (axum_style_path(path) == url_path || match_key(&axum_style_path(path)) == key))
+        .map(|(_, spellings)| spellings)
 }
 
 /// `{name}` -> `:name`, segment by segment — the same conversion
@@ -1558,7 +1652,10 @@ mod tests {
         std::fs::write(root.join("cars/{vin}/endpoint.get.test.json"), "{}").unwrap();
         std::fs::write(root.join("cars/{vin}/_backups/endpoint.get.2026-07-30T15-45-40Z.json"), "{}").unwrap();
 
-        let mut found: Vec<(String, String)> = discover_endpoint_files(&root).into_iter().map(|(path, method, _)| (path, method)).collect();
+        let mut found: Vec<(String, String)> = discover_endpoint_files(&root, MethodCase::Default)
+            .into_iter()
+            .map(|(path, method, _)| (path, method))
+            .collect();
         found.sort();
         let _ = std::fs::remove_dir_all(&root);
 
@@ -1576,21 +1673,24 @@ mod tests {
     fn routable_method_recognizes_every_supported_verb() {
         let root = Path::new("/proj/datasources/endpoints/cars");
         for method in method_token::ROUTABLE_FIXED {
-            assert_eq!(routable_method(&root.join(format!("endpoint.{method}.json"))), Some(method.to_string()));
+            assert_eq!(
+                routable_method(&root.join(format!("endpoint.{method}.json")), MethodCase::Default),
+                Some(method.to_string())
+            );
         }
     }
 
     #[test]
     fn routable_method_ignores_reference_and_test_siblings() {
         let root = Path::new("/proj/datasources/endpoints/cars");
-        assert_eq!(routable_method(&root.join("endpoint.get.reference.json")), None);
-        assert_eq!(routable_method(&root.join("endpoint.get.test.json")), None);
+        assert_eq!(routable_method(&root.join("endpoint.get.reference.json"), MethodCase::Default), None);
+        assert_eq!(routable_method(&root.join("endpoint.get.test.json"), MethodCase::Default), None);
     }
 
     #[test]
     fn routable_method_ignores_an_unsupported_http_method() {
         let root = Path::new("/proj/datasources/endpoints/cars");
-        assert_eq!(routable_method(&root.join("endpoint.options.json")), None);
+        assert_eq!(routable_method(&root.join("endpoint.options.json"), MethodCase::Default), None);
     }
 
     #[test]
@@ -1599,7 +1699,7 @@ mod tests {
         // `strip_prefix("endpoint.")`, so this already falls through
         // naturally rather than needing a dedicated check.
         let root = Path::new("/proj/datasources/endpoints/cars");
-        assert_eq!(routable_method(&root.join("_endpoint.get.json")), None);
+        assert_eq!(routable_method(&root.join("_endpoint.get.json"), MethodCase::Default), None);
     }
 
     /// The roadmap's own Phase 3 exit criterion, proven against a real
@@ -1758,6 +1858,7 @@ mod tests {
             None,
             test_call_timeout(),
             false,
+            MethodCase::Default,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1823,6 +1924,7 @@ mod tests {
             None,
             test_call_timeout(),
             false,
+            MethodCase::Default,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1915,6 +2017,7 @@ mod tests {
             None,
             test_call_timeout(),
             false,
+            MethodCase::Default,
         );
         let router = crate::server::apply_middleware(router);
 
@@ -2421,6 +2524,7 @@ mod tests {
             None,
             test_call_timeout(),
             false,
+            MethodCase::Default,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2730,6 +2834,7 @@ mod tests {
             None,
             test_call_timeout(),
             false,
+            MethodCase::Default,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3693,6 +3798,7 @@ mod tests {
             None,
             test_call_timeout(),
             false,
+            MethodCase::Default,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3705,7 +3811,13 @@ mod tests {
         let resp = client.get(format!("http://{addr}/pricing")).send().await.unwrap();
         assert_eq!(resp.status(), 404, "an invalid nested-many config must mean the route was never registered at all");
 
-        let (count, problems) = validate_endpoint_files(&root.join("datasources/endpoints"), &SecurityConfig::default(), &HashMap::new(), false);
+        let (count, problems) = validate_endpoint_files(
+            &root.join("datasources/endpoints"),
+            &SecurityConfig::default(),
+            &HashMap::new(),
+            false,
+            MethodCase::Default,
+        );
         assert_eq!(count, 1, "the file was still discovered — just invalid");
         assert!(
             problems.iter().any(|p| p.contains("maxConcurrency")),
@@ -3786,6 +3898,7 @@ mod tests {
             Some(provider),
             test_call_timeout(),
             false,
+            MethodCase::Default,
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3969,6 +4082,7 @@ mod m2_tests {
             None,
             NonZeroU64::new(5_000).unwrap(),
             false,
+            MethodCase::Default,
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4002,7 +4116,7 @@ mod m2_tests {
         write_endpoint(&root, "a", "get", r#"{ "operationId": "a", "stream": {}, "sources": {}, "response": {} }"#);
         write_endpoint(&root, "b", "get", r#"{ "operationId": "b", "sources": {}, "response": { "stream": "sources.x.y" } }"#);
         write_endpoint(&root, "c", "post", r#"{ "operationId": "c", "stream": null, "sources": {}, "response": {} }"#);
-        let mut files = reserved_stream_key_files(&root.join("datasources/endpoints"));
+        let mut files = reserved_stream_key_files(&root.join("datasources/endpoints"), MethodCase::Default);
         files.sort();
         assert_eq!(files.len(), 2, "{files:?}");
         assert!(files[0].ends_with("a/endpoint.get.json") || files[0].to_string_lossy().contains('a'));
@@ -4397,7 +4511,10 @@ mod m3_router_tests {
     impl SqlDriver for TestDriver {
         async fn query(&self, _script: &str, params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
             if let Some(key) = params.get("key") {
-                return Ok(vec![HashMap::from([("active".to_string(), SqlValue::Bool(*key == SqlValue::Text("good".to_string())))])]);
+                return Ok(vec![HashMap::from([(
+                    "active".to_string(),
+                    SqlValue::Bool(*key == SqlValue::Text("good".to_string())),
+                )])]);
             }
             let maker = params.get("maker").cloned().unwrap_or(SqlValue::Null);
             Ok(vec![HashMap::from([("maker".to_string(), maker)])])
@@ -4438,6 +4555,7 @@ mod m3_router_tests {
             None,
             NonZeroU64::new(5_000).unwrap(),
             false,
+            MethodCase::Default,
         )
     }
 
@@ -4464,7 +4582,12 @@ mod m3_router_tests {
                "parameters": [{ "name": "maker", "from": "body.maker" }] } }, "response": { "maker": "sources.car.maker" } }"#,
         );
         let base = serve_root(&root).await;
-        let resp = reqwest::Client::new().request(query_method(), format!("{base}/cars")).json(&serde_json::json!({ "maker": "Honda" })).send().await.unwrap();
+        let resp = reqwest::Client::new()
+            .request(query_method(), format!("{base}/cars"))
+            .json(&serde_json::json!({ "maker": "Honda" }))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         let body: Value = resp.json().await.unwrap();
         assert_eq!(body["maker"], "Honda");
@@ -4593,12 +4716,20 @@ mod m3_router_tests {
         let root = temp_root();
         write_endpoint(&root, "things", "query", LITERAL);
         let base = serve_root(&root).await;
-        let resp = reqwest::Client::new().request(reqwest::Method::from_bytes(b"PURGE").unwrap(), format!("{base}/things")).send().await.unwrap();
+        let resp = reqwest::Client::new()
+            .request(reqwest::Method::from_bytes(b"PURGE").unwrap(), format!("{base}/things"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 405);
         assert_eq!(allow_of(&resp), "QUERY");
         // Lowercase is a different method to the exact-match dispatcher when nothing normalizes it.
         let strict_addr = spawn_served(router_for(&root), true).await;
-        let lower = reqwest::Client::new().request(reqwest::Method::from_bytes(b"query").unwrap(), format!("http://{strict_addr}/things")).send().await.unwrap();
+        let lower = reqwest::Client::new()
+            .request(reqwest::Method::from_bytes(b"query").unwrap(), format!("http://{strict_addr}/things"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(lower.status(), 405);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4610,7 +4741,11 @@ mod m3_router_tests {
         write_endpoint(&root, "things", "get", LITERAL);
         let nested = Router::new().nest("/api", router_for(&root));
         let addr = spawn_served(nested, false).await;
-        let resp = reqwest::Client::new().request(query_method(), format!("http://{addr}/api/things")).send().await.unwrap();
+        let resp = reqwest::Client::new()
+            .request(query_method(), format!("http://{addr}/api/things"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(allow_of(&resp), "GET,HEAD,QUERY");
         let _ = std::fs::remove_dir_all(&root);
@@ -4668,13 +4803,26 @@ mod m3_router_tests {
         }
         assert_eq!(client.get(format!("{base}/fine")).send().await.unwrap().status(), 200);
 
-        let found = non_canonical_method_files(&root.join("datasources/endpoints"));
+        let found = method_file_findings(&root.join("datasources/endpoints"), MethodCase::Default);
         let mut names: Vec<_> = found
             .iter()
-            .map(|(p, c)| (p.file_name().unwrap().to_str().unwrap().to_string(), *c))
+            .map(|f| {
+                let hint = match &f.kind {
+                    MethodFileKind::NonCanonical { hint } => hint.clone(),
+                    MethodFileKind::WrongMode { .. } => None,
+                };
+                (f.file.file_name().unwrap().to_str().unwrap().to_string(), hint)
+            })
             .collect();
         names.sort();
-        assert_eq!(names, vec![("endpoint.GET.json".to_string(), "get"), ("endpoint.Query.json".to_string(), "query")]);
+        assert_eq!(
+            names,
+            vec![
+                ("endpoint.GET.json".to_string(), Some("get".to_string())),
+                ("endpoint.Query.json".to_string(), Some("query".to_string())),
+                ("endpoint.purge.json".to_string(), Some("PURGE".to_string())),
+            ]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4688,8 +4836,8 @@ mod m3_router_tests {
         std::fs::write(ep.join("a/_endpoint.GET.json"), "{}").unwrap();
         std::fs::create_dir_all(ep.join("a/_backups")).unwrap();
         std::fs::write(ep.join("a/_backups/endpoint.GET.json"), "{}").unwrap();
-        assert!(non_canonical_method_files(&ep).is_empty());
-        assert!(non_canonical_method_files(&root.join("nope")).is_empty());
+        assert!(method_file_findings(&ep, MethodCase::Default).is_empty());
+        assert!(method_file_findings(&root.join("nope"), MethodCase::Default).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4703,7 +4851,7 @@ mod m3_router_tests {
         for path in ["/o", "/h", "/t"] {
             assert_eq!(reqwest::get(format!("{base}{path}")).await.unwrap().status(), 404, "{path}");
         }
-        assert!(non_canonical_method_files(&root.join("datasources/endpoints")).is_empty());
+        assert!(method_file_findings(&root.join("datasources/endpoints"), MethodCase::Default).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4735,5 +4883,1010 @@ mod m3_router_tests {
         let resp = reqwest::Client::new().request(query_method(), format!("{base}/cars/ABC")).send().await.unwrap();
         assert_eq!(resp.status(), 200);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m4_router_tests {
+    use super::*;
+    use crate::server::{raw_request, spawn_served};
+    use crate::sql::{SqlError, SqlValue};
+
+    fn temp_root() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-endpoint-m4-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_endpoint(root: &Path, dir: &str, token: &str, json: &str) {
+        let d = root.join("datasources/endpoints").join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(format!("endpoint.{token}.json")), json).unwrap();
+    }
+
+    /// An endpoint whose `successStatus` tells the tests which file answered.
+    fn ep(status: u16, security: Option<&str>) -> String {
+        match security {
+            Some(s) => format!(r#"{{ "operationId": "x", "successStatus": {status}, "security": "{s}", "sources": {{}}, "response": {{}} }}"#),
+            None => format!(r#"{{ "operationId": "x", "successStatus": {status}, "sources": {{}}, "response": {{}} }}"#),
+        }
+    }
+
+    #[derive(Debug)]
+    struct KeyDriver;
+
+    #[async_trait::async_trait]
+    impl SqlDriver for KeyDriver {
+        async fn query(&self, _script: &str, params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
+            let good = params.get("key") == Some(&SqlValue::Text("good".to_string()));
+            Ok(vec![HashMap::from([("active".to_string(), SqlValue::Bool(good))])])
+        }
+    }
+
+    fn router_for(root: &Path, mode: MethodCase) -> Router {
+        std::fs::create_dir_all(root.join("datasources/sql/db")).unwrap();
+        std::fs::write(root.join("datasources/sql/db/verify.sql"), "SELECT 1").unwrap();
+        let sec = root.join("sec");
+        std::fs::create_dir_all(sec.join("verifiers")).unwrap();
+        std::fs::write(sec.join("schemes.json"), r#"{ "keyAuth": { "verifier": "key.json" } }"#).unwrap();
+        std::fs::write(
+            sec.join("verifiers/key.json"),
+            r#"{ "type": "sql", "connection": "db", "script": "verify.sql", "parameters": [{ "name": "key", "from": "header.X-Api-Key" }], "validIf": "row.active = true" }"#,
+        )
+        .unwrap();
+        let errs = root.join("errs");
+        std::fs::create_dir_all(&errs).unwrap();
+        std::fs::write(
+            errs.join("core.json"),
+            r#"{ "auth.invalid_credentials": { "httpStatus": 401, "exposeDetail": true }, "auth.verifier_unavailable": { "httpStatus": 500, "exposeDetail": false } }"#,
+        )
+        .unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), Box::new(KeyDriver));
+        build_router(
+            root,
+            Arc::new(drivers),
+            &HashMap::new(),
+            Arc::new(ErrorRegistry::load(&errs).unwrap()),
+            Arc::new(SecurityConfig::load(&sec).unwrap()),
+            Arc::new(HashMap::new()),
+            Arc::new(Mutex::new(DiscoveredErrors::default())),
+            false,
+            None,
+            None,
+            NonZeroU64::new(5_000).unwrap(),
+            false,
+            mode,
+        )
+    }
+
+    async fn serve(root: &Path, mode: MethodCase) -> String {
+        format!("http://{}", spawn_served(router_for(root, mode), mode == MethodCase::Exact).await)
+    }
+
+    async fn call(base: &str, method: &str, path: &str, key: Option<&str>) -> (u16, String) {
+        let mut req = reqwest::Client::new().request(reqwest::Method::from_bytes(method.as_bytes()).unwrap(), format!("{base}{path}"));
+        if let Some(k) = key {
+            req = req.header("X-Api-Key", k);
+        }
+        let resp = req.send().await.unwrap();
+        let allow = resp.headers().get("allow").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+        (resp.status().as_u16(), allow)
+    }
+
+    fn allow_list(allow: &str) -> Vec<String> {
+        allow.split(',').map(str::to_string).collect()
+    }
+
+    #[tokio::test]
+    async fn default_mode_serves_purge_in_any_request_spelling_from_endpoint_upper_purge_and_not_other_methods() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "PURGE", &ep(201, None));
+        let base = serve(&root, MethodCase::Default).await;
+        for method in ["PURGE", "purge", "Purge", "pUrGe"] {
+            assert_eq!(call(&base, method, "/things", None).await.0, 201, "{method}");
+        }
+        assert_eq!(call(&base, "GET", "/things", None).await.0, 405);
+        assert_eq!(call(&base, "get", "/things", None).await.0, 405);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn default_mode_serves_lowercase_get_as_get_and_link_next_to_it() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "get", &ep(200, None));
+        write_endpoint(&root, "things", "LINK", &ep(202, None));
+        let base = serve(&root, MethodCase::Default).await;
+        assert_eq!(call(&base, "get", "/things", None).await.0, 200);
+        assert_eq!(call(&base, "link", "/things", None).await.0, 202);
+        assert_eq!(call(&base, "LINK", "/things", None).await.0, 202);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn exact_mode_routes_each_spelling_to_its_own_file_and_everything_else_is_405() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "~purge", &ep(201, None));
+        write_endpoint(&root, "things", "PURGE", &ep(202, None));
+        write_endpoint(&root, "things", "get", &ep(203, None));
+        let base = serve(&root, MethodCase::Exact).await;
+        assert_eq!(call(&base, "purge", "/things", None).await.0, 201, "purge reaches only ~purge");
+        assert_eq!(call(&base, "PURGE", "/things", None).await.0, 202, "PURGE reaches only PURGE");
+        assert_eq!(call(&base, "Purge", "/things", None).await.0, 405, "an unlisted spelling is 405");
+        assert_eq!(call(&base, "GET", "/things", None).await.0, 203);
+        assert_eq!(call(&base, "get", "/things", None).await.0, 405, "get never reaches GET");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn exact_mode_with_only_purge_upper_answers_lowercase_purge_with_405() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "PURGE", &ep(202, None));
+        let base = serve(&root, MethodCase::Exact).await;
+        assert_eq!(call(&base, "PURGE", "/things", None).await.0, 202);
+        assert_eq!(call(&base, "purge", "/things", None).await.0, 405);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn exact_mode_lowercase_get_never_reaches_a_protected_get_route_and_reaches_only_the_open_tilde_get() {
+        let root = temp_root();
+        write_endpoint(&root, "vault", "get", &ep(200, Some("keyAuth")));
+        write_endpoint(&root, "vault", "~get", &ep(201, None));
+        let base = serve(&root, MethodCase::Exact).await;
+        assert_eq!(call(&base, "get", "/vault", None).await.0, 201, "the lowercase method reaches the open ~get route");
+        assert_eq!(call(&base, "get", "/vault", Some("bad")).await.0, 201);
+        assert_eq!(call(&base, "GET", "/vault", None).await.0, 401, "GET without credentials is rejected");
+        assert_eq!(call(&base, "GET", "/vault", Some("bad")).await.0, 401);
+        assert_eq!(call(&base, "GET", "/vault", Some("good")).await.0, 200);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn exact_mode_lowercase_get_with_no_tilde_get_file_is_405_not_the_protected_route() {
+        let root = temp_root();
+        write_endpoint(&root, "vault", "get", &ep(200, Some("keyAuth")));
+        let base = serve(&root, MethodCase::Exact).await;
+        assert_eq!(call(&base, "get", "/vault", None).await.0, 405);
+        assert_eq!(call(&base, "get", "/vault", Some("good")).await.0, 405);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_extension_method_is_405_with_an_allow_header_naming_standard_and_extension_methods() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "get", &ep(200, None));
+        write_endpoint(&root, "things", "query", &ep(200, None));
+        write_endpoint(&root, "things", "PURGE", &ep(200, None));
+        write_endpoint(&root, "things", "LINK", &ep(200, None));
+        let base = serve(&root, MethodCase::Default).await;
+        let (status, allow) = call(&base, "UNLINK", "/things", None).await;
+        assert_eq!(status, 405);
+        let methods = allow_list(&allow);
+        for expected in ["GET", "HEAD", "QUERY", "PURGE", "LINK"] {
+            assert!(methods.iter().any(|m| m == expected), "{expected} missing from Allow: {allow}");
+        }
+
+        let root2 = temp_root();
+        write_endpoint(&root2, "things", "get", &ep(200, None));
+        write_endpoint(&root2, "things", "~purge", &ep(200, None));
+        write_endpoint(&root2, "things", "PURGE", &ep(200, None));
+        let base2 = serve(&root2, MethodCase::Exact).await;
+        let (status, allow) = call(&base2, "UNLINK", "/things", None).await;
+        assert_eq!(status, 405);
+        let methods = allow_list(&allow);
+        for expected in ["GET", "HEAD", "purge", "PURGE"] {
+            assert!(methods.iter().any(|m| m == expected), "{expected} missing from Allow: {allow}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    #[tokio::test]
+    async fn a_successful_extension_response_carries_the_full_allow_header() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "get", &ep(200, None));
+        write_endpoint(&root, "things", "PURGE", &ep(202, None));
+        let base = serve(&root, MethodCase::Default).await;
+        let (status, allow) = call(&base, "PURGE", "/things", None).await;
+        assert_eq!(status, 202);
+        let methods = allow_list(&allow);
+        assert!(methods.iter().any(|m| m == "GET") && methods.iter().any(|m| m == "PURGE"), "{allow}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_cors_preflight_for_purge_succeeds_in_default_mode_and_for_lowercase_purge_in_exact_mode() {
+        for (mode, requested, file) in [(MethodCase::Default, "PURGE", "PURGE"), (MethodCase::Exact, "purge", "~purge")] {
+            let root = temp_root();
+            write_endpoint(&root, "things", file, &ep(202, None));
+            let router = crate::server::apply_cors(router_for(&root, mode), &["https://app.example".to_string()]);
+            let addr = spawn_served(router, mode == MethodCase::Exact).await;
+            let preflight = reqwest::Client::new()
+                .request(reqwest::Method::OPTIONS, format!("http://{addr}/things"))
+                .header("origin", "https://app.example")
+                .header("access-control-request-method", requested)
+                .send()
+                .await
+                .unwrap();
+            assert!(preflight.status().is_success(), "{mode:?}: {}", preflight.status());
+            assert!(preflight.headers().get("access-control-allow-origin").is_some(), "{mode:?}");
+            let allowed = preflight
+                .headers()
+                .get("access-control-allow-methods")
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default();
+            assert!(allowed.contains(requested), "{mode:?}: allow-methods {allowed:?}");
+
+            let actual = reqwest::Client::new()
+                .request(reqwest::Method::from_bytes(requested.as_bytes()).unwrap(), format!("http://{addr}/things"))
+                .header("origin", "https://app.example")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(actual.status(), 202, "{mode:?}");
+            assert!(actual.headers().get("access-control-allow-origin").is_some(), "{mode:?}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wrong_mode_file_is_never_routed_in_either_direction() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "~purge", &ep(201, None));
+        let base = serve(&root, MethodCase::Default).await;
+        for method in ["PURGE", "purge"] {
+            assert_eq!(
+                call(&base, method, "/things", None).await.0,
+                404,
+                "default mode must skip endpoint.~purge.json: {method}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        // `~get` is valid under exact mode; under default it is a WrongMode file and `get` is plain GET.
+        let root = temp_root();
+        write_endpoint(&root, "things", "~get", &ep(201, None));
+        let base = serve(&root, MethodCase::Default).await;
+        assert_eq!(call(&base, "get", "/things", None).await.0, 404);
+        assert_eq!(call(&base, "GET", "/things", None).await.0, 404);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn invalid_token_files_are_never_routed_in_either_mode() {
+        for mode in [MethodCase::Default, MethodCase::Exact] {
+            let root = temp_root();
+            // one folder per spelling so the fixture is unique after case folding
+            write_endpoint(&root, "a", "GET", &ep(200, None));
+            write_endpoint(&root, "b", "Get", &ep(200, None));
+            write_endpoint(&root, "c", "purge", &ep(200, None));
+            write_endpoint(&root, "d", "~_47_45_54", &ep(200, None));
+            write_endpoint(&root, "e", "~_4c_49_4e_4b", &ep(200, None));
+            let base = serve(&root, mode).await;
+            for (path, methods) in [
+                ("/a", ["GET", "get"]),
+                ("/b", ["GET", "get"]),
+                ("/c", ["purge", "PURGE"]),
+                ("/d", ["GET", "get"]),
+                ("/e", ["LINK", "link"]),
+            ] {
+                for method in methods {
+                    assert_eq!(call(&base, method, path, None).await.0, 404, "{mode:?} {method} {path}");
+                }
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[tokio::test]
+    async fn extension_routes_work_with_path_parameters() {
+        let root = temp_root();
+        write_endpoint(&root, "cars/{vin}", "LINK", &ep(202, None));
+        let base = serve(&root, MethodCase::Default).await;
+        assert_eq!(call(&base, "LINK", "/cars/ABC", None).await.0, 202);
+        assert_eq!(call(&base, "link", "/cars/ABC", None).await.0, 202);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_protected_extension_route_rejects_missing_and_wrong_credentials() {
+        let root = temp_root();
+        write_endpoint(&root, "secret", "LINK", &ep(202, Some("keyAuth")));
+        let base = serve(&root, MethodCase::Default).await;
+        assert_eq!(call(&base, "LINK", "/secret", None).await.0, 401);
+        assert_eq!(call(&base, "LINK", "/secret", Some("bad")).await.0, 401);
+        assert_eq!(call(&base, "link", "/secret", Some("good")).await.0, 202);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discovery_over_a_mixed_tree_returns_exactly_the_valid_routable_files_for_the_mode() {
+        let root = temp_root();
+        write_endpoint(&root, "a", "get", &ep(200, None));
+        write_endpoint(&root, "a", "LINK", &ep(200, None));
+        write_endpoint(&root, "b", "query", &ep(200, None));
+        write_endpoint(&root, "c", "~purge", &ep(200, None));
+        write_endpoint(&root, "d", "PURGE", &ep(200, None));
+        write_endpoint(&root, "e", "GET", &ep(200, None));
+        write_endpoint(&root, "f", "options", &ep(200, None));
+        write_endpoint(&root, "g", "purge", &ep(200, None));
+        write_endpoint(&root, "h", "~_4c_49_4e_4b", &ep(200, None));
+        let ep_root = root.join("datasources/endpoints");
+        std::fs::write(ep_root.join("a/endpoint.LINK.reference.json"), "{}").unwrap();
+        std::fs::write(ep_root.join("a/endpoint.LINK.test.json"), "{}").unwrap();
+        std::fs::write(ep_root.join("a/_endpoint.LINK.json"), "{}").unwrap();
+        std::fs::create_dir_all(ep_root.join("a/_backups")).unwrap();
+        std::fs::write(ep_root.join("a/_backups/endpoint.LINK.json"), "{}").unwrap();
+
+        let found = |mode| {
+            let mut v: Vec<(String, String)> = discover_endpoint_files(&ep_root, mode).into_iter().map(|(p, m, _)| (p, m)).collect();
+            v.sort();
+            v
+        };
+        let pair = |p: &str, m: &str| (p.to_string(), m.to_string());
+        assert_eq!(
+            found(MethodCase::Default),
+            vec![pair("/a", "LINK"), pair("/a", "get"), pair("/b", "query"), pair("/d", "PURGE")]
+        );
+        assert_eq!(
+            found(MethodCase::Exact),
+            vec![pair("/a", "LINK"), pair("/a", "get"), pair("/b", "query"), pair("/c", "~purge"), pair("/d", "PURGE")]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn method_file_findings_classify_non_canonical_and_wrong_mode_files_and_hint_only_accepted_spellings() {
+        let root = temp_root();
+        write_endpoint(&root, "a", "purge", &ep(200, None));
+        write_endpoint(&root, "b", "~purge", &ep(200, None));
+        write_endpoint(&root, "c", "foo", &ep(200, None));
+        write_endpoint(&root, "d", "GET", &ep(200, None));
+        write_endpoint(&root, "e", "~_4c_49_4e_4b", &ep(200, None));
+        write_endpoint(&root, "f", "LINK", &ep(200, None));
+        let ep_root = root.join("datasources/endpoints");
+        let describe = |mode| {
+            let mut v: Vec<(String, String)> = method_file_findings(&ep_root, mode)
+                .into_iter()
+                .map(|f| {
+                    let what = match &f.kind {
+                        MethodFileKind::NonCanonical { hint } => format!("noncanonical:{}", hint.clone().unwrap_or_default()),
+                        MethodFileKind::WrongMode { wire } => format!("wrongmode:{wire}"),
+                    };
+                    (f.file.file_name().unwrap().to_str().unwrap().to_string(), what)
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let s = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            describe(MethodCase::Default),
+            vec![
+                s("endpoint.GET.json", "noncanonical:get"),
+                s("endpoint.foo.json", "noncanonical:FOO"),
+                s("endpoint.purge.json", "noncanonical:PURGE"),
+                s("endpoint.~_4c_49_4e_4b.json", "noncanonical:LINK"),
+                s("endpoint.~purge.json", "wrongmode:purge"),
+            ]
+        );
+        let exact = describe(MethodCase::Exact);
+        assert!(exact.contains(&s("endpoint.purge.json", "noncanonical:~purge")), "{exact:?}");
+        assert!(exact.contains(&s("endpoint.GET.json", "noncanonical:get")), "{exact:?}");
+        assert!(
+            !exact.iter().any(|(name, _)| name == "endpoint.~purge.json" || name == "endpoint.LINK.json"),
+            "{exact:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_wrong_mode_finding_message_uses_the_documented_wording() {
+        let root = temp_root();
+        write_endpoint(&root, "b", "~purge", &ep(200, None));
+        let findings = method_file_findings(&root.join("datasources/endpoints"), MethodCase::Default);
+        assert_eq!(findings.len(), 1);
+        let message = findings[0].message(MethodCase::Default);
+        assert!(message.contains("method 'purge' is case-distinct, but caseSensitiveMethods is false"), "{message}");
+        assert!(message.contains("this file was generated under the other setting"), "{message}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---------------------------------------------------------------- routed set == security-checked set
+
+    fn spec_yaml(mode_ops: &[(&str, &str)]) -> String {
+        let mut yaml = String::from(
+            "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    keyAuth: { type: apiKey, in: header, name: X-Api-Key }\npaths:\n",
+        );
+        for (path, key) in mode_ops {
+            let responses = "      security: [ { keyAuth: [] } ]\n      responses: { '200': { description: ok } }\n";
+            if ["get", "query"].contains(key) {
+                yaml.push_str(&format!("  {path}:\n    {key}:\n      operationId: op{}\n{responses}", path.trim_start_matches('/')));
+            } else {
+                yaml.push_str(&format!(
+                    "  {path}:\n    additionalOperations:\n      '{key}':\n        operationId: op{}\n        security: [ {{ keyAuth: [] }} ]\n        responses: {{ '200': {{ description: ok }} }}\n",
+                    path.trim_start_matches('/')
+                ));
+            }
+        }
+        yaml
+    }
+
+    #[tokio::test]
+    async fn the_set_of_routed_files_equals_the_set_security_check_looks_at_in_both_modes() {
+        for mode in [MethodCase::Default, MethodCase::Exact] {
+            let root = temp_root();
+            // Valid in default mode: a get, b PURGE, c query, d LINK. Valid in exact only: g ~purge.
+            write_endpoint(&root, "a", "get", &ep(200, None));
+            write_endpoint(&root, "b", "PURGE", &ep(200, None));
+            write_endpoint(&root, "c", "query", &ep(200, None));
+            write_endpoint(&root, "d", "LINK", &ep(200, None));
+            // Never served in either mode.
+            write_endpoint(&root, "e", "GET", &ep(200, None));
+            write_endpoint(&root, "f", "purge", &ep(200, None));
+            write_endpoint(&root, "h", "options", &ep(200, None));
+            // Served in exactly one mode.
+            write_endpoint(&root, "g", "~purge", &ep(200, None));
+
+            let spec_ops: Vec<(&str, &str)> = vec![
+                ("/a", "get"),
+                ("/b", "PURGE"),
+                ("/c", "query"),
+                ("/d", "LINK"),
+                ("/e", "get"),
+                ("/f", "PURGE"),
+                ("/g", if mode == MethodCase::Exact { "purge" } else { "PURGE" }),
+            ];
+            std::fs::write(root.join("openapi.yaml"), spec_yaml(&spec_ops)).unwrap();
+            let doc = crate::openapi::load(
+                &root.join("openapi.yaml"),
+                crate::openapi::LoadOptions {
+                    case_sensitive_methods: mode == MethodCase::Exact,
+                },
+            )
+            .unwrap();
+            let check = security_check(&root.join("datasources/endpoints"), &doc);
+            assert!(check.ambiguous.is_empty() && check.unmatched.is_empty(), "{mode:?}");
+            let mut checked: Vec<(String, String)> = check
+                .mismatches
+                .iter()
+                .map(|m| (m.url_path.clone(), method_token::display_token(&m.method)))
+                .collect();
+            checked.sort();
+
+            let base = serve(&root, mode).await;
+            let mut routed: Vec<(String, String)> = Vec::new();
+            for path in ["/a", "/b", "/c", "/d", "/e", "/f", "/g", "/h"] {
+                for method in ["GET", "get", "QUERY", "PURGE", "purge", "LINK", "OPTIONS"] {
+                    // Skip the case-folded duplicates default mode would answer identically.
+                    if mode == MethodCase::Default && method.chars().any(|c| c.is_ascii_lowercase()) {
+                        continue;
+                    }
+                    let (status, _) = call(&base, method, path, None).await;
+                    if status == 200 {
+                        routed.push((path.to_string(), method.to_string()));
+                    }
+                }
+            }
+            routed.sort();
+            assert_eq!(routed, checked, "{mode:?}: routing and the startup security check must see the same files");
+            assert_eq!(checked.len(), if mode == MethodCase::Default { 4 } else { 5 }, "{mode:?}: {checked:?}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn a_file_whose_spec_keys_differ_only_in_case_is_reported_ambiguous_and_never_a_mismatch_or_unmatched() {
+        let root = temp_root();
+        write_endpoint(&root, "x", "PURGE", &ep(200, None));
+        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    keyAuth: { type: apiKey, in: header, name: k }\npaths:\n  /x:\n    additionalOperations:\n      purge:\n        operationId: a\n        security: [ { keyAuth: [] } ]\n        responses: { '200': { description: ok } }\n      PURGE:\n        operationId: b\n        responses: { '200': { description: ok } }\n";
+        std::fs::write(root.join("openapi.yaml"), yaml).unwrap();
+        let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
+        let check = security_check(&root.join("datasources/endpoints"), &doc);
+        assert_eq!(check.ambiguous.len(), 1);
+        assert!(check.mismatches.is_empty() && check.unmatched.is_empty() && check.stricter.is_empty());
+        let message = check.ambiguous[0].message();
+        assert!(
+            message.contains("'purge'") && message.contains("'PURGE'") && message.contains("not served"),
+            "{message}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stale_get_stub_with_a_spec_that_only_declares_an_exact_mode_lowercase_get_is_a_mismatch() {
+        let root = temp_root();
+        write_endpoint(&root, "x", "get", &ep(200, None));
+        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    keyAuth: { type: apiKey, in: header, name: k }\npaths:\n  /x:\n    additionalOperations:\n      get:\n        operationId: lower\n        security: [ { keyAuth: [] } ]\n        responses: { '200': { description: ok } }\n";
+        std::fs::write(root.join("openapi.yaml"), yaml).unwrap();
+        let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions { case_sensitive_methods: true }).unwrap();
+        let check = security_check(&root.join("datasources/endpoints"), &doc);
+        // endpoint.get.json is the GET route; the spec declares no GET, only an exact-mode lowercase get.
+        assert!(check.mismatches.is_empty(), "no spec operation maps to the GET file's token");
+        assert_eq!(
+            check.unmatched.len(),
+            1,
+            "the stale GET file is unmatched, never silently matched to the lowercase get"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_stub_for_an_exact_mode_lowercase_get_is_checked_against_that_operation_only() {
+        let root = temp_root();
+        write_endpoint(&root, "x", "~get", &ep(200, None));
+        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    keyAuth: { type: apiKey, in: header, name: k }\npaths:\n  /x:\n    get:\n      operationId: upper\n      responses: { '200': { description: ok } }\n    additionalOperations:\n      get:\n        operationId: lower\n        security: [ { keyAuth: [] } ]\n        responses: { '200': { description: ok } }\n";
+        std::fs::write(root.join("openapi.yaml"), yaml).unwrap();
+        let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions { case_sensitive_methods: true }).unwrap();
+        let check = security_check(&root.join("datasources/endpoints"), &doc);
+        assert_eq!(check.mismatches.len(), 1, "the ~get stub must satisfy the lowercase get operation's security");
+        assert_eq!(check.mismatches[0].matched, vec![("get".to_string(), "/x".to_string())]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ================================================================== round 2: edge methods
+
+    fn fs_is_case_sensitive(dir: &Path) -> bool {
+        std::fs::create_dir_all(dir).unwrap();
+        let probe = dir.join("case_probe_a");
+        std::fs::write(&probe, b"").unwrap();
+        let sensitive = !dir.join("CASE_PROBE_A").exists();
+        std::fs::remove_file(&probe).unwrap();
+        sensitive
+    }
+
+    async fn raw_status(addr: std::net::SocketAddr, method: &str, path: &str, extra: &str) -> (u16, Vec<(String, String)>) {
+        let req = format!("{method} {path} HTTP/1.1\r\nHost: l\r\nConnection: close\r\n{extra}\r\n");
+        let (line, headers, _, _) = raw_request(addr, req.as_bytes()).await;
+        let status = line
+            .split(' ')
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("no status line for {method}: {line:?}"));
+        (status, headers)
+    }
+
+    fn allow_header(headers: &[(String, String)]) -> String {
+        headers.iter().find(|(k, _)| k == "allow").map(|(_, v)| v.clone()).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn long_and_punctuated_methods_on_the_wire_are_pinned_in_both_modes() {
+        // hyper accepts any RFC 9110 token as a method (up to its own limits); frogs routes the exact
+        // bytes (default mode uppercases first). These are the observed outcomes, pinned deliberately.
+        let root = temp_root();
+        write_endpoint(&root, "t", &"A".repeat(64), &ep(201, None));
+        write_endpoint(&root, "t", "M-SEARCH", &ep(202, None));
+        write_endpoint(&root, "t", "~_58_2e_59", &ep(203, None));
+        write_endpoint(&root, "t", "~_41_2a_42", &ep(204, None));
+        write_endpoint(&root, "t", "get", &ep(200, None));
+        let long64 = "A".repeat(64);
+        let long65 = "A".repeat(65);
+        let lower64 = "a".repeat(64);
+        let table: [(MethodCase, Vec<(&str, u16)>); 2] = [
+            (
+                MethodCase::Default,
+                vec![
+                    (&long64, 201),
+                    (&long65, 405),
+                    (&lower64, 201),
+                    ("M-SEARCH", 202),
+                    ("m-search", 202),
+                    ("X.Y", 203),
+                    ("x.y", 203),
+                    ("A*B", 204),
+                    ("a*b", 204),
+                    ("UNLINK", 405),
+                ],
+            ),
+            (
+                MethodCase::Exact,
+                vec![
+                    (&long64, 201),
+                    (&long65, 405),
+                    (&lower64, 405),
+                    ("M-SEARCH", 202),
+                    ("m-search", 405),
+                    ("X.Y", 203),
+                    ("x.y", 405),
+                    ("A*B", 204),
+                    ("a*b", 405),
+                    ("UNLINK", 405),
+                ],
+            ),
+        ];
+        for (mode, rows) in table {
+            let addr = spawn_served(router_for(&root, mode), mode == MethodCase::Exact).await;
+            for (method, expected) in rows {
+                let (status, headers) = raw_status(addr, method, "/t", "").await;
+                assert_eq!(status, expected, "{mode:?} {method}");
+                if expected == 405 {
+                    let allow = allow_header(&headers);
+                    for listed in ["GET", "HEAD", "M-SEARCH", "X.Y", "A*B", long64.as_str()] {
+                        assert!(allow.split(',').any(|m| m == listed), "{mode:?} {method}: {listed} missing from Allow {allow}");
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn an_enormous_method_token_never_panics_the_server_and_never_reaches_a_route() {
+        let root = temp_root();
+        write_endpoint(&root, "t", "get", &ep(200, None));
+        let addr = spawn_served(router_for(&root, MethodCase::Default), false).await;
+        let huge = "A".repeat(5_000);
+        let req = format!("{huge} /t HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n");
+        let (line, _, _, _) = raw_request(addr, req.as_bytes()).await;
+        assert!(line.is_empty() || line.starts_with("HTTP/1.1 4"), "got {line:?}");
+        assert_eq!(raw_status(addr, "GET", "/t", "").await.0, 200, "the server is still healthy afterwards");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn exact_mode_odd_case_get_never_reaches_a_protected_get_even_with_a_tilde_get_beside_it() {
+        for with_tilde in [false, true] {
+            let root = temp_root();
+            write_endpoint(&root, "vault", "get", &ep(200, Some("keyAuth")));
+            if with_tilde {
+                write_endpoint(&root, "vault", "~get", &ep(201, None));
+            }
+            let addr = spawn_served(router_for(&root, MethodCase::Exact), true).await;
+            for method in ["gEt", "Get", "gET", "GEt"] {
+                let (status, _) = raw_status(addr, method, "/vault", "").await;
+                assert_eq!(status, 405, "with_tilde={with_tilde}: {method} must be 405, never the protected GET (200) nor ~get");
+            }
+            let (status, _) = raw_status(addr, "get", "/vault", "").await;
+            assert_eq!(status, if with_tilde { 201 } else { 405 }, "with_tilde={with_tilde}");
+            assert_eq!(raw_status(addr, "GET", "/vault", "").await.0, 401);
+            assert_eq!(raw_status(addr, "GET", "/vault", "X-Api-Key: good\r\n").await.0, 200);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[tokio::test]
+    async fn head_connect_and_exact_connect_behave_as_before_when_extension_routes_share_the_path() {
+        let root = temp_root();
+        write_endpoint(&root, "t", "get", &ep(200, None));
+        write_endpoint(&root, "t", "LINK", &ep(202, None));
+        for mode in [MethodCase::Default, MethodCase::Exact] {
+            let addr = spawn_served(router_for(&root, mode), mode == MethodCase::Exact).await;
+            assert_eq!(raw_status(addr, "HEAD", "/t", "").await.0, 200, "{mode:?}: HEAD is GET's implicit companion");
+            let (status, headers) = raw_status(addr, "head", "/t", "").await;
+            assert_eq!(status, 405, "{mode:?}: lowercase head is not normalised to HEAD");
+            assert!(
+                allow_header(&headers).split(',').any(|m| m == "LINK"),
+                "{mode:?}: Allow lists the extension: {headers:?}"
+            );
+            assert_eq!(raw_status(addr, "connect", "/t", "").await.0, 405, "{mode:?}");
+            assert_eq!(raw_status(addr, "CONNECT", "/t", "").await.0, 501, "{mode:?}: CONNECT is refused before routing");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn router_with_doc(root: &Path, mode: MethodCase, doc: &crate::openapi::OpenApiDocument) -> Router {
+        std::fs::create_dir_all(root.join("datasources/sql/db")).unwrap();
+        let sec = root.join("sec");
+        std::fs::create_dir_all(sec.join("verifiers")).unwrap();
+        std::fs::write(sec.join("schemes.json"), "{}").unwrap();
+        let errs = root.join("errs");
+        std::fs::create_dir_all(&errs).unwrap();
+        std::fs::write(
+            errs.join("core.json"),
+            r#"{ "validation.missing_parameter": { "httpStatus": 400, "exposeDetail": true }, "validation.invalid_type": { "httpStatus": 400, "exposeDetail": true } }"#,
+        )
+        .unwrap();
+        build_router(
+            root,
+            Arc::new(HashMap::new()),
+            &HashMap::new(),
+            Arc::new(ErrorRegistry::load(&errs).unwrap()),
+            Arc::new(SecurityConfig::load(&sec).unwrap()),
+            Arc::new(HashMap::new()),
+            Arc::new(Mutex::new(DiscoveredErrors::default())),
+            false,
+            Some(doc),
+            None,
+            NonZeroU64::new(5_000).unwrap(),
+            false,
+            mode,
+        )
+    }
+
+    const BODY_SPEC_OP: &str = "        operationId: op\n        requestBody:\n          required: true\n          content:\n            application/json:\n              schema:\n                type: object\n                required: [name]\n                properties:\n                  name: { type: string }\n        responses: { '200': { description: ok } }\n";
+
+    #[tokio::test]
+    async fn an_extension_method_body_over_two_mib_is_413_and_request_validation_applies_to_its_body_schema() {
+        for (mode, key, token, wire) in [(MethodCase::Default, "LINK", "LINK", "link"), (MethodCase::Exact, "purge", "~purge", "purge")] {
+            let root = temp_root();
+            write_endpoint(&root, "t", token, &ep(201, None));
+            std::fs::write(
+                root.join("openapi.yaml"),
+                format!("openapi: 3.2.0\ninfo: {{ title: t, version: '1' }}\npaths:\n  /t:\n    additionalOperations:\n      '{key}':\n{BODY_SPEC_OP}"),
+            )
+            .unwrap();
+            let doc = crate::openapi::load(
+                &root.join("openapi.yaml"),
+                crate::openapi::LoadOptions {
+                    case_sensitive_methods: mode == MethodCase::Exact,
+                },
+            )
+            .unwrap();
+            assert_eq!(doc.operations.len(), 1, "{:?}", doc.issues);
+            let addr = spawn_served(router_with_doc(&root, mode, &doc), mode == MethodCase::Exact).await;
+            let url = format!("http://{addr}/t");
+            let client = reqwest::Client::new();
+            let method = reqwest::Method::from_bytes(wire.as_bytes()).unwrap();
+
+            let ok = client.request(method.clone(), &url).json(&serde_json::json!({ "name": "x" })).send().await.unwrap();
+            assert_eq!(ok.status(), 201, "{mode:?}: a valid body is served");
+            let wrong_type = client.request(method.clone(), &url).json(&serde_json::json!({ "name": 5 })).send().await.unwrap();
+            assert_eq!(
+                wrong_type.status(),
+                400,
+                "{mode:?}: a body that breaks the schema is rejected for an extension operation too"
+            );
+            let missing = client.request(method.clone(), &url).send().await.unwrap();
+            assert_eq!(missing.status(), 400, "{mode:?}: a required body that is absent is rejected");
+
+            let big = vec![b'a'; 2 * 1024 * 1024 + 1024];
+            let huge = client.request(method, &url).body(big).send().await.unwrap();
+            assert_eq!(huge.status(), 413, "{mode:?}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    // ================================================================== round 2: CORS and pinned gaps
+
+    #[tokio::test]
+    async fn exact_mode_preflight_mirrors_the_requested_method_spelling_exactly() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "~purge", &ep(202, None));
+        let router = crate::server::apply_cors(router_for(&root, MethodCase::Exact), &["https://app.example".to_string()]);
+        let addr = spawn_served(router, true).await;
+        for requested in ["purge", "PURGE"] {
+            let resp = reqwest::Client::new()
+                .request(reqwest::Method::OPTIONS, format!("http://{addr}/things"))
+                .header("origin", "https://app.example")
+                .header("access-control-request-method", requested)
+                .send()
+                .await
+                .unwrap();
+            assert!(resp.status().is_success(), "{requested}: {}", resp.status());
+            let allowed = resp.headers().get("access-control-allow-methods").map(|v| v.to_str().unwrap().to_string());
+            assert_eq!(allowed.as_deref(), Some(requested), "the preflight answer mirrors the request spelling byte for byte");
+        }
+        // Deliberate: the preflight is generic (mirror_request), so it is "allowed" for PURGE too,
+        // while the real PURGE request is 405 because only `purge` is routed.
+        let (status, _) = raw_status(addr, "PURGE", "/things", "Origin: https://app.example\r\n").await;
+        assert_eq!(status, 405);
+        assert_eq!(raw_status(addr, "purge", "/things", "Origin: https://app.example\r\n").await.0, 202);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn secured_spec(key: &str) -> String {
+        format!(
+            "openapi: 3.2.0\ninfo: {{ title: t, version: '1' }}\ncomponents:\n  securitySchemes:\n    keyAuth: {{ type: apiKey, in: header, name: X-Api-Key }}\npaths:\n  /x:\n    additionalOperations:\n      '{key}':\n        operationId: op\n        security: [ {{ keyAuth: [] }} ]\n        responses: {{ '200': {{ description: ok }} }}\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn known_gap_an_open_stale_upper_purge_file_is_served_with_only_an_unmatched_warning_in_exact_mode() {
+        // DELIBERATE CURRENT BEHAVIOUR (documented gap): in exact mode the spec declares a *secured* `purge`
+        // (token `~purge`). A leftover open endpoint.PURGE.json has no operation in the spec, so the startup
+        // check reports it only as "unmatched" (a warning) and it keeps being served, unprotected.
+        let root = temp_root();
+        write_endpoint(&root, "x", "PURGE", &ep(202, None));
+        std::fs::write(root.join("openapi.yaml"), secured_spec("purge")).unwrap();
+        let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions { case_sensitive_methods: true }).unwrap();
+        let check = security_check(&root.join("datasources/endpoints"), &doc);
+        assert!(check.mismatches.is_empty(), "no refusal at startup");
+        assert_eq!(check.unmatched.len(), 1, "only an unmatched warning");
+        let addr = spawn_served(router_for(&root, MethodCase::Exact), true).await;
+        assert_eq!(raw_status(addr, "PURGE", "/x", "").await.0, 202, "the stale open route is served without credentials");
+        assert_eq!(raw_status(addr, "purge", "/x", "").await.0, 405, "the secured spelling has no file yet");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn known_gap_an_operation_dropped_for_a_missing_operation_id_leaves_its_hand_made_file_unmatched_and_served() {
+        // DELIBERATE CURRENT BEHAVIOUR (documented gap): an additionalOperations entry without an operationId
+        // is skipped at load (S3), so a hand-made open endpoint.LINK.json is merely "unmatched" and is served
+        // even though the dropped entry declared security. `strictOpenApi` is what turns the S3 into a refusal.
+        let root = temp_root();
+        write_endpoint(&root, "x", "LINK", &ep(202, None));
+        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    keyAuth: { type: apiKey, in: header, name: X-Api-Key }\npaths:\n  /x:\n    additionalOperations:\n      LINK:\n        security: [ { keyAuth: [] } ]\n        responses: { '200': { description: ok } }\n";
+        std::fs::write(root.join("openapi.yaml"), yaml).unwrap();
+        let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
+        assert!(doc.operations.is_empty());
+        assert!(doc.issues.iter().any(|i| i.kind == crate::openapi::IssueKind::InvalidAdditionalOperation));
+        let check = security_check(&root.join("datasources/endpoints"), &doc);
+        assert!(check.mismatches.is_empty());
+        assert_eq!(check.unmatched.len(), 1);
+        let addr = spawn_served(router_for(&root, MethodCase::Default), false).await;
+        assert_eq!(raw_status(addr, "LINK", "/x", "").await.0, 202);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ================================================================== round 2: case-sensitive filesystems only
+
+    #[tokio::test]
+    async fn coexisting_purge_and_upper_purge_files_route_only_the_canonical_one_in_each_mode() {
+        let root = temp_root();
+        if !fs_is_case_sensitive(&root) {
+            eprintln!("skipping: this filesystem is case-insensitive, endpoint.purge.json and endpoint.PURGE.json cannot coexist");
+            return;
+        }
+        write_endpoint(&root, "t", "PURGE", &ep(202, None));
+        write_endpoint(&root, "t", "purge", &ep(201, None));
+        for mode in [MethodCase::Default, MethodCase::Exact] {
+            let addr = spawn_served(router_for(&root, mode), mode == MethodCase::Exact).await;
+            assert_eq!(raw_status(addr, "PURGE", "/t", "").await.0, 202, "{mode:?}");
+            let lower = raw_status(addr, "purge", "/t", "").await.0;
+            assert_eq!(
+                lower,
+                if mode == MethodCase::Default { 202 } else { 405 },
+                "{mode:?}: endpoint.purge.json is never what answers a request"
+            );
+            let findings = method_file_findings(&root.join("datasources/endpoints"), mode);
+            assert_eq!(findings.len(), 1, "{mode:?}");
+            assert!(findings[0].file.ends_with("endpoint.purge.json"));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn coexisting_get_and_upper_get_files_route_only_the_lowercase_one() {
+        let root = temp_root();
+        if !fs_is_case_sensitive(&root) {
+            eprintln!("skipping: this filesystem is case-insensitive, endpoint.get.json and endpoint.GET.json cannot coexist");
+            return;
+        }
+        write_endpoint(&root, "t", "get", &ep(200, None));
+        write_endpoint(&root, "t", "GET", &ep(201, None));
+        for mode in [MethodCase::Default, MethodCase::Exact] {
+            let addr = spawn_served(router_for(&root, mode), mode == MethodCase::Exact).await;
+            assert_eq!(raw_status(addr, "GET", "/t", "").await.0, 200, "{mode:?}");
+            let found: Vec<_> = discover_endpoint_files(&root.join("datasources/endpoints"), mode)
+                .into_iter()
+                .map(|(_, m, _)| m)
+                .collect();
+            assert_eq!(found, ["get"], "{mode:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m4_security_tests {
+    use super::*;
+
+    fn temp_root() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-endpoint-m4sec-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    const HEAD: &str = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    a: { type: apiKey, in: header, name: ka }\n    b: { type: apiKey, in: header, name: kb }\npaths:\n";
+
+    fn check(yaml: &str, file_token: &str, security: Option<&str>, mode: MethodCase) -> (SecurityCheck, crate::openapi::OpenApiDocument) {
+        let root = temp_root();
+        std::fs::write(root.join("openapi.yaml"), format!("{HEAD}{yaml}")).unwrap();
+        let dir = root.join("datasources/endpoints/x");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = match security {
+            Some(s) => format!(r#"{{ "operationId": "x", "security": "{s}", "sources": {{}}, "response": {{}} }}"#),
+            None => r#"{ "operationId": "x", "sources": {}, "response": {} }"#.to_string(),
+        };
+        std::fs::write(dir.join(format!("endpoint.{file_token}.json")), body).unwrap();
+        let doc = crate::openapi::load(
+            &root.join("openapi.yaml"),
+            crate::openapi::LoadOptions {
+                case_sensitive_methods: mode == MethodCase::Exact,
+            },
+        )
+        .unwrap();
+        let result = security_check(&root.join("datasources/endpoints"), &doc);
+        let _ = std::fs::remove_dir_all(&root);
+        (result, doc)
+    }
+
+    #[test]
+    fn two_fallback_matching_extension_operations_must_both_be_satisfied_and_the_message_lists_both_methods() {
+        let yaml = "  /a/{x}:
+    additionalOperations:
+      LINK:
+        operationId: one
+        security: [ { a: [] } ]
+        responses: { '200': { description: ok } }
+  /a/{y}:
+    additionalOperations:
+      LINK:
+        operationId: two
+        security: [ { b: [] } ]
+        responses: { '200': { description: ok } }
+";
+        let root = temp_root();
+        std::fs::write(root.join("openapi.yaml"), format!("{HEAD}{yaml}")).unwrap();
+        let dir = root.join("datasources/endpoints/a/{z}");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("endpoint.LINK.json"),
+            r#"{ "operationId": "x", "security": "a", "sources": {}, "response": {} }"#,
+        )
+        .unwrap();
+        let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
+        let result = security_check(&root.join("datasources/endpoints"), &doc);
+        assert_eq!(result.mismatches.len(), 1);
+        let message = result.mismatches[0].message();
+        assert!(
+            message.contains("LINK /a/{x}") && message.contains("LINK /a/{y}") && message.contains("it must satisfy all of them"),
+            "{message}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    const LINK_OR: &str = "  /x:
+    additionalOperations:
+      LINK:
+        operationId: one
+        security: [ { a: [] }, { b: [] } ]
+        responses: { '200': { description: ok } }
+";
+
+    #[test]
+    fn an_extension_operation_with_alternatives_accepts_any_single_key_alternative_and_rejects_an_unprotected_file() {
+        assert!(check(LINK_OR, "LINK", Some("a"), MethodCase::Default).0.mismatches.is_empty());
+        assert!(check(LINK_OR, "LINK", Some("b"), MethodCase::Default).0.mismatches.is_empty());
+        let (none, _) = check(LINK_OR, "LINK", None, MethodCase::Default);
+        assert_eq!(none.mismatches.len(), 1);
+        assert!(none.mismatches[0].message().starts_with("LINK /x ("), "{}", none.mismatches[0].message());
+    }
+
+    #[test]
+    fn a_stricter_extension_stub_is_reported_as_stricter_not_as_a_mismatch() {
+        let open = "  /x:
+    additionalOperations:
+      LINK:
+        operationId: one
+        responses: { '200': { description: ok } }
+";
+        let (result, _) = check(open, "LINK", Some("a"), MethodCase::Default);
+        assert!(result.mismatches.is_empty());
+        assert_eq!(result.stricter.len(), 1);
+    }
+
+    #[test]
+    fn an_exact_mode_tilde_stub_is_checked_against_its_lowercase_operation_and_named_by_its_wire_method() {
+        let yaml = "  /x:
+    additionalOperations:
+      purge:
+        operationId: one
+        security: [ { a: [] } ]
+        responses: { '200': { description: ok } }
+";
+        let (bad, _) = check(yaml, "~purge", None, MethodCase::Exact);
+        assert_eq!(bad.mismatches.len(), 1);
+        assert!(bad.mismatches[0].message().starts_with("purge /x ("), "{}", bad.mismatches[0].message());
+        let (good, _) = check(yaml, "~purge", Some("a"), MethodCase::Exact);
+        assert!(good.mismatches.is_empty() && good.unmatched.is_empty());
+        // An uppercase PURGE stub has no operation under exact mode: unmatched, never silently checked against `purge`.
+        let (other, _) = check(yaml, "PURGE", None, MethodCase::Exact);
+        assert!(other.mismatches.is_empty());
+        assert_eq!(other.unmatched.len(), 1);
     }
 }

@@ -49,6 +49,12 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      # Real-binary end-to-end tests (spawn `frogs run`, raw TCP, `frogs
+      # stop`). Feature-gated so a plain local `cargo test` never builds
+      # them — see the `e2e-tests` feature's comment in Cargo.toml.
+      - name: End-to-end tests
+        run: cargo test --locked --features e2e-tests --test m4_end_to_end
+
   # A real Postgres instance, exercised via the one `#[ignore]`d live-DB
   # test in src/sql/postgres.rs — Postgres service containers are a
   # Linux-runner-only GitHub Actions feature, hence its own job rather

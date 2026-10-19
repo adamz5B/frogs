@@ -1511,15 +1511,13 @@ mod m3_method_tests {
     /// `/g` is a GET-only route, `/any` echoes the method the handler actually saw
     /// plus whether the normalizer recorded an original spelling.
     fn app() -> Router {
-        Router::new()
-            .route("/g", get(|| async { "hi" }))
-            .route(
-                "/any",
-                any(|req: Request| async move {
-                    let original = req.extensions().get::<OriginalMethod>().map(|o| o.0.clone()).unwrap_or_else(|| "-".to_string());
-                    format!("{}|{}", req.method(), original)
-                }),
-            )
+        Router::new().route("/g", get(|| async { "hi" })).route(
+            "/any",
+            any(|req: Request| async move {
+                let original = req.extensions().get::<OriginalMethod>().map(|o| o.0.clone()).unwrap_or_else(|| "-".to_string());
+                format!("{}|{}", req.method(), original)
+            }),
+        )
     }
 
     async fn send(addr: SocketAddr, method: &str, path: &str) -> (String, Vec<(String, String)>, Vec<u8>, bool) {
@@ -1638,7 +1636,10 @@ mod m3_method_tests {
 
         fn call(&mut self, req: Request<Body>) -> Self::Future {
             let original = req.extensions().get::<OriginalMethod>().map(|o| o.0.clone());
-            self.seen.lock().unwrap().push((req.method().as_str().to_string(), original, req.extensions().get::<Marker>().is_some()));
+            self.seen
+                .lock()
+                .unwrap()
+                .push((req.method().as_str().to_string(), original, req.extensions().get::<Marker>().is_some()));
             std::future::ready(Ok(Response::new(Body::empty())))
         }
     }
@@ -1650,7 +1651,11 @@ mod m3_method_tests {
             inner: probe.clone(),
             case_sensitive,
         };
-        let mut req = Request::builder().method(Method::from_bytes(method.as_bytes()).unwrap()).uri("/x").body(Body::empty()).unwrap();
+        let mut req = Request::builder()
+            .method(Method::from_bytes(method.as_bytes()).unwrap())
+            .uri("/x")
+            .body(Body::empty())
+            .unwrap();
         req.extensions_mut().insert(Marker);
         service.call(req).await.unwrap();
         let seen = probe.seen.lock().unwrap().clone();

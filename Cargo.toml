@@ -172,6 +172,18 @@ mssql = ["dep:tiberius", "dep:deadpool", "dep:tokio-util"]
 # Opt-in, not in `default` — pulls in `oracle-rs`/`deadpool-oracle` instead of
 # an sqlx adapter (see those dependencies' own comment above for why).
 oracle = ["dep:oracle-rs", "dep:deadpool-oracle"]
+# Test-only, never part of a shipped build. Gates the integration tests that
+# drive the real `frogs` binary end to end (spawning `frogs run`, raw TCP on
+# 127.0.0.1, `frogs stop` -> taskkill/kill). That spawn/socket/kill chain trips
+# behaviour-based antivirus heuristics on developer machines, so a plain
+# `cargo test` doesn't build them at all. CI runs them as their own step:
+# `cargo test --locked --features e2e-tests --test m4_end_to_end`.
+e2e-tests = []
+
+[[test]]
+name = "m4_end_to_end"
+path = "tests/m4_end_to_end.rs"
+required-features = ["e2e-tests"]
 
 [profile.release]
 opt-level = "z"     # optimize for size over speed

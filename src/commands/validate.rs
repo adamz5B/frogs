@@ -108,7 +108,11 @@ async fn validate_api(root: &Path) -> usize {
                 println!("  error: {}", error.message);
             }
             problems += plan.errors.len();
-            for message in &plan.non_canonical {
+            for message in &plan.wrong_mode {
+                println!("  error: {message}");
+                problems += 1;
+            }
+            for message in &plan.invalid_tokens {
                 if config.server.strict_open_api() {
                     println!("  error: {message}");
                     problems += 1;
@@ -121,6 +125,10 @@ async fn validate_api(root: &Path) -> usize {
                 println!("  error: {}", mismatch.message());
             }
             problems += security.mismatches.len();
+            for file in &security.ambiguous {
+                println!("  error: {}", file.message());
+            }
+            problems += security.ambiguous.len();
             for stricter in &security.stricter {
                 warn(&stricter.message());
             }
@@ -165,8 +173,14 @@ async fn validate_api(root: &Path) -> usize {
     }
 
     let endpoints_root = api_dir.join("datasources/endpoints");
-    let (count, endpoint_problems) =
-        crate::endpoint::validate_endpoint_files(&endpoints_root, &config.security, &config.connections, config.server.tls.client_identity_enabled());
+    let method_case = crate::openapi::method_token::MethodCase::from_case_sensitive(config.server.case_sensitive_methods());
+    let (count, endpoint_problems) = crate::endpoint::validate_endpoint_files(
+        &endpoints_root,
+        &config.security,
+        &config.connections,
+        config.server.tls.client_identity_enabled(),
+        method_case,
+    );
     println!("  endpoint files: {count} discovered, {} problem(s)", endpoint_problems.len());
     for problem in &endpoint_problems {
         println!("    - {problem}");
@@ -174,7 +188,7 @@ async fn validate_api(root: &Path) -> usize {
     problems += endpoint_problems.len();
 
     let strict = config.server.strict_open_api();
-    for path in crate::endpoint::reserved_stream_key_files(&endpoints_root) {
+    for path in crate::endpoint::reserved_stream_key_files(&endpoints_root, method_case) {
         let message = format!(
             "{}: \"stream\" is reserved for streaming responses, which this frogs version does not implement — serving a single JSON response",
             path.display()
@@ -837,7 +851,12 @@ mod m3_validate_tests {
 
     #[tokio::test]
     async fn a_missing_case_sensitive_methods_key_is_never_counted_as_a_problem() {
-        for server in ["{}", r#"{ "caseSensitiveMethods": false }"#, r#"{ "caseSensitiveMethods": true }"#, r#"{ "strictOpenApi": true }"#] {
+        for server in [
+            "{}",
+            r#"{ "caseSensitiveMethods": false }"#,
+            r#"{ "caseSensitiveMethods": true }"#,
+            r#"{ "strictOpenApi": true }"#,
+        ] {
             let root = project(server);
             assert_eq!(validate_api(&root).await, 0, "{server}");
             let _ = fs::remove_dir_all(&root);
@@ -859,8 +878,118 @@ mod m3_validate_tests {
         let root = project("{}");
         let spec = "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths:\n  /things:\n    query:\n      operationId: q\n      responses:\n        '200': { description: ok }\n";
         fs::write(root.join(MANIFEST_FILE), spec).unwrap();
-        fs::write(root.join("api/datasources/endpoints/things/endpoint.get.json"), r#"{ "operationId": "q", "sources": {}, "response": {} }"#).unwrap();
+        fs::write(
+            root.join("api/datasources/endpoints/things/endpoint.get.json"),
+            r#"{ "operationId": "q", "sources": {}, "response": {} }"#,
+        )
+        .unwrap();
         assert_eq!(validate_api(&root).await, 0);
+        fs::write(root.join("api/config/server.json"), r#"{ "strictOpenApi": true }"#).unwrap();
+        assert!(validate_api(&root).await >= 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m4_validate_tests {
+    use super::*;
+    use std::fs;
+
+    fn project(server_json: &str, spec: &str, files: &[(&str, &str)]) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-validate-m4-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(root.join("api/config")).unwrap();
+        fs::write(root.join("api/config/server.json"), server_json).unwrap();
+        fs::write(root.join(MANIFEST_FILE), spec).unwrap();
+        for (folder, name) in files {
+            let dir = root.join("api/datasources/endpoints").join(folder);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(name), r#"{ "operationId": "o", "sources": {}, "response": {} }"#).unwrap();
+        }
+        root
+    }
+
+    const EMPTY_SPEC: &str = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths: {}\n";
+    const PURGE_LOWER: &str = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /x:\n    additionalOperations:\n      purge:\n        operationId: p\n        responses: { '200': { description: ok } }\n";
+    const PURGE_UPPER: &str = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /x:\n    additionalOperations:\n      PURGE:\n        operationId: p\n        responses: { '200': { description: ok } }\n";
+    const DUPLICATES: &str = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /x:\n    additionalOperations:\n      purge:\n        operationId: a\n        responses: { '200': { description: ok } }\n      PURGE:\n        operationId: b\n        responses: { '200': { description: ok } }\n";
+
+    #[tokio::test]
+    async fn a_clean_extension_project_validates_with_zero_problems_in_both_modes() {
+        let ok = project(r#"{ "caseSensitiveMethods": false }"#, PURGE_UPPER, &[("x", "endpoint.PURGE.json")]);
+        assert_eq!(validate_api(&ok).await, 0);
+        let exact = project(r#"{ "caseSensitiveMethods": true }"#, PURGE_LOWER, &[("x", "endpoint.~purge.json")]);
+        assert_eq!(validate_api(&exact).await, 0, "a W1 warning is not a problem");
+        let _ = fs::remove_dir_all(&ok);
+        let _ = fs::remove_dir_all(&exact);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_mode_file_is_a_problem_even_without_strict() {
+        let root = project(r#"{ "caseSensitiveMethods": false }"#, EMPTY_SPEC, &[("gone", "endpoint.~purge.json")]);
+        assert_eq!(validate_api(&root).await, 1);
+        fs::write(root.join("api/config/server.json"), r#"{ "caseSensitiveMethods": true }"#).unwrap();
+        assert_eq!(validate_api(&root).await, 0, "the same file is valid under the other setting");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_case_only_mismatch_between_a_stub_and_the_spec_is_a_problem_without_strict() {
+        // default -> exact: endpoint.PURGE.json still on disk while the spec says purge
+        let a = project(r#"{ "caseSensitiveMethods": true }"#, PURGE_LOWER, &[("x", "endpoint.PURGE.json")]);
+        assert_eq!(validate_api(&a).await, 1);
+        // exact -> default: endpoint.~purge.json on disk (WrongMode) while the spec now resolves to PURGE
+        let b = project(r#"{ "caseSensitiveMethods": false }"#, PURGE_LOWER, &[("x", "endpoint.~purge.json")]);
+        assert_eq!(validate_api(&b).await, 1, "the mismatch is counted once, not again as a bare wrong-mode file");
+        let _ = fs::remove_dir_all(&a);
+        let _ = fs::remove_dir_all(&b);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_token_file_is_a_warning_without_strict_and_a_problem_under_strict() {
+        let root = project(r#"{ "caseSensitiveMethods": false }"#, EMPTY_SPEC, &[("gone", "endpoint.purge.json")]);
+        assert_eq!(validate_api(&root).await, 0);
+        fs::write(root.join("api/config/server.json"), r#"{ "caseSensitiveMethods": false, "strictOpenApi": true }"#).unwrap();
+        assert_eq!(validate_api(&root).await, 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn duplicate_case_variant_keys_are_problems_and_an_existing_stub_for_them_adds_one_more() {
+        let without = project(r#"{ "caseSensitiveMethods": false }"#, DUPLICATES, &[]);
+        let base = validate_api(&without).await;
+        assert!(base >= 1, "the S4 issue is an error-level problem");
+        let with_file = project(r#"{ "caseSensitiveMethods": false }"#, DUPLICATES, &[("x", "endpoint.PURGE.json")]);
+        assert_eq!(
+            validate_api(&with_file).await,
+            base + 1,
+            "the file the spec can no longer vouch for is one more problem"
+        );
+        let _ = fs::remove_dir_all(&without);
+        let _ = fs::remove_dir_all(&with_file);
+    }
+
+    #[tokio::test]
+    async fn the_same_duplicate_keys_in_exact_mode_are_two_distinct_methods_and_cost_nothing_but_a_warning() {
+        let root = project(
+            r#"{ "caseSensitiveMethods": true }"#,
+            DUPLICATES,
+            &[("x", "endpoint.~purge.json"), ("x", "endpoint.PURGE.json")],
+        );
+        assert_eq!(validate_api(&root).await, 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn an_s3_key_is_a_problem_and_still_counts_under_strict() {
+        let spec = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /x:\n    additionalOperations:\n      OPTIONS:\n        operationId: o\n        responses: { '200': { description: ok } }\n";
+        let root = project("{}", spec, &[]);
+        assert!(validate_api(&root).await >= 1);
         fs::write(root.join("api/config/server.json"), r#"{ "strictOpenApi": true }"#).unwrap();
         assert!(validate_api(&root).await >= 1);
         let _ = fs::remove_dir_all(&root);

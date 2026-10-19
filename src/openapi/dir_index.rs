@@ -77,6 +77,11 @@ impl DirIndex {
         self.entries.iter().any(|e| e.utf8.as_deref() == Some(name))
     }
 
+    /// Every entry whose name is valid UTF-8, exactly as listed; non-UTF-8 names are skipped.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, EntryKind)> {
+        self.entries.iter().filter_map(|e| e.utf8.as_deref().map(|name| (name, e.kind)))
+    }
+
     pub fn case_variants(&self, name: &str) -> Vec<OsString> {
         let folded = fold(name);
         self.entries

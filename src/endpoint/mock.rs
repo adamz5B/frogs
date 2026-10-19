@@ -23,7 +23,7 @@ pub const VERIFIER_MOCK_KEY: &str = "verifier";
 
 /// One registered route, in the OpenAPI-style `{name}` path form a
 /// `.test.json` file's folder already uses (`/cars/{vin}`), never axum's
-/// `:name` form. `method` is lowercase, matching `endpoint.<method>.json`.
+/// `:name` form. `method` is the canonical file token (`MethodToken::file_token`), matching `endpoint.<method>.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RouteKey {
     pub method: String,

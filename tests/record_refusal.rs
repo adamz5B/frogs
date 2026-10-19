@@ -113,11 +113,11 @@ fn record_with(root: &std::path::Path, method: &str) -> std::process::Output {
 #[test]
 fn recording_with_a_dotted_or_unknown_method_argument_exits_1_before_connecting() {
     let root = project("{}");
-    for bad in ["get.reference", "purge", "", "../get", "g\u{1b}[31met"] {
+    for bad in ["", "../get", "g\u{1b}[31met"] {
         let out = record_with(&root, bad);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{bad:?}: {stderr}");
-        assert!(stderr.contains("is not an HTTP method frogs knows (get, put, post, delete, options, head, patch, trace, query)"), "{bad:?}: {stderr}");
+        assert!(stderr.contains("is not a valid method token"), "{bad:?}: {stderr}");
         assert!(!stderr.contains('\u{1b}'), "the argument must be sanitised before it is echoed: {stderr:?}");
         assert!(!stderr.to_lowercase().contains("nosuchdriver"), "the connect step ran: {stderr}");
     }
@@ -130,7 +130,7 @@ fn recording_accepts_any_case_of_a_known_method_past_the_allowlist() {
     for ok in ["QUERY", "Get", "get"] {
         let out = record_with(&root, ok);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(!stderr.contains("is not an HTTP method frogs knows"), "{ok}: {stderr}");
+        assert!(!stderr.contains("is not a valid method token"), "{ok}: {stderr}");
     }
     let _ = std::fs::remove_dir_all(&root);
 }

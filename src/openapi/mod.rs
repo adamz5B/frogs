@@ -6,7 +6,7 @@ pub mod method_token;
 pub mod path_rules;
 mod schema_walk;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 
@@ -16,12 +16,11 @@ pub use change_detection::{content_hash, referenced_component_names};
 pub use path_rules::{PortabilityPolicy, untrusted};
 pub use schema_walk::{SchemaWalker, merge_stub_response, stub_from_descriptor, walk_response_schema};
 
-use method_token::FIXED_FIELDS;
+use method_token::{FIXED_FIELDS, KeyClass, MethodCase, MethodToken, RejectKind, W1Note, untrusted_short};
 
 /// Caller-supplied loader settings (the loader itself never reads config).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LoadOptions {
-    #[allow(dead_code)] // M4: additionalOperations classification
     pub case_sensitive_methods: bool,
 }
 
@@ -68,8 +67,9 @@ pub struct Operation {
     pub path: String,
     /// The file token (`get`, `query`, ...) — what names the endpoint file.
     pub method: String,
-    /// The method sent on the wire (`GET`, `QUERY`, ...). Always taken from the
-    /// constant field table, never from spec text.
+    /// The method sent on the wire (`GET`, `QUERY`, `PURGE`, ...). For an
+    /// `additionalOperations` entry this is spec text, validated as an RFC 9110
+    /// token (1-64 bytes) before it ever lands here.
     pub http_method: String,
     pub operation_id: String,
     pub response_schema: Option<Value>,
@@ -652,8 +652,12 @@ pub enum IssueKind {
     VersionUnrecognized,
     Swagger2,
     VersionNewer,
-    /// Interim: `additionalOperations` is loaded but not served yet.
-    NotServed,
+    /// An `additionalOperations` value or entry that can't be served (S3).
+    InvalidAdditionalOperation,
+    /// `additionalOperations` keys that collide with a fixed method or each other under case folding (S4).
+    MethodCaseCollision,
+    /// A served extension method whose spelling is not all uppercase (W1).
+    CaseDistinctMethod,
     /// A 3.0/3.1 document uses an operation field introduced in 3.2.
     OperationNeedsNewerVersion,
     UnsafePath,
@@ -675,7 +679,7 @@ impl IssueKind {
     /// Whether `strictOpenApi: true` turns this kind into a refusal.
     pub fn is_strict_error(&self) -> bool {
         match self {
-            IssueKind::NotServed
+            IssueKind::CaseDistinctMethod
             | IssueKind::StreamingDeclared
             | IssueKind::NonJsonRequestBody
             | IssueKind::DeprecatedSecurityScheme
@@ -685,6 +689,8 @@ impl IssueKind {
             | IssueKind::Swagger2
             | IssueKind::VersionNewer
             | IssueKind::OperationNeedsNewerVersion
+            | IssueKind::InvalidAdditionalOperation
+            | IssueKind::MethodCaseCollision
             | IssueKind::UnsafePath
             | IssueKind::WindowsPortability
             | IssueKind::CaseOnlyPathCollision
@@ -733,6 +739,16 @@ pub struct OpenApiDocument {
     /// Those paths' operations — kept out of `operations` so generate never
     /// writes for them, but request validation still finds them.
     pub ambiguous_operations: Vec<Operation>,
+    /// `(normalised path, file token)` of `additionalOperations` keys that
+    /// collapse to the same method under case folding. Every spelling was
+    /// skipped; generate neither writes nor orphans these files and a stub
+    /// already on disk is never served.
+    pub ambiguous_methods: BTreeMap<(String, String), Vec<String>>,
+    /// `(normalised path, fixed file token)` an `additionalOperations` key
+    /// collided with (S4). Only orphan protection reads it.
+    pub protected_methods: BTreeSet<(String, String)>,
+    /// The `caseSensitiveMethods` interpretation this document was loaded under.
+    pub method_case: MethodCase,
     /// Raw `paths` keys skipped as unsafe. Only ever compared as strings,
     /// never used to build a filesystem path.
     pub skipped_paths: BTreeSet<String>,
@@ -883,22 +899,24 @@ fn detect_version(doc: &Value, issues: &mut Vec<LoadIssue>) -> SpecVersion {
     version
 }
 
-fn parse_operations(path: &str, item: &Map<String, Value>, ctx: &OpCtx, spec_version: &SpecVersion, issues: &mut Vec<LoadIssue>) -> Result<Vec<Operation>, OpenApiError> {
-    let mut operations = Vec::new();
-    for method in FIXED_FIELDS {
-        let Some(operation_obj) = item.get(method).and_then(Value::as_object) else {
-            continue;
+fn build_operation(
+    path: &str,
+    token: &MethodToken,
+    operation_obj: &Map<String, Value>,
+    ctx: &OpCtx,
+    spec_version: &SpecVersion,
+    issues: &mut Vec<LoadIssue>,
+) -> Operation {
+    let operation_id = operation_obj.get("operationId").and_then(Value::as_str).unwrap_or_default();
+    let http_method = token.wire().into_owned();
+    let label = format!("{} {}", untrusted_short(&http_method), untrusted(path));
+    if matches!(spec_version, SpecVersion::V3_0 | SpecVersion::V3_1) {
+        let field = match token {
+            MethodToken::Fixed("query") => Some("the `query` operation field"),
+            MethodToken::Extension(_) => Some("`additionalOperations`"),
+            MethodToken::Fixed(_) => None,
         };
-        let operation_id = operation_obj
-            .get("operationId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| OpenApiError::MissingOperationId {
-                path: path.to_string(),
-                method: method.to_string(),
-            })?;
-        let http_method = method.to_ascii_uppercase();
-        let label = format!("{http_method} {}", untrusted(path));
-        if method == "query" && matches!(spec_version, SpecVersion::V3_0 | SpecVersion::V3_1) {
+        if let Some(field) = field {
             let declared = match spec_version {
                 SpecVersion::V3_0 => "3.0",
                 _ => "3.1",
@@ -907,74 +925,198 @@ fn parse_operations(path: &str, item: &Map<String, Value>, ctx: &OpCtx, spec_ver
                 IssueKind::OperationNeedsNewerVersion,
                 Severity::Warning,
                 format!(
-                    "QUERY {} (operationId {}) uses the `query` operation field from OpenAPI 3.2, but this document declares openapi {} — served anyway; declare openapi: 3.2.0",
-                    untrusted(path),
-                    untrusted(operation_id),
-                    declared
+                    "{label} (operationId {}) uses {field} from OpenAPI 3.2, but this document declares openapi {declared} — served anyway; declare openapi: 3.2.0",
+                    untrusted(operation_id)
                 ),
             ));
         }
-        let parameters = extract_parameters(operation_obj, ctx, &label, issues);
-        let (request_body, request_body_unresolved, request_stream) = extract_request_body(operation_obj, ctx, &label, issues);
-        let (response_schema, response_mode) = extract_response(operation_obj, ctx, &label, issues);
-        let (security, declared_security_schemes, security_alternatives) = match operation_obj.get("security") {
-            Some(value) => resolve_security(value, ctx.scheme_names, &label, issues),
-            None => ctx.document_security.cloned().unwrap_or_default(),
+    }
+    let parameters = extract_parameters(operation_obj, ctx, &label, issues);
+    let (request_body, request_body_unresolved, request_stream) = extract_request_body(operation_obj, ctx, &label, issues);
+    let (response_schema, response_mode) = extract_response(operation_obj, ctx, &label, issues);
+    let (security, declared_security_schemes, security_alternatives) = match operation_obj.get("security") {
+        Some(value) => resolve_security(value, ctx.scheme_names, &label, issues),
+        None => ctx.document_security.cloned().unwrap_or_default(),
+    };
+    Operation {
+        path: path.to_string(),
+        method: token.file_token().into_owned(),
+        http_method,
+        operation_id: operation_id.to_string(),
+        response_schema,
+        parameters,
+        request_body,
+        response_status_codes: declared_response_codes(operation_obj),
+        security,
+        declared_security_schemes,
+        security_alternatives,
+        response_mode,
+        request_stream,
+        request_body_unresolved,
+    }
+}
+
+#[derive(Default)]
+struct ParsedPath {
+    operations: Vec<Operation>,
+    protected: Vec<String>,
+    ambiguous: Vec<(String, Vec<String>)>,
+}
+
+fn parse_operations(
+    path: &str,
+    item: &Map<String, Value>,
+    ctx: &OpCtx,
+    spec_version: &SpecVersion,
+    mode: MethodCase,
+    issues: &mut Vec<LoadIssue>,
+) -> Result<ParsedPath, OpenApiError> {
+    let mut parsed = ParsedPath::default();
+    for method in FIXED_FIELDS {
+        let Some(operation_obj) = item.get(method).and_then(Value::as_object) else {
+            continue;
         };
-        operations.push(Operation {
-            path: path.to_string(),
-            method: method.to_string(),
-            http_method,
-            operation_id: operation_id.to_string(),
-            response_schema,
-            parameters,
-            request_body,
-            response_status_codes: declared_response_codes(operation_obj),
-            security,
-            declared_security_schemes,
-            security_alternatives,
-            response_mode,
-            request_stream,
-            request_body_unresolved,
-        });
-    }
-    Ok(operations)
-}
-
-fn not_served_issue(method: &str, path: &str, operation: &Value) -> LoadIssue {
-    let operation_id = operation
-        .get("operationId")
-        .and_then(Value::as_str)
-        .map(untrusted)
-        .unwrap_or_else(|| "<none>".to_string());
-    LoadIssue::new(
-        IssueKind::NotServed,
-        Severity::Warning,
-        format!(
-            "{} {} (operationId {operation_id}) is not served by this version of frogs",
-            untrusted(method),
-            untrusted(path)
-        ),
-    )
-}
-
-fn not_served_issues(path: &str, item: &Map<String, Value>, issues: &mut Vec<LoadIssue>) {
-    match item.get("additionalOperations") {
-        None => {}
-        Some(Value::Object(additional)) => {
-            for (name, operation) in additional {
-                issues.push(not_served_issue(name, path, operation));
-            }
+        if operation_obj.get("operationId").and_then(Value::as_str).is_none() {
+            return Err(OpenApiError::MissingOperationId {
+                path: path.to_string(),
+                method: method.to_string(),
+            });
         }
-        Some(_) => issues.push(LoadIssue::new(
-            IssueKind::NotServed,
-            Severity::Warning,
-            format!("additionalOperations on {} is not a map and is not served by this version of frogs", untrusted(path)),
-        )),
+        parsed
+            .operations
+            .push(build_operation(path, &MethodToken::Fixed(method), operation_obj, ctx, spec_version, issues));
     }
+
+    let additional = match item.get("additionalOperations") {
+        None => return Ok(parsed),
+        Some(Value::Object(additional)) => additional,
+        Some(_) => {
+            issues.push(LoadIssue::new(
+                IssueKind::InvalidAdditionalOperation,
+                Severity::Error,
+                format!("additionalOperations on {} is not a map — all its entries skipped", untrusted(path)),
+            ));
+            return Ok(parsed);
+        }
+    };
+
+    type Accepted<'a> = (&'a String, MethodToken, Option<W1Note>, &'a Map<String, Value>);
+    let mut accepted: Vec<Accepted> = Vec::new();
+    for (key, entry) in additional {
+        match method_token::classify_additional_key(key, mode) {
+            KeyClass::Reject { kind, reason } => {
+                let issue_kind = match kind {
+                    RejectKind::S3 => IssueKind::InvalidAdditionalOperation,
+                    RejectKind::S4 => {
+                        parsed.protected.push(key.to_ascii_lowercase());
+                        IssueKind::MethodCaseCollision
+                    }
+                };
+                issues.push(LoadIssue::new(
+                    issue_kind,
+                    Severity::Error,
+                    format!("additionalOperations key '{}' on {} {reason} — skipped", untrusted_short(key), untrusted(path)),
+                ));
+            }
+            KeyClass::Accept { method, note } => match entry.as_object() {
+                Some(obj) => accepted.push((key, method, note, obj)),
+                None => issues.push(LoadIssue::new(
+                    IssueKind::InvalidAdditionalOperation,
+                    Severity::Error,
+                    format!(
+                        "additionalOperations key '{}' on {} is not an operation object — skipped",
+                        untrusted_short(key),
+                        untrusted(path)
+                    ),
+                )),
+            },
+        }
+    }
+
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (i, (_, method, _, _)) in accepted.iter().enumerate() {
+        let wire = method.wire().into_owned();
+        match groups.iter_mut().find(|(w, _)| *w == wire) {
+            Some((_, members)) => members.push(i),
+            None => groups.push((wire, vec![i])),
+        }
+    }
+    let mut dropped: BTreeSet<usize> = BTreeSet::new();
+    for (wire, members) in &groups {
+        if members.len() < 2 {
+            continue;
+        }
+        let spellings: Vec<String> = members.iter().map(|&i| accepted[i].0.clone()).collect();
+        let shown: Vec<String> = spellings.iter().map(|k| format!("'{}'", untrusted_short(k))).collect();
+        issues.push(LoadIssue::new(
+            IssueKind::MethodCaseCollision,
+            Severity::Error,
+            format!(
+                "additionalOperations keys {} on {} differ only by letter case and are the same method {} once uppercased (caseSensitiveMethods is false) — all skipped; existing endpoint files are left alone",
+                shown.join(", "),
+                untrusted(path),
+                untrusted_short(wire)
+            ),
+        ));
+        let token = accepted[members[0]].1.file_token().into_owned();
+        parsed.ambiguous.push((token, spellings));
+        dropped.extend(members.iter().copied());
+    }
+
+    for (i, (key, method, note, obj)) in accepted.into_iter().enumerate() {
+        if dropped.contains(&i) {
+            continue;
+        }
+        if obj.get("operationId").and_then(Value::as_str).is_none() {
+            issues.push(LoadIssue::new(
+                IssueKind::InvalidAdditionalOperation,
+                Severity::Error,
+                format!(
+                    "additionalOperations key '{}' on {} has no operationId — skipped",
+                    untrusted_short(key),
+                    untrusted(path)
+                ),
+            ));
+            continue;
+        }
+        match note {
+            Some(W1Note::FixedVariant) => {
+                let wire = method.wire();
+                let fixed_lower = wire.to_ascii_lowercase();
+                let fixed_upper = wire.to_ascii_uppercase();
+                issues.push(LoadIssue::new(
+                    IssueKind::CaseDistinctMethod,
+                    Severity::Warning,
+                    format!(
+                        "'{}' on {} is a different method from {fixed_upper} — case matters on the wire: a {fixed_upper} request is served by endpoint.{fixed_lower}.json, a '{}' request by endpoint.{}.json",
+                        untrusted_short(key),
+                        untrusted(path),
+                        untrusted_short(key),
+                        method.file_token()
+                    ),
+                ));
+            }
+            Some(W1Note::CaseDistinct) => {
+                issues.push(LoadIssue::new(
+                    IssueKind::CaseDistinctMethod,
+                    Severity::Warning,
+                    format!(
+                        "'{}' on {} is case-distinct on the wire — clients must send exactly '{}'; '{}' will get 405",
+                        untrusted_short(key),
+                        untrusted(path),
+                        untrusted_short(key),
+                        untrusted_short(&key.to_ascii_uppercase())
+                    ),
+                ));
+            }
+            None => {}
+        }
+        parsed.operations.push(build_operation(path, &method, obj, ctx, spec_version, issues));
+    }
+    Ok(parsed)
 }
 
-pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, _options: LoadOptions) -> Result<OpenApiDocument, OpenApiError> {
+pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, options: LoadOptions) -> Result<OpenApiDocument, OpenApiError> {
     let contents = std::fs::read_to_string(path).map_err(OpenApiError::Io)?;
     let doc: Value = serde_yaml::from_str(&contents).map_err(OpenApiError::Parse)?;
 
@@ -1065,15 +1207,23 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, _options:
         }
     }
 
+    let method_case = MethodCase::from_case_sensitive(options.case_sensitive_methods);
     let mut operations = Vec::new();
     let mut ambiguous_operations = Vec::new();
+    let mut ambiguous_methods = BTreeMap::new();
+    let mut protected_methods = BTreeSet::new();
     for (i, (normalized, item)) in accepted.iter().enumerate() {
-        let parsed = parse_operations(normalized, item, &ctx, &spec_version, &mut issues)?;
-        not_served_issues(normalized, item, &mut issues);
+        let parsed = parse_operations(normalized, item, &ctx, &spec_version, method_case, &mut issues)?;
+        for token in parsed.protected {
+            protected_methods.insert((normalized.clone(), token));
+        }
+        for (token, spellings) in parsed.ambiguous {
+            ambiguous_methods.insert((normalized.clone(), token), spellings);
+        }
         if ambiguous_indexes.contains(&i) {
-            ambiguous_operations.extend(parsed);
+            ambiguous_operations.extend(parsed.operations);
         } else {
-            operations.extend(parsed);
+            operations.extend(parsed.operations);
         }
     }
 
@@ -1117,6 +1267,9 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, _options:
         issues,
         ambiguous,
         ambiguous_operations,
+        ambiguous_methods,
+        protected_methods,
+        method_case,
         skipped_paths,
         unwritable_components,
         deprecated_security_schemes,
@@ -1688,8 +1841,8 @@ mod load_hardening_tests {
     }
 
     #[test]
-    fn strict_error_classification_covers_everything_except_not_served() {
-        assert!(!IssueKind::NotServed.is_strict_error());
+    fn strict_error_classification_covers_everything_except_the_warning_kinds() {
+        assert!(!IssueKind::CaseDistinctMethod.is_strict_error());
         for kind in [
             IssueKind::VersionMissing,
             IssueKind::VersionUnrecognized,
@@ -1766,26 +1919,6 @@ info: {{ title: t, version: 1 }}
             "querystring params are still collected"
         );
         assert_eq!(a.operations[0].response_schema_hash(), b.operations[0].response_schema_hash());
-    }
-
-    #[test]
-    fn additional_operations_are_loaded_as_not_served_warnings_only_and_query_is_served() {
-        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: 1 }\npaths:\n  /search:\n    get:\n      operationId: s\n      responses: { '200': { description: ok } }\n    query:\n      operationId: q\n      responses: { '200': { description: ok } }\n    additionalOperations:\n      PURGE:\n        operationId: purge\n        responses: { '200': { description: ok } }\n      LINK:\n        responses: { '200': { description: ok } }\n";
-        let doc = load_yaml(yaml);
-        assert_eq!(doc.operations.len(), 2, "the get and the query are served operations");
-        let not_served: Vec<&LoadIssue> = doc.issues.iter().filter(|i| i.kind == IssueKind::NotServed).collect();
-        assert_eq!(not_served.len(), 2, "{:?}", doc.issues);
-        assert!(not_served.iter().all(|i| i.severity == Severity::Warning));
-        assert!(not_served.iter().any(|i| i.message.starts_with("PURGE /search (operationId purge)")));
-        assert!(not_served.iter().any(|i| i.message.starts_with("LINK /search (operationId <none>)")));
-        assert_eq!(doc.issues.len(), 2);
-    }
-
-    #[test]
-    fn a_non_map_additional_operations_value_is_one_generic_not_served_warning() {
-        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: 1 }\npaths:\n  /x:\n    additionalOperations: [1, 2]\n    get:\n      operationId: x\n      responses: { '200': { description: ok } }\n";
-        let doc = load_yaml(yaml);
-        assert_eq!(kinds(&doc), vec![IssueKind::NotServed]);
     }
 
     #[test]
@@ -2443,7 +2576,7 @@ mod m2_schema_and_security_tests {
         assert!(!IssueKind::StreamingDeclared.is_strict_error());
         assert!(!IssueKind::NonJsonRequestBody.is_strict_error());
         assert!(!IssueKind::DeprecatedSecurityScheme.is_strict_error());
-        assert!(!IssueKind::NotServed.is_strict_error());
+        assert!(!IssueKind::CaseDistinctMethod.is_strict_error());
     }
 
     // ------------------------------------------------------------------ W4
@@ -2785,15 +2918,6 @@ mod m3_query_tests {
     }
 
     #[test]
-    fn query_is_no_longer_reported_as_not_served_but_additional_operations_still_are() {
-        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /things:\n    query:\n      operationId: q\n      responses: { '200': { description: ok } }\n    additionalOperations:\n      PURGE:\n        operationId: p\n        responses: { '200': { description: ok } }\n";
-        let doc = load_yaml(yaml).unwrap();
-        let not_served: Vec<_> = doc.issues.iter().filter(|i| i.kind == IssueKind::NotServed).collect();
-        assert_eq!(not_served.len(), 1, "{:?}", doc.issues);
-        assert!(!not_served[0].message.to_lowercase().contains("query"), "{}", not_served[0].message);
-    }
-
-    #[test]
     fn operation_order_for_a_spec_without_query_follows_the_historical_field_order() {
         let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /a:\n    patch: { operationId: pa, responses: { '200': { description: ok } } }\n    delete: { operationId: de, responses: { '200': { description: ok } } }\n    post: { operationId: po, responses: { '200': { description: ok } } }\n    get: { operationId: ge, responses: { '200': { description: ok } } }\n    put: { operationId: pu, responses: { '200': { description: ok } } }\n";
         let doc = load_yaml(yaml).unwrap();
@@ -2808,5 +2932,300 @@ mod m3_query_tests {
         for op in &doc.operations {
             assert_eq!(op.http_method, op.method.to_ascii_uppercase());
         }
+    }
+}
+
+#[cfg(test)]
+mod m4_load_tests {
+    use super::*;
+
+    fn tempdir() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "frogs-openapi-m4-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn load_yaml(yaml: &str, case_sensitive: bool) -> Result<OpenApiDocument, OpenApiError> {
+        let dir = tempdir();
+        let path = dir.join("openapi.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let result = load(
+            &path,
+            LoadOptions {
+                case_sensitive_methods: case_sensitive,
+            },
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    const RESPONSES: &str = "responses: { '200': { description: ok } }";
+
+    /// One `additionalOperations` entry with a quoted key and an operationId derived from `id`.
+    fn entry(key: &str, id: &str) -> String {
+        format!("      '{key}':\n        operationId: {id}\n        {RESPONSES}\n")
+    }
+
+    /// `/x` with a `get` and the given raw `additionalOperations` body.
+    fn spec(version: &str, additional_body: &str) -> String {
+        format!(
+            "openapi: {version}\ninfo: {{ title: t, version: '1' }}\npaths:\n  /x:\n    get:\n      operationId: getX\n      {RESPONSES}\n    additionalOperations:\n{additional_body}"
+        )
+    }
+
+    fn kinds_of(doc: &OpenApiDocument, kind: IssueKind) -> Vec<&LoadIssue> {
+        doc.issues.iter().filter(|i| i.kind == kind).collect()
+    }
+
+    fn by_http<'a>(doc: &'a OpenApiDocument, method: &str) -> Option<&'a Operation> {
+        doc.operations.iter().find(|o| o.http_method == method)
+    }
+
+    #[test]
+    fn a_purge_entry_loads_with_the_uppercase_wire_method_and_verbatim_token_in_default_mode() {
+        let doc = load_yaml(&spec("3.2.0", &entry("purge", "purgeX")), false).unwrap();
+        let op = by_http(&doc, "PURGE").expect("served");
+        assert_eq!((op.method.as_str(), op.http_method.as_str(), op.operation_id.as_str()), ("PURGE", "PURGE", "purgeX"));
+        assert!(doc.issues.is_empty(), "{:?}", doc.issues);
+        assert_eq!(doc.method_case, MethodCase::Default);
+    }
+
+    #[test]
+    fn a_purge_entry_in_exact_mode_keeps_its_bytes_gets_an_escaped_token_and_one_w1_warning() {
+        let doc = load_yaml(&spec("3.2.0", &entry("purge", "purgeX")), true).unwrap();
+        let op = by_http(&doc, "purge").expect("served");
+        assert_eq!((op.method.as_str(), op.http_method.as_str()), ("~purge", "purge"));
+        assert_eq!(doc.method_case, MethodCase::Exact);
+        let w1 = kinds_of(&doc, IssueKind::CaseDistinctMethod);
+        assert_eq!(w1.len(), 1, "{:?}", doc.issues);
+        assert_eq!(w1[0].severity, Severity::Warning);
+        assert!(!w1[0].kind.is_strict_error(), "W1 is a warning, never a strict error");
+        assert!(
+            w1[0].message.contains("case-distinct") && w1[0].message.contains("'PURGE' will get 405"),
+            "{}",
+            w1[0].message
+        );
+        assert_eq!(doc.issues.len(), 1);
+    }
+
+    #[test]
+    fn a_lowercase_fixed_variant_in_exact_mode_is_served_separately_and_the_w1_text_names_both_files() {
+        let doc = load_yaml(&spec("3.2.0", &entry("get", "lowerGet")), true).unwrap();
+        assert_eq!(doc.operations.len(), 2);
+        let fixed = by_http(&doc, "GET").unwrap();
+        assert_eq!(fixed.method, "get");
+        let variant = by_http(&doc, "get").unwrap();
+        assert_eq!(variant.method, "~get");
+        let w1 = kinds_of(&doc, IssueKind::CaseDistinctMethod);
+        assert_eq!(w1.len(), 1, "{:?}", doc.issues);
+        assert!(w1[0].message.contains("a GET request is served by endpoint.get.json"), "{}", w1[0].message);
+        assert!(w1[0].message.contains("endpoint.~get.json"), "{}", w1[0].message);
+        assert!(w1[0].message.contains("is a different method from GET"), "{}", w1[0].message);
+    }
+
+    #[test]
+    fn an_all_uppercase_extension_in_exact_mode_raises_no_issue() {
+        let doc = load_yaml(&spec("3.2.0", &(entry("LINK", "l") + &entry("M-SEARCH", "m"))), true).unwrap();
+        assert!(doc.issues.is_empty(), "{:?}", doc.issues);
+        assert_eq!(doc.operations.len(), 3);
+    }
+
+    #[test]
+    fn every_rejected_spelling_is_one_s3_error_issue_and_the_rest_of_the_path_still_loads() {
+        for mode in [false, true] {
+            let mut body = String::new();
+            let rejected = [
+                "options", "Head", "TRACE", "connect", "CONNECT", "track", "GET", "QUERY", "POST", "PUT", "DELETE", "PATCH",
+            ];
+            for (i, key) in rejected.iter().enumerate() {
+                body.push_str(&entry(key, &format!("op{i}")));
+            }
+            body.push_str(&entry("LINK", "linkX"));
+            let doc = load_yaml(&spec("3.2.0", &body), mode).unwrap();
+            let s3 = kinds_of(&doc, IssueKind::InvalidAdditionalOperation);
+            assert_eq!(s3.len(), rejected.len(), "mode {mode}: {:?}", doc.issues);
+            assert!(s3.iter().all(|i| i.severity == Severity::Error && i.kind.is_strict_error()));
+            for key in rejected {
+                assert!(s3.iter().any(|i| i.message.contains(&format!("'{key}'"))), "mode {mode}: no issue names {key}");
+            }
+            let served: Vec<&str> = doc.operations.iter().map(|o| o.http_method.as_str()).collect();
+            assert_eq!(served, ["GET", "LINK"], "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn an_exact_uppercase_fixed_name_issue_says_it_duplicates_the_fixed_field() {
+        let doc = load_yaml(&spec("3.2.0", &entry("POST", "p")), false).unwrap();
+        let s3 = kinds_of(&doc, IssueKind::InvalidAdditionalOperation);
+        assert_eq!(s3.len(), 1);
+        assert!(s3[0].message.contains("duplicates the fixed field post"), "{}", s3[0].message);
+    }
+
+    #[test]
+    fn a_lowercase_fixed_name_is_s4_in_default_mode_marks_the_token_protected_and_leaves_the_real_get_alone() {
+        let doc = load_yaml(&spec("3.2.0", &entry("get", "dup")), false).unwrap();
+        let s4 = kinds_of(&doc, IssueKind::MethodCaseCollision);
+        assert_eq!(s4.len(), 1, "{:?}", doc.issues);
+        assert_eq!(s4[0].severity, Severity::Error);
+        assert!(s4[0].kind.is_strict_error());
+        assert!(
+            s4[0].message.contains("is the fixed method GET once uppercased (caseSensitiveMethods is false)"),
+            "{}",
+            s4[0].message
+        );
+        assert!(doc.protected_methods.contains(&("/x".to_string(), "get".to_string())), "{:?}", doc.protected_methods);
+        assert_eq!(doc.operations.len(), 1);
+        assert_eq!(doc.operations[0].operation_id, "getX", "the genuine fixed GET operation is untouched");
+        assert!(doc.ambiguous_methods.is_empty());
+    }
+
+    #[test]
+    fn keys_differing_only_in_case_are_all_skipped_as_s4_and_recorded_as_ambiguous_in_default_mode() {
+        let doc = load_yaml(&spec("3.2.0", &(entry("purge", "a") + &entry("PURGE", "b") + &entry("LINK", "c"))), false).unwrap();
+        let s4 = kinds_of(&doc, IssueKind::MethodCaseCollision);
+        assert_eq!(s4.len(), 1, "{:?}", doc.issues);
+        assert_eq!(s4[0].severity, Severity::Error);
+        assert!(s4[0].message.contains("'purge'") && s4[0].message.contains("'PURGE'"), "{}", s4[0].message);
+        assert!(by_http(&doc, "PURGE").is_none(), "neither spelling may be served");
+        assert!(by_http(&doc, "LINK").is_some(), "an unrelated entry still loads");
+        let spellings = doc.ambiguous_methods.get(&("/x".to_string(), "PURGE".to_string())).expect("ambiguous entry");
+        assert_eq!(spellings, &vec!["purge".to_string(), "PURGE".to_string()]);
+    }
+
+    #[test]
+    fn three_case_variants_are_reported_once_with_every_spelling() {
+        let doc = load_yaml(&spec("3.2.0", &(entry("purge", "a") + &entry("Purge", "b") + &entry("PURGE", "c"))), false).unwrap();
+        let s4 = kinds_of(&doc, IssueKind::MethodCaseCollision);
+        assert_eq!(s4.len(), 1, "{:?}", doc.issues);
+        assert_eq!(doc.ambiguous_methods[&("/x".to_string(), "PURGE".to_string())].len(), 3);
+        assert_eq!(doc.operations.len(), 1);
+    }
+
+    #[test]
+    fn keys_differing_only_in_case_are_both_accepted_with_distinct_tokens_in_exact_mode() {
+        let doc = load_yaml(&spec("3.2.0", &(entry("purge", "a") + &entry("PURGE", "b"))), true).unwrap();
+        assert!(doc.ambiguous_methods.is_empty());
+        assert!(kinds_of(&doc, IssueKind::MethodCaseCollision).is_empty());
+        let mut tokens: Vec<&str> = doc.operations.iter().map(|o| o.method.as_str()).collect();
+        tokens.sort_unstable();
+        assert_eq!(tokens, ["PURGE", "get", "~purge"]);
+    }
+
+    #[test]
+    fn a_non_map_additional_operations_value_is_one_s3_error_and_the_fixed_operations_still_load() {
+        let yaml = format!(
+            "openapi: 3.2.0\ninfo: {{ title: t, version: '1' }}\npaths:\n  /x:\n    additionalOperations: [1, 2]\n    get:\n      operationId: x\n      {RESPONSES}\n"
+        );
+        let doc = load_yaml(&yaml, false).unwrap();
+        let s3 = kinds_of(&doc, IssueKind::InvalidAdditionalOperation);
+        assert_eq!(s3.len(), 1, "{:?}", doc.issues);
+        assert_eq!(s3[0].severity, Severity::Error);
+        assert!(s3[0].message.contains("is not a map"), "{}", s3[0].message);
+        assert_eq!(doc.operations.len(), 1);
+    }
+
+    #[test]
+    fn a_non_object_entry_is_one_s3_error_and_its_siblings_still_load() {
+        let body = "      PURGE: 5\n      BREW: [1]\n".to_string() + &entry("LINK", "l");
+        let doc = load_yaml(&spec("3.2.0", &body), false).unwrap();
+        let s3 = kinds_of(&doc, IssueKind::InvalidAdditionalOperation);
+        assert_eq!(s3.len(), 2, "{:?}", doc.issues);
+        assert!(s3.iter().all(|i| i.message.contains("is not an operation object")));
+        assert!(by_http(&doc, "LINK").is_some());
+        assert!(by_http(&doc, "PURGE").is_none() && by_http(&doc, "BREW").is_none());
+    }
+
+    #[test]
+    fn a_missing_or_non_string_operation_id_on_an_additional_entry_is_s3_and_the_load_continues() {
+        let body = format!("      PURGE:\n        {RESPONSES}\n      BREW:\n        operationId: 12\n        {RESPONSES}\n") + &entry("LINK", "l");
+        let doc = load_yaml(&spec("3.2.0", &body), false).expect("a bad additional entry is an issue, never a load error");
+        let s3 = kinds_of(&doc, IssueKind::InvalidAdditionalOperation);
+        assert_eq!(s3.len(), 2, "{:?}", doc.issues);
+        assert!(s3.iter().all(|i| i.message.contains("has no operationId") && i.severity == Severity::Error));
+        let served: Vec<&str> = doc.operations.iter().map(|o| o.http_method.as_str()).collect();
+        assert_eq!(served, ["GET", "LINK"]);
+    }
+
+    #[test]
+    fn a_missing_operation_id_on_a_fixed_field_is_still_a_hard_load_error() {
+        let yaml = format!("openapi: 3.2.0\ninfo: {{ title: t, version: '1' }}\npaths:\n  /x:\n    get:\n      {RESPONSES}\n");
+        assert!(matches!(load_yaml(&yaml, false), Err(OpenApiError::MissingOperationId { .. })));
+    }
+
+    #[test]
+    fn additional_operations_on_a_3_0_or_3_1_document_raise_the_s2_issue_and_are_served_anyway() {
+        for version in ["3.0.3", "3.1.0"] {
+            let doc = load_yaml(&spec(version, &entry("LINK", "l")), false).unwrap();
+            assert!(by_http(&doc, "LINK").is_some(), "{version}: served anyway");
+            let s2 = kinds_of(&doc, IssueKind::OperationNeedsNewerVersion);
+            assert_eq!(s2.len(), 1, "{version}: {:?}", doc.issues);
+            assert!(s2[0].kind.is_strict_error());
+            assert!(
+                s2[0].message.contains("LINK /x (operationId l)") && s2[0].message.contains("`additionalOperations`"),
+                "{}",
+                s2[0].message
+            );
+            assert!(s2[0].message.contains(&format!("openapi {}", &version[..3])), "{}", s2[0].message);
+        }
+        let doc = load_yaml(&spec("3.2.0", &entry("LINK", "l")), false).unwrap();
+        assert!(kinds_of(&doc, IssueKind::OperationNeedsNewerVersion).is_empty());
+    }
+
+    #[test]
+    fn a_hostile_key_is_escaped_and_truncated_in_the_issue_message() {
+        let long = "A".repeat(200);
+        let body = format!("      \"\\e[31mEVIL\\n\":\n        operationId: e\n        {RESPONSES}\n      '{long}':\n        operationId: l\n        {RESPONSES}\n");
+        let doc = load_yaml(&spec("3.2.0", &body), false).unwrap();
+        let s3 = kinds_of(&doc, IssueKind::InvalidAdditionalOperation);
+        assert_eq!(s3.len(), 2, "{:?}", doc.issues);
+        for issue in &s3 {
+            assert!(
+                !issue.message.contains('\u{1b}') && !issue.message.contains('\n'),
+                "raw control character leaked: {:?}",
+                issue.message
+            );
+        }
+        let long_issue = s3.iter().find(|i| i.message.contains("AAAA")).unwrap();
+        assert!(long_issue.message.contains('\u{2026}'), "{}", long_issue.message);
+        assert!(!long_issue.message.contains(&"A".repeat(100)), "the key must be cut well short of its full length");
+        assert!(doc.operations.iter().all(|o| o.http_method == "GET"));
+    }
+
+    #[test]
+    fn operations_load_in_fixed_field_order_then_additional_operations_in_yaml_order() {
+        let yaml = format!(
+            "openapi: 3.2.0\ninfo: {{ title: t, version: '1' }}\npaths:\n  /x:\n    additionalOperations:\n{}{}{}    post:\n      operationId: p\n      {RESPONSES}\n    get:\n      operationId: g\n      {RESPONSES}\n    query:\n      operationId: q\n      {RESPONSES}\n",
+            entry("UNLINK", "u"),
+            entry("LINK", "l"),
+            entry("BREW", "b")
+        );
+        let doc = load_yaml(&yaml, false).unwrap();
+        let order: Vec<&str> = doc.operations.iter().map(|o| o.http_method.as_str()).collect();
+        assert_eq!(order, ["GET", "POST", "QUERY", "UNLINK", "LINK", "BREW"]);
+    }
+
+    #[test]
+    fn issue_kind_strictness_for_the_m4_kinds() {
+        assert!(IssueKind::InvalidAdditionalOperation.is_strict_error());
+        assert!(IssueKind::MethodCaseCollision.is_strict_error());
+        assert!(!IssueKind::CaseDistinctMethod.is_strict_error());
+    }
+
+    #[test]
+    fn an_operation_on_an_ambiguous_path_keeps_its_additional_operations_out_of_the_main_list() {
+        let yaml = format!(
+            "openapi: 3.2.0\ninfo: {{ title: t, version: '1' }}\npaths:\n  /Y:\n    additionalOperations:\n{}  /y:\n    additionalOperations:\n{}",
+            entry("LINK", "a"),
+            entry("LINK", "b")
+        );
+        let doc = load_yaml(&yaml, false).unwrap();
+        assert!(by_http(&doc, "LINK").is_none());
+        assert_eq!(doc.ambiguous_operations.iter().filter(|o| o.http_method == "LINK").count(), 2);
     }
 }

@@ -391,6 +391,7 @@ async fn serve_router(security: SecurityConfig, endpoint_json: &str, client_iden
         None,
         NonZeroU64::new(5_000).unwrap(),
         client_identity_available,
+        MethodCase::Default,
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -464,15 +465,15 @@ fn validate_endpoint_files_reports_a_cert_dependent_route_only_when_identity_is_
     std::fs::write(dir.join("endpoint.get.json"), SECURED_ENDPOINT).unwrap();
     let security = security_with(MTLS_ORDERS);
 
-    let (count, problems) = validate_endpoint_files(&root, &security, &HashMap::new(), false);
+    let (count, problems) = validate_endpoint_files(&root, &security, &HashMap::new(), false, MethodCase::Default);
     assert_eq!(count, 1);
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(problems[0].contains("client certificate") && problems[0].contains("certAuth"), "{problems:?}");
 
-    let (_, problems) = validate_endpoint_files(&root, &security, &HashMap::new(), true);
+    let (_, problems) = validate_endpoint_files(&root, &security, &HashMap::new(), true, MethodCase::Default);
     assert!(problems.is_empty(), "{problems:?}");
 
-    let (_, problems) = validate_endpoint_files(&root, &security_with(SQL_API_KEY), &HashMap::new(), false);
+    let (_, problems) = validate_endpoint_files(&root, &security_with(SQL_API_KEY), &HashMap::new(), false, MethodCase::Default);
     assert!(problems.is_empty(), "a header-only scheme never needs clientAuth: {problems:?}");
 }
 
@@ -507,6 +508,7 @@ async fn serve_mocked(verifier: &str, selection: MockSelection) -> String {
         Some(Arc::new(FixedProvider(selection))),
         NonZeroU64::new(5_000).unwrap(),
         true,
+        MethodCase::Default,
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -675,6 +677,7 @@ async fn test_files_and_their_client_cert_are_inert_when_no_mock_provider_is_ins
         None,
         NonZeroU64::new(5_000).unwrap(),
         true,
+        MethodCase::Default,
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -689,4 +692,107 @@ async fn test_files_and_their_client_cert_are_inert_when_no_mock_provider_is_ins
         .unwrap();
     assert_eq!(response.status(), 401);
     assert_eq!(response.json::<Value>().await.unwrap()["name"], "auth.client_cert_missing");
+}
+
+// ---------------------------------------------------------------------
+// M4: extension-method routes with cert-dependent verifiers
+// ---------------------------------------------------------------------
+
+const SQL_FINGERPRINT_CACHED: &str = r#"{
+    "type": "sql", "connection": "db", "script": "verify.sql",
+    "parameters": [{ "name": "fp", "from": "cert.fingerprint" }],
+    "validIf": "row.active = true",
+    "cacheTtlSeconds": 30
+}"#;
+
+async fn serve_extension_router(token: &str, mode: MethodCase, identity: Option<ClientCertIdentity>, calls: Arc<AtomicUsize>) -> (String, PathBuf) {
+    let root = temp_dir("endpoint-m4-router");
+    std::fs::create_dir_all(root.join("datasources/sql/db")).unwrap();
+    std::fs::write(root.join("datasources/sql/db/verify.sql"), "SELECT 1").unwrap();
+    for (dir, body) in [
+        ("secret", r#"{ "operationId": "s", "security": "certAuth", "sources": {}, "response": {} }"#),
+        (
+            "limited",
+            r#"{ "operationId": "l", "security": "certAuth", "sources": {}, "response": {}, "rateLimit": { "requestsPerSecond": 1, "burst": 1 } }"#,
+        ),
+    ] {
+        let d = root.join("datasources/endpoints").join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(format!("endpoint.{token}.json")), body).unwrap();
+    }
+    let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+    drivers.insert("db".to_string(), Box::new(CountingDriver(calls)));
+    let mut router = build_router(
+        &root,
+        Arc::new(drivers),
+        &HashMap::new(),
+        Arc::new(registry()),
+        Arc::new(security_with(SQL_FINGERPRINT_CACHED)),
+        Arc::new(HashMap::new()),
+        Arc::new(Mutex::new(DiscoveredErrors::default())),
+        false,
+        None,
+        None,
+        NonZeroU64::new(5_000).unwrap(),
+        true,
+        mode,
+    );
+    if let Some(id) = identity {
+        router = router.layer(axum::Extension(Arc::new(id)));
+    }
+    let addr = crate::server::spawn_served(router, mode == MethodCase::Exact).await;
+    (format!("http://{addr}"), root)
+}
+
+async fn status_for(base: &str, method: &str, path: &str) -> (u16, Value) {
+    let resp = reqwest::Client::new()
+        .request(reqwest::Method::from_bytes(method.as_bytes()).unwrap(), format!("{base}{path}"))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn an_extension_route_with_a_cert_verifier_authorizes_caches_and_rate_limits_like_any_other_route() {
+    for (token, request, mode) in [("LINK", "LINK", MethodCase::Default), ("~purge", "purge", MethodCase::Exact)] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let id = identity(&LeafSpec::valid());
+        let (base, root) = serve_extension_router(token, mode, Some(id), calls.clone()).await;
+
+        assert_eq!(status_for(&base, request, "/secret").await.0, 200, "{token}");
+        assert_eq!(status_for(&base, request, "/secret").await.0, 200, "{token}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{token}: the second request is served from the verifier cache");
+
+        assert_eq!(status_for(&base, request, "/limited").await.0, 200, "{token}: first request inside the burst");
+        assert_eq!(
+            status_for(&base, request, "/limited").await.0,
+            429,
+            "{token}: the per-route rate limit applies to extension methods"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[tokio::test]
+async fn an_extension_route_with_no_certificate_or_an_expired_one_is_rejected_before_the_datasource() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (base, _root) = serve_extension_router("LINK", MethodCase::Default, None, calls.clone()).await;
+    let (status, body) = status_for(&base, "LINK", "/secret").await;
+    assert_eq!((status, name_of(&body)), (401, "auth.client_cert_missing"), "{body}");
+
+    let (base, _root) = serve_extension_router("LINK", MethodCase::Default, Some(identity(&LeafSpec::expired())), calls.clone()).await;
+    let (status, body) = status_for(&base, "link", "/secret").await;
+    assert_eq!((status, name_of(&body)), (401, "auth.client_cert_expired"), "{body}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn in_exact_mode_the_wrong_spelling_of_a_cert_protected_extension_route_is_405_never_a_bypass() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (base, _root) = serve_extension_router("PURGE", MethodCase::Exact, None, calls.clone()).await;
+    assert_eq!(status_for(&base, "purge", "/secret").await.0, 405);
+    assert_eq!(status_for(&base, "PURGE", "/secret").await.0, 401, "the real spelling still demands the certificate");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }

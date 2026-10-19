@@ -8,6 +8,7 @@ use axum::Router;
 
 use crate::config::{Config, ServerConfig, TlsConfig, TlsMode};
 use crate::endpoint::mock::MockProvider;
+use crate::openapi::method_token::MethodCase;
 use crate::project::{MANIFEST_FILE, require_project_root};
 use crate::server::pidfile;
 use crate::server::service::{self, RunDecision, ServiceRecord};
@@ -408,7 +409,7 @@ pub(crate) fn load_openapi_for_startup_reported(
                     ));
                 }
                 if strict {
-                    let stream_files = crate::endpoint::reserved_stream_key_files(&crate::project::api_base(root).join("datasources/endpoints"));
+                    let stream_files = crate::endpoint::reserved_stream_key_files(&crate::project::api_base(root).join("datasources/endpoints"), doc.method_case);
                     if !stream_files.is_empty() {
                         for file in &stream_files {
                             let message = format!(
@@ -443,6 +444,20 @@ pub(crate) fn load_openapi_for_startup_reported(
                 tracing::warn!("{}", crate::endpoint::unmatched_security_message(file));
             }
             report.unmatched = check.unmatched;
+            if !check.ambiguous.is_empty() {
+                for file in &check.ambiguous {
+                    let message = file.message();
+                    eprintln!("error: {message}");
+                    tracing::error!("{message}");
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{} endpoint file(s) belong to a method openapi.yaml declares ambiguously (keys differing only in case) — refusing to start; fix openapi.yaml, then run frogs validate{refusal_hint}",
+                        check.ambiguous.len()
+                    ),
+                ));
+            }
             if !check.mismatches.is_empty() {
                 for mismatch in &check.mismatches {
                     let message = mismatch.message();
@@ -507,6 +522,15 @@ pub(crate) async fn assemble_api_router(
 ) -> io::Result<(Router, ServerConfig)> {
     let api_dir = crate::project::api_base(root);
     let debug_mode = config.server.debug_mode;
+    let method_case = MethodCase::from_case_sensitive(config.server.case_sensitive_methods());
+    if let Some(doc) = &openapi_document
+        && doc.method_case != method_case
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "openapi.yaml was loaded under a different caseSensitiveMethods setting than the router is being built with — refusing to start",
+        ));
+    }
     // The client-certificate codes ship as runtime defaults (rather than
     // only in a freshly generated `config/errors/core.json`, which is
     // write-once) so a project generated before mTLS existed classifies
@@ -552,6 +576,7 @@ pub(crate) async fn assemble_api_router(
         mock_provider,
         config.server.effective_source_call_timeout_ms(),
         client_identity_available,
+        method_case,
     );
     let mut router = crate::server::router().merge(endpoint_router);
 
@@ -567,7 +592,7 @@ pub(crate) async fn assemble_api_router(
         router = router.merge(crate::server::metrics_router(metrics.clone()));
     }
     if config.server.docs_ui.mode != crate::config::DocsUiMode::Off {
-        let endpoint_summaries = crate::endpoint::endpoint_summaries(&api_dir.join("datasources/endpoints"));
+        let endpoint_summaries = crate::endpoint::endpoint_summaries(&api_dir.join("datasources/endpoints"), method_case);
         router = router.merge(crate::server::docs_ui_router(
             config.server.docs_ui.mode,
             &config.server.docs_ui.path,
@@ -2011,7 +2036,8 @@ mod m3_method_case_tests {
         assert!(unset.get("caseSensitiveMethods").is_none(), "{unset}");
     }
 
-    const QUERY_ON_31: &str = "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths:\n  /q:\n    query:\n      operationId: q\n      responses:\n        '200': { description: ok }\n";
+    const QUERY_ON_31: &str =
+        "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths:\n  /q:\n    query:\n      operationId: q\n      responses:\n        '200': { description: ok }\n";
 
     fn scratch(server_json: &str, spec: &str) -> std::path::PathBuf {
         let root = temp_project();
@@ -2033,7 +2059,11 @@ mod m3_method_case_tests {
         let root = scratch(strict, QUERY_ON_31);
         let err = load_openapi_for_startup(&root, &server(strict)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(load_openapi_for_startup(&root, &server(r#"{ "features": { "requestValidation": true } }"#)).unwrap().is_some());
+        assert!(
+            load_openapi_for_startup(&root, &server(r#"{ "features": { "requestValidation": true } }"#))
+                .unwrap()
+                .is_some()
+        );
 
         std::fs::write(root.join("openapi.yaml"), QUERY_ON_31.replace("3.1.0", "3.2.0")).unwrap();
         assert!(load_openapi_for_startup(&root, &server(strict)).unwrap().is_some());
@@ -2085,5 +2115,169 @@ mod m3_method_case_tests {
     #[tokio::test]
     async fn a_both_roles_project_applies_case_sensitive_methods_to_its_static_routes_too() {
         assert_eq!(both_roles_get_status(r#", "caseSensitiveMethods": true"#).await, 405);
+    }
+}
+
+#[cfg(test)]
+mod m4_run_tests {
+    use super::*;
+
+    fn temp_project() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-run-m4-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn server(json: &str) -> ServerConfig {
+        serde_json::from_str(json).unwrap()
+    }
+
+    const DUPLICATE_KEYS: &str = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /x:\n    additionalOperations:\n      purge:\n        operationId: a\n        responses: { '200': { description: ok } }\n      PURGE:\n        operationId: b\n        responses: { '200': { description: ok } }\n";
+    const SINGLE_PURGE: &str = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /x:\n    additionalOperations:\n      PURGE:\n        operationId: a\n        responses: { '200': { description: ok } }\n";
+    const STUB: &str = r#"{ "operationId": "a", "sources": {}, "response": {} }"#;
+
+    fn project(spec: &str, server_json: &str, files: &[&str]) -> std::path::PathBuf {
+        let root = temp_project();
+        let api = root.join("api");
+        for dir in ["config/errors", "security", "datasources/endpoints/x"] {
+            std::fs::create_dir_all(api.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("openapi.yaml"), spec).unwrap();
+        std::fs::write(api.join("config/server.json"), server_json).unwrap();
+        std::fs::write(api.join("config/errors/core.json"), "{}").unwrap();
+        std::fs::write(api.join("config/connections.json"), "{}").unwrap();
+        std::fs::write(api.join("security/schemes.json"), "{}").unwrap();
+        for file in files {
+            std::fs::write(api.join("datasources/endpoints/x").join(file), STUB).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn an_endpoint_file_for_a_method_declared_by_case_only_duplicate_keys_refuses_startup_with_strict_off() {
+        let root = project(DUPLICATE_KEYS, "{}", &["endpoint.PURGE.json"]);
+        let err = load_openapi_for_startup(&root, &server("{}")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("declares ambiguously"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_same_ambiguous_file_refuses_startup_with_strict_on_too() {
+        let root = project(DUPLICATE_KEYS, r#"{ "strictOpenApi": true }"#, &["endpoint.PURGE.json"]);
+        let err = load_openapi_for_startup(&root, &server(r#"{ "strictOpenApi": true }"#)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn case_only_duplicate_keys_with_no_endpoint_file_do_not_stop_startup_when_strict_is_off() {
+        let root = project(DUPLICATE_KEYS, "{}", &[]);
+        assert!(load_openapi_for_startup(&root, &server("{}")).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_registered_service_precheck_refuses_an_ambiguous_method_file_too() {
+        let root = project(DUPLICATE_KEYS, "{}", &["endpoint.PURGE.json"]);
+        let err = precheck_security_for_service(&root).unwrap_err();
+        assert!(err.to_string().contains("declares ambiguously"), "{err}");
+        let ok = project(SINGLE_PURGE, "{}", &["endpoint.PURGE.json"]);
+        assert!(precheck_security_for_service(&ok).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&ok);
+    }
+
+    #[test]
+    fn strict_startup_refuses_every_m4_issue_kind_and_a_clean_spec_starts() {
+        let strict = r#"{ "strictOpenApi": true }"#;
+        let bad_key = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /x:\n    additionalOperations:\n      OPTIONS:\n        operationId: a\n        responses: { '200': { description: ok } }\n";
+        let root = project(bad_key, strict, &[]);
+        assert!(load_openapi_for_startup(&root, &server(strict)).is_err(), "S3 under strict");
+        assert!(load_openapi_for_startup(&root, &server("{}")).is_ok(), "S3 without strict only warns");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let fixed_variant = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /x:\n    additionalOperations:\n      get:\n        operationId: a\n        responses: { '200': { description: ok } }\n";
+        let root = project(fixed_variant, strict, &[]);
+        assert!(load_openapi_for_startup(&root, &server(strict)).is_err(), "S4 under strict");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // W1 (case-distinct method, exact mode) never refuses, even under strict.
+        let exact_strict = r#"{ "strictOpenApi": true, "caseSensitiveMethods": true }"#;
+        let root = project(&fixed_variant.replace("get:", "purge:"), exact_strict, &[]);
+        assert!(load_openapi_for_startup(&root, &server(exact_strict)).is_ok(), "W1 is not a strict error");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let root = project(SINGLE_PURGE, strict, &["endpoint.PURGE.json"]);
+        assert!(load_openapi_for_startup(&root, &server(strict)).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn assemble_api_router_refuses_a_document_loaded_under_the_other_case_setting() {
+        for (server_json, load_case_sensitive) in [(r#"{ "caseSensitiveMethods": true }"#, false), (r#"{ "caseSensitiveMethods": false }"#, true)] {
+            let root = project(SINGLE_PURGE, server_json, &[]);
+            let api = root.join("api");
+            let config = Config::load(&api).unwrap();
+            let doc = crate::openapi::load(
+                &root.join("openapi.yaml"),
+                crate::openapi::LoadOptions {
+                    case_sensitive_methods: load_case_sensitive,
+                },
+            )
+            .unwrap();
+            let err = assemble_api_router(&root, config, Arc::new(HashMap::new()), None, Some(Arc::new(doc)))
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("different caseSensitiveMethods"), "{err}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[tokio::test]
+    async fn assemble_api_router_accepts_a_document_loaded_under_the_same_setting_and_serves_the_extension_route() {
+        for (server_json, case_sensitive, token, request) in [
+            (
+                r#"{ "caseSensitiveMethods": false, "features": { "requestValidation": false } }"#,
+                false,
+                "PURGE",
+                "purge",
+            ),
+            (
+                r#"{ "caseSensitiveMethods": true, "features": { "requestValidation": false } }"#,
+                true,
+                "PURGE",
+                "PURGE",
+            ),
+        ] {
+            let root = project(SINGLE_PURGE, server_json, &[]);
+            std::fs::write(root.join("api/datasources/endpoints/x").join(format!("endpoint.{token}.json")), STUB).unwrap();
+            let config = Config::load(&root.join("api")).unwrap();
+            let doc = crate::openapi::load(
+                &root.join("openapi.yaml"),
+                crate::openapi::LoadOptions {
+                    case_sensitive_methods: case_sensitive,
+                },
+            )
+            .unwrap();
+            let (router, server_config) = assemble_api_router(&root, config, Arc::new(HashMap::new()), None, Some(Arc::new(doc)))
+                .await
+                .expect("matching settings assemble");
+            let addr = crate::server::spawn_served(router, server_config.case_sensitive_methods()).await;
+            let resp = reqwest::Client::new()
+                .request(reqwest::Method::from_bytes(request.as_bytes()).unwrap(), format!("http://{addr}/x"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{server_json} {request}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 }
