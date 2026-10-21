@@ -5,6 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::dir_index::{DirIndex, EndpointFsError, EntryKind, Lookup, check_file, create_endpoint_dir, resolve_endpoint_dir};
+use super::endpoint_tree::{LinkContext, ProjectBoundary};
+use crate::config::EndpointSymlinks;
 
 fn tempdir() -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -21,7 +23,7 @@ fn tempdir() -> PathBuf {
 /// Makes `link` point at the directory `target`. Windows tries a real
 /// directory symlink first and falls back to a junction (no admin needed).
 /// Returns false (after saying so) when neither can be created.
-fn link_dir(target: &Path, link: &Path) -> bool {
+pub(crate) fn link_dir(target: &Path, link: &Path) -> bool {
     #[cfg(unix)]
     {
         match std::os::unix::fs::symlink(target, link) {
@@ -37,10 +39,12 @@ fn link_dir(target: &Path, link: &Path) -> bool {
         if std::os::windows::fs::symlink_dir(target, link).is_ok() {
             return true;
         }
+        // `mklink` rejects the forward slashes a `join("a/b")` leaves in a path.
+        let backslashed = |path: &Path| path.to_string_lossy().replace('/', "\\");
         let status = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
+            .arg(backslashed(link))
+            .arg(backslashed(target))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
@@ -54,7 +58,25 @@ fn link_dir(target: &Path, link: &Path) -> bool {
     }
 }
 
-fn link_file(target: &Path, link: &Path) -> bool {
+/// A directory link left dangling: the target is created, linked to, then removed,
+/// which works the same for symlinks and junctions on every OS.
+#[allow(dead_code)] // Shared helper for the dangling-link tests.
+pub(crate) fn link_dangling_dir(target: &Path, link: &Path) -> bool {
+    if fs::create_dir_all(target).is_err() || !link_dir(target, link) {
+        return false;
+    }
+    fs::remove_dir(target).is_ok()
+}
+
+#[allow(dead_code)] // Shared helper for the dangling-link tests.
+pub(crate) fn link_dangling_file(target: &Path, link: &Path) -> bool {
+    if fs::write(target, b"x").is_err() || !link_file(target, link) {
+        return false;
+    }
+    fs::remove_file(target).is_ok()
+}
+
+pub(crate) fn link_file(target: &Path, link: &Path) -> bool {
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(target, link).is_ok()
@@ -63,6 +85,12 @@ fn link_file(target: &Path, link: &Path) -> bool {
     {
         std::os::windows::fs::symlink_file(target, link).is_ok()
     }
+}
+
+/// Under `refuse` every link is refused, which is what these tests pin down
+/// (the targets here sit inside the project).
+fn refuse(root: &Path) -> LinkContext {
+    LinkContext::new(root, EndpointSymlinks::Refuse)
 }
 
 #[test]
@@ -80,13 +108,16 @@ fn a_symlinked_or_junctioned_directory_component_is_refused_and_nothing_is_creat
     let index = DirIndex::read(&endpoints).unwrap();
     assert_eq!(index.lookup("cars"), Lookup::Exact(EntryKind::Symlink));
 
-    assert!(matches!(resolve_endpoint_dir(&endpoints, &["cars"]).unwrap_err(), EndpointFsError::Symlink { .. }));
     assert!(matches!(
-        resolve_endpoint_dir(&endpoints, &["cars", "{vin}"]).unwrap_err(),
+        resolve_endpoint_dir(&refuse(&root), &endpoints, &["cars"]).unwrap_err(),
         EndpointFsError::Symlink { .. }
     ));
     assert!(matches!(
-        create_endpoint_dir(&endpoints, &["cars", "{vin}"]).unwrap_err(),
+        resolve_endpoint_dir(&refuse(&root), &endpoints, &["cars", "{vin}"]).unwrap_err(),
+        EndpointFsError::Symlink { .. }
+    ));
+    assert!(matches!(
+        create_endpoint_dir(&refuse(&root), &endpoints, &["cars", "{vin}"]).unwrap_err(),
         EndpointFsError::Symlink { .. }
     ));
     assert_eq!(fs::read_dir(&outside).unwrap().count(), 0, "nothing may be created through the link");
@@ -103,8 +134,14 @@ fn a_symlinked_endpoints_root_is_refused() {
         let _ = fs::remove_dir_all(&root);
         return;
     }
-    assert!(matches!(resolve_endpoint_dir(&endpoints, &["cars"]).unwrap_err(), EndpointFsError::Symlink { .. }));
-    assert!(matches!(create_endpoint_dir(&endpoints, &["cars"]).unwrap_err(), EndpointFsError::Symlink { .. }));
+    assert!(matches!(
+        resolve_endpoint_dir(&refuse(&root), &endpoints, &["cars"]).unwrap_err(),
+        EndpointFsError::Symlink { .. }
+    ));
+    assert!(matches!(
+        create_endpoint_dir(&refuse(&root), &endpoints, &["cars"]).unwrap_err(),
+        EndpointFsError::Symlink { .. }
+    ));
     assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
     let _ = fs::remove_dir_all(&root);
 }
@@ -123,7 +160,7 @@ fn a_symlinked_reference_file_is_refused_and_its_target_left_unchanged() {
     assert!(matches!(err, EndpointFsError::Symlink { .. }), "{err:?}");
     assert!(err.is_strict_error());
     assert!(matches!(
-        super::dir_index::create_new_file(&root, "endpoint.get.reference.json", b"overwritten").unwrap_err(),
+        super::dir_index::create_new_file(&ProjectBoundary::new(&root), &root, "endpoint.get.reference.json", b"overwritten").unwrap_err(),
         EndpointFsError::Symlink { .. }
     ));
     assert_eq!(fs::read(&target).unwrap(), b"precious");

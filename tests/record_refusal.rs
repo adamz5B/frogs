@@ -134,3 +134,171 @@ fn recording_accepts_any_case_of_a_known_method_past_the_allowlist() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------- links (endpointSymlinks)
+
+/// A directory link: a real symlink where the OS allows it, else (Windows) a junction.
+fn link_dir(target: &std::path::Path, link: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+            return true;
+        }
+        let backslashed = |p: &std::path::Path| p.to_string_lossy().replace('/', "\\");
+        Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(backslashed(link))
+            .arg(backslashed(target))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
+fn unlink(link: &std::path::Path) {
+    if std::fs::remove_dir(link).is_err() {
+        let _ = std::fs::remove_file(link);
+    }
+}
+
+const STUB: &str = r#"{ "operationId": "x", "sources": {}, "response": {} }"#;
+
+fn list(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+#[test]
+fn recording_refuses_before_connecting_when_the_api_folder_is_a_link_to_outside_the_project() {
+    let root = project("{}");
+    let outside = scratch();
+    let moved = outside.join("api");
+    std::fs::rename(root.join("api"), &moved).unwrap();
+    if !link_dir(&moved, &root.join("api")) {
+        eprintln!("skipping: cannot create a link here");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        return;
+    }
+    let before = list(&moved.join("datasources/endpoints/things"));
+    let out = record(&root);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(!stderr.to_lowercase().contains("nosuchdriver"), "the connect step ran first: {stderr}");
+    assert_eq!(
+        list(&moved.join("datasources/endpoints/things")),
+        before,
+        "nothing may be written outside the project"
+    );
+    unlink(&root.join("api"));
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn recording_into_an_outside_linked_endpoint_folder_refuses_before_connecting_under_follow_and_finds_no_target_under_contained() {
+    for mode in ["follow", "contained", "refuse"] {
+        let root = project(&format!(r#"{{ "endpointSymlinks": "{mode}" }}"#));
+        let outside = scratch();
+        std::fs::write(outside.join("endpoint.get.json"), STUB).unwrap();
+        let things = root.join("api/datasources/endpoints/things");
+        std::fs::remove_dir_all(&things).unwrap();
+        if !link_dir(&outside, &things) {
+            eprintln!("skipping: cannot create a link here");
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&outside);
+            return;
+        }
+        let out = record(&root);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{mode}: {stderr}");
+        assert!(!stderr.to_lowercase().contains("nosuchdriver"), "{mode}: the connect step ran first: {stderr}");
+        assert_eq!(list(&outside), vec!["endpoint.get.json"], "{mode}: nothing may be written outside the project");
+        unlink(&things);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+}
+
+#[test]
+fn recording_through_an_in_project_link_gets_past_the_write_gate_under_contained() {
+    let root = project("{}");
+    let shared = root.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("endpoint.get.json"), STUB).unwrap();
+    let things = root.join("api/datasources/endpoints/things");
+    std::fs::remove_dir_all(&things).unwrap();
+    if !link_dir(&shared, &things) {
+        eprintln!("skipping: cannot create a link here");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    let out = record(&root);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.to_lowercase().contains("nosuchdriver"),
+        "the gate must let a contained in-project link through to the connect step: {stderr}"
+    );
+    unlink(&things);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn recording_under_strict_refuses_before_connecting_when_an_outside_link_exists() {
+    let root = project(r#"{ "strictOpenApi": true }"#);
+    let outside = scratch();
+    let link = root.join("api/datasources/endpoints/ext");
+    if !link_dir(&outside, &link) {
+        eprintln!("skipping: cannot create a link here");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        return;
+    }
+    let out = record(&root);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(!stderr.to_lowercase().contains("nosuchdriver"), "{stderr}");
+    unlink(&link);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn validate_and_test_never_print_the_content_of_an_unparseable_file_reached_through_a_link() {
+    let root = project("{}");
+    let shared = root.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(
+        shared.join("endpoint.get.json"),
+        r#"{ "operationId": "x", "sources": "TOPSECRET-123", "response": {} }"#,
+    )
+    .unwrap();
+    std::fs::write(shared.join("endpoint.get.test.json"), r#"{ "cases": "TOPSECRET-123" }"#).unwrap();
+    let link = root.join("api/datasources/endpoints/linked");
+    if !link_dir(&shared, &link) {
+        eprintln!("skipping: cannot create a link here");
+        let _ = std::fs::remove_dir_all(&root);
+        return;
+    }
+    for args in [["validate"].as_slice(), ["test"].as_slice()] {
+        let out = Command::new(env!("CARGO_BIN_EXE_frogs"))
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .expect("the frogs binary should run");
+        let everything = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(!everything.contains("TOPSECRET"), "{args:?} leaked linked file content: {everything}");
+        assert!(!out.status.success(), "{args:?}: {everything}");
+    }
+    unlink(&link);
+    let _ = std::fs::remove_dir_all(&root);
+}

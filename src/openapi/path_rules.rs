@@ -1,6 +1,7 @@
 use std::path::{Component, Path};
 
 use super::dir_index::fold;
+use super::route_syntax::{SegmentKind, classify_route_segment};
 use super::{IssueKind, Severity};
 
 const MAX_SEGMENT_BYTES: usize = 255;
@@ -87,7 +88,7 @@ pub(crate) fn is_single_normal_component(seg: &str) -> bool {
     matches!((components.next(), components.next()), (Some(Component::Normal(_)), None))
 }
 
-fn unsafe_segment_reason(seg: &str, is_file_name: bool) -> Option<String> {
+pub(crate) fn unsafe_segment_reason(seg: &str, is_file_name: bool) -> Option<String> {
     if seg.is_empty() {
         return Some("empty path segment".to_string());
     }
@@ -159,6 +160,20 @@ pub fn validate_path(raw: &str, policy: PortabilityPolicy) -> Result<PathCheck, 
     for seg in normalized[1..].split('/') {
         if let Some(reason) = unsafe_segment_reason(seg, false) {
             return Err((IssueKind::UnsafePath, format!("path '{shown}' skipped: {reason}")));
+        }
+        match classify_route_segment(seg) {
+            Err(reason) => {
+                return Err((IssueKind::UnsafePath, format!("path '{shown}' skipped: segment '{}' {reason}", untrusted(seg))));
+            }
+            Ok(SegmentKind::PartialTemplate) => issues.push((
+                IssueKind::PartialPathTemplate,
+                Severity::Warning,
+                format!(
+                    "path '{shown}': segment '{}' mixes literal text with braces — it is served as a literal, not a parameter (use a whole-segment {{name}})",
+                    untrusted(seg)
+                ),
+            )),
+            Ok(_) => {}
         }
         let mut windows_hit = false;
         if let Some(reason) = windows_reason(seg) {
@@ -300,11 +315,10 @@ mod tests {
     }
 
     #[test]
-    fn a_drive_letter_segment_is_rejected_under_skip_and_kept_with_a_warning_under_warn() {
-        assert_eq!(rejected_kind("/C:/x", PortabilityPolicy::Skip), IssueKind::WindowsPortability);
-        let check = ok("/C:/x", PortabilityPolicy::Warn);
-        assert_eq!(check.normalized, "/C:/x");
-        assert!(check.issues.iter().any(|(k, s, _)| *k == IssueKind::WindowsPortability && *s == Severity::Warning));
+    fn a_drive_letter_segment_is_unsafe_under_both_policies() {
+        for policy in [PortabilityPolicy::Skip, PortabilityPolicy::Warn] {
+            assert_eq!(rejected_kind("/C:/x", policy), IssueKind::UnsafePath);
+        }
     }
 
     #[test]
@@ -341,7 +355,7 @@ mod tests {
 
     #[test]
     fn windows_unfriendly_segments_are_portability_hits_not_unsafe_paths() {
-        for raw in ["/CON", "/a/con.txt", "/a.", "/a ", "/a?", "/a*b", "/a<b", "/a|b", "/a\"b", "/a>b"] {
+        for raw in ["/CON", "/a/con.txt", "/a.", "/a ", "/a?", "/a<b", "/a|b", "/a\"b", "/a>b"] {
             assert_eq!(rejected_kind(raw, PortabilityPolicy::Skip), IssueKind::WindowsPortability, "{raw:?}");
             let kept = ok(raw, PortabilityPolicy::Warn);
             assert_eq!(kept.normalized, raw);
@@ -406,5 +420,80 @@ mod tests {
     fn for_host_picks_skip_on_windows_and_warn_elsewhere() {
         let expected = if cfg!(windows) { PortabilityPolicy::Skip } else { PortabilityPolicy::Warn };
         assert_eq!(PortabilityPolicy::for_host(), expected);
+    }
+}
+
+#[cfg(test)]
+mod route_syntax_tests {
+    use super::*;
+
+    const BOTH: [PortabilityPolicy; 2] = [PortabilityPolicy::Skip, PortabilityPolicy::Warn];
+
+    #[test]
+    fn paths_with_route_special_characters_are_unsafe_under_both_policies() {
+        let bad = [
+            "/a:b",
+            "/b-:c",
+            "/a*b",
+            "/*",
+            "/x/*rest",
+            "/x/{}",
+            "/x/{a:b}",
+            "/x/{a*b}",
+            "/x/{*rest}",
+            "/v1/{id}:cancel",
+            "/C:/x",
+        ];
+        for raw in bad {
+            for policy in BOTH {
+                match validate_path(raw, policy) {
+                    Err((kind, _)) => assert_eq!(kind, IssueKind::UnsafePath, "{raw:?} under {policy:?}"),
+                    Ok(check) => panic!("{raw:?} under {policy:?} should be rejected, got {check:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_segment_mixing_literal_text_with_braces_is_kept_with_one_strict_class_warning() {
+        for raw in ["/x/{id}.json", "/x/a{b}", "/x/{abc", "/x/abc}"] {
+            for policy in BOTH {
+                let check = validate_path(raw, policy).unwrap_or_else(|e| panic!("{raw:?} must be accepted: {e:?}"));
+                assert_eq!(check.normalized, raw);
+                let partial: Vec<_> = check.issues.iter().filter(|i| i.0 == IssueKind::PartialPathTemplate).collect();
+                assert_eq!(partial.len(), 1, "{raw:?}: {:?}", check.issues);
+                assert_eq!(partial[0].1, Severity::Warning);
+                assert!(IssueKind::PartialPathTemplate.is_strict_error());
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_templates_and_underscore_names_stay_clean() {
+        for raw in ["/cars/{vin}/parts", "/{a-b}", "/{a.b}", "/_health"] {
+            for policy in BOTH {
+                let check = validate_path(raw, policy).unwrap_or_else(|e| panic!("{raw:?}: {e:?}"));
+                assert!(check.issues.is_empty(), "{raw:?}: {:?}", check.issues);
+            }
+        }
+    }
+
+    #[test]
+    fn the_rejection_message_for_a_colon_path_with_escape_codes_has_no_control_characters() {
+        for policy in BOTH {
+            let (_, message) = validate_path("/a:\u{1b}[2Jb", policy).unwrap_err();
+            assert!(!message.chars().any(char::is_control), "{message:?}");
+        }
+    }
+
+    #[test]
+    fn a_colon_or_star_is_never_a_windows_portability_issue_any_more() {
+        for raw in ["/a*b", "/C:/x", "/a:b"] {
+            assert_eq!(
+                validate_path(raw, PortabilityPolicy::Skip).unwrap_err().0,
+                IssueKind::UnsafePath,
+                "{raw}: kind must not depend on policy"
+            );
+        }
     }
 }

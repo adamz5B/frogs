@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) use serve::router;
+pub(crate) use serve::{WEB_ROUTES, router};
 
 use crate::config::TlsConfig;
 

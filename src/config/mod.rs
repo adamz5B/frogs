@@ -3,8 +3,8 @@ mod server;
 
 pub use connections::ConnectionConfig;
 pub use server::{
-    ClientAuthConfig, ClientAuthMode, CrlPolicy, DocsUiMode, LogLevel, LoggingConfig, MAX_SOURCE_CALL_TIMEOUT_MS, ManualTlsConfig, RateLimitConfig, ServerConfig,
-    TlsConfig, TlsMode,
+    ClientAuthConfig, ClientAuthMode, CrlPolicy, DocsUiMode, EndpointSymlinks, LogLevel, LoggingConfig, MAX_SOURCE_CALL_TIMEOUT_MS, ManualTlsConfig, RateLimitConfig,
+    ServerConfig, TlsConfig, TlsMode,
 };
 
 use std::collections::HashMap;

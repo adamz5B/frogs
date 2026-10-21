@@ -235,6 +235,9 @@ impl SaveEntry {
 pub enum TestLoadError {
     Io(std::io::Error),
     Parse(serde_json::Error),
+    /// A parse failure of a file reached through a link, reduced to a position
+    /// and category so no byte of the linked file is echoed.
+    Redacted(String),
 }
 
 impl std::fmt::Display for TestLoadError {
@@ -242,6 +245,7 @@ impl std::fmt::Display for TestLoadError {
         match self {
             TestLoadError::Io(e) => write!(f, "failed to read test file: {e}"),
             TestLoadError::Parse(e) => write!(f, "failed to parse test file: {e}"),
+            TestLoadError::Redacted(summary) => write!(f, "failed to parse test file: {summary}"),
         }
     }
 }
@@ -261,13 +265,28 @@ pub fn load(path: &std::path::Path) -> Result<TestFile, TestLoadError> {
     Ok(file)
 }
 
-/// Writes a whole `TestFile` back out — `frogs test record`'s only writer.
+/// `load` for a file reached through a link: same result, but a failure never
+/// quotes the file's content.
+pub fn load_redacted(path: &std::path::Path) -> Result<TestFile, TestLoadError> {
+    let contents = std::fs::read_to_string(path).map_err(TestLoadError::Io)?;
+    let file: TestFile = serde_json::from_str(&contents).map_err(|e| TestLoadError::Redacted(crate::openapi::endpoint_tree::parse_error_summary(&e)))?;
+    for case in &file.cases {
+        if case.client_cert.as_ref().is_some_and(|client_cert| client_cert.validate().is_err()) {
+            return Err(TestLoadError::Redacted("invalid clientCert settings in a case".to_string()));
+        }
+    }
+    Ok(file)
+}
+
+/// Writes a whole `TestFile` back out (what `frogs test record` does, through
+/// `dir_index::write_existing_file` so the write stays inside the project).
 /// Round-trips the entire file (not just an appended case), so an existing
 /// hand-authored case's formatting gets normalized the same way `generate`
 /// already normalizes stub/reference JSON; its *content* is untouched,
 /// since deserializing into `TestFile` and serializing back out is exactly
 /// the round trip a plain-string `save` entry or a `MockOutcome::Fail`
 /// mock already preserves (see their own `Deserialize`/`Serialize` impls).
+#[cfg(test)]
 pub fn save_to(path: &std::path::Path, test_file: &TestFile) -> std::io::Result<()> {
     let json = serde_json::to_string_pretty(test_file).expect("TestFile always serializes");
     std::fs::write(path, json)

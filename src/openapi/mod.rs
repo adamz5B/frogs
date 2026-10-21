@@ -1,9 +1,13 @@
 mod change_detection;
 pub mod dir_index;
+pub mod endpoint_tree;
 #[cfg(test)]
-mod fs_os_tests;
+mod endpoint_tree_tests;
+#[cfg(test)]
+pub(crate) mod fs_os_tests;
 pub mod method_token;
 pub mod path_rules;
+pub mod route_syntax;
 mod schema_walk;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -103,6 +107,8 @@ pub struct Operation {
     /// against what the spec actually allows rather than the collapsed first
     /// name. Empty outer list: no security required.
     pub security_alternatives: Vec<Vec<String>>,
+    /// The effective `security:` came only from the document-wide default, not from this operation.
+    pub security_inherited: bool,
     /// Streaming is detected but not served: the endpoint is still one JSON
     /// response, this just records what the spec asked for.
     pub response_mode: ResponseMode,
@@ -308,6 +314,72 @@ struct OpCtx<'a> {
     media_types: &'a Map<String, Value>,
     scheme_names: &'a Map<String, Value>,
     document_security: Option<&'a ResolvedSecurity>,
+    document_security_malformed: bool,
+}
+
+/// What a skipped or dropped entry's effective security looks like, read
+/// leniently: `(alternatives, unparseable, inherited)`. A `security` value
+/// that isn't a list of objects is `unparseable` (callers fail closed: secured,
+/// with no acceptable scheme). Never produces load issues.
+fn lenient_security(entry: Option<&Value>, ctx: &OpCtx) -> (Vec<Vec<String>>, bool, bool) {
+    match entry.and_then(Value::as_object).and_then(|obj| obj.get("security")) {
+        Some(value) => {
+            let well_formed = value.as_array().is_some_and(|list| list.iter().all(Value::is_object));
+            let mut scratch = Vec::new();
+            let (_, _, alternatives) = resolve_security(value, ctx.scheme_names, "", &mut scratch);
+            (alternatives, !well_formed, false)
+        }
+        None => (ctx.document_security.map(|d| d.2.clone()).unwrap_or_default(), ctx.document_security_malformed, true),
+    }
+}
+
+fn key_wire(key: &str, mode: MethodCase) -> String {
+    match mode {
+        MethodCase::Default => key.to_ascii_uppercase(),
+        MethodCase::Exact => key.to_string(),
+    }
+}
+
+fn dropped_entry(path: &str, key: &str, entry: &Value, ctx: &OpCtx, mode: MethodCase) -> DroppedOperation {
+    let (security_alternatives, security_unparseable, security_inherited) = lenient_security(Some(entry), ctx);
+    DroppedOperation {
+        path: path.to_string(),
+        key: key.to_string(),
+        wire: key_wire(key, mode),
+        security_alternatives,
+        security_unparseable,
+        security_inherited,
+    }
+}
+
+/// Every operation of a path the loader set aside, with the security it would
+/// have carried, so routing-shadow checks can still see what that path meant.
+fn read_skipped_path(raw: &str, item: &Value, reason: &str, ctx: &OpCtx, mode: MethodCase) -> Vec<SkippedOperation> {
+    let Some(item) = item.as_object() else { return Vec::new() };
+    let mut out = Vec::new();
+    let mut push = |wire: String, entry: &Value| {
+        let (security_alternatives, security_unparseable, security_inherited) = lenient_security(Some(entry), ctx);
+        out.push(SkippedOperation {
+            raw_path: raw.to_string(),
+            reason: reason.to_string(),
+            method_wire: wire,
+            operation_id: entry.get("operationId").and_then(Value::as_str).unwrap_or_default().to_string(),
+            security_alternatives,
+            security_unparseable,
+            security_inherited,
+        });
+    };
+    for method in FIXED_FIELDS {
+        if let Some(entry) = item.get(method).filter(|v| v.is_object()) {
+            push(method.to_ascii_uppercase(), entry);
+        }
+    }
+    if let Some(additional) = item.get("additionalOperations").and_then(Value::as_object) {
+        for (key, entry) in additional {
+            push(key_wire(key, mode), entry);
+        }
+    }
+    out
 }
 
 fn media_ref_issue(message: String) -> LoadIssue {
@@ -673,6 +745,10 @@ pub enum IssueKind {
     NonJsonRequestBody,
     DeprecatedSecurityScheme,
     SecurityRequirementCollapsed,
+    /// A segment mixes literal text with braces (`{id}.json`): served as a literal.
+    PartialPathTemplate,
+    /// Two accepted paths cannot both be registered in the route table.
+    RouteTemplateConflict,
 }
 
 impl IssueKind {
@@ -699,6 +775,8 @@ impl IssueKind {
             | IssueKind::UnsafeComponentName
             | IssueKind::MediaTypeRefUnresolved
             | IssueKind::DefaultMappingUnresolved
+            | IssueKind::PartialPathTemplate
+            | IssueKind::RouteTemplateConflict
             | IssueKind::SecurityRequirementUnresolved => true,
         }
     }
@@ -756,6 +834,35 @@ pub struct OpenApiDocument {
     pub unwritable_components: BTreeSet<String>,
     /// `components/securitySchemes` names whose `deprecated` is JSON `true`.
     pub deprecated_security_schemes: HashSet<String>,
+    /// `additionalOperations` entries on accepted paths that were skipped, with their security.
+    pub dropped_operations: Vec<DroppedOperation>,
+    /// Operations of every path skipped at load, with their security.
+    pub skipped_operations: Vec<SkippedOperation>,
+}
+
+/// An `additionalOperations` entry on an accepted path that the loader dropped (S3, S4,
+/// case-collision, non-object, missing operationId).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DroppedOperation {
+    pub path: String,
+    pub key: String,
+    pub wire: String,
+    pub security_alternatives: Vec<Vec<String>>,
+    /// The `security` value was not a list of requirement objects: treated as secured with no acceptable scheme.
+    pub security_unparseable: bool,
+    pub security_inherited: bool,
+}
+
+/// One operation of a path skipped by `validate_path` or a trailing-slash collision.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkippedOperation {
+    pub raw_path: String,
+    pub reason: String,
+    pub method_wire: String,
+    pub operation_id: String,
+    pub security_alternatives: Vec<Vec<String>>,
+    pub security_unparseable: bool,
+    pub security_inherited: bool,
 }
 
 impl OpenApiDocument {
@@ -934,6 +1041,7 @@ fn build_operation(
     let parameters = extract_parameters(operation_obj, ctx, &label, issues);
     let (request_body, request_body_unresolved, request_stream) = extract_request_body(operation_obj, ctx, &label, issues);
     let (response_schema, response_mode) = extract_response(operation_obj, ctx, &label, issues);
+    let security_inherited = operation_obj.get("security").is_none() && ctx.document_security.is_some();
     let (security, declared_security_schemes, security_alternatives) = match operation_obj.get("security") {
         Some(value) => resolve_security(value, ctx.scheme_names, &label, issues),
         None => ctx.document_security.cloned().unwrap_or_default(),
@@ -950,6 +1058,7 @@ fn build_operation(
         security,
         declared_security_schemes,
         security_alternatives,
+        security_inherited,
         response_mode,
         request_stream,
         request_body_unresolved,
@@ -961,6 +1070,7 @@ struct ParsedPath {
     operations: Vec<Operation>,
     protected: Vec<String>,
     ambiguous: Vec<(String, Vec<String>)>,
+    dropped: Vec<DroppedOperation>,
 }
 
 fn parse_operations(
@@ -1005,6 +1115,7 @@ fn parse_operations(
     for (key, entry) in additional {
         match method_token::classify_additional_key(key, mode) {
             KeyClass::Reject { kind, reason } => {
+                parsed.dropped.push(dropped_entry(path, key, entry, ctx, mode));
                 let issue_kind = match kind {
                     RejectKind::S3 => IssueKind::InvalidAdditionalOperation,
                     RejectKind::S4 => {
@@ -1020,15 +1131,18 @@ fn parse_operations(
             }
             KeyClass::Accept { method, note } => match entry.as_object() {
                 Some(obj) => accepted.push((key, method, note, obj)),
-                None => issues.push(LoadIssue::new(
-                    IssueKind::InvalidAdditionalOperation,
-                    Severity::Error,
-                    format!(
-                        "additionalOperations key '{}' on {} is not an operation object — skipped",
-                        untrusted_short(key),
-                        untrusted(path)
-                    ),
-                )),
+                None => {
+                    parsed.dropped.push(dropped_entry(path, key, entry, ctx, mode));
+                    issues.push(LoadIssue::new(
+                        IssueKind::InvalidAdditionalOperation,
+                        Severity::Error,
+                        format!(
+                            "additionalOperations key '{}' on {} is not an operation object — skipped",
+                            untrusted_short(key),
+                            untrusted(path)
+                        ),
+                    ));
+                }
             },
         }
     }
@@ -1058,6 +1172,11 @@ fn parse_operations(
                 untrusted_short(wire)
             ),
         ));
+        for &i in members {
+            parsed
+                .dropped
+                .push(dropped_entry(path, accepted[i].0, &Value::Object(accepted[i].3.clone()), ctx, mode));
+        }
         let token = accepted[members[0]].1.file_token().into_owned();
         parsed.ambiguous.push((token, spellings));
         dropped.extend(members.iter().copied());
@@ -1068,6 +1187,7 @@ fn parse_operations(
             continue;
         }
         if obj.get("operationId").and_then(Value::as_str).is_none() {
+            parsed.dropped.push(dropped_entry(path, key, &Value::Object(obj.clone()), ctx, mode));
             issues.push(LoadIssue::new(
                 IssueKind::InvalidAdditionalOperation,
                 Severity::Error,
@@ -1129,11 +1249,17 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, options: 
     let document_security = doc
         .get("security")
         .map(|value| resolve_security(value, scheme_names, "top-level security", &mut issues));
+    let document_security_malformed = doc
+        .get("security")
+        .is_some_and(|value| !value.as_array().is_some_and(|list| list.iter().all(Value::is_object)));
     let ctx = OpCtx {
         media_types,
         scheme_names,
         document_security: document_security.as_ref(),
+        document_security_malformed,
     };
+    let method_case = MethodCase::from_case_sensitive(options.case_sensitive_methods);
+    let mut skipped_operations: Vec<SkippedOperation> = Vec::new();
 
     let mut skipped_paths = BTreeSet::new();
     let mut accepted: Vec<(String, &Map<String, Value>)> = Vec::new();
@@ -1143,6 +1269,7 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, options: 
             match path_rules::validate_path(raw, policy) {
                 Ok(check) => checked.push((raw, item, check)),
                 Err((kind, message)) => {
+                    skipped_operations.extend(read_skipped_path(raw, item, &message, &ctx, method_case));
                     issues.push(LoadIssue::new(kind, Severity::Error, message));
                     skipped_paths.insert(raw.clone());
                 }
@@ -1157,15 +1284,13 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, options: 
         let mut seen: BTreeSet<String> = BTreeSet::new();
         for (raw, item, check) in checked {
             if raw.as_str() != check.normalized && (canonical.contains(check.normalized.as_str()) || seen.contains(&check.normalized)) {
-                issues.push(LoadIssue::new(
-                    IssueKind::TrailingSlashCollision,
-                    Severity::Error,
-                    format!(
-                        "path '{}' normalises to '{}', which another path already provides — skipped",
-                        untrusted(raw),
-                        untrusted(&check.normalized)
-                    ),
-                ));
+                let message = format!(
+                    "path '{}' normalises to '{}', which another path already provides — skipped",
+                    untrusted(raw),
+                    untrusted(&check.normalized)
+                );
+                skipped_operations.extend(read_skipped_path(raw, item, &message, &ctx, method_case));
+                issues.push(LoadIssue::new(IssueKind::TrailingSlashCollision, Severity::Error, message));
                 skipped_paths.insert(raw.clone());
                 continue;
             }
@@ -1176,6 +1301,30 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, options: 
             let Some(item) = item.as_object() else { continue };
             accepted.push((check.normalized, item));
         }
+    }
+
+    let axum_paths: Vec<String> = accepted.iter().map(|(normalized, _)| route_syntax::axum_style(normalized)).collect();
+    for conflict in route_syntax::find_conflicts(&axum_paths).conflicts {
+        let shown = |p: &str| {
+            untrusted(
+                &p.split('/')
+                    .map(|s| s.strip_prefix(':').map_or(s.to_string(), |n| format!("{{{n}}}")))
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            )
+        };
+        let with = match &conflict.b {
+            Some(b) => format!("'{}'", shown(b)),
+            None => format!("a route near '{}'", untrusted(conflict.near.as_deref().unwrap_or_default())),
+        };
+        issues.push(LoadIssue::new(
+            IssueKind::RouteTemplateConflict,
+            Severity::Warning,
+            format!(
+                "paths '{}' and {with} cannot both be routed (for example different parameter names at the same position) — endpoint folders for both would be refused at startup",
+                shown(&conflict.a)
+            ),
+        ));
     }
 
     let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
@@ -1207,13 +1356,14 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, options: 
         }
     }
 
-    let method_case = MethodCase::from_case_sensitive(options.case_sensitive_methods);
     let mut operations = Vec::new();
+    let mut dropped_operations = Vec::new();
     let mut ambiguous_operations = Vec::new();
     let mut ambiguous_methods = BTreeMap::new();
     let mut protected_methods = BTreeSet::new();
     for (i, (normalized, item)) in accepted.iter().enumerate() {
         let parsed = parse_operations(normalized, item, &ctx, &spec_version, method_case, &mut issues)?;
+        dropped_operations.extend(parsed.dropped);
         for token in parsed.protected {
             protected_methods.insert((normalized.clone(), token));
         }
@@ -1273,6 +1423,8 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, options: 
         skipped_paths,
         unwritable_components,
         deprecated_security_schemes,
+        dropped_operations,
+        skipped_operations,
     };
 
     let mut mapping_issues = Vec::new();
@@ -1321,6 +1473,7 @@ mod tests {
             media_types: &empty,
             scheme_names: &empty,
             document_security: None,
+            document_security_malformed: false,
         };
         super::extract_parameters(operation, &ctx, "test", &mut Vec::new())
     }
@@ -1331,6 +1484,7 @@ mod tests {
             media_types: &empty,
             scheme_names: &empty,
             document_security: None,
+            document_security_malformed: false,
         };
         super::extract_request_body(operation, &ctx, "test", &mut Vec::new()).0
     }
@@ -2015,14 +2169,13 @@ info: {{ title: t, version: 1 }}
     }
 
     #[test]
-    fn a_drive_letter_path_is_skipped_under_skip_and_kept_with_a_warning_under_warn() {
+    fn a_drive_letter_path_is_skipped_as_an_unsafe_path_under_both_policies() {
         let yaml = spec_with_paths(&["/C:/x"]);
-        let skip = load_yaml_with(&yaml, PortabilityPolicy::Skip).unwrap();
-        assert!(skip.operations.is_empty());
-        assert!(skip.issues.iter().any(|i| i.kind == IssueKind::WindowsPortability && i.severity == Severity::Error));
-        let warn = load_yaml_with(&yaml, PortabilityPolicy::Warn).unwrap();
-        assert_eq!(warn.operations.len(), 1);
-        assert!(warn.issues.iter().any(|i| i.kind == IssueKind::WindowsPortability && i.severity == Severity::Warning));
+        for policy in [PortabilityPolicy::Skip, PortabilityPolicy::Warn] {
+            let doc = load_yaml_with(&yaml, policy).unwrap();
+            assert!(doc.operations.is_empty());
+            assert!(doc.issues.iter().any(|i| i.kind == IssueKind::UnsafePath && i.severity == Severity::Error));
+        }
     }
 
     #[test]
@@ -3229,3 +3382,6 @@ mod m4_load_tests {
         assert_eq!(doc.ambiguous_operations.iter().filter(|o| o.http_method == "LINK").count(), 2);
     }
 }
+
+#[cfg(test)]
+mod route_loader_tests;

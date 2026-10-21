@@ -4,7 +4,9 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use super::endpoint_tree::{Access, LeafRule, LinkContext, LinkFindingKind, LinkKind, ProjectBoundary};
 use super::path_rules::{is_single_normal_component, untrusted};
+use crate::config::EndpointSymlinks;
 
 /// Case folding used for every "do these two names collide" question. The
 /// upper-then-lower round trip makes `Straße` and `STRASSE` fold together;
@@ -116,14 +118,43 @@ impl DirState {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum OutsideReason {
+    Outside,
+    Excluded,
+    Unresolvable { component: String, error: String },
+    BadRoot(String),
+}
+
 #[derive(Debug)]
 pub enum EndpointFsError {
-    CaseConflict { wanted: String, found: String, at: PathBuf },
-    Symlink { at: PathBuf },
-    NotADirectory { at: PathBuf },
-    NotARegularFile { at: PathBuf },
+    CaseConflict {
+        wanted: String,
+        found: String,
+        at: PathBuf,
+    },
+    Symlink {
+        at: PathBuf,
+    },
+    LinkEscapes {
+        at: PathBuf,
+        target: Option<PathBuf>,
+    },
+    OutsideProject {
+        at: PathBuf,
+        resolved: Option<PathBuf>,
+        reason: OutsideReason,
+    },
+    NotADirectory {
+        at: PathBuf,
+    },
+    NotARegularFile {
+        at: PathBuf,
+    },
     Containment(String),
-    AlreadyExists { at: PathBuf },
+    AlreadyExists {
+        at: PathBuf,
+    },
     Io(io::Error),
 }
 
@@ -133,7 +164,12 @@ impl EndpointFsError {
     pub fn is_strict_error(&self) -> bool {
         matches!(
             self,
-            EndpointFsError::CaseConflict { .. } | EndpointFsError::Symlink { .. } | EndpointFsError::NotARegularFile { .. } | EndpointFsError::Containment(_)
+            EndpointFsError::CaseConflict { .. }
+                | EndpointFsError::Symlink { .. }
+                | EndpointFsError::LinkEscapes { .. }
+                | EndpointFsError::OutsideProject { .. }
+                | EndpointFsError::NotARegularFile { .. }
+                | EndpointFsError::Containment(_)
         )
     }
 }
@@ -145,6 +181,40 @@ impl fmt::Display for EndpointFsError {
                 write!(f, "{found} exists where {wanted} is needed — rename or remove it by hand (in {})", at.display())
             }
             EndpointFsError::Symlink { at } => write!(f, "{} is a symbolic link or junction — refusing to follow it", at.display()),
+            EndpointFsError::LinkEscapes { at, target } => match target {
+                Some(target) => write!(
+                    f,
+                    "{} is a symbolic link or junction to {}, which is outside the project — refusing to write through it",
+                    at.display(),
+                    target.display()
+                ),
+                None => write!(
+                    f,
+                    "{} is a symbolic link or junction whose target is outside the project or missing — refusing to write through it",
+                    at.display()
+                ),
+            },
+            EndpointFsError::OutsideProject { at, resolved, reason } => match (reason, resolved) {
+                (OutsideReason::Unresolvable { component, error }, _) => write!(
+                    f,
+                    "{}: cannot resolve '{component}' ({error}) — refusing to write (a dangling link counts as outside the project)",
+                    at.display()
+                ),
+                (OutsideReason::BadRoot(message), _) => write!(f, "{}: {message} — refusing to write", at.display()),
+                (OutsideReason::Excluded, Some(resolved)) => write!(
+                    f,
+                    "{} resolves to {}, inside the project's .frogs or .git folder — refusing to write there",
+                    at.display(),
+                    resolved.display()
+                ),
+                (_, Some(resolved)) => write!(
+                    f,
+                    "{} resolves to {}, outside the project — refusing to write there",
+                    at.display(),
+                    resolved.display()
+                ),
+                (_, None) => write!(f, "{} resolves outside the project — refusing to write there", at.display()),
+            },
             EndpointFsError::NotADirectory { at } => write!(f, "{} exists but is not a directory", at.display()),
             EndpointFsError::NotARegularFile { at } => write!(f, "{} exists but is not a regular file", at.display()),
             EndpointFsError::Containment(message) => write!(f, "{message}"),
@@ -167,6 +237,7 @@ impl From<EndpointFsError> for io::Error {
         match e {
             EndpointFsError::Io(e) => e,
             EndpointFsError::Containment(message) => io::Error::new(io::ErrorKind::InvalidInput, message),
+            EndpointFsError::LinkEscapes { .. } | EndpointFsError::OutsideProject { .. } => io::Error::new(io::ErrorKind::InvalidInput, e.to_string()),
             EndpointFsError::AlreadyExists { .. } => io::Error::new(io::ErrorKind::AlreadyExists, e.to_string()),
             other => io::Error::other(other.to_string()),
         }
@@ -182,12 +253,30 @@ fn check_segments(segments: &[&str]) -> Result<(), EndpointFsError> {
     Ok(())
 }
 
-/// `Ok(true)` if the root exists as a real directory, `Ok(false)` if absent.
-fn check_root(endpoints_root: &Path) -> Result<bool, EndpointFsError> {
+/// The write-side verdict on a link met while resolving a folder: `Symlink`
+/// when links are refused outright, `LinkEscapes` when this one leads
+/// somewhere writes may not go.
+fn link_refusal(ctx: &LinkContext, link: &Path, kind: LinkFindingKind, target: Option<PathBuf>) -> EndpointFsError {
+    if kind == LinkFindingKind::Refused || ctx.policy == EndpointSymlinks::Refuse {
+        return EndpointFsError::Symlink { at: link.to_path_buf() };
+    }
+    EndpointFsError::LinkEscapes { at: link.to_path_buf(), target }
+}
+
+fn decide_write_link(ctx: &LinkContext, link: &Path) -> Result<(), EndpointFsError> {
+    let target = ctx.classify_link(link);
+    ctx.decide(&target, Access::Write)
+        .map_err(|kind| link_refusal(ctx, link, kind, target.canonical.clone()))
+}
+
+/// `Ok(true)` if the root exists as a real directory (or a followable link to
+/// one), `Ok(false)` if absent.
+fn check_root(ctx: &LinkContext, endpoints_root: &Path) -> Result<bool, EndpointFsError> {
     match fs::symlink_metadata(endpoints_root) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(EndpointFsError::Symlink {
-            at: endpoints_root.to_path_buf(),
-        }),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            decide_write_link(ctx, endpoints_root)?;
+            Ok(true)
+        }
         Ok(meta) if !meta.is_dir() => Err(EndpointFsError::NotADirectory {
             at: endpoints_root.to_path_buf(),
         }),
@@ -213,9 +302,9 @@ fn case_conflict(wanted: &str, found: OsString, at: &Path) -> EndpointFsError {
     }
 }
 
-pub fn resolve_endpoint_dir(endpoints_root: &Path, segments: &[&str]) -> Result<DirState, EndpointFsError> {
+pub fn resolve_endpoint_dir(ctx: &LinkContext, endpoints_root: &Path, segments: &[&str]) -> Result<DirState, EndpointFsError> {
     check_segments(segments)?;
-    if !check_root(endpoints_root)? {
+    if !check_root(ctx, endpoints_root)? {
         return Ok(DirState::WillCreate(join_all(endpoints_root, segments)));
     }
     let mut current = endpoints_root.to_path_buf();
@@ -223,7 +312,10 @@ pub fn resolve_endpoint_dir(endpoints_root: &Path, segments: &[&str]) -> Result<
         let index = DirIndex::read(&current)?;
         match index.lookup(seg) {
             Lookup::Exact(EntryKind::Dir) => current.push(seg),
-            Lookup::Exact(EntryKind::Symlink) => return Err(EndpointFsError::Symlink { at: current.join(seg) }),
+            Lookup::Exact(EntryKind::Symlink) => {
+                decide_write_link(ctx, &current.join(seg))?;
+                current.push(seg);
+            }
             Lookup::Exact(_) => return Err(EndpointFsError::NotADirectory { at: current.join(seg) }),
             Lookup::CaseConflict { found } => return Err(case_conflict(seg, found, &current)),
             Lookup::Absent => return Ok(DirState::WillCreate(join_all(&current, &segments[i..]))),
@@ -232,47 +324,96 @@ pub fn resolve_endpoint_dir(endpoints_root: &Path, segments: &[&str]) -> Result<
     Ok(DirState::Exists(current))
 }
 
+/// Creates exactly one directory level, re-checking the parent's physical
+/// location immediately before the syscall. An existing directory (or a link
+/// that resolves inside the project) is accepted as is.
+pub fn create_dir_checked(boundary: &ProjectBoundary, dir: &Path) -> Result<(), EndpointFsError> {
+    let parent = dir
+        .parent()
+        .ok_or_else(|| EndpointFsError::Containment(format!("{} has no parent folder", untrusted(&dir.display().to_string()))))?;
+    boundary.check_write_target(parent, LeafRule::Dir)?;
+    // Also covers a not-yet-existing leaf: it must itself land inside the project (not in `.git`, say) before it is created.
+    boundary.check_write_target(dir, LeafRule::Dir)?;
+    match fs::symlink_metadata(dir) {
+        Ok(_) => {
+            if !fs::metadata(dir)?.is_dir() {
+                return Err(EndpointFsError::NotADirectory { at: dir.to_path_buf() });
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match fs::create_dir(dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let meta = fs::symlink_metadata(dir)?;
+                if meta.file_type().is_symlink() {
+                    return Err(EndpointFsError::Symlink { at: dir.to_path_buf() });
+                }
+                if !meta.is_dir() {
+                    return Err(EndpointFsError::NotADirectory { at: dir.to_path_buf() });
+                }
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        },
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `create_dir_checked` for every missing level of `dir` below the project
+/// root, outermost first — never `create_dir_all`.
+pub fn create_dirs_checked(boundary: &ProjectBoundary, dir: &Path) -> Result<(), EndpointFsError> {
+    let project_root = boundary.lexical_root();
+    let relative = dir.strip_prefix(project_root).map_err(|_| {
+        EndpointFsError::Containment(format!(
+            "{} is not under the project root {}",
+            untrusted(&dir.display().to_string()),
+            project_root.display()
+        ))
+    })?;
+    let mut current = project_root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        create_dir_checked(boundary, &current)?;
+    }
+    Ok(())
+}
+
 /// Creates every missing level one `create_dir` at a time (never
 /// `create_dir_all`, which would follow a link planted between the check
-/// and the create).
-pub fn create_endpoint_dir(endpoints_root: &Path, segments: &[&str]) -> Result<PathBuf, EndpointFsError> {
+/// and the create), each preceded by a physical-location check.
+pub fn create_endpoint_dir(ctx: &LinkContext, endpoints_root: &Path, segments: &[&str]) -> Result<PathBuf, EndpointFsError> {
     check_segments(segments)?;
-    if !check_root(endpoints_root)? {
-        fs::create_dir_all(endpoints_root)?;
-        check_root(endpoints_root)?;
+    if !check_root(ctx, endpoints_root)? {
+        create_dirs_checked(&ctx.boundary, endpoints_root)?;
+        check_root(ctx, endpoints_root)?;
     }
     let mut current = endpoints_root.to_path_buf();
     for seg in segments {
         let index = DirIndex::read(&current)?;
         match index.lookup(seg) {
             Lookup::Exact(EntryKind::Dir) => current.push(seg),
-            Lookup::Exact(EntryKind::Symlink) => return Err(EndpointFsError::Symlink { at: current.join(seg) }),
+            Lookup::Exact(EntryKind::Symlink) => {
+                decide_write_link(ctx, &current.join(seg))?;
+                current.push(seg);
+            }
             Lookup::Exact(_) => return Err(EndpointFsError::NotADirectory { at: current.join(seg) }),
             Lookup::CaseConflict { found } => return Err(case_conflict(seg, found, &current)),
             Lookup::Absent => {
                 current.push(seg);
-                match fs::create_dir(&current) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                        let meta = fs::symlink_metadata(&current)?;
-                        if meta.file_type().is_symlink() {
-                            return Err(EndpointFsError::Symlink { at: current });
-                        }
-                        if !meta.is_dir() {
-                            return Err(EndpointFsError::NotADirectory { at: current });
-                        }
-                    }
-                    Err(e) => return Err(e.into()),
-                }
+                create_dir_checked(&ctx.boundary, &current)?;
             }
         }
     }
+    ctx.boundary.check_write_target(&current, LeafRule::Dir)?;
     Ok(current)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileState {
     Present(PathBuf),
+    /// A stub that is itself a link whose target the read policy accepts.
+    /// Never written through; only returned by `check_file_with`.
+    PresentViaLink(PathBuf),
     Absent,
 }
 
@@ -291,11 +432,40 @@ pub fn check_file(dir: &Path, name: &str) -> Result<FileState, EndpointFsError> 
     }
 }
 
-pub fn create_new_file(dir: &Path, name: &str, contents: &[u8]) -> Result<(), EndpointFsError> {
+/// `check_file` for a stub name, where a link the read policy accepts is a
+/// present-but-read-only file instead of an error.
+pub fn check_file_with(ctx: &LinkContext, dir: &Path, name: &str) -> Result<FileState, EndpointFsError> {
+    check_segments(&[name])?;
+    let index = DirIndex::read(dir)?;
+    match index.lookup(name) {
+        Lookup::Exact(EntryKind::Symlink) => {
+            let path = dir.join(name);
+            let target = ctx.classify_link(&path);
+            if !matches!(target.kind, LinkKind::File | LinkKind::Dangling) {
+                return Err(EndpointFsError::NotARegularFile { at: path });
+            }
+            match ctx.decide(&target, Access::Read) {
+                Ok(()) => Ok(FileState::PresentViaLink(path)),
+                Err(kind) => Err(link_refusal(ctx, &path, kind, target.canonical)),
+            }
+        }
+        _ => check_file(dir, name),
+    }
+}
+
+pub fn create_new_file(boundary: &ProjectBoundary, dir: &Path, name: &str, contents: &[u8]) -> Result<(), EndpointFsError> {
     if let FileState::Present(path) = check_file(dir, name)? {
         return Err(EndpointFsError::AlreadyExists { at: path });
     }
+    create_new_checked(boundary, dir, name, contents)
+}
+
+/// The syscall half of `create_new_file`, without its case-variant listing
+/// check (component files deliberately tolerate case variants).
+pub fn create_new_checked(boundary: &ProjectBoundary, dir: &Path, name: &str, contents: &[u8]) -> Result<(), EndpointFsError> {
+    check_segments(&[name])?;
     let path = dir.join(name);
+    boundary.check_write_target(&path, LeafRule::NoLink)?;
     let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(EndpointFsError::AlreadyExists { at: path }),
@@ -305,13 +475,48 @@ pub fn create_new_file(dir: &Path, name: &str, contents: &[u8]) -> Result<(), En
     Ok(())
 }
 
+/// Overwrites a regular file that is already there. The leaf must not be a
+/// link and the folder must resolve inside the project, checked immediately
+/// before the open.
+pub fn write_existing_file(boundary: &ProjectBoundary, dir: &Path, name: &str, contents: &[u8]) -> Result<(), EndpointFsError> {
+    check_segments(&[name])?;
+    let path = dir.join(name);
+    boundary.check_write_target(&path, LeafRule::NoLink)?;
+    let mut file = fs::OpenOptions::new().write(true).truncate(true).open(&path)?;
+    file.write_all(contents)?;
+    Ok(())
+}
+
+/// Copies `src`'s bytes to `dest_dir/dest_name` (overwriting an existing
+/// regular file, creating it otherwise) through the checked write primitives.
+pub fn copy_into_checked(boundary: &ProjectBoundary, src: &Path, dest_dir: &Path, dest_name: &str) -> Result<(), EndpointFsError> {
+    let bytes = fs::read(src)?;
+    match check_file(dest_dir, dest_name)? {
+        FileState::Present(_) => write_existing_file(boundary, dest_dir, dest_name, &bytes),
+        _ => create_new_file(boundary, dest_dir, dest_name, &bytes),
+    }
+}
+
 /// Renames `dir/from` to `dir/to`, refusing when the target exists in any
-/// casing (a plain `fs::rename` silently overwrites on every OS).
-pub fn rename_checked(dir: &Path, from: &str, to: &str) -> Result<(), EndpointFsError> {
+/// casing (a plain `fs::rename` silently overwrites on every OS). The source
+/// must be a regular file.
+#[allow(dead_code)] // The no-links variant of `rename_checked_with`; exercised by tests.
+pub fn rename_checked(boundary: &ProjectBoundary, dir: &Path, from: &str, to: &str) -> Result<(), EndpointFsError> {
+    rename_impl(boundary, dir, from, to, false)
+}
+
+/// Like `rename_checked`, but a link entry may be the source (the link itself
+/// moves, never its target) unless the policy is `refuse`.
+pub fn rename_checked_with(ctx: &LinkContext, dir: &Path, from: &str, to: &str) -> Result<(), EndpointFsError> {
+    rename_impl(&ctx.boundary, dir, from, to, ctx.policy != EndpointSymlinks::Refuse)
+}
+
+fn rename_impl(boundary: &ProjectBoundary, dir: &Path, from: &str, to: &str, allow_link_source: bool) -> Result<(), EndpointFsError> {
     check_segments(&[from, to])?;
     let index = DirIndex::read(dir)?;
     match index.lookup(from) {
         Lookup::Exact(EntryKind::File) => {}
+        Lookup::Exact(EntryKind::Symlink) if allow_link_source => {}
         Lookup::Exact(EntryKind::Symlink) => return Err(EndpointFsError::Symlink { at: dir.join(from) }),
         Lookup::Exact(_) => return Err(EndpointFsError::NotARegularFile { at: dir.join(from) }),
         Lookup::CaseConflict { found } => return Err(case_conflict(from, found, dir)),
@@ -322,6 +527,7 @@ pub fn rename_checked(dir: &Path, from: &str, to: &str) -> Result<(), EndpointFs
         Lookup::Exact(_) => return Err(EndpointFsError::AlreadyExists { at: dir.join(to) }),
         Lookup::CaseConflict { found } => return Err(case_conflict(to, found, dir)),
     }
+    boundary.check_write_target(dir, LeafRule::Dir)?;
     fs::rename(dir.join(from), dir.join(to))?;
     Ok(())
 }
@@ -329,6 +535,10 @@ pub fn rename_checked(dir: &Path, from: &str, to: &str) -> Result<(), EndpointFs
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ctx(root: &Path) -> LinkContext {
+        LinkContext::new(root, EndpointSymlinks::Contained)
+    }
 
     fn tempdir() -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -366,7 +576,7 @@ mod tests {
         case_insensitive_fs(&root);
         let endpoints = root.join("endpoints");
         fs::create_dir_all(endpoints.join("Cars")).unwrap();
-        let err = resolve_endpoint_dir(&endpoints, &["cars"]).unwrap_err();
+        let err = resolve_endpoint_dir(&ctx(&root), &endpoints, &["cars"]).unwrap_err();
         match err {
             EndpointFsError::CaseConflict { wanted, found, .. } => {
                 assert_eq!(wanted, "cars");
@@ -375,7 +585,7 @@ mod tests {
             other => panic!("expected CaseConflict, got {other:?}"),
         }
         assert!(matches!(
-            create_endpoint_dir(&endpoints, &["cars"]).unwrap_err(),
+            create_endpoint_dir(&ctx(&root), &endpoints, &["cars"]).unwrap_err(),
             EndpointFsError::CaseConflict { .. }
         ));
         let _ = fs::remove_dir_all(&root);
@@ -386,11 +596,14 @@ mod tests {
         let root = tempdir();
         let endpoints = root.join("endpoints");
         fs::create_dir_all(endpoints.join("cars")).unwrap();
-        assert_eq!(resolve_endpoint_dir(&endpoints, &["cars"]).unwrap(), DirState::Exists(endpoints.join("cars")));
-        let state = resolve_endpoint_dir(&endpoints, &["cars", "{vin}"]).unwrap();
+        assert_eq!(
+            resolve_endpoint_dir(&ctx(&root), &endpoints, &["cars"]).unwrap(),
+            DirState::Exists(endpoints.join("cars"))
+        );
+        let state = resolve_endpoint_dir(&ctx(&root), &endpoints, &["cars", "{vin}"]).unwrap();
         assert_eq!(state, DirState::WillCreate(endpoints.join("cars").join("{vin}")));
         assert_eq!(state.path(), endpoints.join("cars").join("{vin}"));
-        assert_eq!(resolve_endpoint_dir(&endpoints, &[]).unwrap(), DirState::Exists(endpoints.clone()));
+        assert_eq!(resolve_endpoint_dir(&ctx(&root), &endpoints, &[]).unwrap(), DirState::Exists(endpoints.clone()));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -398,7 +611,7 @@ mod tests {
     fn an_absent_endpoints_root_resolves_to_will_create_for_the_whole_chain() {
         let root = tempdir();
         let endpoints = root.join("nope");
-        let state = resolve_endpoint_dir(&endpoints, &["a", "b"]).unwrap();
+        let state = resolve_endpoint_dir(&ctx(&root), &endpoints, &["a", "b"]).unwrap();
         assert_eq!(state, DirState::WillCreate(endpoints.join("a").join("b")));
         assert!(!endpoints.exists(), "resolve is read-only");
         let _ = fs::remove_dir_all(&root);
@@ -411,13 +624,13 @@ mod tests {
         fs::create_dir_all(&endpoints).unwrap();
         fs::write(endpoints.join("cars"), b"x").unwrap();
         assert!(matches!(
-            resolve_endpoint_dir(&endpoints, &["cars"]).unwrap_err(),
+            resolve_endpoint_dir(&ctx(&root), &endpoints, &["cars"]).unwrap_err(),
             EndpointFsError::NotADirectory { .. }
         ));
         let file_root = root.join("file_root");
         fs::write(&file_root, b"x").unwrap();
         assert!(matches!(
-            resolve_endpoint_dir(&file_root, &["cars"]).unwrap_err(),
+            resolve_endpoint_dir(&ctx(&root), &file_root, &["cars"]).unwrap_err(),
             EndpointFsError::NotADirectory { .. }
         ));
         let _ = fs::remove_dir_all(&root);
@@ -428,10 +641,13 @@ mod tests {
         let root = tempdir();
         let endpoints = root.join("endpoints");
         for seg in ["..", ".", "", "a/b", "a\0b"] {
-            let err = resolve_endpoint_dir(&endpoints, &[seg]).unwrap_err();
+            let err = resolve_endpoint_dir(&ctx(&root), &endpoints, &[seg]).unwrap_err();
             assert!(matches!(err, EndpointFsError::Containment(_)), "{seg:?} -> {err:?}");
             assert!(err.is_strict_error());
-            assert!(matches!(create_endpoint_dir(&endpoints, &[seg]).unwrap_err(), EndpointFsError::Containment(_)));
+            assert!(matches!(
+                create_endpoint_dir(&ctx(&root), &endpoints, &[seg]).unwrap_err(),
+                EndpointFsError::Containment(_)
+            ));
         }
         assert!(!endpoints.exists());
         let io_err: io::Error = EndpointFsError::Containment("x".into()).into();
@@ -443,10 +659,10 @@ mod tests {
     fn create_endpoint_dir_creates_each_missing_level_and_is_idempotent() {
         let root = tempdir();
         let endpoints = root.join("endpoints");
-        let made = create_endpoint_dir(&endpoints, &["cars", "{vin}"]).unwrap();
+        let made = create_endpoint_dir(&ctx(&root), &endpoints, &["cars", "{vin}"]).unwrap();
         assert_eq!(made, endpoints.join("cars").join("{vin}"));
         assert!(made.is_dir());
-        assert_eq!(create_endpoint_dir(&endpoints, &["cars", "{vin}"]).unwrap(), made);
+        assert_eq!(create_endpoint_dir(&ctx(&root), &endpoints, &["cars", "{vin}"]).unwrap(), made);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -487,9 +703,9 @@ mod tests {
     #[test]
     fn create_new_file_writes_a_new_file_and_refuses_to_overwrite_an_existing_one() {
         let root = tempdir();
-        create_new_file(&root, "x.json", b"first").unwrap();
+        create_new_file(&ProjectBoundary::new(&root), &root, "x.json", b"first").unwrap();
         assert_eq!(fs::read(root.join("x.json")).unwrap(), b"first");
-        let err = create_new_file(&root, "x.json", b"second").unwrap_err();
+        let err = create_new_file(&ProjectBoundary::new(&root), &root, "x.json", b"second").unwrap_err();
         assert!(matches!(err, EndpointFsError::AlreadyExists { .. }));
         assert_eq!(fs::read(root.join("x.json")).unwrap(), b"first");
         let io_err: io::Error = err.into();
@@ -502,7 +718,7 @@ mod tests {
         let root = tempdir();
         case_insensitive_fs(&root);
         fs::write(root.join("x.json"), b"first").unwrap();
-        let err = create_new_file(&root, "X.json", b"second").unwrap_err();
+        let err = create_new_file(&ProjectBoundary::new(&root), &root, "X.json", b"second").unwrap_err();
         assert!(matches!(err, EndpointFsError::CaseConflict { .. }), "{err:?}");
         assert_eq!(fs::read(root.join("x.json")).unwrap(), b"first");
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
@@ -513,7 +729,7 @@ mod tests {
     fn rename_checked_moves_a_file_to_a_free_name() {
         let root = tempdir();
         fs::write(root.join("a.json"), b"A").unwrap();
-        rename_checked(&root, "a.json", "_a.json").unwrap();
+        rename_checked(&ProjectBoundary::new(&root), &root, "a.json", "_a.json").unwrap();
         assert!(!root.join("a.json").exists());
         assert_eq!(fs::read(root.join("_a.json")).unwrap(), b"A");
         let _ = fs::remove_dir_all(&root);
@@ -524,7 +740,7 @@ mod tests {
         let root = tempdir();
         fs::write(root.join("a.json"), b"A").unwrap();
         fs::write(root.join("_a.json"), b"OLD").unwrap();
-        let err = rename_checked(&root, "a.json", "_a.json").unwrap_err();
+        let err = rename_checked(&ProjectBoundary::new(&root), &root, "a.json", "_a.json").unwrap_err();
         assert!(matches!(err, EndpointFsError::AlreadyExists { .. }), "{err:?}");
         assert_eq!(fs::read(root.join("a.json")).unwrap(), b"A");
         assert_eq!(fs::read(root.join("_a.json")).unwrap(), b"OLD");
@@ -537,7 +753,7 @@ mod tests {
         case_insensitive_fs(&root);
         fs::write(root.join("a.json"), b"A").unwrap();
         fs::write(root.join("_A.json"), b"OTHER").unwrap();
-        let err = rename_checked(&root, "a.json", "_a.json").unwrap_err();
+        let err = rename_checked(&ProjectBoundary::new(&root), &root, "a.json", "_a.json").unwrap_err();
         assert!(matches!(err, EndpointFsError::CaseConflict { .. }), "{err:?}");
         assert_eq!(fs::read(root.join("a.json")).unwrap(), b"A");
         assert_eq!(fs::read(root.join("_A.json")).unwrap(), b"OTHER");
@@ -547,7 +763,7 @@ mod tests {
     #[test]
     fn rename_checked_on_a_missing_source_is_a_not_found_io_error() {
         let root = tempdir();
-        match rename_checked(&root, "nope.json", "_nope.json").unwrap_err() {
+        match rename_checked(&ProjectBoundary::new(&root), &root, "nope.json", "_nope.json").unwrap_err() {
             EndpointFsError::Io(e) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
             other => panic!("expected Io(NotFound), got {other:?}"),
         }

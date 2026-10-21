@@ -61,12 +61,36 @@ async fn validate_api(root: &Path) -> usize {
     // describes them didn't even load.
     let config = Config::load_or_exit(&api_dir);
     println!(
-        "  config: OK ({} connection(s), {} error code(s), {} security scheme(s), strictOpenApi={})",
+        "  config: OK ({} connection(s), {} error code(s), {} security scheme(s), strictOpenApi={}, endpointSymlinks={})",
         config.connections.len(),
         config.errors.len(),
         config.security.schemes.len(),
-        config.server.strict_open_api()
+        config.server.strict_open_api(),
+        config.server.endpoint_symlinks().as_str()
     );
+
+    // Same read-only check generate makes before it writes anything: every
+    // folder and file it would create must resolve inside the project.
+    let boundary = crate::openapi::endpoint_tree::ProjectBoundary::new(root);
+    if let Err(e) = crate::commands::generate::write_gate(&boundary, &api_dir) {
+        println!("  error: {e}");
+        problems += 1;
+    }
+    let ctx = crate::commands::run::link_context(root, &config.server);
+    let endpoint_tree = crate::commands::run::scan_endpoint_tree(root, &config.server);
+    let links = crate::commands::generate::link_report(&endpoint_tree);
+    for message in &links.errors {
+        println!("  error: {message}");
+        problems += 1;
+    }
+    for message in &links.warnings {
+        if config.server.strict_open_api() {
+            println!("  error: {message}");
+            problems += 1;
+        } else {
+            warn(message);
+        }
+    }
 
     match crate::commands::run::method_case_notice(&config.server) {
         None => println!("  method case: exact (caseSensitiveMethods: true)"),
@@ -99,11 +123,28 @@ async fn validate_api(root: &Path) -> usize {
         );
     }
 
+    let strict_routes = config.server.strict_open_api();
+    let route_mode = crate::openapi::method_token::MethodCase::from_case_sensitive(config.server.case_sensitive_methods());
+    let route_ctx = crate::endpoint::route_plan::RouteContext::for_server(&config.server).with_extras(crate::endpoint::route_plan::RootExtras {
+        web: root.join("webserve.json").is_file(),
+        control_plane: false,
+    });
+    let route_plan = crate::endpoint::route_plan::RoutePlan::build(&endpoint_tree, route_mode, &route_ctx);
+    let route_refusals = route_plan.refusals(strict_routes);
+    println!("  routes: {} registered, {} problem(s)", route_plan.routes.len(), route_refusals.len());
+    for problem in &route_refusals {
+        println!("    - {}", problem.message());
+    }
+    problems += route_refusals.len();
+    for problem in route_plan.warnings(strict_routes) {
+        warn(problem.message());
+    }
+
     match crate::openapi::load(&root.join(MANIFEST_FILE), config.server.openapi_load_options()) {
         Ok(doc) => {
             println!("  {MANIFEST_FILE}: OK ({} operation(s))", doc.operations.len());
             problems += report_spec_issues(&doc, config.server.strict_open_api());
-            let plan = crate::commands::generate::plan_endpoint_files(&api_dir, &doc);
+            let plan = crate::commands::generate::plan_endpoint_files(&api_dir, &doc, &endpoint_tree, &ctx);
             for error in &plan.errors {
                 println!("  error: {}", error.message);
             }
@@ -120,20 +161,33 @@ async fn validate_api(root: &Path) -> usize {
                     warn(message);
                 }
             }
-            let security = crate::endpoint::security_check(&api_dir.join("datasources/endpoints"), &doc);
-            for mismatch in &security.mismatches {
-                println!("  error: {}", mismatch.message());
+            let security = crate::endpoint::security_check_with_routes(&endpoint_tree, &doc, &route_plan);
+            let mut security_errors: Vec<String> = Vec::new();
+            security_errors.extend(security.mismatches.iter().map(|m| m.message()));
+            security_errors.extend(security.ambiguous.iter().map(|m| m.message()));
+            security_errors.extend(security.stale_variants.iter().map(|m| m.message()));
+            security_errors.extend(security.template_instances.iter().map(|m| m.message()));
+            security_errors.extend(security.shadowed.iter().map(|m| m.message()));
+            security_errors.extend(security.unverifiable.iter().map(|m| m.message()));
+            security_errors.extend(security.builtin_refusals.iter().map(|m| m.message()));
+            for message in &security_errors {
+                println!("  error: {message}");
             }
-            problems += security.mismatches.len();
-            for file in &security.ambiguous {
-                println!("  error: {}", file.message());
+            problems += security_errors.len();
+            for message in &security.builtin_warnings {
+                warn(message);
             }
-            problems += security.ambiguous.len();
             for stricter in &security.stricter {
                 warn(&stricter.message());
             }
             for file in &security.unmatched {
-                warn(&crate::endpoint::unmatched_security_message(file));
+                let message = crate::endpoint::unmatched_security_message(file);
+                if config.server.strict_open_api() {
+                    println!("  error: {message} (\"strictOpenApi\" is true)");
+                    problems += 1;
+                } else {
+                    warn(&message);
+                }
             }
             for op in &doc.operations {
                 let Some(scheme) = &op.security else { continue };
@@ -172,10 +226,9 @@ async fn validate_api(root: &Path) -> usize {
         }
     }
 
-    let endpoints_root = api_dir.join("datasources/endpoints");
     let method_case = crate::openapi::method_token::MethodCase::from_case_sensitive(config.server.case_sensitive_methods());
     let (count, endpoint_problems) = crate::endpoint::validate_endpoint_files(
-        &endpoints_root,
+        &endpoint_tree,
         &config.security,
         &config.connections,
         config.server.tls.client_identity_enabled(),
@@ -188,7 +241,7 @@ async fn validate_api(root: &Path) -> usize {
     problems += endpoint_problems.len();
 
     let strict = config.server.strict_open_api();
-    for path in crate::endpoint::reserved_stream_key_files(&endpoints_root, method_case) {
+    for path in crate::endpoint::reserved_stream_key_files(&endpoint_tree, method_case) {
         let message = format!(
             "{}: \"stream\" is reserved for streaming responses, which this frogs version does not implement — serving a single JSON response",
             path.display()
@@ -704,7 +757,10 @@ mod m2_validate_tests {
 
     fn project_with_stream_key_file(strict: bool) -> PathBuf {
         let root = temp_project();
-        write_spec_body(&root, "paths: {}\n");
+        write_spec_body(
+            &root,
+            "paths:\n  /things:\n    get:\n      operationId: getThings\n      responses: { '200': { description: ok } }\n",
+        );
         if strict {
             make_strict(&root);
         } else {
@@ -995,3 +1051,9 @@ mod m4_validate_tests {
         let _ = fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(test)]
+mod symlink_tests;
+
+#[cfg(test)]
+mod route_tests;

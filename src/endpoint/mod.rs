@@ -4,6 +4,9 @@ mod format;
 pub(crate) mod mock;
 mod request_validation;
 mod resolve;
+pub(crate) mod route_plan;
+#[cfg(test)]
+mod route_plan_tests;
 mod schema;
 
 use std::collections::{BTreeMap, HashMap};
@@ -19,11 +22,16 @@ use axum::{Json, Router};
 
 use crate::config::ConnectionConfig;
 use crate::errors::{DiscoveredErrors, ErrorRegistry};
+#[cfg(test)]
+use crate::openapi::endpoint_tree::tree_for_tests;
+use crate::openapi::endpoint_tree::{EndpointTree, parse_error_summary};
 use crate::openapi::method_token::{self, MethodCase, TokenStatus};
+use crate::openapi::route_syntax::axum_style as axum_style_path;
 use crate::openapi::{Operation, ResponseMode};
 use crate::security::{ClientCertIdentity, SecurityConfig, VerifierCache};
 use crate::server::RequestId;
 use crate::sql::SqlDriver;
+use route_plan::{EntryStatus, InventoryEntry, RouteContext, RouteInventory, RouteKind, RoutePlan};
 use serde_json::{Map, Value};
 
 /// Re-exported for `testing`, the only other module that needs to reach
@@ -103,18 +111,25 @@ pub(crate) fn has_reserved_stream_key(contents: &str) -> bool {
     serde_json::from_str::<Value>(contents).is_ok_and(|v| v.as_object().is_some_and(|obj| obj.contains_key("stream")))
 }
 
-pub(crate) fn reserved_stream_key_files(endpoints_root: &Path, mode: MethodCase) -> Vec<PathBuf> {
-    discover_endpoint_files(endpoints_root, mode)
+pub(crate) fn reserved_stream_key_files(tree: &EndpointTree, mode: MethodCase) -> Vec<PathBuf> {
+    discover_endpoint_files(tree, mode)
         .into_iter()
         .filter(|(_, _, file_path)| std::fs::read_to_string(file_path).is_ok_and(|contents| has_reserved_stream_key(&contents)))
         .map(|(_, _, file_path)| file_path)
         .collect()
 }
 
-/// Scans `datasources/endpoints/` for `endpoint.<method>.json` files (one
-/// of `method_token::ROUTABLE_FIXED`) and registers one axum route per
-/// distinct path (QUERY lives in a per-path dispatch table, see
-/// `dispatch_extension`).
+/// Parses an endpoint file's JSON. A file reached through a link may be
+/// arbitrary bytes from elsewhere on disk, so its failure is reported by
+/// position and category only — serde's own message can quote the content.
+pub(crate) fn parse_endpoint_json(contents: &str, via_link: bool) -> Result<EndpointFile, String> {
+    serde_json::from_str(contents).map_err(|e| if via_link { parse_error_summary(&e) } else { format!("invalid JSON: {e}") })
+}
+
+/// Registers one axum route per distinct path for the `endpoint.<method>.json`
+/// files (one of `method_token::ROUTABLE_FIXED`) in `endpoint_tree`, the scan
+/// of `datasources/endpoints/` the caller already made and reported on (QUERY
+/// lives in a per-path dispatch table, see `dispatch_extension`).
 /// `drivers` is already `Arc`-wrapped by the caller (`commands::run`), not
 /// built fresh here, so the same connection pool can be shared with
 /// `server::router`'s `/readyz` check rather than each holding its own copy.
@@ -125,6 +140,7 @@ pub(crate) fn reserved_stream_key_files(endpoints_root: &Path, mode: MethodCase)
 #[allow(clippy::too_many_arguments)]
 pub fn build_router(
     project_root: &Path,
+    endpoint_tree: &EndpointTree,
     drivers: Arc<HashMap<String, Box<dyn SqlDriver>>>,
     connections: &HashMap<String, ConnectionConfig>,
     errors: Arc<ErrorRegistry>,
@@ -155,7 +171,6 @@ pub fn build_router(
 ) -> Router {
     let sql_root = project_root.join("datasources/sql");
     let http_root = project_root.join("datasources/http");
-    let endpoints_root = project_root.join("datasources/endpoints");
     let discovered_errors_path = project_root.join("config/errors.discovered.json");
     // One shared client for every route — reuses connection pooling across
     // requests instead of paying a fresh-connection cost per call.
@@ -163,165 +178,187 @@ pub fn build_router(
     let verifier_cache = Arc::new(VerifierCache::new());
     let component_schemas = Arc::new(openapi_document.map(|doc| doc.component_schemas.clone()).unwrap_or_default());
 
-    for finding in method_file_findings(&endpoints_root, method_case) {
+    for finding in method_file_findings(endpoint_tree, method_case) {
         tracing::warn!("{}", finding.message(method_case));
     }
 
+    let inventory = route_inventory(endpoint_tree, method_case);
+    let plan = RoutePlan::from_inventory(&inventory, &RouteContext::endpoints_only());
+    for problem in plan.refusals(true) {
+        tracing::error!("route table: {}", problem.message());
+    }
+    let unavailable = Arc::new(UnavailableState { errors: errors.clone() });
+
     let mut by_path: BTreeMap<String, PathRoutes> = BTreeMap::new();
-    for (url_path, method, file_path) in discover_endpoint_files(&endpoints_root, method_case) {
-        let TokenStatus::Valid(token) = method_token::parse_file_token(&method, method_case) else {
-            tracing::warn!("skipping {}: not a method frogs routes", file_path.display());
-            continue;
-        };
-        let wire = token.wire();
-        let contents = match std::fs::read_to_string(&file_path) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("skipping {}: {e}", file_path.display());
+    for entry in &inventory.entries {
+        let (url_path, method, file_path, wire) = (&entry.url_path, &entry.token, &entry.file, entry.wire.as_str());
+        match &entry.status {
+            EntryStatus::NotRouted(reason) => {
+                tracing::warn!("skipping {}: {reason}", crate::openapi::untrusted(&file_path.display().to_string()));
                 continue;
             }
-        };
-        let endpoint: EndpointFile = match serde_json::from_str(&contents) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!("skipping {}: invalid JSON: {e}", file_path.display());
-                continue;
-            }
-        };
-
-        // A declared scheme that `security/schemes.json` doesn't actually
-        // define is a config mistake — fail closed by refusing to serve
-        // the route at all rather than accidentally leaving it open, the
-        // same "skip with a loud warning" posture used for a malformed
-        // endpoint file above.
-        if let Some(scheme) = &endpoint.security
-            && !security.verifiers.contains_key(scheme)
-        {
-            tracing::warn!(
-                "skipping {}: security scheme '{scheme}' has no matching entry in security/schemes.json",
-                file_path.display()
-            );
-            continue;
-        }
-
-        if let Some(scheme) = &endpoint.security
-            && let Some(verifier) = security.verifiers.get(scheme)
-            && verifier.requires_client_cert()
-            && !client_identity_available
-        {
-            tracing::warn!(
-                "skipping {}: security scheme '{scheme}' needs a client certificate, but this server's TLS listener doesn't request one \
-                 (set tls.mode to \"manual\" and enable tls.clientAuth in config/server.json)",
-                file_path.display()
-            );
-            continue;
-        }
-
-        let mut source_problems = validate_nested_many(&endpoint, connections);
-        source_problems.extend(validate_source_call_timeout(&endpoint));
-        if !source_problems.is_empty() {
-            for problem in &source_problems {
-                tracing::warn!("skipping {}: {problem}", file_path.display());
-            }
-            continue;
-        }
-
-        tracing::info!("{wire} {url_path} -> {} (operationId: {})", file_path.display(), endpoint.operation_id);
-
-        if has_reserved_stream_key(&contents) {
-            tracing::warn!(
-                "{}: \"stream\" is reserved for streaming responses, which this frogs version does not implement — serving a single JSON response",
-                file_path.display()
-            );
-        }
-
-        let operation = openapi_document.and_then(|doc| find_operation(doc, &url_path, &method));
-        if openapi_document.is_some() && operation.is_none() {
-            tracing::warn!(
-                "{}: no matching operation found in openapi.yaml — request validation skipped for this route",
-                file_path.display()
-            );
-        }
-        if let Some(op) = operation {
-            if let ResponseMode::Stream(spec) = &op.response_mode {
+            EntryStatus::Duplicate => {
                 tracing::warn!(
-                    "{wire} {url_path}: declares a streaming response ({}); frogs does not serve streaming responses — serving a single JSON response",
-                    crate::openapi::untrusted(&spec.media_type)
+                    "skipping {}: {wire} {} is already registered by another endpoint file",
+                    crate::openapi::untrusted(&file_path.display().to_string()),
+                    crate::openapi::untrusted(url_path)
+                );
+                continue;
+            }
+            EntryStatus::Routed => {}
+        }
+        if plan.is_excluded(url_path) {
+            tracing::error!(
+                "not serving {}: {wire} {} is part of a route-table problem (see the error above)",
+                crate::openapi::untrusted(&file_path.display().to_string()),
+                crate::openapi::untrusted(url_path)
+            );
+            continue;
+        }
+        let Some(kind) = entry.kind.clone() else { continue };
+        let via_link = endpoint_tree.is_via_link(file_path);
+        let built: Result<MethodRouter<()>, String> = (|| {
+            let contents = std::fs::read_to_string(file_path).map_err(|e| e.to_string())?;
+            let endpoint: EndpointFile = parse_endpoint_json(&contents, via_link)?;
+
+            // A declared scheme that `security/schemes.json` doesn't actually
+            // define is a config mistake — fail closed by refusing to serve
+            // the route at all rather than accidentally leaving it open, the
+            // same "skip with a loud warning" posture used for a malformed
+            // endpoint file above.
+            if let Some(scheme) = &endpoint.security
+                && !security.verifiers.contains_key(scheme)
+            {
+                return Err(format!("security scheme '{scheme}' has no matching entry in security/schemes.json"));
+            }
+
+            if let Some(scheme) = &endpoint.security
+                && let Some(verifier) = security.verifiers.get(scheme)
+                && verifier.requires_client_cert()
+                && !client_identity_available
+            {
+                return Err(format!(
+                    "security scheme '{scheme}' needs a client certificate, but this server's TLS listener doesn't request one \
+                 (set tls.mode to \"manual\" and enable tls.clientAuth in config/server.json)"
+                ));
+            }
+
+            let mut source_problems = validate_nested_many(&endpoint, connections);
+            source_problems.extend(validate_source_call_timeout(&endpoint));
+            if !source_problems.is_empty() {
+                return Err(source_problems.join("; "));
+            }
+
+            tracing::info!("{wire} {url_path} -> {} (operationId: {})", file_path.display(), endpoint.operation_id);
+
+            if has_reserved_stream_key(&contents) {
+                tracing::warn!(
+                    "{}: \"stream\" is reserved for streaming responses, which this frogs version does not implement — serving a single JSON response",
+                    file_path.display()
                 );
             }
-            if let Some(reason) = &op.request_body_unresolved {
-                tracing::warn!("{wire} {url_path}: request body schema unresolved ({reason}) — body validation skipped for this route");
-            }
-        }
-        let response_mode = operation.map(|op| op.response_mode.clone()).unwrap_or_default();
 
-        // Each route gets its own `RouteState` baked in via `with_state` —
-        // this is what lets one shared `handle_request` function serve
-        // every endpoint file: axum's `State` extractor pulls out whichever
-        // `Arc<RouteState>` this particular route was registered with.
-        let state = Arc::new(RouteState {
-            endpoint,
-            route: RouteKey {
-                method: method.clone(),
-                path: mock::openapi_style_path(&url_path),
-            },
-            sql_root: sql_root.clone(),
-            http_root: http_root.clone(),
-            drivers: drivers.clone(),
-            http_client: http_client.clone(),
-            errors: errors.clone(),
-            security: security.clone(),
-            services: services.clone(),
-            verifier_cache: verifier_cache.clone(),
-            discovered_errors: discovered_errors.clone(),
-            discovered_errors_path: discovered_errors_path.clone(),
-            debug_mode,
-            operation: operation.cloned(),
-            component_schemas: component_schemas.clone(),
-            source_call_timeout_ms,
-            mock_provider: mock_provider.clone(),
-            response_mode,
-        });
-        // Read back out before `state` moves into `.with_state` below —
-        // this endpoint's own `rateLimit`, if it declared one, gets its own
-        // dedicated bucket layered onto just this route (in addition to,
-        // not instead of, the global bucket `apply_rate_limit` applies to
-        // the whole router in `commands::run`).
-        let rate_limit_override = state.endpoint.rate_limit.clone();
+            let operation = openapi_document.and_then(|doc| find_operation(doc, url_path, method));
+            if openapi_document.is_some() && operation.is_none() {
+                tracing::warn!(
+                    "{}: no matching operation found in openapi.yaml — request validation skipped for this route",
+                    file_path.display()
+                );
+            }
+            if let Some(op) = operation {
+                if let ResponseMode::Stream(spec) = &op.response_mode {
+                    tracing::warn!(
+                        "{wire} {url_path}: declares a streaming response ({}); frogs does not serve streaming responses — serving a single JSON response",
+                        crate::openapi::untrusted(&spec.media_type)
+                    );
+                }
+                if let Some(reason) = &op.request_body_unresolved {
+                    tracing::warn!("{wire} {url_path}: request body schema unresolved ({reason}) — body validation skipped for this route");
+                }
+            }
+            let response_mode = operation.map(|op| op.response_mode.clone()).unwrap_or_default();
+
+            // Each route gets its own `RouteState` baked in via `with_state` —
+            // this is what lets one shared `handle_request` function serve
+            // every endpoint file: axum's `State` extractor pulls out whichever
+            // `Arc<RouteState>` this particular route was registered with.
+            let state = Arc::new(RouteState {
+                endpoint,
+                route: RouteKey {
+                    method: method.clone(),
+                    path: mock::openapi_style_path(url_path),
+                },
+                sql_root: sql_root.clone(),
+                http_root: http_root.clone(),
+                drivers: drivers.clone(),
+                http_client: http_client.clone(),
+                errors: errors.clone(),
+                security: security.clone(),
+                services: services.clone(),
+                verifier_cache: verifier_cache.clone(),
+                discovered_errors: discovered_errors.clone(),
+                discovered_errors_path: discovered_errors_path.clone(),
+                debug_mode,
+                operation: operation.cloned(),
+                component_schemas: component_schemas.clone(),
+                source_call_timeout_ms,
+                mock_provider: mock_provider.clone(),
+                response_mode,
+            });
+            // Read back out before `state` moves into `.with_state` below —
+            // this endpoint's own `rateLimit`, if it declared one, gets its own
+            // dedicated bucket layered onto just this route (in addition to,
+            // not instead of, the global bucket `apply_rate_limit` applies to
+            // the whole router in `commands::run`).
+            let rate_limit_override = state.endpoint.rate_limit.clone();
+
+            let mut method_router: MethodRouter<()> = match &kind {
+                RouteKind::Standard(Method::GET) => get(handle_request).with_state(state),
+                RouteKind::Standard(Method::POST) => post(handle_request).with_state(state),
+                RouteKind::Standard(Method::PUT) => put(handle_request).with_state(state),
+                RouteKind::Standard(Method::PATCH) => patch(handle_request).with_state(state),
+                RouteKind::Standard(Method::DELETE) => delete(handle_request).with_state(state),
+                _ => any(handle_request).with_state(state),
+            };
+            if let Some(rate_limit) = rate_limit_override {
+                let limiter = Arc::new(crate::server::RateLimiter::new(rate_limit.requests_per_second, rate_limit.burst));
+                method_router = crate::server::apply_rate_limit_to_route(method_router, limiter);
+            }
+            Ok(method_router)
+        })();
+
+        // A file that can't be served keeps its slot with a 503, so its requests can't fall through to a sibling `{param}` route.
+        let method_router = match built {
+            Ok(method_router) => method_router,
+            Err(message) => {
+                tracing::warn!(
+                    "skipping {}: {} — answering 503 so requests can't fall through to another route",
+                    crate::openapi::untrusted(&file_path.display().to_string()),
+                    crate::openapi::untrusted(&message)
+                );
+                match &kind {
+                    RouteKind::Standard(Method::GET) => get(handle_unavailable).with_state(unavailable.clone()),
+                    RouteKind::Standard(Method::POST) => post(handle_unavailable).with_state(unavailable.clone()),
+                    RouteKind::Standard(Method::PUT) => put(handle_unavailable).with_state(unavailable.clone()),
+                    RouteKind::Standard(Method::PATCH) => patch(handle_unavailable).with_state(unavailable.clone()),
+                    RouteKind::Standard(Method::DELETE) => delete(handle_unavailable).with_state(unavailable.clone()),
+                    _ => any(handle_unavailable).with_state(unavailable.clone()),
+                }
+            }
+        };
 
         let routes = by_path.entry(url_path.clone()).or_default();
-        let mut method_router: MethodRouter<()> = match token.standard_method() {
-            Some(Method::GET) => get(handle_request).with_state(state),
-            Some(Method::POST) => post(handle_request).with_state(state),
-            Some(Method::PUT) => put(handle_request).with_state(state),
-            Some(Method::PATCH) => patch(handle_request).with_state(state),
-            Some(Method::DELETE) => delete(handle_request).with_state(state),
-            _ => any(handle_request).with_state(state),
-        };
-        if let Some(rate_limit) = rate_limit_override {
-            let limiter = Arc::new(crate::server::RateLimiter::new(rate_limit.requests_per_second, rate_limit.burst));
-            method_router = crate::server::apply_rate_limit_to_route(method_router, limiter);
-        }
-        if token.standard_method().is_some() {
-            if routes.standard_names.iter().any(|n| n == wire.as_ref()) {
-                tracing::warn!("skipping {}: {wire} {url_path} is already registered by another endpoint file", file_path.display());
-                continue;
+        match kind {
+            RouteKind::Standard(_) => {
+                routes.standard_names.push(wire.to_string());
+                routes.standard = Some(match routes.standard.take() {
+                    Some(existing) => existing.merge(method_router),
+                    None => method_router,
+                });
             }
-            routes.standard_names.push(wire.to_string());
-            routes.standard = Some(match routes.standard.take() {
-                Some(existing) => existing.merge(method_router),
-                None => method_router,
-            });
-        } else {
-            let Ok(wire_method) = Method::from_bytes(wire.as_bytes()) else {
-                tracing::warn!("skipping {}: {wire} is not a valid HTTP method", file_path.display());
-                continue;
-            };
-            if routes.table.contains_key(&wire_method) {
-                tracing::warn!("skipping {}: {wire} {url_path} is already registered by another endpoint file", file_path.display());
-                continue;
+            RouteKind::Extension(wire_method) => {
+                routes.table.insert(wire_method, method_router);
             }
-            routes.table.insert(wire_method, method_router);
         }
     }
 
@@ -340,6 +377,72 @@ pub fn build_router(
         router = router.route(&url_path, combined);
     }
     router
+}
+
+/// Every endpoint file the tree holds, decided once the way `build_router`
+/// registers it: the plan and the router both read this, so they can't diverge.
+/// A duplicate wire on one path keeps the first file in discovery order.
+pub(crate) fn route_inventory(tree: &EndpointTree, mode: MethodCase) -> RouteInventory {
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+    for (url_path, token_text, file) in discover_endpoint_files(tree, mode) {
+        let segments: Vec<String> = file
+            .parent()
+            .and_then(|dir| dir.strip_prefix(tree.endpoints_root()).ok())
+            .map(|relative| relative.components().filter_map(|c| c.as_os_str().to_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let mut entry = InventoryEntry {
+            url_path: url_path.clone(),
+            token: token_text.clone(),
+            wire: String::new(),
+            kind: None,
+            file,
+            segments,
+            status: EntryStatus::Routed,
+        };
+        let TokenStatus::Valid(token) = method_token::parse_file_token(&token_text, mode) else {
+            entry.status = EntryStatus::NotRouted("not a method frogs routes".to_string());
+            entries.push(entry);
+            continue;
+        };
+        entry.wire = token.wire().into_owned();
+        entry.kind = match token.standard_method() {
+            Some(method) => Some(RouteKind::Standard(method)),
+            None => match Method::from_bytes(entry.wire.as_bytes()) {
+                Ok(method) => Some(RouteKind::Extension(method)),
+                Err(_) => {
+                    entry.status = EntryStatus::NotRouted(format!("{} is not a valid HTTP method", crate::openapi::untrusted(&entry.wire)));
+                    None
+                }
+            },
+        };
+        if entry.status == EntryStatus::Routed && !seen.insert((url_path, entry.wire.clone())) {
+            entry.status = EntryStatus::Duplicate;
+        }
+        entries.push(entry);
+    }
+    RouteInventory { entries }
+}
+
+/// What a skipped (unservable) endpoint file answers instead of letting its
+/// requests fall through to another route. Holds only the registry: it reads
+/// `endpoint.unavailable` if the project defines it, never records a
+/// discovered error, and never echoes file content.
+struct UnavailableState {
+    errors: Arc<ErrorRegistry>,
+}
+
+async fn handle_unavailable(State(state): State<Arc<UnavailableState>>) -> Response {
+    let (status, expose_detail) = match state.errors.get("endpoint.unavailable") {
+        Some(definition) => (definition.http_status, definition.expose_detail),
+        None => (503, false),
+    };
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+    let mut body = serde_json::json!({ "code": status.as_u16(), "name": "endpoint.unavailable" });
+    if expose_detail {
+        body["detail"] = Value::String("this endpoint is configured but could not be loaded".to_string());
+    }
+    (status, Json(body)).into_response()
 }
 
 #[derive(Default)]
@@ -404,17 +507,18 @@ async fn dispatch_extension(table: Arc<HashMap<Method, MethodRouter<()>>>, allow
 /// is small enough that duplicating it here stays cheaper than
 /// restructuring `build_router` to serve both callers.
 pub(crate) fn validate_endpoint_files(
-    endpoints_root: &Path,
+    endpoint_tree: &EndpointTree,
     security: &SecurityConfig,
     connections: &HashMap<String, ConnectionConfig>,
     client_identity_available: bool,
     mode: MethodCase,
 ) -> (usize, Vec<String>) {
-    let discovered = discover_endpoint_files(endpoints_root, mode);
+    let discovered = discover_endpoint_files(endpoint_tree, mode);
     let count = discovered.len();
     let mut problems = Vec::new();
 
     for (_, _, file_path) in discovered {
+        let via_link = endpoint_tree.is_via_link(&file_path);
         let contents = match std::fs::read_to_string(&file_path) {
             Ok(c) => c,
             Err(e) => {
@@ -422,10 +526,10 @@ pub(crate) fn validate_endpoint_files(
                 continue;
             }
         };
-        let endpoint: EndpointFile = match serde_json::from_str(&contents) {
+        let endpoint: EndpointFile = match parse_endpoint_json(&contents, via_link) {
             Ok(e) => e,
-            Err(e) => {
-                problems.push(format!("{}: invalid JSON: {e}", file_path.display()));
+            Err(message) => {
+                problems.push(format!("{}: {message}", file_path.display()));
                 continue;
             }
         };
@@ -1240,28 +1344,17 @@ fn record_discovered_error(discovered_errors: &Mutex<DiscoveredErrors>, path: &P
     }
 }
 
-pub(crate) fn discover_endpoint_files(root: &Path, mode: MethodCase) -> Vec<(String, String, PathBuf)> {
-    let mut out = Vec::new();
-    walk(root, root, mode, &mut out);
-    out
-}
-
-fn walk(root: &Path, dir: &Path, mode: MethodCase, out: &mut Vec<(String, String, PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            // `_backups/` holds history, not live config — never routable.
-            if path.file_name().and_then(|n| n.to_str()) == Some("_backups") {
-                continue;
-            }
-            walk(root, &path, mode, out);
-        } else if let Some(method) = routable_method(&path, mode)
-            && let Some(url_path) = url_path_for(root, &path)
-        {
-            out.push((url_path, method, path.clone()));
-        }
-    }
+/// Routable files only; `_backups/` and links the policy refuses never reach
+/// the tree, so nothing here touches the filesystem.
+pub(crate) fn discover_endpoint_files(tree: &EndpointTree, mode: MethodCase) -> Vec<(String, String, PathBuf)> {
+    tree.files()
+        .iter()
+        .filter_map(|file| {
+            let method = routable_method(&file.logical, mode)?;
+            let url_path = url_path_for(tree.endpoints_root(), &file.logical)?;
+            Some((url_path, method, file.logical.clone()))
+        })
+        .collect()
 }
 
 /// The file token of an `endpoint.<token>.json` file whose token is valid and
@@ -1312,43 +1405,27 @@ impl MethodFileFinding {
 /// `endpoint.<token>.json` files under `endpoints_root` that are never served
 /// although they look like endpoint files: a token that is not canonical
 /// (`endpoint.GET.json`, `endpoint.purge.json`) or that is valid only under the
-/// other `caseSensitiveMethods` setting. Never renamed, only reported. Uses
-/// `DirEntry::file_type`, so links are not followed.
-pub(crate) fn method_file_findings(endpoints_root: &Path, mode: MethodCase) -> Vec<MethodFileFinding> {
+/// other `caseSensitiveMethods` setting. Never renamed, only reported.
+pub(crate) fn method_file_findings(tree: &EndpointTree, mode: MethodCase) -> Vec<MethodFileFinding> {
     let mut out = Vec::new();
-    walk_method_files(endpoints_root, endpoints_root, mode, &mut out);
+    for file in tree.files() {
+        let Some(token) = method_token::stub_file_token(&file.name) else { continue };
+        let kind = match method_token::parse_file_token(token, mode) {
+            TokenStatus::Valid(_) => continue,
+            TokenStatus::WrongMode { wire } => MethodFileKind::WrongMode { wire },
+            TokenStatus::Invalid => MethodFileKind::NonCanonical {
+                hint: method_token::canonical_hint(token, mode),
+            },
+        };
+        out.push(MethodFileFinding {
+            url_path: url_path_for(tree.endpoints_root(), &file.logical).unwrap_or_default(),
+            token: token.to_string(),
+            file: file.logical.clone(),
+            kind,
+        });
+    }
     out.sort_by(|a, b| a.file.cmp(&b.file));
     out
-}
-
-fn walk_method_files(root: &Path, dir: &Path, mode: MethodCase, out: &mut Vec<MethodFileFinding>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else { continue };
-        let path = entry.path();
-        if file_type.is_dir() {
-            if path.file_name().and_then(|n| n.to_str()) != Some("_backups") {
-                walk_method_files(root, &path, mode, out);
-            }
-        } else if file_type.is_file()
-            && let Some(name) = path.file_name().and_then(|n| n.to_str())
-            && let Some(token) = method_token::stub_file_token(name)
-        {
-            let kind = match method_token::parse_file_token(token, mode) {
-                TokenStatus::Valid(_) => continue,
-                TokenStatus::WrongMode { wire } => MethodFileKind::WrongMode { wire },
-                TokenStatus::Invalid => MethodFileKind::NonCanonical {
-                    hint: method_token::canonical_hint(token, mode),
-                },
-            };
-            out.push(MethodFileFinding {
-                url_path: url_path_for(root, &path).unwrap_or_default(),
-                token: token.to_string(),
-                file: path.clone(),
-                kind,
-            });
-        }
-    }
 }
 
 /// Finds the `openapi.yaml` operation matching an already-registered
@@ -1457,12 +1534,337 @@ impl SecurityStricter {
     }
 }
 
+/// Where a secured operation that a route would shadow came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShadowOrigin {
+    Served,
+    /// The spec path was skipped at load (the message says why).
+    Skipped(String),
+    /// An `additionalOperations` entry the loader dropped.
+    Dropped,
+}
+
+fn acceptable_display(acceptable: &[String], unknown: bool) -> String {
+    if unknown {
+        "unknown — the security value in openapi.yaml is malformed".to_string()
+    } else {
+        quoted_names(acceptable)
+    }
+}
+
+fn origin_note(origin: &ShadowOrigin) -> String {
+    match origin {
+        ShadowOrigin::Served => String::new(),
+        ShadowOrigin::Skipped(reason) => format!(" [path skipped at load: {reason}]"),
+        ShadowOrigin::Dropped => " [operation dropped at load]".to_string(),
+    }
+}
+
+/// A secured operation with no file of its own that a different, less-protected route answers.
+pub(crate) struct SecurityShadow {
+    pub op_method: String,
+    pub op_path: String,
+    pub operation_id: String,
+    pub origin: ShadowOrigin,
+    pub served_route: String,
+    pub file: PathBuf,
+    pub file_security: Option<String>,
+    pub acceptable: Vec<String>,
+    pub unknown: bool,
+}
+
+impl SecurityShadow {
+    pub(crate) fn message(&self) -> String {
+        use crate::openapi::{method_token::untrusted_short, untrusted};
+        let declares = match &self.file_security {
+            Some(scheme) => format!("security '{}'", untrusted(scheme)),
+            None => "no \"security\"".to_string(),
+        };
+        let file = untrusted(&self.file.display().to_string());
+        format!(
+            "{} {} (operationId {}){}: openapi.yaml requires security ({}) but the request would be served by route {} ({file}), which declares {declares} — run frogs generate to create its own file, or make {file} declare an acceptable scheme",
+            method_token::display_token(&self.op_method),
+            untrusted(&self.op_path),
+            untrusted_short(&self.operation_id),
+            origin_note(&self.origin),
+            acceptable_display(&self.acceptable, self.unknown),
+            untrusted(&self.served_route),
+        )
+    }
+}
+
+/// A skipped secured path whose raw text can't be turned into a probe request.
+pub(crate) struct UnverifiableSecuredPath {
+    pub op_method: String,
+    pub op_path: String,
+    pub reason: String,
+    pub acceptable: Vec<String>,
+    pub unknown: bool,
+}
+
+impl UnverifiableSecuredPath {
+    pub(crate) fn message(&self) -> String {
+        use crate::openapi::untrusted;
+        format!(
+            "openapi.yaml path '{}' ({}, security {}) was skipped ({}) and frogs can't determine which route would serve it — fix the path in openapi.yaml",
+            untrusted(&self.op_path),
+            method_token::display_token(&self.op_method),
+            acceptable_display(&self.acceptable, self.unknown),
+            self.reason
+        )
+    }
+}
+
+/// A secured operation that one of frogs's own built-in routes answers without authentication.
+pub(crate) struct BuiltinShadow {
+    pub op_method: String,
+    pub op_path: String,
+    pub operation_id: String,
+    pub origin: ShadowOrigin,
+    pub acceptable: Vec<String>,
+    pub unknown: bool,
+    pub label: &'static str,
+    pub field: Option<&'static str>,
+    pub inherited: bool,
+}
+
+impl BuiltinShadow {
+    pub(crate) fn message(&self) -> String {
+        use crate::openapi::{method_token::untrusted_short, untrusted};
+        let head = format!(
+            "{} {} (operationId {}){}: openapi.yaml requires security ({}) but frogs's built-in {} route answers it without authentication",
+            method_token::display_token(&self.op_method),
+            untrusted(&self.op_path),
+            untrusted_short(&self.operation_id),
+            origin_note(&self.origin),
+            acceptable_display(&self.acceptable, self.unknown),
+            self.label
+        );
+        let turn_off = match self.field {
+            Some(field) => format!("turn {field} off, change apiRoot"),
+            None => "change apiRoot".to_string(),
+        };
+        if self.inherited {
+            format!("{head} — the security is only the document-wide default: add `security: []` on the operation if the exposure is intended, or {turn_off}")
+        } else {
+            format!("{head} — {turn_off}, or remove security from that operation")
+        }
+    }
+}
+
+/// An unmatched endpoint file whose method spelling differs only in case from a secured operation on its path.
+pub(crate) struct StaleVariant {
+    pub method: String,
+    pub url_path: String,
+    pub file: PathBuf,
+    pub file_security: Option<String>,
+    pub operations: Vec<String>,
+    pub acceptable: Vec<String>,
+    pub unknown: bool,
+}
+
+impl StaleVariant {
+    pub(crate) fn message(&self) -> String {
+        unmatched_refusal_message(
+            "a spelling of this method that differs only in letter case",
+            &self.method,
+            &self.url_path,
+            &self.file,
+            &self.file_security,
+            &self.operations,
+            &self.acceptable,
+            self.unknown,
+        )
+    }
+}
+
+/// An unmatched endpoint file that textually instantiates a secured operation's path template.
+pub(crate) struct TemplateInstance {
+    pub method: String,
+    pub url_path: String,
+    pub file: PathBuf,
+    pub file_security: Option<String>,
+    pub operations: Vec<String>,
+    pub acceptable: Vec<String>,
+    pub unknown: bool,
+}
+
+impl TemplateInstance {
+    pub(crate) fn message(&self) -> String {
+        unmatched_refusal_message(
+            "a path template this file's folder is an instance of",
+            &self.method,
+            &self.url_path,
+            &self.file,
+            &self.file_security,
+            &self.operations,
+            &self.acceptable,
+            self.unknown,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn unmatched_refusal_message(
+    relation: &str,
+    method: &str,
+    url_path: &str,
+    file: &Path,
+    file_security: &Option<String>,
+    operations: &[String],
+    acceptable: &[String],
+    unknown: bool,
+) -> String {
+    use crate::openapi::untrusted;
+    let declares = match file_security {
+        Some(scheme) => format!("security '{}'", untrusted(scheme)),
+        None => "no \"security\"".to_string(),
+    };
+    let file = untrusted(&file.display().to_string());
+    format!(
+        "{} {} ({file}): openapi.yaml secures {} ({}) — {relation} — but this file declares {declares}; make {file} declare an acceptable scheme, or fix the file name/folder",
+        method_token::display_token(method),
+        untrusted(url_path),
+        operations.join(", "),
+        acceptable_display(acceptable, unknown)
+    )
+}
+
 #[derive(Default)]
 pub(crate) struct SecurityCheck {
     pub mismatches: Vec<SecurityMismatch>,
     pub stricter: Vec<SecurityStricter>,
     pub unmatched: Vec<PathBuf>,
     pub ambiguous: Vec<AmbiguousMethodFile>,
+    pub stale_variants: Vec<StaleVariant>,
+    pub template_instances: Vec<TemplateInstance>,
+    pub shadowed: Vec<SecurityShadow>,
+    pub unverifiable: Vec<UnverifiableSecuredPath>,
+    pub builtin_refusals: Vec<BuiltinShadow>,
+    pub builtin_warnings: Vec<String>,
+}
+
+/// One secured operation (served, dropped or skipped) as the routing checks see it.
+struct SecuredView {
+    wire: String,
+    path: String,
+    operation_id: String,
+    acceptable: Vec<String>,
+    /// The security value was malformed: secured, nothing acceptable.
+    unknown: bool,
+    inherited: bool,
+    origin: ShadowOrigin,
+    /// `(axum-style path, file token)` of the file this operation owns, for served operations.
+    own: Option<(String, String)>,
+}
+
+fn secured_views(doc: &crate::openapi::OpenApiDocument) -> Vec<SecuredView> {
+    let mut views = Vec::new();
+    for op in doc.operations.iter().chain(&doc.ambiguous_operations) {
+        if let Some(acceptable) = acceptable_schemes(op) {
+            views.push(SecuredView {
+                wire: op.http_method.clone(),
+                path: op.path.clone(),
+                operation_id: op.operation_id.clone(),
+                acceptable,
+                unknown: false,
+                inherited: op.security_inherited,
+                origin: ShadowOrigin::Served,
+                own: Some((axum_style_path(&op.path), op.method.clone())),
+            });
+        }
+    }
+    let secured = |alternatives: &[Vec<String>], unparseable: bool| -> Option<(Vec<String>, bool)> {
+        if unparseable {
+            return Some((Vec::new(), true));
+        }
+        acceptable_from_alternatives(alternatives).map(|a| (a, false))
+    };
+    for dropped in &doc.dropped_operations {
+        if let Some((acceptable, unknown)) = secured(&dropped.security_alternatives, dropped.security_unparseable) {
+            views.push(SecuredView {
+                wire: dropped.wire.clone(),
+                path: dropped.path.clone(),
+                operation_id: String::new(),
+                acceptable,
+                unknown,
+                inherited: dropped.security_inherited,
+                origin: ShadowOrigin::Dropped,
+                own: None,
+            });
+        }
+    }
+    for skipped in &doc.skipped_operations {
+        if let Some((acceptable, unknown)) = secured(&skipped.security_alternatives, skipped.security_unparseable) {
+            views.push(SecuredView {
+                wire: skipped.method_wire.clone(),
+                path: skipped.raw_path.clone(),
+                operation_id: skipped.operation_id.clone(),
+                acceptable,
+                unknown,
+                inherited: skipped.security_inherited,
+                origin: ShadowOrigin::Skipped(skipped.reason.clone()),
+                own: None,
+            });
+        }
+    }
+    views
+}
+
+fn path_segments(path: &str) -> Vec<&str> {
+    let trimmed = path.strip_prefix('/').unwrap_or(path);
+    if trimmed.is_empty() { Vec::new() } else { trimmed.split('/').collect() }
+}
+
+fn view_matches_path(view: &SecuredView, url_path: &str) -> bool {
+    let axum_path = axum_style_path(&view.path);
+    axum_path == url_path || match_key(&axum_path) == match_key(url_path)
+}
+
+fn view_label(view: &SecuredView) -> String {
+    format!("{} {}", method_token::display_token(&view.wire), crate::openapi::untrusted(&view.path))
+}
+
+fn stub_fails(stub: &Option<String>, view: &SecuredView) -> bool {
+    view.unknown || !stub.as_ref().is_some_and(|s| view.acceptable.contains(s))
+}
+
+/// Whether a file at `url_path` is a textual instance of the view's path template: same
+/// number of segments, equal literals, and at least one template segment of the operation
+/// facing a literal segment of the file.
+fn is_template_instance(view: &SecuredView, url_path: &str) -> bool {
+    let op_path = match view.origin {
+        ShadowOrigin::Skipped(_) => view.path.clone(),
+        _ => axum_style_path(&view.path),
+    };
+    let op_segments = path_segments(&op_path);
+    let file_segments = path_segments(url_path);
+    if op_segments.len() != file_segments.len() {
+        return false;
+    }
+    let mut template_vs_literal = false;
+    for (op_seg, file_seg) in op_segments.iter().zip(&file_segments) {
+        if !crate::openapi::route_syntax::is_non_literal_segment(op_seg) {
+            if op_seg != file_seg {
+                return false;
+            }
+        } else if !file_seg.starts_with(':') {
+            template_vs_literal = true;
+        }
+    }
+    template_vs_literal
+}
+
+fn joined_acceptable(failing: &[&SecuredView]) -> (Vec<String>, bool) {
+    let mut out: Vec<String> = Vec::new();
+    for view in failing {
+        for name in &view.acceptable {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+    }
+    (out, failing.iter().any(|v| v.unknown))
 }
 
 pub(crate) fn unmatched_security_message(file: &Path) -> String {
@@ -1488,11 +1890,15 @@ fn match_key(axum_path: &str) -> String {
 /// only that), in spec order, deduped. `None` when the operation requires no
 /// security at all.
 fn acceptable_schemes(op: &Operation) -> Option<Vec<String>> {
-    if !op.security_alternatives.iter().any(|alt| !alt.is_empty()) {
+    acceptable_from_alternatives(&op.security_alternatives)
+}
+
+fn acceptable_from_alternatives(alternatives: &[Vec<String>]) -> Option<Vec<String>> {
+    if !alternatives.iter().any(|alt| !alt.is_empty()) {
         return None;
     }
     let mut out: Vec<String> = Vec::new();
-    for first in op.security_alternatives.iter().filter_map(|alt| alt.first()) {
+    for first in alternatives.iter().filter_map(|alt| alt.first()) {
         if !out.contains(first) {
             out.push(first.clone());
         }
@@ -1503,9 +1909,19 @@ fn acceptable_schemes(op: &Operation) -> Option<Vec<String>> {
 /// Compares every readable endpoint file's `security` against what
 /// `openapi.yaml` requires for the operation it maps to. Read-only; opens no
 /// connections.
-pub(crate) fn security_check(endpoints_root: &Path, doc: &crate::openapi::OpenApiDocument) -> SecurityCheck {
+#[cfg(test)]
+pub(crate) fn security_check(tree: &EndpointTree, doc: &crate::openapi::OpenApiDocument) -> SecurityCheck {
+    let plan = RoutePlan::build(tree, doc.method_case, &RouteContext::endpoints_only());
+    security_check_with_routes(tree, doc, &plan)
+}
+
+/// `security_check` plus the routing questions: which less-protected route or built-in
+/// would answer a secured operation that has no file of its own, and which unmatched
+/// files stand in for a secured operation under another spelling or template.
+pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::openapi::OpenApiDocument, plan: &RoutePlan) -> SecurityCheck {
     let mut check = SecurityCheck::default();
-    for (url_path, method, file) in discover_endpoint_files(endpoints_root, doc.method_case) {
+    let views = secured_views(doc);
+    for (url_path, method, file) in discover_endpoint_files(tree, doc.method_case) {
         let Ok(contents) = std::fs::read_to_string(&file) else { continue };
         let Ok(endpoint) = serde_json::from_str::<EndpointFile>(&contents) else { continue };
         let stub = endpoint.security;
@@ -1535,7 +1951,62 @@ pub(crate) fn security_check(endpoints_root: &Path, doc: &crate::openapi::OpenAp
                 .collect();
         }
         if matched.is_empty() {
-            check.unmatched.push(file);
+            let wire = match method_token::parse_file_token(&method, doc.method_case) {
+                TokenStatus::Valid(token) => token.wire().into_owned(),
+                _ => method.to_ascii_uppercase(),
+            };
+            let stale: Vec<&SecuredView> = views
+                .iter()
+                .filter(|v| {
+                    matches!(v.origin, ShadowOrigin::Served | ShadowOrigin::Dropped)
+                        && view_matches_path(v, &url_path)
+                        && v.wire.eq_ignore_ascii_case(&wire)
+                        && (v.wire != wire || matches!(v.origin, ShadowOrigin::Dropped))
+                })
+                .collect();
+            let instances: Vec<&SecuredView> = views
+                .iter()
+                .filter(|v| {
+                    (v.wire == wire || (v.wire == "HEAD" && wire == "GET"))
+                        && match &v.origin {
+                            ShadowOrigin::Skipped(_) => crate::openapi::route_syntax::probe_path(&v.path).is_ok(),
+                            _ => true,
+                        }
+                        && is_template_instance(v, &url_path)
+                })
+                .collect();
+            let mut refused = false;
+            let failing_stale: Vec<&SecuredView> = stale.iter().copied().filter(|v| stub_fails(&stub, v)).collect();
+            if !failing_stale.is_empty() {
+                let (acceptable, unknown) = joined_acceptable(&failing_stale);
+                check.stale_variants.push(StaleVariant {
+                    method: method.clone(),
+                    url_path: url_path.clone(),
+                    file: file.clone(),
+                    file_security: stub.clone(),
+                    operations: failing_stale.iter().map(|v| view_label(v)).collect(),
+                    acceptable,
+                    unknown,
+                });
+                refused = true;
+            }
+            let failing_instances: Vec<&SecuredView> = instances.iter().copied().filter(|v| stub_fails(&stub, v)).collect();
+            if !failing_instances.is_empty() {
+                let (acceptable, unknown) = joined_acceptable(&failing_instances);
+                check.template_instances.push(TemplateInstance {
+                    method: method.clone(),
+                    url_path: url_path.clone(),
+                    file: file.clone(),
+                    file_security: stub.clone(),
+                    operations: failing_instances.iter().map(|v| view_label(v)).collect(),
+                    acceptable,
+                    unknown,
+                });
+                refused = true;
+            }
+            if !refused {
+                check.unmatched.push(file);
+            }
             continue;
         }
 
@@ -1560,6 +2031,82 @@ pub(crate) fn security_check(endpoints_root: &Path, doc: &crate::openapi::OpenAp
             });
         }
     }
+
+    let mut seen: std::collections::HashSet<(String, String, PathBuf)> = std::collections::HashSet::new();
+    let mut seen_builtin: std::collections::HashSet<(String, String, &'static str)> = std::collections::HashSet::new();
+    for view in &views {
+        let probe = match crate::openapi::route_syntax::probe_path(&view.path) {
+            Ok(probe) => probe,
+            Err(_) => {
+                if let ShadowOrigin::Skipped(reason) = &view.origin {
+                    check.unverifiable.push(UnverifiableSecuredPath {
+                        op_method: view.wire.clone(),
+                        op_path: view.path.clone(),
+                        reason: reason.clone(),
+                        acceptable: view.acceptable.clone(),
+                        unknown: view.unknown,
+                    });
+                }
+                continue;
+            }
+        };
+        let Some(route) = plan.resolve(&probe) else { continue };
+        if let Some(planned) = route.files.iter().find(|f| f.wire == view.wire || (view.wire == "HEAD" && f.wire == "GET")) {
+            if let Some((axum_path, token)) = &view.own
+                && planned.token == *token
+                && (route.path == *axum_path || match_key(&route.path) == match_key(axum_path))
+            {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(&planned.file) else { continue };
+            let Ok(endpoint) = serde_json::from_str::<EndpointFile>(&contents) else { continue };
+            if !stub_fails(&endpoint.security, view) {
+                continue;
+            }
+            if !seen.insert((view.wire.clone(), view.path.clone(), planned.file.clone())) {
+                continue;
+            }
+            check.shadowed.push(SecurityShadow {
+                op_method: view.wire.clone(),
+                op_path: view.path.clone(),
+                operation_id: view.operation_id.clone(),
+                origin: view.origin.clone(),
+                served_route: route.path.clone(),
+                file: planned.file.clone(),
+                file_security: endpoint.security,
+                acceptable: view.acceptable.clone(),
+                unknown: view.unknown,
+            });
+        } else if let Some(builtin) = &route.builtin
+            && builtin.methods.contains(&view.wire.as_str())
+        {
+            if !seen_builtin.insert((view.wire.clone(), view.path.clone(), builtin.label)) {
+                continue;
+            }
+            let shadow = BuiltinShadow {
+                op_method: view.wire.clone(),
+                op_path: view.path.clone(),
+                operation_id: view.operation_id.clone(),
+                origin: view.origin.clone(),
+                acceptable: view.acceptable.clone(),
+                unknown: view.unknown,
+                label: builtin.label,
+                field: builtin.field,
+                inherited: view.inherited,
+            };
+            if view.inherited && builtin.inherited_exempt {
+                check.builtin_warnings.push(shadow.message());
+            } else {
+                check.builtin_refusals.push(shadow);
+            }
+        }
+    }
+    check.shadowed.sort_by_key(SecurityShadow::message);
+    check.unverifiable.sort_by_key(UnverifiableSecuredPath::message);
+    check.builtin_refusals.sort_by_key(BuiltinShadow::message);
+    check.stale_variants.sort_by_key(StaleVariant::message);
+    check.template_instances.sort_by_key(TemplateInstance::message);
+    check.builtin_warnings.sort();
     check
 }
 
@@ -1570,20 +2117,6 @@ fn ambiguous_spellings<'a>(doc: &'a crate::openapi::OpenApiDocument, url_path: &
         .iter()
         .find(|((path, t), _)| t == token && (axum_style_path(path) == url_path || match_key(&axum_style_path(path)) == key))
         .map(|(_, spellings)| spellings)
-}
-
-/// `{name}` -> `:name`, segment by segment — the same conversion
-/// `url_path_for` does for a filesystem path, applied directly to an
-/// OpenAPI path string instead.
-fn axum_style_path(openapi_path: &str) -> String {
-    openapi_path
-        .split('/')
-        .map(|segment| match segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-            Some(name) => format!(":{name}"),
-            None => segment.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 /// Converts a folder path under `datasources/endpoints/` into an axum route,
@@ -1652,7 +2185,7 @@ mod tests {
         std::fs::write(root.join("cars/{vin}/endpoint.get.test.json"), "{}").unwrap();
         std::fs::write(root.join("cars/{vin}/_backups/endpoint.get.2026-07-30T15-45-40Z.json"), "{}").unwrap();
 
-        let mut found: Vec<(String, String)> = discover_endpoint_files(&root, MethodCase::Default)
+        let mut found: Vec<(String, String)> = discover_endpoint_files(&tree_for_tests(&root), MethodCase::Default)
             .into_iter()
             .map(|(path, method, _)| (path, method))
             .collect();
@@ -1847,6 +2380,7 @@ mod tests {
         let security = Arc::new(SecurityConfig::default());
         let router = build_router(
             &root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(drivers),
             &HashMap::new(),
             errors,
@@ -1913,6 +2447,7 @@ mod tests {
         // `features.rateLimiting` layer, which isn't part of `build_router`.
         let router = build_router(
             &root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(drivers),
             &HashMap::new(),
             errors,
@@ -2006,6 +2541,7 @@ mod tests {
         let security = Arc::new(SecurityConfig::default());
         let router = build_router(
             &root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(drivers),
             &HashMap::new(),
             errors,
@@ -2513,6 +3049,7 @@ mod tests {
         let security = Arc::new(SecurityConfig::default());
         let router = build_router(
             &root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(drivers),
             &HashMap::new(),
             errors,
@@ -2823,6 +3360,7 @@ mod tests {
         let security = Arc::new(SecurityConfig::default());
         let router = build_router(
             &root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(drivers),
             &HashMap::new(),
             errors,
@@ -3787,6 +4325,7 @@ mod tests {
         let security = Arc::new(SecurityConfig::default());
         let router = build_router(
             &root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(drivers),
             &HashMap::new(),
             errors,
@@ -3809,10 +4348,10 @@ mod tests {
 
         let client = reqwest::Client::new();
         let resp = client.get(format!("http://{addr}/pricing")).send().await.unwrap();
-        assert_eq!(resp.status(), 404, "an invalid nested-many config must mean the route was never registered at all");
+        assert_eq!(resp.status(), 503, "an invalid nested-many config keeps the route's slot with a 503 placeholder");
 
         let (count, problems) = validate_endpoint_files(
-            &root.join("datasources/endpoints"),
+            &tree_for_tests(&root.join("datasources/endpoints")),
             &SecurityConfig::default(),
             &HashMap::new(),
             false,
@@ -3887,6 +4426,7 @@ mod tests {
         let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
         let router = build_router(
             &root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(drivers),
             &HashMap::new(),
             Arc::new(errors),
@@ -4046,6 +4586,9 @@ mod tests {
 mod mtls_tests;
 
 #[cfg(test)]
+mod symlink_tests;
+
+#[cfg(test)]
 mod m2_tests {
     use super::*;
 
@@ -4071,6 +4614,7 @@ mod m2_tests {
         let errors = Arc::new(ErrorRegistry::load(&root.join("does-not-exist")).unwrap());
         let router = build_router(
             root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(HashMap::new()),
             &HashMap::new(),
             errors,
@@ -4116,7 +4660,7 @@ mod m2_tests {
         write_endpoint(&root, "a", "get", r#"{ "operationId": "a", "stream": {}, "sources": {}, "response": {} }"#);
         write_endpoint(&root, "b", "get", r#"{ "operationId": "b", "sources": {}, "response": { "stream": "sources.x.y" } }"#);
         write_endpoint(&root, "c", "post", r#"{ "operationId": "c", "stream": null, "sources": {}, "response": {} }"#);
-        let mut files = reserved_stream_key_files(&root.join("datasources/endpoints"), MethodCase::Default);
+        let mut files = reserved_stream_key_files(&tree_for_tests(&root.join("datasources/endpoints")), MethodCase::Default);
         files.sort();
         assert_eq!(files.len(), 2, "{files:?}");
         assert!(files[0].ends_with("a/endpoint.get.json") || files[0].to_string_lossy().contains('a'));
@@ -4195,8 +4739,8 @@ mod m2_tests {
         );
         write_endpoint(&root, "open", "get", r#"{ "operationId": "c", "sources": {}, "response": {} }"#);
         let base = serve(&root, None).await;
-        assert_eq!(reqwest::get(format!("{base}/ref")).await.unwrap().status(), 404);
-        assert_eq!(reqwest::get(format!("{base}/uri")).await.unwrap().status(), 404);
+        assert_eq!(reqwest::get(format!("{base}/ref")).await.unwrap().status(), 503);
+        assert_eq!(reqwest::get(format!("{base}/uri")).await.unwrap().status(), 503);
         assert_eq!(reqwest::get(format!("{base}/open")).await.unwrap().status(), 200);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4254,7 +4798,7 @@ mod m2_7_security_check_tests {
             std::fs::write(d.join(format!("endpoint.{method}.json")), contents).unwrap();
         }
         let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
-        let check = security_check(&endpoints, &doc);
+        let check = security_check(&tree_for_tests(&endpoints), &doc);
         let _ = std::fs::remove_dir_all(&root);
         check
     }
@@ -4544,6 +5088,7 @@ mod m3_router_tests {
         drivers.insert("db".to_string(), Box::new(TestDriver));
         build_router(
             root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(drivers),
             &HashMap::new(),
             Arc::new(ErrorRegistry::load(&errs).unwrap()),
@@ -4803,7 +5348,7 @@ mod m3_router_tests {
         }
         assert_eq!(client.get(format!("{base}/fine")).send().await.unwrap().status(), 200);
 
-        let found = method_file_findings(&root.join("datasources/endpoints"), MethodCase::Default);
+        let found = method_file_findings(&tree_for_tests(&root.join("datasources/endpoints")), MethodCase::Default);
         let mut names: Vec<_> = found
             .iter()
             .map(|f| {
@@ -4836,8 +5381,8 @@ mod m3_router_tests {
         std::fs::write(ep.join("a/_endpoint.GET.json"), "{}").unwrap();
         std::fs::create_dir_all(ep.join("a/_backups")).unwrap();
         std::fs::write(ep.join("a/_backups/endpoint.GET.json"), "{}").unwrap();
-        assert!(method_file_findings(&ep, MethodCase::Default).is_empty());
-        assert!(method_file_findings(&root.join("nope"), MethodCase::Default).is_empty());
+        assert!(method_file_findings(&tree_for_tests(&ep), MethodCase::Default).is_empty());
+        assert!(method_file_findings(&tree_for_tests(&root.join("nope")), MethodCase::Default).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4851,7 +5396,7 @@ mod m3_router_tests {
         for path in ["/o", "/h", "/t"] {
             assert_eq!(reqwest::get(format!("{base}{path}")).await.unwrap().status(), 404, "{path}");
         }
-        assert!(method_file_findings(&root.join("datasources/endpoints"), MethodCase::Default).is_empty());
+        assert!(method_file_findings(&tree_for_tests(&root.join("datasources/endpoints")), MethodCase::Default).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4951,6 +5496,7 @@ mod m4_router_tests {
         drivers.insert("db".to_string(), Box::new(KeyDriver));
         build_router(
             root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(drivers),
             &HashMap::new(),
             Arc::new(ErrorRegistry::load(&errs).unwrap()),
@@ -5226,7 +5772,7 @@ mod m4_router_tests {
         std::fs::write(ep_root.join("a/_backups/endpoint.LINK.json"), "{}").unwrap();
 
         let found = |mode| {
-            let mut v: Vec<(String, String)> = discover_endpoint_files(&ep_root, mode).into_iter().map(|(p, m, _)| (p, m)).collect();
+            let mut v: Vec<(String, String)> = discover_endpoint_files(&tree_for_tests(&ep_root), mode).into_iter().map(|(p, m, _)| (p, m)).collect();
             v.sort();
             v
         };
@@ -5253,7 +5799,7 @@ mod m4_router_tests {
         write_endpoint(&root, "f", "LINK", &ep(200, None));
         let ep_root = root.join("datasources/endpoints");
         let describe = |mode| {
-            let mut v: Vec<(String, String)> = method_file_findings(&ep_root, mode)
+            let mut v: Vec<(String, String)> = method_file_findings(&tree_for_tests(&ep_root), mode)
                 .into_iter()
                 .map(|f| {
                     let what = match &f.kind {
@@ -5291,7 +5837,7 @@ mod m4_router_tests {
     fn a_wrong_mode_finding_message_uses_the_documented_wording() {
         let root = temp_root();
         write_endpoint(&root, "b", "~purge", &ep(200, None));
-        let findings = method_file_findings(&root.join("datasources/endpoints"), MethodCase::Default);
+        let findings = method_file_findings(&tree_for_tests(&root.join("datasources/endpoints")), MethodCase::Default);
         assert_eq!(findings.len(), 1);
         let message = findings[0].message(MethodCase::Default);
         assert!(message.contains("method 'purge' is case-distinct, but caseSensitiveMethods is false"), "{message}");
@@ -5352,7 +5898,7 @@ mod m4_router_tests {
                 },
             )
             .unwrap();
-            let check = security_check(&root.join("datasources/endpoints"), &doc);
+            let check = security_check(&tree_for_tests(&root.join("datasources/endpoints")), &doc);
             assert!(check.ambiguous.is_empty() && check.unmatched.is_empty(), "{mode:?}");
             let mut checked: Vec<(String, String)> = check
                 .mismatches
@@ -5389,7 +5935,7 @@ mod m4_router_tests {
         let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    keyAuth: { type: apiKey, in: header, name: k }\npaths:\n  /x:\n    additionalOperations:\n      purge:\n        operationId: a\n        security: [ { keyAuth: [] } ]\n        responses: { '200': { description: ok } }\n      PURGE:\n        operationId: b\n        responses: { '200': { description: ok } }\n";
         std::fs::write(root.join("openapi.yaml"), yaml).unwrap();
         let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
-        let check = security_check(&root.join("datasources/endpoints"), &doc);
+        let check = security_check(&tree_for_tests(&root.join("datasources/endpoints")), &doc);
         assert_eq!(check.ambiguous.len(), 1);
         assert!(check.mismatches.is_empty() && check.unmatched.is_empty() && check.stricter.is_empty());
         let message = check.ambiguous[0].message();
@@ -5407,14 +5953,15 @@ mod m4_router_tests {
         let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    keyAuth: { type: apiKey, in: header, name: k }\npaths:\n  /x:\n    additionalOperations:\n      get:\n        operationId: lower\n        security: [ { keyAuth: [] } ]\n        responses: { '200': { description: ok } }\n";
         std::fs::write(root.join("openapi.yaml"), yaml).unwrap();
         let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions { case_sensitive_methods: true }).unwrap();
-        let check = security_check(&root.join("datasources/endpoints"), &doc);
+        let check = security_check(&tree_for_tests(&root.join("datasources/endpoints")), &doc);
         // endpoint.get.json is the GET route; the spec declares no GET, only an exact-mode lowercase get.
         assert!(check.mismatches.is_empty(), "no spec operation maps to the GET file's token");
         assert_eq!(
-            check.unmatched.len(),
+            check.stale_variants.len(),
             1,
-            "the stale GET file is unmatched, never silently matched to the lowercase get"
+            "the stale GET file is never silently matched to the lowercase get; it is a stale variant of a secured operation"
         );
+        assert!(check.unmatched.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5425,7 +5972,7 @@ mod m4_router_tests {
         let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    keyAuth: { type: apiKey, in: header, name: k }\npaths:\n  /x:\n    get:\n      operationId: upper\n      responses: { '200': { description: ok } }\n    additionalOperations:\n      get:\n        operationId: lower\n        security: [ { keyAuth: [] } ]\n        responses: { '200': { description: ok } }\n";
         std::fs::write(root.join("openapi.yaml"), yaml).unwrap();
         let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions { case_sensitive_methods: true }).unwrap();
-        let check = security_check(&root.join("datasources/endpoints"), &doc);
+        let check = security_check(&tree_for_tests(&root.join("datasources/endpoints")), &doc);
         assert_eq!(check.mismatches.len(), 1, "the ~get stub must satisfy the lowercase get operation's security");
         assert_eq!(check.mismatches[0].matched, vec![("get".to_string(), "/x".to_string())]);
         let _ = std::fs::remove_dir_all(&root);
@@ -5586,6 +6133,7 @@ mod m4_router_tests {
         .unwrap();
         build_router(
             root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(HashMap::new()),
             &HashMap::new(),
             Arc::new(ErrorRegistry::load(&errs).unwrap()),
@@ -5679,17 +6227,18 @@ mod m4_router_tests {
     }
 
     #[tokio::test]
-    async fn known_gap_an_open_stale_upper_purge_file_is_served_with_only_an_unmatched_warning_in_exact_mode() {
-        // DELIBERATE CURRENT BEHAVIOUR (documented gap): in exact mode the spec declares a *secured* `purge`
-        // (token `~purge`). A leftover open endpoint.PURGE.json has no operation in the spec, so the startup
-        // check reports it only as "unmatched" (a warning) and it keeps being served, unprotected.
+    async fn an_open_stale_upper_purge_file_is_a_stale_variant_refusal_in_exact_mode() {
+        // In exact mode the spec declares a *secured* `purge` (token `~purge`). A leftover open
+        // endpoint.PURGE.json has no operation in the spec, but differs from it only by case: the startup
+        // check reports it as a stale variant (a refusal); the router itself still serves it.
         let root = temp_root();
         write_endpoint(&root, "x", "PURGE", &ep(202, None));
         std::fs::write(root.join("openapi.yaml"), secured_spec("purge")).unwrap();
         let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions { case_sensitive_methods: true }).unwrap();
-        let check = security_check(&root.join("datasources/endpoints"), &doc);
+        let check = security_check(&tree_for_tests(&root.join("datasources/endpoints")), &doc);
         assert!(check.mismatches.is_empty(), "no refusal at startup");
-        assert_eq!(check.unmatched.len(), 1, "only an unmatched warning");
+        assert_eq!(check.stale_variants.len(), 1, "a stale-variant refusal");
+        assert!(check.unmatched.is_empty());
         let addr = spawn_served(router_for(&root, MethodCase::Exact), true).await;
         assert_eq!(raw_status(addr, "PURGE", "/x", "").await.0, 202, "the stale open route is served without credentials");
         assert_eq!(raw_status(addr, "purge", "/x", "").await.0, 405, "the secured spelling has no file yet");
@@ -5697,10 +6246,9 @@ mod m4_router_tests {
     }
 
     #[tokio::test]
-    async fn known_gap_an_operation_dropped_for_a_missing_operation_id_leaves_its_hand_made_file_unmatched_and_served() {
-        // DELIBERATE CURRENT BEHAVIOUR (documented gap): an additionalOperations entry without an operationId
-        // is skipped at load (S3), so a hand-made open endpoint.LINK.json is merely "unmatched" and is served
-        // even though the dropped entry declared security. `strictOpenApi` is what turns the S3 into a refusal.
+    async fn an_operation_dropped_for_a_missing_operation_id_makes_its_open_hand_made_file_a_stale_variant_refusal() {
+        // An additionalOperations entry without an operationId is skipped at load (S3); its security is
+        // still read, so a hand-made open endpoint.LINK.json is a stale-variant refusal, not just "unmatched".
         let root = temp_root();
         write_endpoint(&root, "x", "LINK", &ep(202, None));
         let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    keyAuth: { type: apiKey, in: header, name: X-Api-Key }\npaths:\n  /x:\n    additionalOperations:\n      LINK:\n        security: [ { keyAuth: [] } ]\n        responses: { '200': { description: ok } }\n";
@@ -5708,9 +6256,10 @@ mod m4_router_tests {
         let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
         assert!(doc.operations.is_empty());
         assert!(doc.issues.iter().any(|i| i.kind == crate::openapi::IssueKind::InvalidAdditionalOperation));
-        let check = security_check(&root.join("datasources/endpoints"), &doc);
+        let check = security_check(&tree_for_tests(&root.join("datasources/endpoints")), &doc);
         assert!(check.mismatches.is_empty());
-        assert_eq!(check.unmatched.len(), 1);
+        assert_eq!(check.stale_variants.len(), 1);
+        assert!(check.unmatched.is_empty());
         let addr = spawn_served(router_for(&root, MethodCase::Default), false).await;
         assert_eq!(raw_status(addr, "LINK", "/x", "").await.0, 202);
         let _ = std::fs::remove_dir_all(&root);
@@ -5736,7 +6285,7 @@ mod m4_router_tests {
                 if mode == MethodCase::Default { 202 } else { 405 },
                 "{mode:?}: endpoint.purge.json is never what answers a request"
             );
-            let findings = method_file_findings(&root.join("datasources/endpoints"), mode);
+            let findings = method_file_findings(&tree_for_tests(&root.join("datasources/endpoints")), mode);
             assert_eq!(findings.len(), 1, "{mode:?}");
             assert!(findings[0].file.ends_with("endpoint.purge.json"));
         }
@@ -5755,7 +6304,7 @@ mod m4_router_tests {
         for mode in [MethodCase::Default, MethodCase::Exact] {
             let addr = spawn_served(router_for(&root, mode), mode == MethodCase::Exact).await;
             assert_eq!(raw_status(addr, "GET", "/t", "").await.0, 200, "{mode:?}");
-            let found: Vec<_> = discover_endpoint_files(&root.join("datasources/endpoints"), mode)
+            let found: Vec<_> = discover_endpoint_files(&tree_for_tests(&root.join("datasources/endpoints")), mode)
                 .into_iter()
                 .map(|(_, m, _)| m)
                 .collect();
@@ -5800,7 +6349,7 @@ mod m4_security_tests {
             },
         )
         .unwrap();
-        let result = security_check(&root.join("datasources/endpoints"), &doc);
+        let result = security_check(&tree_for_tests(&root.join("datasources/endpoints")), &doc);
         let _ = std::fs::remove_dir_all(&root);
         (result, doc)
     }
@@ -5830,7 +6379,7 @@ mod m4_security_tests {
         )
         .unwrap();
         let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
-        let result = security_check(&root.join("datasources/endpoints"), &doc);
+        let result = security_check(&tree_for_tests(&root.join("datasources/endpoints")), &doc);
         assert_eq!(result.mismatches.len(), 1);
         let message = result.mismatches[0].message();
         assert!(
@@ -5884,9 +6433,11 @@ mod m4_security_tests {
         assert!(bad.mismatches[0].message().starts_with("purge /x ("), "{}", bad.mismatches[0].message());
         let (good, _) = check(yaml, "~purge", Some("a"), MethodCase::Exact);
         assert!(good.mismatches.is_empty() && good.unmatched.is_empty());
-        // An uppercase PURGE stub has no operation under exact mode: unmatched, never silently checked against `purge`.
+        // An uppercase PURGE stub has no operation under exact mode: never silently checked against `purge`
+        // (not a mismatch), but an open one is a stale variant of the secured `purge`.
         let (other, _) = check(yaml, "PURGE", None, MethodCase::Exact);
         assert!(other.mismatches.is_empty());
-        assert_eq!(other.unmatched.len(), 1);
+        assert_eq!(other.stale_variants.len(), 1);
+        assert!(other.unmatched.is_empty());
     }
 }

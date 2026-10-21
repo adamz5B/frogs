@@ -4,16 +4,26 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::config::EndpointSymlinks;
 use crate::config::{Config, ServerConfig};
 use crate::openapi::dir_index::{
-    DirIndex, DirState, EndpointFsError, EntryKind, FileState, Lookup, check_file, create_endpoint_dir, create_new_file, fold, rename_checked, resolve_endpoint_dir,
+    DirIndex, DirState, EndpointFsError, EntryKind, FileState, Lookup, check_file, check_file_with, copy_into_checked, create_dir_checked, create_dirs_checked,
+    create_endpoint_dir, create_new_checked, create_new_file, fold, rename_checked_with, resolve_endpoint_dir, write_existing_file,
 };
+#[cfg(test)]
+use crate::openapi::endpoint_tree::tree_for_tests;
+use crate::openapi::endpoint_tree::{EndpointTree, LeafRule, LinkContext, LinkFindingKind, ProjectBoundary};
 use crate::openapi::method_token::{self, MethodCase, TokenStatus};
 use crate::openapi::path_rules::is_single_normal_component;
 use crate::openapi::{
     LoadIssue, OpenApiDocument, Operation, ResponseMode, Severity, StreamSpec, content_hash, merge_stub_response, stub_from_descriptor, untrusted, walk_response_schema,
 };
 use crate::project::{MANIFEST_FILE, find_files_with_extensions, require_project_root};
+
+#[cfg(test)]
+fn test_ctx(root: &Path) -> LinkContext {
+    LinkContext::new(root, EndpointSymlinks::Contained)
+}
 
 /// Files `generate --role web` scans the project root for (non-recursive —
 /// see `find_files_with_extensions`) to confirm there's a static project
@@ -111,18 +121,34 @@ pub(crate) fn print_issues(issues: &[LoadIssue]) {
 
 pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
     let api_root = crate::project::api_base(root);
-    scaffold_config(&api_root)?;
     let mut outcome = GenerateOutcome::default();
+
+    // Nothing is created, not even the scaffold, until every place generate
+    // will write resolves inside the project — whatever `server.json` says.
+    let boundary = ProjectBoundary::new(root);
+    if let Err(e) = write_gate(&boundary, &api_root) {
+        eprintln!("error: {e}");
+        eprintln!("error: nothing was generated — fix the link or folder above and re-run");
+        outcome.errors.push(e.to_string());
+        return Ok(outcome);
+    }
+    scaffold_config(&boundary, &api_root)?;
 
     let config = Config::load_or_exit(&api_root);
     println!(
-        "loaded config — debugMode={}, {} connection(s), {} error code(s), strictOpenApi={}, caseSensitiveMethods={}",
+        "loaded config — debugMode={}, {} connection(s), {} error code(s), strictOpenApi={}, caseSensitiveMethods={}, endpointSymlinks={}",
         config.server.debug_mode,
         config.connections.len(),
         config.errors.len(),
         config.server.strict_open_api(),
-        config.server.case_sensitive_methods()
+        config.server.case_sensitive_methods(),
+        config.server.endpoint_symlinks().as_str()
     );
+    let ctx = LinkContext {
+        boundary,
+        policy: config.server.endpoint_symlinks(),
+    };
+    let endpoints_root = api_root.join("datasources/endpoints");
 
     let doc = match crate::openapi::load(&root.join(MANIFEST_FILE), config.server.openapi_load_options()) {
         Ok(doc) => doc,
@@ -138,19 +164,26 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
     }
     print_issues(&doc.issues);
 
-    let plan = plan_endpoint_files(&api_root, &doc);
+    let tree = EndpointTree::scan(&ctx, &endpoints_root);
+    let plan = plan_endpoint_files(&api_root, &doc, &tree, &ctx);
     for error in &plan.errors {
         eprintln!("error: {}", error.message);
     }
 
-    for message in plan.invalid_tokens.iter().chain(&plan.wrong_mode) {
+    let links = link_report(&tree);
+    for message in &links.errors {
+        eprintln!("error: {message}");
+    }
+    for message in plan.invalid_tokens.iter().chain(&plan.wrong_mode).chain(&links.warnings) {
         eprintln!("warning: {message}");
     }
 
     let strict_findings = doc.issues.iter().filter(|i| i.kind.is_strict_error()).count()
         + plan.errors.iter().filter(|e| e.strict).count()
         + plan.invalid_tokens.len()
-        + plan.wrong_mode.len();
+        + plan.wrong_mode.len()
+        + links.errors.len()
+        + links.warnings.len();
     if strict_findings > 0 {
         if config.server.strict_open_api() {
             eprintln!(
@@ -166,9 +199,10 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
         .errors
         .extend(doc.issues.iter().filter(|i| i.severity == Severity::Error).map(|i| i.message.clone()));
     outcome.errors.extend(plan.errors.iter().map(|e| e.message.clone()));
+    outcome.errors.extend(links.errors);
 
     let mut file_errors = Vec::new();
-    let (components, changed_components) = resolve_and_write_components(&api_root, &doc, &mut file_errors)?;
+    let (components, changed_components) = resolve_and_write_components(&ctx.boundary, &api_root, &doc, &mut file_errors)?;
     if !components.is_empty() {
         let mut names: Vec<&String> = components.keys().collect();
         names.sort();
@@ -187,7 +221,7 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
         );
     }
 
-    let restored = restore_orphaned_endpoints(&api_root, &doc, &plan.skip, &mut file_errors)?;
+    let restored = restore_orphaned_endpoints(&ctx, &api_root, &doc, &plan.skip, &mut file_errors)?;
     for (path, method) in &restored {
         println!(
             "  restoring {} {} (was orphaned) — will run through the normal migration flow below",
@@ -198,6 +232,7 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
 
     let restored_set: HashSet<(String, String)> = restored.into_iter().collect();
     let summary = write_endpoint_files(
+        &ctx,
         &api_root,
         &doc,
         &components,
@@ -213,7 +248,9 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
         summary.skipped, summary.created, summary.migrated, summary.drift_warned
     );
 
-    let orphaned = mark_orphaned_endpoints(&api_root, &doc, &plan.rejected_paths, &plan.protected_files, &mut file_errors)?;
+    // What the write phase just created or renamed is on disk now; the orphan pass and the final checks read the fresh state.
+    let tree = EndpointTree::scan(&ctx, &endpoints_root);
+    let orphaned = mark_orphaned_endpoints(&ctx, &tree, &doc, &plan.rejected_paths, &plan.protected_files, &mut file_errors)?;
     for (path, method) in &orphaned {
         println!(
             "  {} {} no longer in {MANIFEST_FILE} — prefixed with _ (never deleted; restores automatically \
@@ -232,7 +269,7 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
     }
     outcome.errors.extend(file_errors);
 
-    let validation_errors = validate_success_statuses(&api_root, &doc);
+    let validation_errors = validate_success_statuses(&tree, &doc);
     for error in &validation_errors {
         eprintln!("error: {error}");
     }
@@ -245,19 +282,61 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
         outcome.errors.extend(validation_errors);
     }
 
-    let security = crate::endpoint::security_check(&api_root.join("datasources/endpoints"), &doc);
-    for mismatch in &security.mismatches {
-        let message = mismatch.message();
+    use crate::endpoint::route_plan::{RootExtras, RouteContext, RoutePlan};
+    let strict = config.server.strict_open_api();
+    let method_case = crate::openapi::method_token::MethodCase::from_case_sensitive(config.server.case_sensitive_methods());
+    let route_ctx = RouteContext::for_server(&config.server).with_extras(RootExtras {
+        web: root.join("webserve.json").is_file(),
+        control_plane: false,
+    });
+    let route_plan = RoutePlan::build(&tree, method_case, &route_ctx);
+    for problem in route_plan.warnings(strict) {
+        eprintln!("warning: {}", problem.message());
+    }
+    for problem in route_plan.refusals(strict) {
+        eprintln!("error: {}", problem.message());
+        outcome.errors.push(problem.message().to_string());
+    }
+    let with_control_plane = RoutePlan::build(
+        &tree,
+        method_case,
+        &route_ctx.clone().with_extras(RootExtras {
+            web: route_ctx.extras.web,
+            control_plane: true,
+        }),
+    );
+    for problem in with_control_plane.refusals(strict) {
+        if !route_plan.problems.contains(problem) {
+            let message = format!("{} (frogs test would refuse to start)", problem.message());
+            eprintln!("error: {message}");
+            outcome.errors.push(message);
+        }
+    }
+
+    let security = crate::endpoint::security_check_with_routes(&tree, &doc, &route_plan);
+    let mut security_errors: Vec<String> = Vec::new();
+    security_errors.extend(security.mismatches.iter().map(|m| m.message()));
+    security_errors.extend(security.ambiguous.iter().map(|m| m.message()));
+    security_errors.extend(security.stale_variants.iter().map(|m| m.message()));
+    security_errors.extend(security.template_instances.iter().map(|m| m.message()));
+    security_errors.extend(security.shadowed.iter().map(|m| m.message()));
+    security_errors.extend(security.unverifiable.iter().map(|m| m.message()));
+    security_errors.extend(security.builtin_refusals.iter().map(|m| m.message()));
+    for message in security_errors {
         eprintln!("error: {message}");
         outcome.errors.push(message);
     }
-    for file in &security.ambiguous {
-        let message = file.message();
-        eprintln!("error: {message}");
-        outcome.errors.push(message);
+    for message in &security.builtin_warnings {
+        eprintln!("warning: {message}");
     }
     for file in &security.unmatched {
-        eprintln!("warning: {}", crate::endpoint::unmatched_security_message(file));
+        let message = crate::endpoint::unmatched_security_message(file);
+        if strict {
+            eprintln!("error: {message} (\"strictOpenApi\" is true)");
+            outcome.errors.push(message);
+        } else {
+            eprintln!("warning: {message}");
+        }
     }
     if !security.mismatches.is_empty() || !security.unmatched.is_empty() {
         println!("note: generate never changes an existing endpoint file's \"security\" — edit it by hand");
@@ -312,23 +391,27 @@ fn mutual_tls_hints(doc: &crate::openapi::OpenApiDocument, security: &crate::sec
 /// endpoint stub) has no natural place for a `_todo`-style marker without
 /// changing the on-disk shape every existing project's `connections.json`
 /// already uses.
-fn scaffold_config(api_root: &Path) -> io::Result<()> {
+fn scaffold_config(boundary: &ProjectBoundary, api_root: &Path) -> io::Result<()> {
     write_if_absent(
+        boundary,
         &api_root.join("config/server.json"),
         &serde_json::to_string_pretty(&ServerConfig::default()).expect("always serializes"),
         "config/server.json",
     )?;
     write_if_absent(
+        boundary,
         &api_root.join("config/errors/core.json"),
         &serde_json::to_string_pretty(&default_core_errors()).expect("always serializes"),
         "config/errors/core.json",
     )?;
     write_if_absent(
+        boundary,
         &api_root.join("config/connections.json"),
         "{}",
         "config/connections.json (empty — add your SQL connections here)",
     )?;
     write_if_absent(
+        boundary,
         &api_root.join("security/schemes.json"),
         "{}",
         "security/schemes.json (empty — add security schemes + verifiers here, or leave empty if this API needs none)",
@@ -336,14 +419,37 @@ fn scaffold_config(api_root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn write_if_absent(path: &Path, contents: &str, message: &str) -> io::Result<()> {
-    if path.is_file() {
-        return Ok(());
+/// Every scaffold file, relative to `api/`.
+const SCAFFOLD_FILES: [&str; 4] = ["config/server.json", "config/errors/core.json", "config/connections.json", "security/schemes.json"];
+
+/// Read-only: confirms every folder and file `generate` is about to write
+/// resolves inside the project (a dangling link counts as outside), so a
+/// planted link can't redirect the scaffold, the endpoint folders or the
+/// component cache. `frogs validate` reports the same failure.
+pub(crate) fn write_gate(boundary: &ProjectBoundary, api_root: &Path) -> Result<(), EndpointFsError> {
+    boundary.check_write_target(api_root, LeafRule::Dir)?;
+    for dir in ["config", "config/errors", "security", "datasources/endpoints", "datasources/components"] {
+        boundary.check_write_target(&api_root.join(dir), LeafRule::Dir)?;
+    }
+    for file in SCAFFOLD_FILES {
+        boundary.check_write_target(&api_root.join(file), LeafRule::NoLink)?;
+    }
+    Ok(())
+}
+
+fn write_if_absent(boundary: &ProjectBoundary, path: &Path, contents: &str, message: &str) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => return Err(EndpointFsError::Symlink { at: path.to_path_buf() }.into()),
+        Ok(meta) if meta.is_file() => return Ok(()),
+        Ok(_) => return Err(EndpointFsError::NotARegularFile { at: path.to_path_buf() }.into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_dirs_checked(boundary, parent)?;
     }
-    std::fs::write(path, contents)?;
+    let name = path.file_name().and_then(|n| n.to_str()).expect("scaffold paths always end in a file name");
+    create_new_checked(boundary, path.parent().expect("a file always has a parent"), name, contents.as_bytes())?;
     println!("wrote {message}");
     Ok(())
 }
@@ -438,7 +544,12 @@ fn generate_web(root: &Path, web_files: &[PathBuf]) -> io::Result<()> {
 /// whose resolved shape changed since the last run. A component whose name
 /// can't safely be a file name, or whose cache file can't safely be written,
 /// is never written and always counts as changed.
-fn resolve_and_write_components(root: &Path, doc: &OpenApiDocument, errors: &mut Vec<String>) -> io::Result<(HashMap<String, Value>, HashSet<String>)> {
+fn resolve_and_write_components(
+    boundary: &ProjectBoundary,
+    root: &Path,
+    doc: &OpenApiDocument,
+    errors: &mut Vec<String>,
+) -> io::Result<(HashMap<String, Value>, HashSet<String>)> {
     let descriptors = doc.resolve_components();
     let dir = root.join("datasources/components");
 
@@ -452,7 +563,7 @@ fn resolve_and_write_components(root: &Path, doc: &OpenApiDocument, errors: &mut
         }
         Ok(_) => true,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(&dir)?;
+            create_dirs_checked(boundary, &dir)?;
             true
         }
         Err(e) => return Err(e),
@@ -497,17 +608,22 @@ fn resolve_and_write_components(root: &Path, doc: &OpenApiDocument, errors: &mut
         }
 
         let contents = serde_json::to_string_pretty(&with_hash(&new_hash, descriptor)).expect("always serializes");
-        if existing {
-            std::fs::write(&path, contents)?;
+        let written = if existing {
+            write_existing_file(boundary, &dir, &file_name, contents.as_bytes())
         } else {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => std::io::Write::write_all(&mut file, contents.as_bytes())?,
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    errors.push(format!("{} already exists in a different letter case — refusing to overwrite it", path.display()));
-                    changed.insert(name.clone());
-                }
-                Err(e) => return Err(e),
+            create_new_checked(boundary, &dir, &file_name, contents.as_bytes())
+        };
+        match written {
+            Ok(()) => {}
+            Err(EndpointFsError::AlreadyExists { .. }) if !existing => {
+                errors.push(format!("{} already exists in a different letter case — refusing to overwrite it", path.display()));
+                changed.insert(name.clone());
             }
+            Err(e) if e.is_strict_error() => {
+                errors.push(format!("{}: {e}", path.display()));
+                changed.insert(name.clone());
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 
@@ -562,9 +678,9 @@ fn endpoint_segments(path: &str) -> Result<Vec<&str>, EndpointFsError> {
 
 /// Maps an OpenAPI path to its folder under `endpoints_root` without
 /// creating anything, refusing symlinks and case-variant folders on the way.
-fn endpoint_dir(endpoints_root: &Path, path: &str) -> Result<DirState, EndpointFsError> {
+fn endpoint_dir(ctx: &LinkContext, endpoints_root: &Path, path: &str) -> Result<DirState, EndpointFsError> {
     let segments = endpoint_segments(path)?;
-    let state = resolve_endpoint_dir(endpoints_root, &segments)?;
+    let state = resolve_endpoint_dir(ctx, endpoints_root, &segments)?;
     if !state.path().starts_with(endpoints_root) {
         return Err(EndpointFsError::Containment(format!(
             "path '{}' resolves outside the endpoints folder",
@@ -574,9 +690,9 @@ fn endpoint_dir(endpoints_root: &Path, path: &str) -> Result<DirState, EndpointF
     Ok(state)
 }
 
-fn create_endpoint_dir_for(endpoints_root: &Path, path: &str) -> Result<PathBuf, EndpointFsError> {
+fn create_endpoint_dir_for(ctx: &LinkContext, endpoints_root: &Path, path: &str) -> Result<PathBuf, EndpointFsError> {
     let segments = endpoint_segments(path)?;
-    let dir = create_endpoint_dir(endpoints_root, &segments)?;
+    let dir = create_endpoint_dir(ctx, endpoints_root, &segments)?;
     if !dir.starts_with(endpoints_root) {
         return Err(EndpointFsError::Containment(format!(
             "path '{}' resolves outside the endpoints folder",
@@ -589,6 +705,7 @@ fn create_endpoint_dir_for(endpoints_root: &Path, path: &str) -> Result<PathBuf,
 /// The reverse of `endpoint_dir`: given a folder under
 /// `datasources/endpoints/`, what OpenAPI path does it represent. An empty
 /// relative path (the `endpoints/` folder itself) maps back to `/`.
+#[cfg(test)]
 fn path_for_endpoint_dir(endpoints_root: &Path, dir: &Path) -> String {
     let relative = dir.strip_prefix(endpoints_root).unwrap_or(dir);
     if relative.as_os_str().is_empty() {
@@ -629,14 +746,37 @@ pub(crate) struct Plan {
 /// conflicts, symlinks, containment failures and folder-claim collisions
 /// before a single byte is written, so `strictOpenApi` can refuse cleanly
 /// and `validate` can report the same problems without writing.
-pub(crate) fn plan_endpoint_files(api_root: &Path, doc: &OpenApiDocument) -> Plan {
+/// What the endpoint tree's link findings amount to: under `refuse` every
+/// refusal is an error (as it always was), every other finding a warning —
+/// all of them strict-class.
+#[derive(Debug, Default)]
+pub(crate) struct LinkReport {
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+pub(crate) fn link_report(tree: &EndpointTree) -> LinkReport {
+    let mut report = LinkReport::default();
+    for finding in tree.findings() {
+        let message = finding.message(tree.policy());
+        if tree.policy() == EndpointSymlinks::Refuse && finding.kind == LinkFindingKind::Refused {
+            report.errors.push(message);
+        } else {
+            report.warnings.push(message);
+        }
+    }
+    report
+}
+
+pub(crate) fn plan_endpoint_files(api_root: &Path, doc: &OpenApiDocument, tree: &EndpointTree, ctx: &LinkContext) -> Plan {
     let endpoints_root = api_root.join("datasources/endpoints");
     let mut plan = Plan::default();
     let mut claimed: HashMap<String, String> = HashMap::new();
+    let mut physical_claimed: HashMap<String, String> = HashMap::new();
     let mut handled: HashSet<&str> = HashSet::new();
 
     let mode = doc.method_case;
-    let findings = crate::endpoint::method_file_findings(&endpoints_root, mode);
+    let findings = crate::endpoint::method_file_findings(tree, mode);
     plan.invalid_tokens = findings
         .iter()
         .filter(|f| matches!(f.kind, crate::endpoint::MethodFileKind::NonCanonical { .. }))
@@ -653,8 +793,26 @@ pub(crate) fn plan_endpoint_files(api_root: &Path, doc: &OpenApiDocument) -> Pla
         plan.protected_files.insert((fold(path), token.clone()));
     }
 
+    // Two spec paths that reach one physical folder (one through a link) claim
+    // it in this order: paths with no link on the way first, then the rest,
+    // each in spec order — so a real folder always beats a link to it.
+    let mut distinct_paths: Vec<&str> = Vec::new();
     for op in &doc.operations {
-        let path = op.path.as_str();
+        if !distinct_paths.contains(&op.path.as_str()) {
+            distinct_paths.push(op.path.as_str());
+        }
+    }
+    let is_linked = |path: &str| match endpoint_segments(path) {
+        Ok(segments) => {
+            let mut full = endpoints_root.clone();
+            full.extend(&segments);
+            ctx.boundary.path_has_link(&full)
+        }
+        Err(_) => false,
+    };
+    let (linked_paths, plain_paths): (Vec<&str>, Vec<&str>) = distinct_paths.into_iter().partition(|path| is_linked(path));
+
+    for path in plain_paths.into_iter().chain(linked_paths) {
         if !handled.insert(path) {
             continue;
         }
@@ -692,13 +850,33 @@ pub(crate) fn plan_endpoint_files(api_root: &Path, doc: &OpenApiDocument) -> Pla
             claimed.insert(key, path.to_string());
         }
 
-        let state = match endpoint_dir(&endpoints_root, path) {
+        let state = match endpoint_dir(ctx, &endpoints_root, path) {
             Ok(state) => state,
             Err(e) => {
                 reject(&mut plan, e.is_strict_error(), format!("{} {}: {e}", describe_ops(&ops_here), untrusted(path)));
                 continue;
             }
         };
+        if let Some(key) = physical_claim_key(&state) {
+            match physical_claimed.get(&key) {
+                Some(first) if first != path => {
+                    reject(
+                        &mut plan,
+                        true,
+                        format!(
+                            "path '{}' resolves to the same folder as '{}' (through a link) — skipped, its files are left alone",
+                            untrusted(path),
+                            untrusted(first)
+                        ),
+                    );
+                    continue;
+                }
+                Some(_) => {}
+                None => {
+                    physical_claimed.insert(key, path.to_string());
+                }
+            }
+        }
         let DirState::Exists(dir) = state else { continue };
 
         match DirIndex::read(&dir).map(|index| index.lookup("_backups")) {
@@ -741,8 +919,14 @@ pub(crate) fn plan_endpoint_files(api_root: &Path, doc: &OpenApiDocument) -> Pla
                 format!("_endpoint.{}.json", op.method),
                 format!("_endpoint.{}.reference.json", op.method),
             ];
-            for name in &names {
-                if let Err(e) = check_file(&dir, name) {
+            for (position, name) in names.iter().enumerate() {
+                // The stub names (0 and 2) may be links the read policy accepts; the reference files never.
+                let checked = if position % 2 == 0 {
+                    check_file_with(ctx, &dir, name)
+                } else {
+                    check_file(&dir, name)
+                };
+                if let Err(e) = checked {
                     plan.errors.push(PlanError {
                         strict: e.is_strict_error(),
                         message: format!("{} {}: {e}", op.http_method, untrusted(&op.path)),
@@ -759,6 +943,21 @@ pub(crate) fn plan_endpoint_files(api_root: &Path, doc: &OpenApiDocument) -> Pla
         .map(|f| f.message(mode))
         .collect();
     plan
+}
+
+/// Identifies the physical folder a spec path lands in: the canonical form of
+/// its deepest existing ancestor plus the (case-folded) names still to be
+/// created. `None` when nothing can be resolved, which simply opts the path
+/// out of the physical claim.
+fn physical_claim_key(state: &DirState) -> Option<String> {
+    let mut existing = state.path().to_path_buf();
+    let mut remaining: Vec<String> = Vec::new();
+    while std::fs::symlink_metadata(&existing).is_err() {
+        remaining.push(fold(&existing.file_name()?.to_string_lossy()));
+        existing = existing.parent()?.to_path_buf();
+    }
+    remaining.reverse();
+    Some(format!("{}\u{0}{}", std::fs::canonicalize(&existing).ok()?.display(), remaining.join("/")))
 }
 
 /// Compares, for one spec path, the operations in the spec with the stub files on
@@ -845,46 +1044,41 @@ fn describe_ops(ops: &[&Operation]) -> String {
     ops.iter().map(|o| o.http_method.clone()).collect::<Vec<_>>().join("/")
 }
 
-/// Finds every currently-*active* `endpoint.<method>.json` file under
-/// `datasources/endpoints/` (skipping `_backups/` and anything already
-/// underscore-prefixed), paired with the (path, method) it represents.
-/// Symlinked folders and stub files are reported in `problems` rather than
-/// followed.
-fn discover_active_endpoint_files(endpoints_root: &Path, mode: MethodCase, problems: &mut Vec<String>) -> Vec<(String, String, PathBuf)> {
-    let mut found = Vec::new();
-    walk_active_endpoint_files(endpoints_root, endpoints_root, mode, &mut found, problems);
-    found
+/// One currently-active stub: the path and method it represents, where it
+/// sits, and whether its folder may be written through.
+struct ActiveStub {
+    path: String,
+    method: String,
+    stub_path: PathBuf,
+    dir_writable: bool,
 }
 
-fn walk_active_endpoint_files(root: &Path, dir: &Path, mode: MethodCase, out: &mut Vec<(String, String, PathBuf)>, problems: &mut Vec<String>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else { continue };
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if file_type.is_symlink() {
-            if name == "_backups" || name.starts_with("endpoint.") || !name.contains('.') {
-                problems.push(format!("{} is a symbolic link or junction — not followed", path.display()));
-            }
-            continue;
-        }
-        if file_type.is_dir() {
-            if name == "_backups" {
-                continue;
-            }
-            walk_active_endpoint_files(root, &path, mode, out, problems);
-        } else if let Some(token_text) = method_token::stub_file_token(&name)
-            && let TokenStatus::Valid(token) = method_token::parse_file_token(token_text, mode)
-        {
-            // Only a canonical token valid in this mode counts: that also excludes
-            // `.reference.json`/`.test.json` siblings, and `WrongMode`/`Invalid` names
-            // are never orphan candidates.
-            out.push((path_for_endpoint_dir(root, dir), token.file_token().into_owned(), path.clone()));
-        }
-    }
+/// Every currently-*active* `endpoint.<method>.json` file in `tree`, paired
+/// with the (path, method) it represents. Only a canonical token valid in this
+/// mode counts: that also excludes `.reference.json`/`.test.json` siblings,
+/// underscore-prefixed orphans, and `WrongMode`/`Invalid` names, which are
+/// never orphan candidates.
+fn discover_active_endpoint_files(tree: &EndpointTree, mode: MethodCase) -> Vec<ActiveStub> {
+    tree.files()
+        .iter()
+        .filter_map(|file| {
+            let token_text = method_token::stub_file_token(&file.name)?;
+            let TokenStatus::Valid(token) = method_token::parse_file_token(token_text, mode) else {
+                return None;
+            };
+            let path = if file.rel_dir.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{}", file.rel_dir.join("/"))
+            };
+            Some(ActiveStub {
+                path,
+                method: token.file_token().into_owned(),
+                stub_path: file.logical.clone(),
+                dir_writable: file.dir_writable,
+            })
+        })
+        .collect()
 }
 
 /// If a previously-orphaned (`_`-prefixed) endpoint's path+method is back
@@ -895,14 +1089,20 @@ fn walk_active_endpoint_files(root: &Path, dir: &Path, mode: MethodCase, out: &m
 /// it as drifted and run it through the ordinary backup-and-migrate flow —
 /// exactly the design doc's "restoration is treated like an update, not a
 /// fresh start."
-fn restore_orphaned_endpoints(root: &Path, doc: &OpenApiDocument, skip: &HashSet<(String, String)>, errors: &mut Vec<String>) -> io::Result<Vec<(String, String)>> {
+fn restore_orphaned_endpoints(
+    ctx: &LinkContext,
+    root: &Path,
+    doc: &OpenApiDocument,
+    skip: &HashSet<(String, String)>,
+    errors: &mut Vec<String>,
+) -> io::Result<Vec<(String, String)>> {
     let endpoints_root = root.join("datasources/endpoints");
     let mut restored = Vec::new();
     for op in &doc.operations {
         if skip.contains(&(op.path.clone(), op.method.clone())) {
             continue;
         }
-        let dir = match endpoint_dir(&endpoints_root, &op.path) {
+        let dir = match endpoint_dir(ctx, &endpoints_root, &op.path) {
             Ok(DirState::Exists(dir)) => dir,
             Ok(DirState::WillCreate(_)) => continue,
             Err(e) => {
@@ -913,13 +1113,13 @@ fn restore_orphaned_endpoints(root: &Path, doc: &OpenApiDocument, skip: &HashSet
         let active_stub = format!("endpoint.{}.json", op.method);
         let orphaned_stub = format!("_endpoint.{}.json", op.method);
         let outcome = (|| -> Result<bool, EndpointFsError> {
-            if matches!(check_file(&dir, &active_stub)?, FileState::Present(_)) || matches!(check_file(&dir, &orphaned_stub)?, FileState::Absent) {
+            if !matches!(check_file_with(ctx, &dir, &active_stub)?, FileState::Absent) || matches!(check_file_with(ctx, &dir, &orphaned_stub)?, FileState::Absent) {
                 return Ok(false);
             }
-            rename_checked(&dir, &orphaned_stub, &active_stub)?;
+            rename_checked_with(ctx, &dir, &orphaned_stub, &active_stub)?;
             let orphaned_reference = format!("_endpoint.{}.reference.json", op.method);
             if matches!(check_file(&dir, &orphaned_reference)?, FileState::Present(_)) {
-                rename_checked(&dir, &orphaned_reference, &format!("endpoint.{}.reference.json", op.method))?;
+                rename_checked_with(ctx, &dir, &orphaned_reference, &format!("endpoint.{}.reference.json", op.method))?;
             }
             Ok(true)
         })();
@@ -939,13 +1139,13 @@ fn restore_orphaned_endpoints(root: &Path, doc: &OpenApiDocument, skip: &HashSet
 /// belonging to a path the loader or preflight set aside (ambiguous,
 /// unsafe, claim-rejected) is left alone.
 fn mark_orphaned_endpoints(
-    root: &Path,
+    ctx: &LinkContext,
+    tree: &EndpointTree,
     doc: &OpenApiDocument,
     rejected_paths: &BTreeSet<String>,
     protected_files: &HashSet<(String, String)>,
     errors: &mut Vec<String>,
 ) -> io::Result<Vec<(String, String)>> {
-    let endpoints_root = root.join("datasources/endpoints");
     let active: HashSet<(String, String)> = doc.operations.iter().map(|op| (fold(&op.path), op.method.clone())).collect();
     let protected: HashSet<String> = doc
         .ambiguous
@@ -956,7 +1156,13 @@ fn mark_orphaned_endpoints(
         .collect();
 
     let mut orphaned = Vec::new();
-    for (path, method, stub_path) in discover_active_endpoint_files(&endpoints_root, doc.method_case, errors) {
+    for ActiveStub {
+        path,
+        method,
+        stub_path,
+        dir_writable,
+    } in discover_active_endpoint_files(tree, doc.method_case)
+    {
         let folded_path = fold(&path);
         let key = (folded_path, method.clone());
         if active.contains(&key) || protected.contains(&key.0) || protected_files.contains(&key) {
@@ -965,10 +1171,13 @@ fn mark_orphaned_endpoints(
 
         let dir = stub_path.parent().expect("a file always has a parent").to_path_buf();
         let outcome = (|| -> Result<(), EndpointFsError> {
-            rename_checked(&dir, &format!("endpoint.{method}.json"), &format!("_endpoint.{method}.json"))?;
+            if !dir_writable {
+                return Err(EndpointFsError::LinkEscapes { at: dir.clone(), target: None });
+            }
+            rename_checked_with(ctx, &dir, &format!("endpoint.{method}.json"), &format!("_endpoint.{method}.json"))?;
             let reference_name = format!("endpoint.{method}.reference.json");
             if matches!(check_file(&dir, &reference_name)?, FileState::Present(_)) {
-                rename_checked(&dir, &reference_name, &format!("_endpoint.{method}.reference.json"))?;
+                rename_checked_with(ctx, &dir, &reference_name, &format!("_endpoint.{method}.reference.json"))?;
             }
             Ok(())
         })();
@@ -984,17 +1193,16 @@ fn mark_orphaned_endpoints(
 /// at all) against its operation's own declared response codes — run last,
 /// against whatever's on disk after generation/migration/orphan-handling,
 /// since it's validating the *user's* config, not producing it.
-fn validate_success_statuses(root: &Path, doc: &OpenApiDocument) -> Vec<String> {
-    let endpoints_root = root.join("datasources/endpoints");
+fn validate_success_statuses(tree: &EndpointTree, doc: &OpenApiDocument) -> Vec<String> {
     let mut errors = Vec::new();
     for op in &doc.operations {
-        let Ok(DirState::Exists(dir)) = endpoint_dir(&endpoints_root, &op.path) else {
+        let Ok(segments) = endpoint_segments(&op.path) else { continue };
+        let mut dir = tree.endpoints_root().to_path_buf();
+        dir.extend(&segments);
+        let Some(stub) = tree.file_in(&dir, &format!("endpoint.{}.json", op.method)) else {
             continue;
         };
-        let Ok(FileState::Present(stub_path)) = check_file(&dir, &format!("endpoint.{}.json", op.method)) else {
-            continue;
-        };
-        let Some(endpoint_file) = read_json(&stub_path) else {
+        let Some(endpoint_file) = read_json(&stub.logical) else {
             continue;
         };
         if let Err(message) = op.validate_success_status(&endpoint_file) {
@@ -1097,6 +1305,7 @@ struct GenerateSummary {
 /// be used safely is reported in `errors` and skipped; the rest still run.
 #[allow(clippy::too_many_arguments)]
 fn write_endpoint_files(
+    ctx: &LinkContext,
     root: &Path,
     doc: &OpenApiDocument,
     components: &HashMap<String, Value>,
@@ -1114,6 +1323,7 @@ fn write_endpoint_files(
             continue;
         }
         match write_one_endpoint(
+            ctx,
             &endpoints_root,
             op,
             components,
@@ -1131,7 +1341,9 @@ fn write_endpoint_files(
     Ok(summary)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_one_endpoint(
+    ctx: &LinkContext,
     endpoints_root: &Path,
     op: &Operation,
     components: &HashMap<String, Value>,
@@ -1140,15 +1352,15 @@ fn write_one_endpoint(
     auto_migrate_endpoints: bool,
     summary: &mut GenerateSummary,
 ) -> Result<(), EndpointFsError> {
-    let state = endpoint_dir(endpoints_root, &op.path)?;
+    let state = endpoint_dir(ctx, endpoints_root, &op.path)?;
     let reference_file_name = format!("endpoint.{}.reference.json", op.method);
     let stub_file_name = format!("endpoint.{}.json", op.method);
     let reference_state = check_file(state.path(), &reference_file_name)?;
-    let stub_state = check_file(state.path(), &stub_file_name)?;
+    let stub_state = check_file_with(ctx, state.path(), &stub_file_name)?;
 
     let current_hash = op.response_schema_hash();
     let stored_reference = match &reference_state {
-        FileState::Present(path) => read_json(path),
+        FileState::Present(path) | FileState::PresentViaLink(path) => read_json(path),
         FileState::Absent => None,
     };
     let stored_hash = stored_reference.as_ref().and_then(|v| v.get("_hash").and_then(Value::as_str).map(str::to_string));
@@ -1171,30 +1383,42 @@ fn write_one_endpoint(
         || just_restored.contains(&(op.path.clone(), op.method.clone()))
         || stored_security != op.security;
 
-    if !drifted && matches!(stub_state, FileState::Present(_)) && matches!(reference_state, FileState::Present(_)) {
+    if !drifted && !matches!(stub_state, FileState::Absent) && matches!(reference_state, FileState::Present(_)) {
         summary.skipped += 1;
         return Ok(());
     }
 
-    let dir = create_endpoint_dir_for(endpoints_root, &op.path)?;
+    let dir = create_endpoint_dir_for(ctx, endpoints_root, &op.path)?;
     let response_descriptor = op.resolve_response(components).unwrap_or(Value::Null);
 
     let reference = build_reference_file(op, &current_hash, &response_descriptor, components);
     let reference_bytes = serde_json::to_string_pretty(&reference).expect("always serializes");
     match &reference_state {
-        FileState::Present(path) => std::fs::write(path, reference_bytes)?,
-        FileState::Absent => create_new_file(&dir, &reference_file_name, reference_bytes.as_bytes())?,
+        FileState::Present(_) | FileState::PresentViaLink(_) => write_existing_file(&ctx.boundary, &dir, &reference_file_name, reference_bytes.as_bytes())?,
+        FileState::Absent => create_new_file(&ctx.boundary, &dir, &reference_file_name, reference_bytes.as_bytes())?,
     }
 
     match stub_state {
         FileState::Absent => {
             let stub = build_stub_file(op, &reference_file_name, &response_descriptor);
-            create_new_file(&dir, &stub_file_name, serde_json::to_string_pretty(&stub).expect("always serializes").as_bytes())?;
+            create_new_file(
+                &ctx.boundary,
+                &dir,
+                &stub_file_name,
+                serde_json::to_string_pretty(&stub).expect("always serializes").as_bytes(),
+            )?;
             summary.created += 1;
         }
+        FileState::PresentViaLink(stub_path) => {
+            eprintln!(
+                "warning: {} has drifted from its updated schema but is a link; not migrated, review by hand against {reference_file_name}",
+                stub_path.display()
+            );
+            summary.drift_warned += 1;
+        }
         FileState::Present(stub_path) if auto_migrate_endpoints => {
-            backup_stub(&dir, &op.method, &stub_path)?;
-            migrate_stub(&stub_path, &response_descriptor)?;
+            backup_stub(&ctx.boundary, &dir, &op.method, &stub_path)?;
+            migrate_stub(&ctx.boundary, &dir, &stub_file_name, &stub_path, &response_descriptor)?;
             summary.migrated += 1;
         }
         FileState::Present(stub_path) => {
@@ -1213,11 +1437,11 @@ fn write_one_endpoint(
 /// alongside its other methods — never a shared directory) before
 /// migration touches anything, so a bad automatic migration is always
 /// trivially reversible by hand.
-fn backup_stub(dir: &Path, method: &str, stub_path: &Path) -> Result<(), EndpointFsError> {
+fn backup_stub(boundary: &ProjectBoundary, dir: &Path, method: &str, stub_path: &Path) -> Result<(), EndpointFsError> {
     let backups_dir = dir.join("_backups");
     match DirIndex::read(dir)?.lookup("_backups") {
         Lookup::Exact(EntryKind::Dir) => {}
-        Lookup::Absent => std::fs::create_dir(&backups_dir)?,
+        Lookup::Absent => create_dir_checked(boundary, &backups_dir)?,
         Lookup::Exact(EntryKind::Symlink) => return Err(EndpointFsError::Symlink { at: backups_dir }),
         Lookup::Exact(_) => return Err(EndpointFsError::NotADirectory { at: backups_dir }),
         Lookup::CaseConflict { found } => {
@@ -1230,13 +1454,7 @@ fn backup_stub(dir: &Path, method: &str, stub_path: &Path) -> Result<(), Endpoin
     }
     let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ");
     let backup_name = format!("endpoint.{method}.{timestamp}.json");
-    match check_file(&backups_dir, &backup_name)? {
-        FileState::Present(path) => {
-            std::fs::copy(stub_path, path)?;
-        }
-        FileState::Absent => create_new_file(&backups_dir, &backup_name, &std::fs::read(stub_path)?)?,
-    }
-    Ok(())
+    copy_into_checked(boundary, stub_path, &backups_dir, &backup_name)
 }
 
 /// Structurally merges the existing stub's `response` tree onto the fresh
@@ -1244,7 +1462,7 @@ fn backup_stub(dir: &Path, method: &str, stub_path: &Path) -> Result<(), Endpoin
 /// `sources` are carried forward exactly as they were — migration never
 /// touches `sources`, and doesn't invent or remove metadata fields the
 /// endpoint file didn't already have.
-fn migrate_stub(stub_path: &Path, response_descriptor: &Value) -> io::Result<()> {
+fn migrate_stub(boundary: &ProjectBoundary, dir: &Path, stub_name: &str, stub_path: &Path, response_descriptor: &Value) -> Result<(), EndpointFsError> {
     let mut stub = read_json(stub_path).unwrap_or_else(|| serde_json::json!({}));
     let fresh_response = stub_from_descriptor(response_descriptor);
     let old_response = stub.get("response").cloned().unwrap_or(Value::Null);
@@ -1254,7 +1472,7 @@ fn migrate_stub(stub_path: &Path, response_descriptor: &Value) -> io::Result<()>
         fields.insert("response".to_string(), merged_response);
     }
 
-    std::fs::write(stub_path, serde_json::to_string_pretty(&stub).expect("always serializes"))
+    write_existing_file(boundary, dir, stub_name, serde_json::to_string_pretty(&stub).expect("always serializes").as_bytes())
 }
 
 #[cfg(test)]
@@ -1264,14 +1482,14 @@ mod tests {
     #[test]
     fn endpoint_dir_strips_the_leading_slash_and_keeps_brace_segments_literal() {
         let root = Path::new("/proj/datasources/endpoints");
-        assert_eq!(endpoint_dir(root, "/cars").unwrap().path(), root.join("cars"));
-        assert_eq!(endpoint_dir(root, "/cars/{vin}").unwrap().path(), root.join("cars/{vin}"));
+        assert_eq!(endpoint_dir(&test_ctx(root), root, "/cars").unwrap().path(), root.join("cars"));
+        assert_eq!(endpoint_dir(&test_ctx(root), root, "/cars/{vin}").unwrap().path(), root.join("cars/{vin}"));
     }
 
     #[test]
     fn endpoint_dir_maps_the_root_path_to_the_endpoints_folder_itself() {
         let root = Path::new("/proj/datasources/endpoints");
-        assert_eq!(endpoint_dir(root, "/").unwrap().path(), root);
+        assert_eq!(endpoint_dir(&test_ctx(root), root, "/").unwrap().path(), root);
     }
 
     /// A per-process atomic counter, not just a nanosecond timestamp, is
@@ -1323,7 +1541,18 @@ mod tests {
         let doc = doc_from_yaml(PING_YAML);
         let components = HashMap::new();
 
-        let summary = write_endpoint_files(&root, &doc, &components, &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut Vec::new()).unwrap();
+        let summary = write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc,
+            &components,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(
             summary,
             GenerateSummary {
@@ -1369,7 +1598,18 @@ mod tests {
         let doc = doc_from_yaml(PROTECTED_PING_YAML);
         let components = HashMap::new();
 
-        let summary = write_endpoint_files(&root, &doc, &components, &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut Vec::new()).unwrap();
+        let summary = write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc,
+            &components,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(
             summary,
             GenerateSummary {
@@ -1400,7 +1640,18 @@ mod tests {
         let doc = doc_from_yaml(PING_YAML);
         let components = HashMap::new();
 
-        write_endpoint_files(&root, &doc, &components, &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut Vec::new()).unwrap();
+        write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc,
+            &components,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         let stub = read_json(&root.join("datasources/endpoints/ping/endpoint.get.json")).unwrap();
         assert!(stub.get("security").is_none());
@@ -1419,7 +1670,18 @@ mod tests {
         let root = temp_project();
         let doc_v1 = doc_from_yaml(PROTECTED_PING_YAML);
         let components = HashMap::new();
-        write_endpoint_files(&root, &doc_v1, &components, &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut Vec::new()).unwrap();
+        write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc_v1,
+            &components,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         let stub_path = root.join("datasources/endpoints/ping/endpoint.get.json");
         std::fs::write(
@@ -1433,7 +1695,18 @@ mod tests {
         let changed_yaml = PROTECTED_PING_YAML.replace("schema: { type: string }", "schema: { type: object, properties: { value: { type: string } } }");
         let doc_v2 = doc_from_yaml(&changed_yaml);
 
-        let summary = write_endpoint_files(&root, &doc_v2, &components, &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut Vec::new()).unwrap();
+        let summary = write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc_v2,
+            &components,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(
             summary,
             GenerateSummary {
@@ -1459,14 +1732,36 @@ mod tests {
         let root = temp_project();
         let doc_v1 = doc_from_yaml(PING_YAML); // unprotected
         let components = HashMap::new();
-        write_endpoint_files(&root, &doc_v1, &components, &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut Vec::new()).unwrap();
+        write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc_v1,
+            &components,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         let reference_path = root.join("datasources/endpoints/ping/endpoint.get.reference.json");
         assert!(read_json(&reference_path).unwrap()["security"].is_null());
 
         // Same response schema as PING_YAML — only `security:` is new.
         let doc_v2 = doc_from_yaml(PROTECTED_PING_YAML);
-        let summary = write_endpoint_files(&root, &doc_v2, &components, &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut Vec::new()).unwrap();
+        let summary = write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc_v2,
+            &components,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(
             summary,
             GenerateSummary {
@@ -1488,11 +1783,33 @@ mod tests {
         let doc = doc_from_yaml(PING_YAML);
         let components = HashMap::new();
 
-        write_endpoint_files(&root, &doc, &components, &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut Vec::new()).unwrap();
+        write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc,
+            &components,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         let stub_path = root.join("datasources/endpoints/ping/endpoint.get.json");
         let modified_before = std::fs::metadata(&stub_path).unwrap().modified().unwrap();
 
-        let summary = write_endpoint_files(&root, &doc, &components, &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut Vec::new()).unwrap();
+        let summary = write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc,
+            &components,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(
             summary,
             GenerateSummary {
@@ -1512,7 +1829,18 @@ mod tests {
         let root = temp_project();
         let doc_v1 = doc_from_yaml(PING_YAML);
         let components = HashMap::new();
-        write_endpoint_files(&root, &doc_v1, &components, &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut Vec::new()).unwrap();
+        write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc_v1,
+            &components,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         let stub_path = root.join("datasources/endpoints/ping/endpoint.get.json");
         std::fs::write(&stub_path, r#"{ "operationId": "ping", "sources": { "x": 1 }, "response": "sources.x.value" }"#).unwrap();
@@ -1522,7 +1850,18 @@ mod tests {
         let changed_yaml = PING_YAML.replace("schema: { type: string }", "schema: { type: object, properties: { value: { type: string } } }");
         let doc_v2 = doc_from_yaml(&changed_yaml);
 
-        let summary = write_endpoint_files(&root, &doc_v2, &components, &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut Vec::new()).unwrap();
+        let summary = write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc_v2,
+            &components,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(
             summary,
             GenerateSummary {
@@ -1548,7 +1887,18 @@ mod tests {
         let root = temp_project();
         let doc_v1 = doc_from_yaml(PING_YAML);
         let components = HashMap::new();
-        write_endpoint_files(&root, &doc_v1, &components, &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut Vec::new()).unwrap();
+        write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc_v1,
+            &components,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         let stub_path = root.join("datasources/endpoints/ping/endpoint.get.json");
         std::fs::write(&stub_path, r#"{ "operationId": "ping", "sources": {}, "response": "hand-edited" }"#).unwrap();
@@ -1556,7 +1906,18 @@ mod tests {
         let changed_yaml = PING_YAML.replace("type: string", "type: integer");
         let doc_v2 = doc_from_yaml(&changed_yaml);
 
-        let summary = write_endpoint_files(&root, &doc_v2, &components, &HashSet::new(), &HashSet::new(), false, &HashSet::new(), &mut Vec::new()).unwrap();
+        let summary = write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc_v2,
+            &components,
+            &HashSet::new(),
+            &HashSet::new(),
+            false,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(
             summary,
             GenerateSummary {
@@ -1581,7 +1942,7 @@ mod tests {
     fn path_for_endpoint_dir_is_the_reverse_of_endpoint_dir() {
         let endpoints_root = Path::new("/proj/datasources/endpoints");
         for path in ["/cars", "/cars/{vin}", "/"] {
-            let dir = endpoint_dir(endpoints_root, path).unwrap();
+            let dir = endpoint_dir(&test_ctx(endpoints_root), endpoints_root, path).unwrap();
             assert_eq!(path_for_endpoint_dir(endpoints_root, dir.path()), path);
         }
     }
@@ -1595,12 +1956,31 @@ mod tests {
         let root = temp_project();
         let doc = doc_from_yaml(PING_YAML);
         let components = HashMap::new();
-        write_endpoint_files(&root, &doc, &components, &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut Vec::new()).unwrap();
+        write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc,
+            &components,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         let dir = root.join("datasources/endpoints/ping");
         std::fs::write(dir.join("endpoint.get.test.json"), r#"{ "cases": [] }"#).unwrap();
 
-        let orphaned = mark_orphaned_endpoints(&root, &doc, &BTreeSet::new(), &HashSet::new(), &mut Vec::new()).unwrap();
+        let orphaned = mark_orphaned_endpoints(
+            &test_ctx(&root),
+            &tree_for_tests(&root.join("datasources/endpoints")),
+            &doc,
+            &BTreeSet::new(),
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert!(orphaned.is_empty(), "a .test.json sibling must not be treated as its own endpoint file");
         assert!(dir.join("endpoint.get.test.json").is_file(), "the test file itself must be untouched");
 
@@ -1612,12 +1992,31 @@ mod tests {
         let root = temp_project();
         let doc_v1 = doc_from_yaml(PING_YAML);
         let components = HashMap::new();
-        write_endpoint_files(&root, &doc_v1, &components, &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut Vec::new()).unwrap();
+        write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc_v1,
+            &components,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         // /ping no longer exists in the new spec.
         let doc_v2 = doc_from_yaml("openapi: 3.0.3\ninfo: { title: t, version: 0.1.0 }\npaths: {}\n");
 
-        let orphaned = mark_orphaned_endpoints(&root, &doc_v2, &BTreeSet::new(), &HashSet::new(), &mut Vec::new()).unwrap();
+        let orphaned = mark_orphaned_endpoints(
+            &test_ctx(&root),
+            &tree_for_tests(&root.join("datasources/endpoints")),
+            &doc_v2,
+            &BTreeSet::new(),
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(orphaned, vec![("/ping".to_string(), "get".to_string())]);
 
         let dir = root.join("datasources/endpoints/ping");
@@ -1633,7 +2032,18 @@ mod tests {
         let root = temp_project();
         let doc_v1 = doc_from_yaml(PING_YAML);
         let components = HashMap::new();
-        write_endpoint_files(&root, &doc_v1, &components, &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut Vec::new()).unwrap();
+        write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc_v1,
+            &components,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         // Hand-edit the stub before it gets orphaned, so we can prove the
         // mapping survives the whole orphan -> restore -> migrate round trip.
@@ -1641,7 +2051,15 @@ mod tests {
         std::fs::write(&stub_path, r#"{ "operationId": "ping", "sources": { "x": 1 }, "response": "sources.x.value" }"#).unwrap();
 
         let empty_doc = doc_from_yaml("openapi: 3.0.3\ninfo: { title: t, version: 0.1.0 }\npaths: {}\n");
-        mark_orphaned_endpoints(&root, &empty_doc, &BTreeSet::new(), &HashSet::new(), &mut Vec::new()).unwrap();
+        mark_orphaned_endpoints(
+            &test_ctx(&root),
+            &tree_for_tests(&root.join("datasources/endpoints")),
+            &empty_doc,
+            &BTreeSet::new(),
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert!(!stub_path.exists());
 
         // /ping comes back, with a schema change (string -> object) at the
@@ -1650,12 +2068,23 @@ mod tests {
         let changed_yaml = PING_YAML.replace("schema: { type: string }", "schema: { type: object, properties: { value: { type: string } } }");
         let doc_v2 = doc_from_yaml(&changed_yaml);
 
-        let restored = restore_orphaned_endpoints(&root, &doc_v2, &HashSet::new(), &mut Vec::new()).unwrap();
+        let restored = restore_orphaned_endpoints(&test_ctx(&root), &root, &doc_v2, &HashSet::new(), &mut Vec::new()).unwrap();
         assert_eq!(restored, vec![("/ping".to_string(), "get".to_string())]);
         assert!(stub_path.is_file(), "the active name must be back");
 
         let restored_set: HashSet<(String, String)> = restored.into_iter().collect();
-        let summary = write_endpoint_files(&root, &doc_v2, &components, &HashSet::new(), &restored_set, true, &HashSet::new(), &mut Vec::new()).unwrap();
+        let summary = write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc_v2,
+            &components,
+            &HashSet::new(),
+            &restored_set,
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(summary.migrated, 1, "restoration should be treated as drift, not first-time generation");
 
         let migrated = read_json(&stub_path).unwrap();
@@ -1677,16 +2106,46 @@ mod tests {
         let root = temp_project();
         let doc = doc_from_yaml(PING_YAML);
         let components = HashMap::new();
-        write_endpoint_files(&root, &doc, &components, &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut Vec::new()).unwrap();
+        write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc,
+            &components,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         let empty_doc = doc_from_yaml("openapi: 3.0.3\ninfo: { title: t, version: 0.1.0 }\npaths: {}\n");
-        mark_orphaned_endpoints(&root, &empty_doc, &BTreeSet::new(), &HashSet::new(), &mut Vec::new()).unwrap();
+        mark_orphaned_endpoints(
+            &test_ctx(&root),
+            &tree_for_tests(&root.join("datasources/endpoints")),
+            &empty_doc,
+            &BTreeSet::new(),
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         // Same `doc` as before -- nothing about /ping's schema changed.
-        let restored = restore_orphaned_endpoints(&root, &doc, &HashSet::new(), &mut Vec::new()).unwrap();
+        let restored = restore_orphaned_endpoints(&test_ctx(&root), &root, &doc, &HashSet::new(), &mut Vec::new()).unwrap();
         let restored_set: HashSet<(String, String)> = restored.into_iter().collect();
 
-        let summary = write_endpoint_files(&root, &doc, &components, &HashSet::new(), &restored_set, true, &HashSet::new(), &mut Vec::new()).unwrap();
+        let summary = write_endpoint_files(
+            &test_ctx(&root),
+            &root,
+            &doc,
+            &components,
+            &HashSet::new(),
+            &restored_set,
+            true,
+            &HashSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(summary.migrated, 1, "restoration must force migration even when the hash didn't change");
         assert!(root.join("datasources/endpoints/ping/_backups").is_dir());
 
@@ -1822,7 +2281,7 @@ mod tests {
         let root = temp_project();
         let api_root = root.join("api");
 
-        scaffold_config(&api_root).unwrap();
+        scaffold_config(&ProjectBoundary::new(&root), &api_root).unwrap();
 
         assert!(api_root.join("config/server.json").is_file());
         assert!(api_root.join("config/errors/core.json").is_file());
@@ -1837,7 +2296,7 @@ mod tests {
         let root = temp_project();
         let api_root = root.join("api");
 
-        scaffold_config(&api_root).unwrap();
+        scaffold_config(&ProjectBoundary::new(&root), &api_root).unwrap();
 
         let contents = std::fs::read_to_string(api_root.join("config/server.json")).unwrap();
         let config: ServerConfig = serde_json::from_str(&contents).unwrap();
@@ -1852,7 +2311,7 @@ mod tests {
         let root = temp_project();
         let api_root = root.join("api");
 
-        scaffold_config(&api_root).unwrap();
+        scaffold_config(&ProjectBoundary::new(&root), &api_root).unwrap();
 
         let registry = crate::errors::ErrorRegistry::load(&api_root.join("config/errors")).unwrap();
         assert!(registry.get("datasource.sql.not_found").is_some());
@@ -1867,7 +2326,7 @@ mod tests {
         let root = temp_project();
         let api_root = root.join("api");
 
-        scaffold_config(&api_root).unwrap();
+        scaffold_config(&ProjectBoundary::new(&root), &api_root).unwrap();
 
         let connections: HashMap<String, crate::config::ConnectionConfig> =
             serde_json::from_str(&std::fs::read_to_string(api_root.join("config/connections.json")).unwrap()).unwrap();
@@ -1886,7 +2345,7 @@ mod tests {
         std::fs::create_dir_all(api_root.join("config")).unwrap();
         std::fs::write(api_root.join("config/server.json"), r#"{ "port": 1234 }"#).unwrap();
 
-        scaffold_config(&api_root).unwrap();
+        scaffold_config(&ProjectBoundary::new(&root), &api_root).unwrap();
 
         let contents = std::fs::read_to_string(api_root.join("config/server.json")).unwrap();
         let config: ServerConfig = serde_json::from_str(&contents).unwrap();
@@ -1915,6 +2374,12 @@ mod tests {
 
 #[cfg(test)]
 mod mtls_tests;
+
+#[cfg(test)]
+mod symlink_tests;
+
+#[cfg(test)]
+mod route_tests;
 
 #[cfg(test)]
 mod hardening_tests {
@@ -2092,13 +2557,24 @@ mod hardening_tests {
         for bad in ["/../../escape", "/a/./b", "/a//b", "/a\\b", "/a/../b", "/x\u{0}y"] {
             doc.operations[0].path = bad.to_string();
 
-            let plan = plan_endpoint_files(&dir.join("api"), &doc);
+            let plan = plan_endpoint_files(&dir.join("api"), &doc, &tree_for_tests(&dir.join("api/datasources/endpoints")), &test_ctx(&dir));
             assert_eq!(plan.errors.len(), 1, "{bad:?}");
             assert!(plan.errors[0].strict, "{bad:?}");
             assert!(plan.skip.contains(&(bad.to_string(), "get".to_string())));
 
             let mut errors = Vec::new();
-            let summary = write_endpoint_files(&dir, &doc, &HashMap::new(), &HashSet::new(), &HashSet::new(), true, &HashSet::new(), &mut errors).unwrap();
+            let summary = write_endpoint_files(
+                &test_ctx(&dir),
+                &dir,
+                &doc,
+                &HashMap::new(),
+                &HashSet::new(),
+                &HashSet::new(),
+                true,
+                &HashSet::new(),
+                &mut errors,
+            )
+            .unwrap();
             assert_eq!(errors.len(), 1, "{bad:?}");
             assert_eq!(summary.created, 0);
             assert!(tree(&dir).is_empty(), "{bad:?} created {:?}", tree(&dir).keys().collect::<Vec<_>>());
@@ -2111,7 +2587,7 @@ mod hardening_tests {
     fn endpoint_dir_refuses_traversal_with_a_containment_error() {
         let root = Path::new("/proj/datasources/endpoints");
         for bad in ["/..", "/a/../b", "//", "/a//b", "/a/.", "/a\\b"] {
-            assert!(matches!(endpoint_dir(root, bad), Err(EndpointFsError::Containment(_))), "{bad:?}");
+            assert!(matches!(endpoint_dir(&test_ctx(root), root, bad), Err(EndpointFsError::Containment(_))), "{bad:?}");
         }
     }
 
@@ -2402,7 +2878,7 @@ mod hardening_tests {
         doc.operations[0].path = "/Cars".to_string();
         doc.operations[1].path = "/cars".to_string();
 
-        let plan = plan_endpoint_files(&root.join("api"), &doc);
+        let plan = plan_endpoint_files(&root.join("api"), &doc, &tree_for_tests(&root.join("api/datasources/endpoints")), &test_ctx(&root));
         assert_eq!(plan.errors.len(), 1, "{:?}", plan.errors);
         assert!(plan.errors[0].strict);
         assert!(plan.errors[0].message.contains("/cars") && plan.errors[0].message.contains("/Cars"));
@@ -2465,27 +2941,14 @@ mod hardening_tests {
     #[test]
     fn a_junction_or_symlink_planted_as_an_endpoint_folder_is_refused_and_nothing_lands_in_its_target() {
         let root = temp_project();
-        let outside = root.join("outside");
-        std::fs::create_dir_all(&outside).unwrap();
+        // A separate temp dir: a target inside the project would be a followable link.
+        let outside = temp_project();
         let endpoints = root.join("api/datasources/endpoints");
         std::fs::create_dir_all(&endpoints).unwrap();
         let link = endpoints.join("cars");
-        #[cfg(unix)]
-        let linked = std::os::unix::fs::symlink(&outside, &link).is_ok();
-        #[cfg(windows)]
-        let linked = std::os::windows::fs::symlink_dir(&outside, &link).is_ok()
-            || std::process::Command::new("cmd")
-                .args(["/C", "mklink", "/J"])
-                .arg(&link)
-                .arg(&outside)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-        if !linked {
-            eprintln!("skipping: cannot create a link here");
+        if !crate::openapi::fs_os_tests::link_dir(&outside, &link) {
             let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&outside);
             return;
         }
         write_spec(&root, &spec("3.1.0", &[("/cars", &["get"])], ""));
@@ -2495,6 +2958,7 @@ mod hardening_tests {
         // Remove the link itself before the recursive delete so cleanup never follows it.
         let _ = std::fs::remove_dir(&link);
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }
 
@@ -2904,7 +3368,7 @@ mod m3_generate_tests {
         std::fs::write(root.join("openapi.yaml"), WITHOUT_QUERY).unwrap();
         write_non_canonical(&root, "endpoint.Query.json");
         let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
-        let plan = plan_endpoint_files(&root.join("api"), &doc);
+        let plan = plan_endpoint_files(&root.join("api"), &doc, &tree_for_tests(&root.join("api/datasources/endpoints")), &test_ctx(&root));
         assert_eq!(plan.invalid_tokens.len(), 1, "{:?}", plan.invalid_tokens);
         assert!(plan.invalid_tokens[0].contains("rename it to endpoint.query.json"), "{}", plan.invalid_tokens[0]);
         assert!(plan.errors.is_empty());
@@ -3144,7 +3608,7 @@ mod m4_generate_tests {
         assert_eq!(names_in(&dir_x(&root)), ["endpoint.~purge.json"], "never orphaned");
         assert_eq!(std::fs::read_to_string(existing).unwrap(), STUB);
         let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
-        let plan = plan_endpoint_files(&root.join("api"), &doc);
+        let plan = plan_endpoint_files(&root.join("api"), &doc, &tree_for_tests(&root.join("api/datasources/endpoints")), &test_ctx(&root));
         assert_eq!(plan.wrong_mode.len(), 1, "{:?}", plan.wrong_mode);
         assert!(
             plan.wrong_mode[0].contains("case-distinct") && plan.wrong_mode[0].contains("caseSensitiveMethods is false"),

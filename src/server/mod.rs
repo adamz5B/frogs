@@ -120,7 +120,20 @@ pub(crate) fn served_service(router: Router, case_sensitive: bool) -> IntoMakeSe
 /// merged in by the caller — the correlation-ID middleware is deliberately
 /// *not* applied here; see `apply_middleware`.
 pub fn router() -> Router {
-    Router::new().route("/healthz", get(healthz))
+    Router::new().route(HEALTHZ_PATH, get(healthz))
+}
+
+pub(crate) const HEALTHZ_PATH: &str = "/healthz";
+pub(crate) const READYZ_PATH: &str = "/readyz";
+pub(crate) const METRICS_PATH: &str = "/metrics";
+
+/// The three docs-UI routes for a (normalised) `docsUi.path`: page, `operations.json`, `endpoints.json`.
+pub(crate) fn docs_ui_route_paths(normalized_path: &str) -> [String; 3] {
+    [
+        format!("/{normalized_path}"),
+        format!("/{normalized_path}/operations.json"),
+        format!("/{normalized_path}/endpoints.json"),
+    ]
 }
 
 /// Mounts `router` (already carrying `/healthz` plus every endpoint route —
@@ -146,7 +159,7 @@ pub fn mount_under(router: Router, api_root: &str) -> Router {
 /// than baked into `router()` unconditionally — so turning the feature off
 /// means the route isn't registered at all, not just hidden.
 pub fn readyz_router(drivers: Arc<HashMap<String, Box<dyn SqlDriver>>>) -> Router {
-    Router::new().route("/readyz", get(readyz)).with_state(drivers)
+    Router::new().route(READYZ_PATH, get(readyz)).with_state(drivers)
 }
 
 async fn readyz(State(drivers): State<Arc<HashMap<String, Box<dyn SqlDriver>>>>) -> Response {
@@ -165,7 +178,7 @@ async fn readyz(State(drivers): State<Arc<HashMap<String, Box<dyn SqlDriver>>>>)
 /// be the *same* `Arc` passed to `apply_metrics`, so what this endpoint
 /// reports is actually what the middleware recorded, not an empty copy.
 pub fn metrics_router(metrics: Arc<Metrics>) -> Router {
-    Router::new().route("/metrics", get(metrics_handler)).with_state(metrics)
+    Router::new().route(METRICS_PATH, get(metrics_handler)).with_state(metrics)
 }
 
 async fn metrics_handler(State(metrics): State<Arc<Metrics>>) -> Response {
@@ -221,10 +234,11 @@ pub fn docs_ui_router(
         security,
         endpoint_summaries: Arc::new(endpoint_summaries),
     };
+    let [page_path, operations_path, endpoints_path] = docs_ui_route_paths(&path);
     let router = Router::new()
-        .route(&format!("/{path}"), get(docs_ui_page))
-        .route(&format!("/{path}/operations.json"), get(docs_ui_operations_handler))
-        .route(&format!("/{path}/endpoints.json"), get(docs_ui_endpoints_handler))
+        .route(&page_path, get(docs_ui_page))
+        .route(&operations_path, get(docs_ui_operations_handler))
+        .route(&endpoints_path, get(docs_ui_endpoints_handler))
         .with_state(state);
     match mode {
         crate::config::DocsUiMode::Localhost => router.layer(middleware::from_fn(docs_ui_localhost_gate)),

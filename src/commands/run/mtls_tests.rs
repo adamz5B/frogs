@@ -631,7 +631,7 @@ fn write_api_project(h: &Harness, client_auth: &str, verifier_json: &str, extra_
 }
 
 async fn start_api(h: &mut Harness) {
-    let (router, server_config) = build_api_router(&h.root).await.expect("scratch project should build");
+    let (router, server_config) = build_api_router(&h.root, false).await.expect("scratch project should build");
     h.start(router, server_config.tls).await;
 }
 
@@ -731,7 +731,7 @@ async fn a_cert_route_is_refused_at_startup_when_client_auth_is_off() {
     let client = h.client(None);
     assert_eq!(
         h.get(&client, "/protected").await.unwrap().0,
-        404,
+        503,
         "no way to ever obtain a certificate: the route must not exist"
     );
     assert_eq!(h.get(&client, "/open").await.unwrap().0, 200);
@@ -789,7 +789,7 @@ async fn required_mode_with_probes_enabled_warns_at_startup_and_optional_does_no
             MTLS_ORDERS,
             serde_json::json!({ "features": { "requestCorrelation": false, "requestValidation": false, "readyzCheck": true, "metrics": false } }),
         );
-        let _ = build_api_router(&h.root).await.unwrap();
+        let _ = build_api_router(&h.root, false).await.unwrap();
         let warned = logs.text().contains("load-balancer probes");
         assert_eq!(warned, expect_warning, "{mode}: {}", logs.text());
     }

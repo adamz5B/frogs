@@ -72,6 +72,9 @@ struct ServeState {
     config: WebServeConfig,
 }
 
+/// The two routes the static-content router registers (both GET, so HEAD too).
+pub(crate) const WEB_ROUTES: [&str; 2] = ["/", "/*path"];
+
 /// Builds a router that serves `root` as a static site per `config`: `/`
 /// resolves to `config.startPage`, everything else resolves directly to a
 /// matching file on disk, and a request that doesn't resolve to a real,
@@ -87,7 +90,10 @@ pub fn router(root: PathBuf, config: WebServeConfig) -> Router {
         config,
     });
 
-    Router::new().route("/", get(handle_root)).route("/*path", get(handle_path)).with_state(state)
+    Router::new()
+        .route(WEB_ROUTES[0], get(handle_root))
+        .route(WEB_ROUTES[1], get(handle_path))
+        .with_state(state)
 }
 
 async fn handle_root(State(state): State<Arc<ServeState>>, headers: HeaderMap) -> Response {

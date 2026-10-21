@@ -795,6 +795,7 @@ dependencies = [
  "deadpool",
  "deadpool-oracle",
  "futures-util",
+ "matchit",
  "oracle-rs",
  "percent-encoding",
  "rcgen",

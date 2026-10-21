@@ -1,9 +1,8 @@
-use std::path::Path;
-
 use serde_json::{Value, json};
 
 use super::schema::{ArrayResponse, Cardinality, DetailedField, Parameter, ParameterType, ResponseField, ResponseShape, SourceDef};
 use super::{EndpointFile, discover_endpoint_files};
+use crate::openapi::endpoint_tree::EndpointTree;
 use crate::openapi::method_token::MethodCase;
 
 /// A sanitized, allowlisted summary of every discovered endpoint file's own
@@ -26,8 +25,8 @@ use crate::openapi::method_token::MethodCase;
 /// that fails to read or parse is silently skipped (same graceful-
 /// degradation posture `build_router` itself uses for the exact same
 /// failure) rather than failing the whole summary over one bad file.
-pub(crate) fn endpoint_summaries(endpoints_root: &Path, mode: MethodCase) -> Vec<Value> {
-    discover_endpoint_files(endpoints_root, mode)
+pub(crate) fn endpoint_summaries(tree: &EndpointTree, mode: MethodCase) -> Vec<Value> {
+    discover_endpoint_files(tree, mode)
         .into_iter()
         .filter_map(|(url_path, method, file_path)| {
             let contents = std::fs::read_to_string(&file_path).ok()?;
@@ -169,6 +168,7 @@ fn detailed_field_json(d: &DetailedField) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openapi::endpoint_tree::tree_for_tests;
 
     fn temp_endpoints_root() -> std::path::PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -204,7 +204,7 @@ mod tests {
         )
         .unwrap();
 
-        let summaries = endpoint_summaries(&root, MethodCase::Default);
+        let summaries = endpoint_summaries(&tree_for_tests(&root), MethodCase::Default);
         assert_eq!(summaries.len(), 1);
         let s = &summaries[0];
         assert_eq!(s["method"], "GET");
@@ -233,7 +233,7 @@ mod tests {
         )
         .unwrap();
 
-        let summaries = endpoint_summaries(&root, MethodCase::Default);
+        let summaries = endpoint_summaries(&tree_for_tests(&root), MethodCase::Default);
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0]["generated"], true);
         assert_eq!(summaries[0]["response"]["kind"], "fields");
@@ -255,7 +255,7 @@ mod tests {
         )
         .unwrap();
 
-        let summaries = endpoint_summaries(&root, MethodCase::Default);
+        let summaries = endpoint_summaries(&tree_for_tests(&root), MethodCase::Default);
         let src = &summaries[0]["sources"]["price"];
         assert_eq!(src["type"], "http");
         assert_eq!(src["request"], "pricing_lookup.json");
@@ -275,7 +275,7 @@ mod tests {
         std::fs::create_dir_all(&bad).unwrap();
         std::fs::write(bad.join("endpoint.get.json"), "not valid json").unwrap();
 
-        let summaries = endpoint_summaries(&root, MethodCase::Default);
+        let summaries = endpoint_summaries(&tree_for_tests(&root), MethodCase::Default);
         assert_eq!(summaries.len(), 1, "the malformed file must be skipped, not fail the whole summary");
         assert_eq!(summaries[0]["operationId"], "ping");
     }
@@ -295,7 +295,7 @@ mod tests {
         )
         .unwrap();
 
-        let summaries = endpoint_summaries(&root, MethodCase::Default);
+        let summaries = endpoint_summaries(&tree_for_tests(&root), MethodCase::Default);
         let response = &summaries[0]["response"];
         assert_eq!(response["kind"], "array");
         assert_eq!(response["source"], "sources.cars");
@@ -307,6 +307,7 @@ mod tests {
 #[cfg(test)]
 mod m4_docs_tests {
     use super::*;
+    use crate::openapi::endpoint_tree::tree_for_tests;
 
     fn temp_root() -> std::path::PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -342,7 +343,7 @@ mod m4_docs_tests {
         write(&root, "c", "query");
         write(&root, "d", "~_50urge");
         write(&root, "e", "~_58_2e_59");
-        let found = endpoint_summaries(&root.join("datasources/endpoints"), MethodCase::Exact);
+        let found = endpoint_summaries(&tree_for_tests(&root.join("datasources/endpoints")), MethodCase::Exact);
         assert_eq!(methods(&found), ["PURGE", "Purge", "QUERY", "X.Y", "purge"]);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -352,7 +353,7 @@ mod m4_docs_tests {
         let root = temp_root();
         write(&root, "a", "~purge");
         write(&root, "b", "PURGE");
-        let found = endpoint_summaries(&root.join("datasources/endpoints"), MethodCase::Default);
+        let found = endpoint_summaries(&tree_for_tests(&root.join("datasources/endpoints")), MethodCase::Default);
         assert_eq!(methods(&found), ["PURGE"]);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -365,7 +366,7 @@ mod m4_docs_tests {
         let spec = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /things:\n    additionalOperations:\n      purge:\n        operationId: lower\n        responses: { '200': { description: ok } }\n      PURGE:\n        operationId: upper\n        responses: { '200': { description: ok } }\n";
         std::fs::write(root.join("openapi.yaml"), spec).unwrap();
         let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions { case_sensitive_methods: true }).unwrap();
-        let summaries = endpoint_summaries(&root.join("datasources/endpoints"), MethodCase::Exact);
+        let summaries = endpoint_summaries(&tree_for_tests(&root.join("datasources/endpoints")), MethodCase::Exact);
         let router = crate::server::docs_ui_router(
             crate::config::DocsUiMode::Public,
             "docs",
@@ -421,7 +422,7 @@ mod m4_docs_tests {
         let spec = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /x:\n    get:\n      operationId: upper\n      responses: { '200': { description: ok } }\n    additionalOperations:\n      get:\n        operationId: lower\n        responses: { '200': { description: ok } }\n";
         std::fs::write(root.join("openapi.yaml"), spec).unwrap();
         let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions { case_sensitive_methods: true }).unwrap();
-        let summaries = endpoint_summaries(&root.join("datasources/endpoints"), MethodCase::Exact);
+        let summaries = endpoint_summaries(&tree_for_tests(&root.join("datasources/endpoints")), MethodCase::Exact);
         let router = crate::server::docs_ui_router(
             crate::config::DocsUiMode::Public,
             "docs",

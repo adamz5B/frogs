@@ -380,6 +380,7 @@ async fn serve_router(security: SecurityConfig, endpoint_json: &str, client_iden
 
     let router = build_router(
         &root,
+        &tree_for_tests(&root.join("datasources/endpoints")),
         Arc::new(HashMap::new()),
         &HashMap::new(),
         Arc::new(registry()),
@@ -407,7 +408,7 @@ async fn a_cert_dependent_route_is_refused_when_no_identity_can_ever_be_availabl
         let (base, _root) = serve_router(security_with(verifier), SECURED_ENDPOINT, false).await;
         assert_eq!(
             reqwest::get(format!("{base}/secret")).await.unwrap().status(),
-            404,
+            503,
             "{verifier}: the route must not be registered"
         );
         assert_eq!(reqwest::get(format!("{base}/open")).await.unwrap().status(), 200, "unrelated routes are unaffected");
@@ -434,7 +435,7 @@ async fn a_header_only_scheme_is_registered_regardless_of_identity_availability(
 #[tokio::test]
 async fn a_scheme_with_no_verifier_is_still_refused() {
     let (base, _root) = serve_router(SecurityConfig::default(), SECURED_ENDPOINT, true).await;
-    assert_eq!(reqwest::get(format!("{base}/secret")).await.unwrap().status(), 404);
+    assert_eq!(reqwest::get(format!("{base}/secret")).await.unwrap().status(), 503);
 }
 
 #[tokio::test]
@@ -465,15 +466,15 @@ fn validate_endpoint_files_reports_a_cert_dependent_route_only_when_identity_is_
     std::fs::write(dir.join("endpoint.get.json"), SECURED_ENDPOINT).unwrap();
     let security = security_with(MTLS_ORDERS);
 
-    let (count, problems) = validate_endpoint_files(&root, &security, &HashMap::new(), false, MethodCase::Default);
+    let (count, problems) = validate_endpoint_files(&tree_for_tests(&root), &security, &HashMap::new(), false, MethodCase::Default);
     assert_eq!(count, 1);
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(problems[0].contains("client certificate") && problems[0].contains("certAuth"), "{problems:?}");
 
-    let (_, problems) = validate_endpoint_files(&root, &security, &HashMap::new(), true, MethodCase::Default);
+    let (_, problems) = validate_endpoint_files(&tree_for_tests(&root), &security, &HashMap::new(), true, MethodCase::Default);
     assert!(problems.is_empty(), "{problems:?}");
 
-    let (_, problems) = validate_endpoint_files(&root, &security_with(SQL_API_KEY), &HashMap::new(), false, MethodCase::Default);
+    let (_, problems) = validate_endpoint_files(&tree_for_tests(&root), &security_with(SQL_API_KEY), &HashMap::new(), false, MethodCase::Default);
     assert!(problems.is_empty(), "a header-only scheme never needs clientAuth: {problems:?}");
 }
 
@@ -497,6 +498,7 @@ async fn serve_mocked(verifier: &str, selection: MockSelection) -> String {
     std::fs::write(dir.join("endpoint.get.json"), SECURED_ENDPOINT).unwrap();
     let router = build_router(
         &root,
+        &tree_for_tests(&root.join("datasources/endpoints")),
         Arc::new(HashMap::new()),
         &HashMap::new(),
         Arc::new(registry()),
@@ -666,6 +668,7 @@ async fn test_files_and_their_client_cert_are_inert_when_no_mock_provider_is_ins
     .unwrap();
     let router = build_router(
         &root,
+        &tree_for_tests(&root.join("datasources/endpoints")),
         Arc::new(HashMap::new()),
         &HashMap::new(),
         Arc::new(registry()),
@@ -724,6 +727,7 @@ async fn serve_extension_router(token: &str, mode: MethodCase, identity: Option<
     drivers.insert("db".to_string(), Box::new(CountingDriver(calls)));
     let mut router = build_router(
         &root,
+        &tree_for_tests(&root.join("datasources/endpoints")),
         Arc::new(drivers),
         &HashMap::new(),
         Arc::new(registry()),
