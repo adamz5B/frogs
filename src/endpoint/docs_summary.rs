@@ -448,3 +448,39 @@ mod m4_docs_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(test)]
+mod ref_docs_tests {
+    use serde_json::Value;
+
+    #[tokio::test]
+    async fn operations_json_shows_parameters_request_bodies_and_operations_reached_through_refs() {
+        let root = std::env::temp_dir().join(format!(
+            "frogs-docs-refs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let spec = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  parameters:\n    Limit: { name: limit, in: query, required: true, schema: { type: integer } }\n  requestBodies:\n    Car: { required: true, content: { application/json: { schema: { type: object } } } }\n  pathItems:\n    Shared:\n      post:\n        operationId: viaItem\n        requestBody: { $ref: '#/components/requestBodies/Car' }\n        responses: { '200': { description: ok } }\npaths:\n  /cars:\n    get:\n      operationId: listCars\n      parameters:\n        - $ref: '#/components/parameters/Limit'\n      responses: { '200': { description: ok } }\n  /shared:\n    $ref: '#/components/pathItems/Shared'\n";
+        std::fs::write(root.join("openapi.yaml"), spec).unwrap();
+        let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
+        let router = crate::server::docs_ui_router(
+            crate::config::DocsUiMode::Public,
+            "docs",
+            Some(std::sync::Arc::new(doc)),
+            std::sync::Arc::new(crate::security::SecurityConfig::default()),
+            Vec::new(),
+        );
+        let addr = crate::server::spawn_served(router, true).await;
+        let body: Value = reqwest::get(format!("http://{addr}/docs/operations.json")).await.unwrap().json().await.unwrap();
+        let ops = body["operations"].as_array().unwrap();
+        assert_eq!(ops.len(), 2, "{body}");
+        let list = ops.iter().find(|o| o["operationId"] == "listCars").expect("listCars");
+        assert_eq!(list["parameters"][0]["name"], "limit");
+        assert_eq!(list["parameters"][0]["required"], true);
+        let shared = ops.iter().find(|o| o["operationId"] == "viaItem").expect("operation behind a path item $ref");
+        assert_eq!(shared["path"], "/shared");
+        assert_eq!(shared["requestBody"]["required"], true);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

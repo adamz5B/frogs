@@ -598,3 +598,80 @@ fn every_new_security_message_escapes_control_characters_from_operation_ids_keys
         assert!(no_control_chars(&message), "{message:?}");
     }
 }
+
+// ------------------------------------------------ same template, different parameter names
+
+fn item_id_and_id_spec() -> String {
+    spec("", &(fixed("/items/{itemId}", "get", "byItemId", SEC_A) + &fixed("/items/{id}", "get", "byId", "")))
+}
+
+fn assert_same_template_shadow(a: &Analysis) {
+    assert_eq!(a.check.shadowed.len(), 1, "{:?}", shadow_messages(a));
+    let shadow = &a.check.shadowed[0];
+    assert_eq!(shadow.served_route, "/items/:id");
+    assert_eq!(shadow.op_path, "/items/{itemId}");
+    assert!(shadow.same_template);
+    assert!(a.check.mismatches.is_empty());
+    let message = shadow.message();
+    assert!(!message.contains("run frogs generate"), "{message}");
+    assert!(message.contains("openapi.yaml") && message.contains("different parameter names"), "{message}");
+}
+
+#[test]
+fn a_secured_template_whose_renamed_twin_owns_the_open_file_is_a_same_template_shadow() {
+    let a = analyse(&item_id_and_id_spec(), &[("items/{id}", "get", None)]);
+    assert_same_template_shadow(&a);
+}
+
+#[test]
+fn a_secured_template_whose_renamed_twin_owns_a_file_with_the_acceptable_scheme_is_fully_clean() {
+    let a = analyse(&item_id_and_id_spec(), &[("items/{id}", "get", Some("a"))]);
+    assert_eq!(counts(&a), (0, 0, 0, 0, 0));
+    assert!(a.check.mismatches.is_empty());
+}
+
+#[test]
+fn the_same_template_shadow_does_not_depend_on_the_order_the_spec_declares_the_two_paths() {
+    let reversed = spec("", &(fixed("/items/{id}", "get", "byId", "") + &fixed("/items/{itemId}", "get", "byItemId", SEC_A)));
+    assert_same_template_shadow(&analyse(&reversed, &[("items/{id}", "get", None)]));
+    let clean = analyse(&reversed, &[("items/{id}", "get", Some("a"))]);
+    assert_eq!(counts(&clean), (0, 0, 0, 0, 0));
+}
+
+#[test]
+fn a_lone_secured_template_with_a_renamed_open_file_is_one_mismatch_and_no_shadow_and_clean_when_secured() {
+    let spec = spec("", &fixed("/cars/{vin}", "get", "byVin", SEC_A));
+    let open = analyse(&spec, &[("cars/{id}", "get", None)]);
+    assert_eq!(open.check.mismatches.len(), 1);
+    assert!(open.check.shadowed.is_empty());
+    let secured = analyse(&spec, &[("cars/{id}", "get", Some("a"))]);
+    assert_eq!(counts(&secured), (0, 0, 0, 0, 0));
+    assert!(secured.check.mismatches.is_empty());
+}
+
+#[test]
+fn a_file_with_a_third_parameter_name_matching_neither_spec_spelling_is_a_mismatch_not_a_shadow() {
+    let open = analyse(&item_id_and_id_spec(), &[("items/{x}", "get", None)]);
+    assert_eq!(open.check.mismatches.len(), 1, "{:?}", shadow_messages(&open));
+    assert!(open.check.shadowed.is_empty());
+    let secured = analyse(&item_id_and_id_spec(), &[("items/{x}", "get", Some("a"))]);
+    assert_eq!(counts(&secured), (0, 0, 0, 0, 0));
+    assert!(secured.check.mismatches.is_empty());
+}
+
+#[test]
+fn a_literal_secured_operation_shadowed_by_a_template_file_is_not_flagged_as_same_template() {
+    let spec = spec("", &(fixed("/items/new", "get", "n", SEC_A) + &fixed("/items/{id}", "get", "byId", "")));
+    let a = analyse(&spec, &[("items/{id}", "get", None)]);
+    assert_eq!(a.check.shadowed.len(), 1);
+    assert!(!a.check.shadowed[0].same_template);
+    assert!(a.check.shadowed[0].message().contains("run frogs generate"));
+}
+
+#[test]
+fn a_secured_head_operation_on_a_renamed_template_is_still_shadowed_by_the_open_get_file() {
+    let spec = spec("", &(fixed("/items/{itemId}", "head", "h", SEC_A) + &fixed("/items/{id}", "get", "byId", "")));
+    let a = analyse(&spec, &[("items/{id}", "get", None)]);
+    assert_eq!(a.check.shadowed.len(), 1, "{:?}", shadow_messages(&a));
+    assert_eq!(a.check.shadowed[0].op_method, "HEAD");
+}

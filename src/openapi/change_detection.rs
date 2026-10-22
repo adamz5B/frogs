@@ -42,8 +42,8 @@ fn collect_refs(schema: &Value, names: &mut HashSet<String>) {
     };
 
     if let Some(ref_str) = obj.get("$ref").and_then(Value::as_str) {
-        if let Some(name) = ref_str.strip_prefix("#/components/schemas/") {
-            names.insert(name.to_string());
+        if let Some(Ok(name)) = super::local_ref::component_name(ref_str, "schemas") {
+            names.insert(name.into_owned());
         }
         return;
     }
@@ -66,8 +66,8 @@ fn collect_refs(schema: &Value, names: &mut HashSet<String>) {
     let has_one_of = obj.get("oneOf").is_some_and(Value::is_array) || obj.get("anyOf").is_some_and(Value::is_array);
     if has_one_of && let Some(default) = obj.get("discriminator").and_then(|d| d.get("defaultMapping")).and_then(Value::as_str) {
         names.insert(default.to_string());
-        if let Some(name) = default.strip_prefix("#/components/schemas/") {
-            names.insert(name.to_string());
+        if let Some(Ok(name)) = super::local_ref::component_name(default, "schemas") {
+            names.insert(name.into_owned());
         }
     }
 }

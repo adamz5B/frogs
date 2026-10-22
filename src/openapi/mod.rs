@@ -5,11 +5,17 @@ pub mod endpoint_tree;
 mod endpoint_tree_tests;
 #[cfg(test)]
 pub(crate) mod fs_os_tests;
+pub(crate) mod local_ref;
+#[cfg(test)]
+mod local_ref_tests;
 pub mod method_token;
 pub mod path_rules;
+#[cfg(test)]
+mod ref_loader_tests;
 pub mod route_syntax;
 mod schema_walk;
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
@@ -20,6 +26,7 @@ pub use change_detection::{content_hash, referenced_component_names};
 pub use path_rules::{PortabilityPolicy, untrusted};
 pub use schema_walk::{SchemaWalker, merge_stub_response, stub_from_descriptor, walk_response_schema};
 
+use local_ref::{ExpansionBudget, RefIndex, RefKind, resolve_path_item, resolve_ref};
 use method_token::{FIXED_FIELDS, KeyClass, MethodCase, MethodToken, RejectKind, W1Note, untrusted_short};
 
 /// Caller-supplied loader settings (the loader itself never reads config).
@@ -117,6 +124,9 @@ pub struct Operation {
     /// in which case `request_body` holds a permissive `{}` schema (so
     /// `required` is still enforced) and shape validation is effectively off.
     pub request_body_unresolved: Option<String>,
+    /// Raw `$ref` text of every parameter `$ref` that could not be resolved. Those parameters
+    /// are absent from `parameters`, so request validation for this operation is incomplete.
+    pub unresolved_parameter_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -243,75 +253,10 @@ impl Operation {
     }
 }
 
-const MAX_MEDIA_TYPE_REF_HOPS: usize = 8;
-const MEDIA_TYPE_REF_PREFIX: &str = "#/components/mediaTypes/";
-const SCHEMA_REF_PREFIX: &str = "#/components/schemas/";
-const SECURITY_SCHEME_REF_PREFIX: &str = "#/components/securitySchemes/";
-
-#[derive(Debug, PartialEq, Eq)]
-enum MediaRefError {
-    Cycle,
-    TooLong,
-    UnknownName(String),
-    WrongKind,
-    Unsupported(String),
-    NonStringRef,
-    NotAnObject,
-}
-
-impl fmt::Display for MediaRefError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            MediaRefError::Cycle => write!(f, "cycle"),
-            MediaRefError::TooLong => write!(f, "chain longer than {MAX_MEDIA_TYPE_REF_HOPS} hops"),
-            MediaRefError::UnknownName(name) => write!(f, "unknown media type '{}'", untrusted(name)),
-            MediaRefError::WrongKind => write!(f, "a #/components/schemas/ reference where a media type belongs"),
-            MediaRefError::Unsupported(r) => write!(f, "unsupported reference form '{}' (external references are never fetched)", untrusted(r)),
-            MediaRefError::NonStringRef => write!(f, "$ref is not a string"),
-            MediaRefError::NotAnObject => write!(f, "reference target is not an object"),
-        }
-    }
-}
-
-/// Follows a Media Type Object's `$ref` chain through `components.mediaTypes`
-/// only — never the filesystem or network. A non-object entry is `Ok(None)`
-/// (nothing to read, nothing to report), matching how such an entry was
-/// already ignored before references were supported.
-fn resolve_media_type<'a>(entry: &'a Value, media_types: &'a Map<String, Value>) -> Result<Option<&'a Map<String, Value>>, MediaRefError> {
-    let mut current = entry;
-    let mut hops = 0usize;
-    let mut visited: HashSet<&str> = HashSet::new();
-    loop {
-        let Some(obj) = current.as_object() else {
-            return if hops == 0 { Ok(None) } else { Err(MediaRefError::NotAnObject) };
-        };
-        let Some(reference) = obj.get("$ref") else {
-            return Ok(Some(obj));
-        };
-        let Some(reference) = reference.as_str() else {
-            return Err(MediaRefError::NonStringRef);
-        };
-        if reference.starts_with(SCHEMA_REF_PREFIX) {
-            return Err(MediaRefError::WrongKind);
-        }
-        let Some(name) = reference.strip_prefix(MEDIA_TYPE_REF_PREFIX) else {
-            return Err(MediaRefError::Unsupported(reference.to_string()));
-        };
-        if !visited.insert(name) {
-            return Err(MediaRefError::Cycle);
-        }
-        hops += 1;
-        if hops > MAX_MEDIA_TYPE_REF_HOPS {
-            return Err(MediaRefError::TooLong);
-        }
-        current = media_types.get(name).ok_or_else(|| MediaRefError::UnknownName(name.to_string()))?;
-    }
-}
-
 type ResolvedSecurity = (Option<String>, Vec<String>, Vec<Vec<String>>);
 
 struct OpCtx<'a> {
-    media_types: &'a Map<String, Value>,
+    refs: RefIndex<'a>,
     scheme_names: &'a Map<String, Value>,
     document_security: Option<&'a ResolvedSecurity>,
     document_security_malformed: bool,
@@ -354,8 +299,7 @@ fn dropped_entry(path: &str, key: &str, entry: &Value, ctx: &OpCtx, mode: Method
 
 /// Every operation of a path the loader set aside, with the security it would
 /// have carried, so routing-shadow checks can still see what that path meant.
-fn read_skipped_path(raw: &str, item: &Value, reason: &str, ctx: &OpCtx, mode: MethodCase) -> Vec<SkippedOperation> {
-    let Some(item) = item.as_object() else { return Vec::new() };
+fn read_skipped_path(raw: &str, item: &Map<String, Value>, reason: &str, ctx: &OpCtx, mode: MethodCase) -> Vec<SkippedOperation> {
     let mut out = Vec::new();
     let mut push = |wire: String, entry: &Value| {
         let (security_alternatives, security_unparseable, security_inherited) = lenient_security(Some(entry), ctx);
@@ -367,6 +311,7 @@ fn read_skipped_path(raw: &str, item: &Value, reason: &str, ctx: &OpCtx, mode: M
             security_alternatives,
             security_unparseable,
             security_inherited,
+            any_method: false,
         });
     };
     for method in FIXED_FIELDS {
@@ -382,20 +327,95 @@ fn read_skipped_path(raw: &str, item: &Value, reason: &str, ctx: &OpCtx, mode: M
     out
 }
 
+/// Stands in for every method of a path whose item could not be resolved: secured, with no
+/// acceptable scheme, so route-shadow checks refuse anything that would be served there.
+fn unresolved_path_item_skip(raw_path: &str, reason: String) -> SkippedOperation {
+    SkippedOperation {
+        raw_path: raw_path.to_string(),
+        reason,
+        method_wire: String::new(),
+        operation_id: String::new(),
+        security_alternatives: Vec::new(),
+        security_unparseable: true,
+        security_inherited: false,
+        any_method: true,
+    }
+}
+
 fn media_ref_issue(message: String) -> LoadIssue {
     LoadIssue::new(IssueKind::MediaTypeRefUnresolved, Severity::Error, message)
 }
 
+/// A `$ref` value as spec text, unescaped (stored raw, escaped only where printed).
+fn raw_ref_text(entry: &Value) -> String {
+    match entry.get("$ref") {
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
+/// Reports the keys a Reference Object ignores next to its `$ref` (`summary`/`description` are
+/// allowed there). One warning per reference site.
+fn note_ref_siblings(entry: &Value, what: &str, label: &str, issues: &mut Vec<LoadIssue>) {
+    let siblings = local_ref::ref_siblings(entry);
+    if siblings.is_empty() {
+        return;
+    }
+    let mut keys: Vec<String> = siblings.iter().take(5).map(|key| untrusted_short(key)).collect();
+    if siblings.len() > 5 {
+        keys.push("…".to_string());
+    }
+    issues.push(LoadIssue::new(
+        IssueKind::RefSiblingIgnored,
+        Severity::Warning,
+        format!(
+            "{label}: {what} $ref {} has sibling keys ({}) that are ignored; only summary and description may sit next to a $ref",
+            untrusted(&raw_ref_text(entry)),
+            keys.join(", ")
+        ),
+    ));
+}
+
 /// Extracts `name`/`in`/`required`/`schema.type` from an operation's
-/// `parameters` array. A parameter with no `schema` but exactly one `content`
-/// entry takes its type from that entry's schema.
-fn extract_parameters(operation: &Map<String, Value>, ctx: &OpCtx, label: &str, issues: &mut Vec<LoadIssue>) -> Vec<ParameterInfo> {
+/// `parameters` array (each element may be a `$ref` into `components.parameters`). A parameter
+/// with no `schema` but exactly one `content` entry takes its type from that entry's schema.
+/// The second value lists the raw `$ref`s that could not be resolved: those parameters are
+/// unknown, which request validation must not treat as absent-and-fine.
+fn extract_parameters(operation: &Map<String, Value>, ctx: &OpCtx, label: &str, issues: &mut Vec<LoadIssue>) -> (Vec<ParameterInfo>, Vec<String>) {
     let Some(parameters) = operation.get("parameters").and_then(Value::as_array) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut out = Vec::new();
-    for param in parameters {
+    let mut unresolved = Vec::new();
+    for entry in parameters {
+        let is_reference = entry.get("$ref").is_some();
+        let mut unresolved_because = |reason: String, issues: &mut Vec<LoadIssue>| {
+            issues.push(LoadIssue::new(
+                IssueKind::ParameterRefUnresolved,
+                Severity::Error,
+                format!(
+                    "{label}: parameter $ref {} unresolved ({reason}) — the parameter is unknown",
+                    untrusted(&raw_ref_text(entry))
+                ),
+            ));
+            unresolved.push(raw_ref_text(entry));
+        };
+        let param = match resolve_ref(entry, RefKind::Parameter, &ctx.refs) {
+            Ok(Some(obj)) => obj,
+            Ok(None) => continue,
+            Err(e) => {
+                unresolved_because(e.to_string(), issues);
+                continue;
+            }
+        };
+        if is_reference {
+            note_ref_siblings(entry, "parameter", label, issues);
+        }
         let (Some(name), Some(location)) = (param.get("name").and_then(Value::as_str), param.get("in").and_then(Value::as_str)) else {
+            if is_reference {
+                unresolved_because("target is not a Parameter Object".to_string(), issues);
+            }
             continue;
         };
         let required = param.get("required").and_then(Value::as_bool).unwrap_or(false);
@@ -404,8 +424,11 @@ fn extract_parameters(operation: &Map<String, Value>, ctx: &OpCtx, label: &str, 
             None => match param.get("content").and_then(Value::as_object) {
                 Some(content) if content.len() == 1 => {
                     let (media, entry) = content.iter().next().expect("len checked");
-                    match resolve_media_type(entry, ctx.media_types) {
-                        Ok(Some(obj)) => obj.get("schema").and_then(|s| s.get("type")).and_then(Value::as_str).map(str::to_string),
+                    match resolve_ref(entry, RefKind::MediaType, &ctx.refs) {
+                        Ok(Some(obj)) => {
+                            note_ref_siblings(entry, "media type", label, issues);
+                            obj.get("schema").and_then(|s| s.get("type")).and_then(Value::as_str).map(str::to_string)
+                        }
                         Ok(None) => None,
                         Err(e) => {
                             issues.push(media_ref_issue(format!(
@@ -427,7 +450,7 @@ fn extract_parameters(operation: &Map<String, Value>, ctx: &OpCtx, label: &str, 
             schema_type,
         });
     }
-    out
+    (out, unresolved)
 }
 
 fn is_streaming_entry(media_key: &str, entry: &Map<String, Value>) -> bool {
@@ -460,16 +483,40 @@ fn extract_request_body(
     label: &str,
     issues: &mut Vec<LoadIssue>,
 ) -> (Option<RequestBodySchema>, Option<String>, Option<StreamSpec>) {
-    let Some(request_body) = operation.get("requestBody").and_then(Value::as_object) else {
+    let Some(request_body_entry) = operation.get("requestBody") else {
         return (None, None, None);
     };
+    let request_body = match resolve_ref(request_body_entry, RefKind::RequestBody, &ctx.refs) {
+        Ok(Some(obj)) => obj,
+        Ok(None) => return (None, None, None),
+        Err(e) => {
+            issues.push(LoadIssue::new(
+                IssueKind::RequestBodyRefUnresolved,
+                Severity::Error,
+                format!(
+                    "{label}: requestBody $ref {} unresolved ({e}) — treated as a required body of unknown shape",
+                    untrusted(&raw_ref_text(request_body_entry))
+                ),
+            ));
+            return (
+                Some(RequestBodySchema {
+                    required: true,
+                    schema: Value::Object(Map::new()),
+                }),
+                Some(format!("requestBody $ref unresolved ({e})")),
+                None,
+            );
+        }
+    };
+    note_ref_siblings(request_body_entry, "requestBody", label, issues);
     let Some(content) = request_body.get("content").and_then(Value::as_object) else {
         return (None, None, None);
     };
     let required = request_body.get("required").and_then(Value::as_bool).unwrap_or(false);
 
     if let Some(entry) = content.get("application/json") {
-        return match resolve_media_type(entry, ctx.media_types) {
+        note_ref_siblings(entry, "media type", label, issues);
+        return match resolve_ref(entry, RefKind::MediaType, &ctx.refs) {
             Ok(Some(obj)) => (obj.get("schema").cloned().map(|schema| RequestBodySchema { required, schema }), None, None),
             Ok(None) => (None, None, None),
             Err(e) => {
@@ -489,7 +536,7 @@ fn extract_request_body(
     }
 
     for (media, entry) in content {
-        match resolve_media_type(entry, ctx.media_types) {
+        match resolve_ref(entry, RefKind::MediaType, &ctx.refs) {
             Ok(Some(obj)) if is_streaming_entry(media, obj) => {
                 issues.push(LoadIssue::new(
                     IssueKind::StreamingDeclared,
@@ -546,13 +593,32 @@ fn extract_response(operation: &Map<String, Value>, ctx: &OpCtx, label: &str, is
     let Some(responses) = operation.get("responses").and_then(Value::as_object) else {
         return (None, ResponseMode::Single);
     };
-    let success = || responses.iter().filter(|(status, _)| status.starts_with('2'));
+    let mut success: Vec<(&String, &Map<String, Value>)> = Vec::new();
+    for (status, response) in responses.iter().filter(|(status, _)| status.starts_with('2')) {
+        match resolve_ref(response, RefKind::Response, &ctx.refs) {
+            Ok(Some(obj)) => {
+                note_ref_siblings(response, "response", label, issues);
+                success.push((status, obj));
+            }
+            Ok(None) => {}
+            Err(e) => issues.push(LoadIssue::new(
+                IssueKind::ResponseRefUnresolved,
+                Severity::Error,
+                format!(
+                    "{label}: response {} $ref {} unresolved ({e}) — treated as having no schema",
+                    untrusted(status),
+                    untrusted(&raw_ref_text(response))
+                ),
+            )),
+        }
+    }
 
-    for (status, response) in success() {
+    for (status, response) in &success {
         let Some(entry) = response.get("content").and_then(|c| c.get("application/json")) else {
             continue;
         };
-        match resolve_media_type(entry, ctx.media_types) {
+        note_ref_siblings(entry, "media type", label, issues);
+        match resolve_ref(entry, RefKind::MediaType, &ctx.refs) {
             Ok(Some(obj)) => {
                 if let Some(schema) = obj.get("schema") {
                     return (Some(schema.clone()), ResponseMode::Single);
@@ -566,12 +632,12 @@ fn extract_response(operation: &Map<String, Value>, ctx: &OpCtx, label: &str, is
         }
     }
 
-    for (status, response) in success() {
+    for (status, response) in &success {
         let Some(content) = response.get("content").and_then(Value::as_object) else {
             continue;
         };
         for (media, entry) in content {
-            match resolve_media_type(entry, ctx.media_types) {
+            match resolve_ref(entry, RefKind::MediaType, &ctx.refs) {
                 Ok(Some(obj)) if is_streaming_entry(media, obj) => {
                     issues.push(LoadIssue::new(
                         IssueKind::StreamingDeclared,
@@ -605,8 +671,8 @@ fn resolve_scheme_key(key: &str, scheme_names: &Map<String, Value>) -> Option<St
     if scheme_names.contains_key(key) {
         return Some(key.to_string());
     }
-    if let Some(name) = key.strip_prefix(SECURITY_SCHEME_REF_PREFIX) {
-        return scheme_names.contains_key(name).then(|| name.to_string());
+    if let Some(decoded) = local_ref::component_name(key, "securitySchemes") {
+        return decoded.ok().filter(|name| scheme_names.contains_key(name.as_ref())).map(std::borrow::Cow::into_owned);
     }
     schema_walk::is_name_shaped(key).then(|| key.to_string())
 }
@@ -749,6 +815,15 @@ pub enum IssueKind {
     PartialPathTemplate,
     /// Two accepted paths cannot both be registered in the route table.
     RouteTemplateConflict,
+    ParameterRefUnresolved,
+    RequestBodyRefUnresolved,
+    ResponseRefUnresolved,
+    /// A path item `$ref` that cannot be followed (unknown, cyclic, external, too large to expand).
+    PathItemRefUnresolved,
+    /// A path item and its `$ref` target both define the same field, so no merge is attempted.
+    PathItemRefConflict,
+    /// Keys next to a `$ref` that a Reference Object ignores.
+    RefSiblingIgnored,
 }
 
 impl IssueKind {
@@ -777,6 +852,12 @@ impl IssueKind {
             | IssueKind::DefaultMappingUnresolved
             | IssueKind::PartialPathTemplate
             | IssueKind::RouteTemplateConflict
+            | IssueKind::ParameterRefUnresolved
+            | IssueKind::RequestBodyRefUnresolved
+            | IssueKind::ResponseRefUnresolved
+            | IssueKind::PathItemRefUnresolved
+            | IssueKind::PathItemRefConflict
+            | IssueKind::RefSiblingIgnored
             | IssueKind::SecurityRequirementUnresolved => true,
         }
     }
@@ -838,6 +919,10 @@ pub struct OpenApiDocument {
     pub dropped_operations: Vec<DroppedOperation>,
     /// Operations of every path skipped at load, with their security.
     pub skipped_operations: Vec<SkippedOperation>,
+    /// Normalised paths of accepted path items whose `$ref` could not be resolved. They stay
+    /// routable-looking (no operations) so collision analysis sees them, and generate never
+    /// treats their endpoint files as orphans.
+    pub unresolved_path_items: BTreeSet<String>,
 }
 
 /// An `additionalOperations` entry on an accepted path that the loader dropped (S3, S4,
@@ -863,6 +948,9 @@ pub struct SkippedOperation {
     pub security_alternatives: Vec<Vec<String>>,
     pub security_unparseable: bool,
     pub security_inherited: bool,
+    /// Stands for every method of the path (an unresolvable path item): `method_wire` is empty and
+    /// must not be compared.
+    pub any_method: bool,
 }
 
 impl OpenApiDocument {
@@ -1038,7 +1126,7 @@ fn build_operation(
             ));
         }
     }
-    let parameters = extract_parameters(operation_obj, ctx, &label, issues);
+    let (parameters, unresolved_parameter_refs) = extract_parameters(operation_obj, ctx, &label, issues);
     let (request_body, request_body_unresolved, request_stream) = extract_request_body(operation_obj, ctx, &label, issues);
     let (response_schema, response_mode) = extract_response(operation_obj, ctx, &label, issues);
     let security_inherited = operation_obj.get("security").is_none() && ctx.document_security.is_some();
@@ -1062,6 +1150,7 @@ fn build_operation(
         response_mode,
         request_stream,
         request_body_unresolved,
+        unresolved_parameter_refs,
     }
 }
 
@@ -1244,7 +1333,16 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, options: 
     let spec_version = detect_version(&doc, &mut issues);
     let empty = Map::new();
     let components_obj = doc.get("components");
-    let media_types = components_obj.and_then(|c| c.get("mediaTypes")).and_then(Value::as_object).unwrap_or(&empty);
+    let component_map = |key: &str| components_obj.and_then(|c| c.get(key)).and_then(Value::as_object).unwrap_or(&empty);
+    let raw_paths = doc.get("paths").and_then(Value::as_object);
+    let refs = RefIndex {
+        media_types: component_map("mediaTypes"),
+        parameters: component_map("parameters"),
+        request_bodies: component_map("requestBodies"),
+        responses: component_map("responses"),
+        path_items: component_map("pathItems"),
+        paths: raw_paths.unwrap_or(&empty),
+    };
     let scheme_names = components_obj.and_then(|c| c.get("securitySchemes")).and_then(Value::as_object).unwrap_or(&empty);
     let document_security = doc
         .get("security")
@@ -1253,7 +1351,7 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, options: 
         .get("security")
         .is_some_and(|value| !value.as_array().is_some_and(|list| list.iter().all(Value::is_object)));
     let ctx = OpCtx {
-        media_types,
+        refs,
         scheme_names,
         document_security: document_security.as_ref(),
         document_security_malformed,
@@ -1262,14 +1360,39 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, options: 
     let mut skipped_operations: Vec<SkippedOperation> = Vec::new();
 
     let mut skipped_paths = BTreeSet::new();
-    let mut accepted: Vec<(String, &Map<String, Value>)> = Vec::new();
-    if let Some(paths) = doc.get("paths").and_then(Value::as_object) {
+    let mut unresolved_path_items = BTreeSet::new();
+    let mut accepted: Vec<(String, Cow<Map<String, Value>>)> = Vec::new();
+    if let Some(paths) = raw_paths {
+        let mut budget = ExpansionBudget::default();
         let mut checked = Vec::new();
         for (raw, item) in paths {
+            let (resolved, unresolved_reason) = match resolve_path_item(item, &refs, &mut budget) {
+                Ok(resolved) => (resolved, None),
+                Err(e) => {
+                    let kind = if e.is_conflict() {
+                        IssueKind::PathItemRefConflict
+                    } else {
+                        IssueKind::PathItemRefUnresolved
+                    };
+                    issues.push(LoadIssue::new(
+                        kind,
+                        Severity::Error,
+                        format!(
+                            "path '{}': path item $ref unresolved ({e}) — every method of this path is treated as secured and unservable",
+                            untrusted(raw)
+                        ),
+                    ));
+                    (
+                        Some(Cow::Owned(Map::new())),
+                        Some(format!("path item $ref unresolved ({e}); treated as secured for every method (fail closed)")),
+                    )
+                }
+            };
             match path_rules::validate_path(raw, policy) {
-                Ok(check) => checked.push((raw, item, check)),
+                Ok(check) => checked.push((raw, resolved, unresolved_reason, check)),
                 Err((kind, message)) => {
-                    skipped_operations.extend(read_skipped_path(raw, item, &message, &ctx, method_case));
+                    skipped_operations.extend(read_skipped_path(raw, resolved.as_deref().unwrap_or(&empty), &message, &ctx, method_case));
+                    skipped_operations.extend(unresolved_reason.map(|reason| unresolved_path_item_skip(raw, reason)));
                     issues.push(LoadIssue::new(kind, Severity::Error, message));
                     skipped_paths.insert(raw.clone());
                 }
@@ -1278,18 +1401,19 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, options: 
 
         let canonical: BTreeSet<&str> = checked
             .iter()
-            .filter(|(raw, _, check)| raw.as_str() == check.normalized)
-            .map(|(raw, _, _)| raw.as_str())
+            .filter(|(raw, _, _, check)| raw.as_str() == check.normalized)
+            .map(|(raw, _, _, _)| raw.as_str())
             .collect();
         let mut seen: BTreeSet<String> = BTreeSet::new();
-        for (raw, item, check) in checked {
+        for (raw, item, unresolved_reason, check) in checked {
             if raw.as_str() != check.normalized && (canonical.contains(check.normalized.as_str()) || seen.contains(&check.normalized)) {
                 let message = format!(
                     "path '{}' normalises to '{}', which another path already provides — skipped",
                     untrusted(raw),
                     untrusted(&check.normalized)
                 );
-                skipped_operations.extend(read_skipped_path(raw, item, &message, &ctx, method_case));
+                skipped_operations.extend(read_skipped_path(raw, item.as_deref().unwrap_or(&empty), &message, &ctx, method_case));
+                skipped_operations.extend(unresolved_reason.map(|reason| unresolved_path_item_skip(raw, reason)));
                 issues.push(LoadIssue::new(IssueKind::TrailingSlashCollision, Severity::Error, message));
                 skipped_paths.insert(raw.clone());
                 continue;
@@ -1298,7 +1422,11 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, options: 
                 issues.push(LoadIssue::new(kind, severity, message));
             }
             seen.insert(check.normalized.clone());
-            let Some(item) = item.as_object() else { continue };
+            let Some(item) = item else { continue };
+            if let Some(reason) = unresolved_reason {
+                unresolved_path_items.insert(check.normalized.clone());
+                skipped_operations.push(unresolved_path_item_skip(&check.normalized, reason));
+            }
             accepted.push((check.normalized, item));
         }
     }
@@ -1425,6 +1553,7 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, options: 
         deprecated_security_schemes,
         dropped_operations,
         skipped_operations,
+        unresolved_path_items,
     };
 
     let mut mapping_issues = Vec::new();
@@ -1470,18 +1599,18 @@ mod tests {
     fn extract_parameters(operation: &Map<String, Value>) -> Vec<ParameterInfo> {
         let empty = Map::new();
         let ctx = OpCtx {
-            media_types: &empty,
+            refs: RefIndex::empty(&empty),
             scheme_names: &empty,
             document_security: None,
             document_security_malformed: false,
         };
-        super::extract_parameters(operation, &ctx, "test", &mut Vec::new())
+        super::extract_parameters(operation, &ctx, "test", &mut Vec::new()).0
     }
 
     fn extract_request_body(operation: &Map<String, Value>) -> Option<RequestBodySchema> {
         let empty = Map::new();
         let ctx = OpCtx {
-            media_types: &empty,
+            refs: RefIndex::empty(&empty),
             scheme_names: &empty,
             document_security: None,
             document_security_malformed: false,

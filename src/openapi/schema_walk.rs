@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
@@ -19,7 +20,7 @@ pub(crate) fn is_name_shaped(s: &str) -> bool {
 
 pub(crate) enum DefaultMapping<'a> {
     Absent,
-    Target(&'a str),
+    Target(Cow<'a, str>),
     Unresolved(&'static str),
 }
 
@@ -38,13 +39,13 @@ pub(crate) fn default_mapping_target<'a>(obj: &'a Map<String, Value>, is_compone
         return DefaultMapping::Unresolved("is not a string");
     };
     if is_component(text) {
-        return DefaultMapping::Target(text);
+        return DefaultMapping::Target(Cow::Borrowed(text));
     }
-    if let Some(name) = text.strip_prefix("#/components/schemas/") {
-        return if is_component(name) {
-            DefaultMapping::Target(name)
-        } else {
-            DefaultMapping::Unresolved("names no component in components/schemas")
+    if let Some(decoded) = super::local_ref::component_name(text, "schemas") {
+        return match decoded {
+            Ok(name) if is_component(&name) => DefaultMapping::Target(name),
+            Ok(_) => DefaultMapping::Unresolved("names no component in components/schemas"),
+            Err(_) => DefaultMapping::Unresolved("is not a valid #/components/schemas/<Name> reference"),
         };
     }
     if is_name_shaped(text) {
@@ -158,12 +159,12 @@ impl<'a> SchemaWalker<'a> {
     }
 
     fn walk_ref(&self, ref_str: &str, in_progress: &mut HashSet<String>, depth: usize) -> Value {
-        let Some(name) = ref_str.strip_prefix("#/components/schemas/") else {
+        let Some(Ok(name)) = super::local_ref::component_name(ref_str, "schemas") else {
             return Value::String(format!("<unsupported $ref: {ref_str}>"));
         };
 
-        let resolved = self.walk_named(name, in_progress, depth + 1);
-        with_component_marker(name, resolved)
+        let resolved = self.walk_named(&name, in_progress, depth + 1);
+        with_component_marker(&name, resolved)
     }
 
     /// `allOf` is the tractable composition case: structurally it's just
@@ -191,9 +192,9 @@ impl<'a> SchemaWalker<'a> {
         let rendered: Vec<String> = variants.iter().map(|variant| render_compact(&self.walk(variant, in_progress, depth + 1))).collect();
         let rendered = format!("oneOf<{}>", rendered.join(", "));
         if let DefaultMapping::Target(name) = default_mapping_target(obj, |n| self.components.contains_key(n))
-            && let Value::Object(fields) = self.walk_named(name, in_progress, depth + 1)
+            && let Value::Object(fields) = self.walk_named(&name, in_progress, depth + 1)
         {
-            return annotate_default(name, rendered, fields);
+            return annotate_default(&name, rendered, fields);
         }
         Value::String(rendered)
     }
@@ -242,11 +243,11 @@ fn walk_response_schema_at(schema: &Value, cache: &HashMap<String, Value>, depth
     };
 
     if let Some(ref_str) = obj.get("$ref").and_then(Value::as_str) {
-        let Some(name) = ref_str.strip_prefix("#/components/schemas/") else {
+        let Some(Ok(name)) = super::local_ref::component_name(ref_str, "schemas") else {
             return Value::String(format!("<unsupported $ref: {ref_str}>"));
         };
-        return match cache.get(name) {
-            Some(resolved) => with_component_marker(name, resolved.clone()),
+        return match cache.get(name.as_ref()) {
+            Some(resolved) => with_component_marker(&name, resolved.clone()),
             None => Value::String(format!("<unknown component: {name}>")),
         };
     }
@@ -268,9 +269,9 @@ fn walk_response_schema_at(schema: &Value, cache: &HashMap<String, Value>, depth
             .collect();
         let rendered = format!("oneOf<{}>", rendered.join(", "));
         if let DefaultMapping::Target(name) = default_mapping_target(obj, |n| cache.contains_key(n))
-            && let Some(Value::Object(fields)) = cache.get(name)
+            && let Some(Value::Object(fields)) = cache.get(name.as_ref())
         {
-            return annotate_default(name, rendered, fields.clone());
+            return annotate_default(&name, rendered, fields.clone());
         }
         return Value::String(rendered);
     }
@@ -929,10 +930,10 @@ mod m2_default_mapping_tests {
                 .unwrap()
                 .clone()
         };
-        assert!(matches!(default_mapping_target(&obj(serde_json::json!("Car")), is_c), DefaultMapping::Target("Car")));
+        assert!(matches!(default_mapping_target(&obj(serde_json::json!("Car")), is_c), DefaultMapping::Target(name) if name == "Car"));
         assert!(matches!(
             default_mapping_target(&obj(serde_json::json!("#/components/schemas/Car")), is_c),
-            DefaultMapping::Target("Car")
+            DefaultMapping::Target(name) if name == "Car"
         ));
         assert!(matches!(default_mapping_target(&obj(serde_json::json!("Nope")), is_c), DefaultMapping::Unresolved(_)));
         assert!(matches!(

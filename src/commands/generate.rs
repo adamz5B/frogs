@@ -247,6 +247,12 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
          (autoMigrateEndpoints off)",
         summary.skipped, summary.created, summary.migrated, summary.drift_warned
     );
+    if summary.references_refreshed > 0 {
+        println!(
+            "  {} reference file(s) refreshed (request parameters changed; stubs untouched)",
+            summary.references_refreshed
+        );
+    }
 
     // What the write phase just created or renamed is on disk now; the orphan pass and the final checks read the fresh state.
     let tree = EndpointTree::scan(&ctx, &endpoints_root);
@@ -1151,6 +1157,7 @@ fn mark_orphaned_endpoints(
         .ambiguous
         .iter()
         .chain(doc.skipped_paths.iter())
+        .chain(doc.unresolved_path_items.iter())
         .chain(rejected_paths.iter())
         .map(|p| fold(p))
         .collect();
@@ -1295,6 +1302,9 @@ struct GenerateSummary {
     /// Drift was detected but `autoMigrateEndpoints` is off; only the
     /// reference file updated, the stub was left alone with a warning.
     drift_warned: usize,
+    /// Nothing else drifted, but the parameter details a `$ref`'d component feeds into the
+    /// reference file (`request`, `availableParameterSources`) did; only that file was rewritten.
+    references_refreshed: usize,
 }
 
 /// Writes (or skips) every operation's reference and stub files, per the
@@ -1384,6 +1394,24 @@ fn write_one_endpoint(
         || stored_security != op.security;
 
     if !drifted && !matches!(stub_state, FileState::Absent) && matches!(reference_state, FileState::Present(_)) {
+        if !reference_parameter_details_match(stored_reference.as_ref(), op) {
+            let response_descriptor = op.resolve_response(components).unwrap_or(Value::Null);
+            let reference_bytes = serde_json::to_string_pretty(&build_reference_file(op, &current_hash, &response_descriptor, components)).expect("always serializes");
+            match create_endpoint_dir_for(ctx, endpoints_root, &op.path)
+                .and_then(|dir| write_existing_file(&ctx.boundary, &dir, &reference_file_name, reference_bytes.as_bytes()))
+            {
+                Ok(()) => summary.references_refreshed += 1,
+                Err(e) => {
+                    eprintln!(
+                        "warning: {} {}: {reference_file_name} is out of date but could not be refreshed ({e})",
+                        op.http_method,
+                        untrusted(&op.path)
+                    );
+                    summary.skipped += 1;
+                }
+            }
+            return Ok(());
+        }
         summary.skipped += 1;
         return Ok(());
     }
@@ -1431,6 +1459,15 @@ fn write_one_endpoint(
         }
     }
     Ok(())
+}
+
+/// Whether a stored reference file already carries this operation's `request` and
+/// `availableParameterSources`. Parameters can come from a `$ref`'d component whose edit changes
+/// neither the response-schema hash nor the stub, so this is the only signal that the reference
+/// file went stale.
+fn reference_parameter_details_match(stored: Option<&Value>, op: &Operation) -> bool {
+    let Some(stored) = stored else { return true };
+    stored.get("request") == Some(&op.request_sources()) && stored.get("availableParameterSources") == Some(&serde_json::json!(op.available_parameter_sources()))
 }
 
 /// Copies the current stub into `_backups/` (inside the path's own folder,
@@ -1559,7 +1596,8 @@ mod tests {
                 skipped: 0,
                 created: 1,
                 migrated: 0,
-                drift_warned: 0
+                drift_warned: 0,
+                references_refreshed: 0
             }
         );
 
@@ -1616,7 +1654,8 @@ mod tests {
                 skipped: 0,
                 created: 1,
                 migrated: 0,
-                drift_warned: 0
+                drift_warned: 0,
+                references_refreshed: 0
             }
         );
 
@@ -1713,7 +1752,8 @@ mod tests {
                 skipped: 0,
                 created: 0,
                 migrated: 1,
-                drift_warned: 0
+                drift_warned: 0,
+                references_refreshed: 0
             }
         );
 
@@ -1768,7 +1808,8 @@ mod tests {
                 skipped: 0,
                 created: 0,
                 migrated: 1,
-                drift_warned: 0
+                drift_warned: 0,
+                references_refreshed: 0
             }
         );
 
@@ -1816,7 +1857,8 @@ mod tests {
                 skipped: 1,
                 created: 0,
                 migrated: 0,
-                drift_warned: 0
+                drift_warned: 0,
+                references_refreshed: 0
             }
         );
         assert_eq!(std::fs::metadata(&stub_path).unwrap().modified().unwrap(), modified_before);
@@ -1868,7 +1910,8 @@ mod tests {
                 skipped: 0,
                 created: 0,
                 migrated: 1,
-                drift_warned: 0
+                drift_warned: 0,
+                references_refreshed: 0
             }
         );
 
@@ -1924,7 +1967,8 @@ mod tests {
                 skipped: 0,
                 created: 0,
                 migrated: 0,
-                drift_warned: 1
+                drift_warned: 1,
+                references_refreshed: 0
             }
         );
 
@@ -2380,6 +2424,9 @@ mod symlink_tests;
 
 #[cfg(test)]
 mod route_tests;
+
+#[cfg(test)]
+mod ref_tests;
 
 #[cfg(test)]
 mod hardening_tests {

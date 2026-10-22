@@ -288,3 +288,24 @@ fn an_unconditional_template_instance_refusal_does_not_depend_on_strict() {
     let err = fx.startup("").map(|_| ()).expect_err("must refuse");
     assert!(err.to_string().contains("instances of a secured openapi.yaml path template"), "{err}");
 }
+
+// ------------------------------------------------------------------- same template, different parameter names
+
+const ITEM_ID_AND_ID: &str = "  /items/{itemId}:\n    get:\n      operationId: byItemId\n      security: [ { a: [] } ]\n      responses: { '200': { description: ok } }\n  /items/{id}:\n    get:\n      operationId: byId\n      responses: { '200': { description: ok } }\n";
+
+#[test]
+fn a_secured_template_declared_twice_with_different_parameter_names_refuses_startup_even_when_not_strict() {
+    let fx = Fx::new(QUIET, ITEM_ID_AND_ID);
+    fx.endpoint("items/{id}", "get", None);
+    let err = fx.startup("").map(|_| ()).expect_err("must refuse");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    let text = err.to_string();
+    assert!(text.contains("would be answered by a route that does not enforce their security"), "{text}");
+}
+
+#[test]
+fn the_same_twice_declared_template_layout_starts_when_the_serving_file_declares_the_scheme() {
+    let fx = Fx::new(QUIET, ITEM_ID_AND_ID);
+    fx.endpoint("items/{id}", "get", Some("a"));
+    assert!(fx.startup("").is_ok());
+}

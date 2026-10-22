@@ -275,6 +275,12 @@ pub fn build_router(
                 if let Some(reason) = &op.request_body_unresolved {
                     tracing::warn!("{wire} {url_path}: request body schema unresolved ({reason}) — body validation skipped for this route");
                 }
+                if !op.unresolved_parameter_refs.is_empty() {
+                    tracing::warn!(
+                        "{wire} {url_path}: openapi.yaml declares parameter(s) frogs could not resolve ({}) — request validation for this route is incomplete",
+                        unresolved_parameter_ref_list(&op.unresolved_parameter_refs)
+                    );
+                }
             }
             let response_mode = operation.map(|op| op.response_mode.clone()).unwrap_or_default();
 
@@ -1445,6 +1451,44 @@ fn find_operation<'a>(doc: &'a crate::openapi::OpenApiDocument, url_path: &str, 
         .find(|op| op.method == method && axum_style_path(&op.path) == url_path)
 }
 
+const MAX_LISTED_UNRESOLVED_PARAMETER_REFS: usize = 5;
+
+/// The raw `$ref` texts of unresolved parameters for a message: escaped here (they are stored
+/// raw), at most five, then an ellipsis.
+pub(crate) fn unresolved_parameter_ref_list(refs: &[String]) -> String {
+    let mut shown: Vec<String> = refs
+        .iter()
+        .take(MAX_LISTED_UNRESOLVED_PARAMETER_REFS)
+        .map(|r| crate::openapi::method_token::untrusted_short(r))
+        .collect();
+    if refs.len() > MAX_LISTED_UNRESOLVED_PARAMETER_REFS {
+        shown.push("…".to_string());
+    }
+    shown.join(", ")
+}
+
+/// One message per routed endpoint file whose exactly-matching `openapi.yaml` operation has a
+/// parameter `$ref` frogs could not resolve: request validation for that route would silently
+/// miss a parameter the spec declares. Files without a matching operation are not reported.
+pub(crate) fn unresolved_parameter_routes(tree: &EndpointTree, doc: &crate::openapi::OpenApiDocument) -> Vec<String> {
+    let mut out = Vec::new();
+    for (url_path, method, _file) in discover_endpoint_files(tree, doc.method_case) {
+        let Some(op) = find_operation(doc, &url_path, &method) else { continue };
+        if op.unresolved_parameter_refs.is_empty() {
+            continue;
+        }
+        out.push(format!(
+            "{} {}: openapi.yaml declares parameter(s) frogs could not resolve ({}) — request validation for this route would be incomplete",
+            crate::openapi::untrusted(&op.http_method),
+            crate::openapi::untrusted(&op.path),
+            unresolved_parameter_ref_list(&op.unresolved_parameter_refs)
+        ));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// An endpoint file whose `security` doesn't agree with what `openapi.yaml`
 /// requires for the matching operation(s). `acceptable` is the intersection of
 /// every requiring operation's acceptable schemes.
@@ -1552,6 +1596,14 @@ fn acceptable_display(acceptable: &[String], unknown: bool) -> String {
     }
 }
 
+fn method_or_every(any_method: bool, wire: &str) -> String {
+    if any_method {
+        "every method".to_string()
+    } else {
+        method_token::display_token(wire)
+    }
+}
+
 fn origin_note(origin: &ShadowOrigin) -> String {
     match origin {
         ShadowOrigin::Served => String::new(),
@@ -1571,6 +1623,8 @@ pub(crate) struct SecurityShadow {
     pub file_security: Option<String>,
     pub acceptable: Vec<String>,
     pub unknown: bool,
+    pub same_template: bool,
+    pub any_method: bool,
 }
 
 impl SecurityShadow {
@@ -1581,9 +1635,16 @@ impl SecurityShadow {
             None => "no \"security\"".to_string(),
         };
         let file = untrusted(&self.file.display().to_string());
+        let remedy = if self.same_template {
+            format!(
+                "openapi.yaml declares this path template twice with different parameter names (e.g. both /items/{{itemId}} and /items/{{id}}) — fix openapi.yaml, or make {file} declare an acceptable scheme"
+            )
+        } else {
+            format!("run frogs generate to create its own file, or make {file} declare an acceptable scheme")
+        };
         format!(
-            "{} {} (operationId {}){}: openapi.yaml requires security ({}) but the request would be served by route {} ({file}), which declares {declares} — run frogs generate to create its own file, or make {file} declare an acceptable scheme",
-            method_token::display_token(&self.op_method),
+            "{} {} (operationId {}){}: openapi.yaml requires security ({}) but the request would be served by route {} ({file}), which declares {declares} — {remedy}",
+            method_or_every(self.any_method, &self.op_method),
             untrusted(&self.op_path),
             untrusted_short(&self.operation_id),
             origin_note(&self.origin),
@@ -1600,6 +1661,7 @@ pub(crate) struct UnverifiableSecuredPath {
     pub reason: String,
     pub acceptable: Vec<String>,
     pub unknown: bool,
+    pub any_method: bool,
 }
 
 impl UnverifiableSecuredPath {
@@ -1608,7 +1670,7 @@ impl UnverifiableSecuredPath {
         format!(
             "openapi.yaml path '{}' ({}, security {}) was skipped ({}) and frogs can't determine which route would serve it — fix the path in openapi.yaml",
             untrusted(&self.op_path),
-            method_token::display_token(&self.op_method),
+            method_or_every(self.any_method, &self.op_method),
             acceptable_display(&self.acceptable, self.unknown),
             self.reason
         )
@@ -1626,6 +1688,7 @@ pub(crate) struct BuiltinShadow {
     pub label: &'static str,
     pub field: Option<&'static str>,
     pub inherited: bool,
+    pub any_method: bool,
 }
 
 impl BuiltinShadow {
@@ -1633,7 +1696,7 @@ impl BuiltinShadow {
         use crate::openapi::{method_token::untrusted_short, untrusted};
         let head = format!(
             "{} {} (operationId {}){}: openapi.yaml requires security ({}) but frogs's built-in {} route answers it without authentication",
-            method_token::display_token(&self.op_method),
+            method_or_every(self.any_method, &self.op_method),
             untrusted(&self.op_path),
             untrusted_short(&self.operation_id),
             origin_note(&self.origin),
@@ -1754,8 +1817,8 @@ struct SecuredView {
     unknown: bool,
     inherited: bool,
     origin: ShadowOrigin,
-    /// `(axum-style path, file token)` of the file this operation owns, for served operations.
-    own: Option<(String, String)>,
+    /// An unresolvable path item: stands for every method, `wire` is empty and never compared.
+    any_method: bool,
 }
 
 fn secured_views(doc: &crate::openapi::OpenApiDocument) -> Vec<SecuredView> {
@@ -1770,7 +1833,7 @@ fn secured_views(doc: &crate::openapi::OpenApiDocument) -> Vec<SecuredView> {
                 unknown: false,
                 inherited: op.security_inherited,
                 origin: ShadowOrigin::Served,
-                own: Some((axum_style_path(&op.path), op.method.clone())),
+                any_method: false,
             });
         }
     }
@@ -1790,7 +1853,7 @@ fn secured_views(doc: &crate::openapi::OpenApiDocument) -> Vec<SecuredView> {
                 unknown,
                 inherited: dropped.security_inherited,
                 origin: ShadowOrigin::Dropped,
-                own: None,
+                any_method: false,
             });
         }
     }
@@ -1804,7 +1867,7 @@ fn secured_views(doc: &crate::openapi::OpenApiDocument) -> Vec<SecuredView> {
                 unknown,
                 inherited: skipped.security_inherited,
                 origin: ShadowOrigin::Skipped(skipped.reason.clone()),
-                own: None,
+                any_method: skipped.any_method,
             });
         }
     }
@@ -1822,7 +1885,7 @@ fn view_matches_path(view: &SecuredView, url_path: &str) -> bool {
 }
 
 fn view_label(view: &SecuredView) -> String {
-    format!("{} {}", method_token::display_token(&view.wire), crate::openapi::untrusted(&view.path))
+    format!("{} {}", method_or_every(view.any_method, &view.wire), crate::openapi::untrusted(&view.path))
 }
 
 fn stub_fails(stub: &Option<String>, view: &SecuredView) -> bool {
@@ -1921,6 +1984,7 @@ pub(crate) fn security_check(tree: &EndpointTree, doc: &crate::openapi::OpenApiD
 pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::openapi::OpenApiDocument, plan: &RoutePlan) -> SecurityCheck {
     let mut check = SecurityCheck::default();
     let views = secured_views(doc);
+    let mut owners: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
     for (url_path, method, file) in discover_endpoint_files(tree, doc.method_case) {
         let Ok(contents) = std::fs::read_to_string(&file) else { continue };
         let Ok(endpoint) = serde_json::from_str::<EndpointFile>(&contents) else { continue };
@@ -1967,7 +2031,7 @@ pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::opena
             let instances: Vec<&SecuredView> = views
                 .iter()
                 .filter(|v| {
-                    (v.wire == wire || (v.wire == "HEAD" && wire == "GET"))
+                    (v.any_method || v.wire == wire || (v.wire == "HEAD" && wire == "GET"))
                         && match &v.origin {
                             ShadowOrigin::Skipped(_) => crate::openapi::route_syntax::probe_path(&v.path).is_ok(),
                             _ => true,
@@ -2010,6 +2074,11 @@ pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::opena
             continue;
         }
 
+        owners
+            .entry((url_path.clone(), method.clone()))
+            .or_default()
+            .extend(matched.iter().map(|op| (op.http_method.clone(), op.path.clone())));
+
         let requiring: Vec<Vec<String>> = matched.iter().filter_map(|op| acceptable_schemes(op)).collect();
         if requiring.is_empty() {
             if let Some(stub) = stub {
@@ -2032,8 +2101,8 @@ pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::opena
         }
     }
 
-    let mut seen: std::collections::HashSet<(String, String, PathBuf)> = std::collections::HashSet::new();
-    let mut seen_builtin: std::collections::HashSet<(String, String, &'static str)> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(bool, String, String, PathBuf)> = std::collections::HashSet::new();
+    let mut seen_builtin: std::collections::HashSet<(bool, String, String, &'static str)> = std::collections::HashSet::new();
     for view in &views {
         let probe = match crate::openapi::route_syntax::probe_path(&view.path) {
             Ok(probe) => probe,
@@ -2045,42 +2114,62 @@ pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::opena
                         reason: reason.clone(),
                         acceptable: view.acceptable.clone(),
                         unknown: view.unknown,
+                        any_method: view.any_method,
                     });
                 }
                 continue;
             }
         };
         let Some(route) = plan.resolve(&probe) else { continue };
-        if let Some(planned) = route.files.iter().find(|f| f.wire == view.wire || (view.wire == "HEAD" && f.wire == "GET")) {
-            if let Some((axum_path, token)) = &view.own
-                && planned.token == *token
-                && (route.path == *axum_path || match_key(&route.path) == match_key(axum_path))
-            {
-                continue;
+        let planned_files: Vec<&route_plan::PlannedFile> = if view.any_method {
+            route.files.iter().collect()
+        } else {
+            route
+                .files
+                .iter()
+                .find(|f| f.wire == view.wire || (view.wire == "HEAD" && f.wire == "GET"))
+                .into_iter()
+                .collect()
+        };
+        if !planned_files.is_empty() {
+            for planned in planned_files {
+                if matches!(view.origin, ShadowOrigin::Served)
+                    && owners
+                        .get(&(route.path.clone(), planned.token.clone()))
+                        .is_some_and(|ops| ops.iter().any(|(wire, path)| *wire == view.wire && *path == view.path))
+                {
+                    continue;
+                }
+                let Ok(contents) = std::fs::read_to_string(&planned.file) else { continue };
+                let Ok(endpoint) = serde_json::from_str::<EndpointFile>(&contents) else { continue };
+                if !stub_fails(&endpoint.security, view) {
+                    continue;
+                }
+                if !seen.insert((view.any_method, view.wire.clone(), view.path.clone(), planned.file.clone())) {
+                    continue;
+                }
+                check.shadowed.push(SecurityShadow {
+                    op_method: view.wire.clone(),
+                    op_path: view.path.clone(),
+                    operation_id: view.operation_id.clone(),
+                    origin: view.origin.clone(),
+                    served_route: route.path.clone(),
+                    file: planned.file.clone(),
+                    file_security: endpoint.security,
+                    acceptable: view.acceptable.clone(),
+                    unknown: view.unknown,
+                    same_template: matches!(view.origin, ShadowOrigin::Served) && match_key(&axum_style_path(&view.path)) == match_key(&route.path),
+                    any_method: view.any_method,
+                });
             }
-            let Ok(contents) = std::fs::read_to_string(&planned.file) else { continue };
-            let Ok(endpoint) = serde_json::from_str::<EndpointFile>(&contents) else { continue };
-            if !stub_fails(&endpoint.security, view) {
-                continue;
-            }
-            if !seen.insert((view.wire.clone(), view.path.clone(), planned.file.clone())) {
-                continue;
-            }
-            check.shadowed.push(SecurityShadow {
-                op_method: view.wire.clone(),
-                op_path: view.path.clone(),
-                operation_id: view.operation_id.clone(),
-                origin: view.origin.clone(),
-                served_route: route.path.clone(),
-                file: planned.file.clone(),
-                file_security: endpoint.security,
-                acceptable: view.acceptable.clone(),
-                unknown: view.unknown,
-            });
         } else if let Some(builtin) = &route.builtin
-            && builtin.methods.contains(&view.wire.as_str())
+            && (if view.any_method {
+                !builtin.methods.is_empty()
+            } else {
+                builtin.methods.contains(&view.wire.as_str())
+            })
         {
-            if !seen_builtin.insert((view.wire.clone(), view.path.clone(), builtin.label)) {
+            if !seen_builtin.insert((view.any_method, view.wire.clone(), view.path.clone(), builtin.label)) {
                 continue;
             }
             let shadow = BuiltinShadow {
@@ -2093,6 +2182,7 @@ pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::opena
                 label: builtin.label,
                 field: builtin.field,
                 inherited: view.inherited,
+                any_method: view.any_method,
             };
             if view.inherited && builtin.inherited_exempt {
                 check.builtin_warnings.push(shadow.message());

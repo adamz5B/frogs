@@ -520,8 +520,13 @@
 
   function resolveSchema(schema) {
     if (schema && schema["$ref"]) {
-      var name = String(schema["$ref"]).split("/").pop();
-      return state.componentSchemas[name] || {};
+      var prefix = "#/components/schemas/";
+      var ref = String(schema["$ref"]);
+      if (ref.indexOf(prefix) !== 0) return {};
+      var token = ref.substring(prefix.length);
+      if (token.indexOf("/") !== -1 || /~(?![01])/.test(token)) return {};
+      var name = token.replace(/~([01])/g, function (_, c) { return c === "1" ? "/" : "~"; });
+      return Object.prototype.hasOwnProperty.call(state.componentSchemas, name) ? state.componentSchemas[name] || {} : {};
     }
     return schema || {};
   }

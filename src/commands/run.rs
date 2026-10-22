@@ -606,6 +606,13 @@ pub(crate) fn load_openapi_for_startup_reported(
                     ),
                 ));
             }
+            if server.features.request_validation {
+                refuse_class(crate::endpoint::unresolved_parameter_routes(tree, &doc), |n| {
+                    format!(
+                        "{n} route(s) have an openapi.yaml parameter $ref frogs could not resolve, so request validation for them would be incomplete — refusing to start; fix the $ref, then run frogs validate{refusal_hint}"
+                    )
+                })?;
+            }
             Ok((spec_needed.then(|| Arc::new(doc)), report))
         }
         Err(e) if strict => {
@@ -2463,3 +2470,6 @@ mod symlink_tests;
 
 #[cfg(test)]
 mod route_tests;
+
+#[cfg(test)]
+mod ref_tests;

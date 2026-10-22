@@ -170,6 +170,7 @@ async fn validate_api(root: &Path) -> usize {
             security_errors.extend(security.shadowed.iter().map(|m| m.message()));
             security_errors.extend(security.unverifiable.iter().map(|m| m.message()));
             security_errors.extend(security.builtin_refusals.iter().map(|m| m.message()));
+            security_errors.extend(crate::endpoint::unresolved_parameter_routes(&endpoint_tree, &doc));
             for message in &security_errors {
                 println!("  error: {message}");
             }
@@ -567,6 +568,9 @@ mod tests {
 
 #[cfg(test)]
 mod mtls_tests;
+
+#[cfg(test)]
+mod ref_tests;
 
 #[cfg(test)]
 mod spec_hardening_tests {
