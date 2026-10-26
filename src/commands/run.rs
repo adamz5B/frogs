@@ -15,7 +15,7 @@ use crate::project::{MANIFEST_FILE, require_project_root};
 use crate::server::pidfile;
 use crate::server::service::{self, RunDecision, ServiceRecord};
 use crate::sql::SqlDriver;
-use crate::webserve::WebServeConfig;
+use crate::webserve::{ProtectedPaths, WebServeConfig};
 
 /// `service_managed` is the hidden, internal-only flag baked into every
 /// registered service definition's own command line (`run
@@ -159,7 +159,7 @@ pub(crate) fn refuse_if_already_running(root: &Path) -> io::Result<()> {
 
 async fn run_api(root: &Path, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> io::Result<()> {
     println!("project root: {}", root.display());
-    let (router, server_config) = build_api_router(root, false).await?;
+    let (router, server_config, _) = build_api_router_with_protected(root, false).await?;
 
     println!(
         "serving GET/POST/PUT/PATCH/DELETE/QUERY endpoints discovered under datasources/endpoints/ (see log output \
@@ -203,7 +203,7 @@ fn operational_routes_display(server_config: &ServerConfig) -> Vec<String> {
 
 async fn run_web(root: &Path, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> io::Result<()> {
     println!("project root: {}", root.display());
-    let (router, config) = build_web_router(root);
+    let (router, config) = build_web_router(root, false, ProtectedPaths::default());
 
     println!(
         "serving static content — startPage: {}, port: {}{}",
@@ -221,8 +221,8 @@ async fn run_web(root: &Path, shutdown: impl std::future::Future<Output = ()> + 
 
 async fn run_both(root: &Path, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> io::Result<()> {
     println!("project root: {}", root.display());
-    let (api_router, server_config) = build_api_router(root, true).await?;
-    let (web_router, web_config) = build_web_router(root);
+    let (api_router, server_config, protected) = build_api_router_with_protected(root, true).await?;
+    let (web_router, web_config) = build_web_router(root, true, protected);
 
     let api_root_display = crate::server::normalize_api_root(&server_config.api_root).unwrap_or_else(|| "unprefixed".to_string());
     println!(
@@ -281,7 +281,16 @@ async fn run_both(root: &Path, shutdown: impl std::future::Future<Output = ()> +
 /// middleware-wrapped API router — the piece `run_api` and `run_both` both
 /// need, extracted so serving both roles from one process doesn't mean
 /// duplicating SQL connection handling or router composition.
+#[cfg(test)]
 async fn build_api_router(root: &Path, web_role: bool) -> io::Result<(Router, ServerConfig)> {
+    let (router, server_config, _) = build_api_router_with_protected(root, web_role).await?;
+    Ok((router, server_config))
+}
+
+/// `build_api_router`'s real body, also returning the local files this
+/// side owns (TLS material, SQLite databases) so a static router serving
+/// the same project root can refuse to expose them.
+async fn build_api_router_with_protected(root: &Path, web_role: bool) -> io::Result<(Router, ServerConfig, ProtectedPaths)> {
     let api_dir = crate::project::api_base(root);
     let config = Config::load_or_exit(&api_dir);
     println!(
@@ -313,16 +322,12 @@ async fn build_api_router(root: &Path, web_role: bool) -> io::Result<(Router, Se
     // Before any connection is opened: a strict refusal must not have
     // touched real infrastructure, let alone bound a port or written a pidfile.
     let endpoint_tree = startup_endpoint_tree(root, &config.server)?;
-    check_route_table(
-        &config.server,
-        &endpoint_tree,
-        RootExtras {
-            web: web_role,
-            control_plane: false,
-        },
-        "",
-    )?;
-    let openapi_document = load_openapi_for_startup(root, &config.server, &endpoint_tree)?;
+    let extras = RootExtras {
+        web: web_role,
+        control_plane: false,
+    };
+    check_route_table(&config.server, &endpoint_tree, extras, "")?;
+    let openapi_document = load_openapi_for_startup_with(root, &config.server, &endpoint_tree, extras)?;
 
     let drivers = match crate::sql::connect_all(&config.connections).await {
         Ok(drivers) => drivers,
@@ -333,7 +338,12 @@ async fn build_api_router(root: &Path, web_role: bool) -> io::Result<(Router, Se
     };
     println!("connected {} SQL data source(s)", drivers.len());
 
-    assemble_api_router(root, config, Arc::new(drivers), None, openapi_document, endpoint_tree).await
+    let mut protected = ProtectedPaths::default();
+    protected.add_tls(&config.server.tls, &api_dir);
+    protected.add_sqlite(&config.connections, root);
+
+    let (router, server_config) = assemble_api_router(root, config, Arc::new(drivers), None, openapi_document, endpoint_tree).await?;
+    Ok((router, server_config, protected))
 }
 
 #[cfg(test)]
@@ -481,8 +491,19 @@ pub(crate) const REGISTERED_SERVICE_SECURITY_HINT: &str = " — a registered ser
 /// itself — and every issue it found is logged. A load failure degrades to
 /// `None` with a warning, except under strict where it (and any
 /// strict-class issue) refuses to start.
+pub(crate) fn load_openapi_for_startup_with(
+    root: &Path,
+    server: &ServerConfig,
+    tree: &EndpointTree,
+    extras: RootExtras,
+) -> io::Result<Option<Arc<crate::openapi::OpenApiDocument>>> {
+    load_openapi_for_startup_reported(root, server, "", tree, extras).map(|(doc, _)| doc)
+}
+
+/// Default extras (no web role, no control plane): production code must name its own via `load_openapi_for_startup_with`.
+#[cfg(test)]
 pub(crate) fn load_openapi_for_startup(root: &Path, server: &ServerConfig, tree: &EndpointTree) -> io::Result<Option<Arc<crate::openapi::OpenApiDocument>>> {
-    load_openapi_for_startup_reported(root, server, "", tree).map(|(doc, _)| doc)
+    load_openapi_for_startup_with(root, server, tree, RootExtras::default())
 }
 
 pub(crate) fn load_openapi_for_startup_reported(
@@ -490,6 +511,7 @@ pub(crate) fn load_openapi_for_startup_reported(
     server: &ServerConfig,
     refusal_hint: &str,
     tree: &EndpointTree,
+    extras: RootExtras,
 ) -> io::Result<(Option<Arc<crate::openapi::OpenApiDocument>>, StartupSecurityReport)> {
     let strict = server.strict_open_api();
     let spec_needed = strict || server.features.request_validation || server.docs_ui.mode != crate::config::DocsUiMode::Off;
@@ -549,7 +571,7 @@ pub(crate) fn load_openapi_for_startup_reported(
                 }
             }
             let mode = MethodCase::from_case_sensitive(server.case_sensitive_methods());
-            let plan = RoutePlan::build(tree, mode, &RouteContext::for_server(server));
+            let plan = RoutePlan::build(tree, mode, &RouteContext::for_server(server).with_extras(extras));
             let check = crate::endpoint::security_check_with_routes(tree, &doc, &plan);
             for message in &check.builtin_warnings {
                 tracing::warn!("{message}");
@@ -646,16 +668,12 @@ pub(crate) fn precheck_security_for_service(root: &Path) -> io::Result<()> {
     }
     let config = Config::load(&crate::project::api_base(root)).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     let tree = startup_endpoint_tree(root, &config.server)?;
-    check_route_table(
-        &config.server,
-        &tree,
-        RootExtras {
-            web: root.join("webserve.json").is_file(),
-            control_plane: false,
-        },
-        REGISTERED_SERVICE_SECURITY_HINT,
-    )?;
-    load_openapi_for_startup_reported(root, &config.server, REGISTERED_SERVICE_SECURITY_HINT, &tree).map(|_| ())
+    let extras = RootExtras {
+        web: root.join("webserve.json").is_file(),
+        control_plane: false,
+    };
+    check_route_table(&config.server, &tree, extras, REGISTERED_SERVICE_SECURITY_HINT)?;
+    load_openapi_for_startup_reported(root, &config.server, REGISTERED_SERVICE_SECURITY_HINT, &tree, extras).map(|_| ())
 }
 
 /// Composes the fully-nested, middleware-wrapped API router from an
@@ -705,6 +723,7 @@ pub(crate) async fn assemble_api_router(
         },
     );
     let errors = std::sync::Arc::new(errors);
+    // Deliberately a subset of the caller's own `check_route_table` (no web/control-plane extras): a second line of defence for callers that skip it, never the place web or control-plane routing is decided.
     check_route_table_logging(&config.server, &endpoint_tree, RootExtras::default(), "", false)?;
     let client_identity_available = mock_provider.is_some() || config.server.tls.client_identity_enabled();
     if config
@@ -805,7 +824,7 @@ pub(crate) async fn assemble_api_router(
 /// `run_web` and `run_both` both need. Exits the process on a malformed
 /// config, same posture as `build_api_router` does for a broken
 /// `config/server.json`.
-fn build_web_router(root: &Path) -> (Router, WebServeConfig) {
+fn build_web_router(root: &Path, has_api: bool, mut protected: ProtectedPaths) -> (Router, WebServeConfig) {
     let config = match crate::webserve::load(&root.join("webserve.json")) {
         Ok(config) => config,
         Err(err) => {
@@ -813,7 +832,13 @@ fn build_web_router(root: &Path) -> (Router, WebServeConfig) {
             std::process::exit(1);
         }
     };
-    let router = crate::webserve::router(root.to_path_buf(), config.clone());
+    protected.add_dir("logging.directory", &crate::server::logging::resolve_log_directory(root, has_api).0);
+    let (problems, warnings) = crate::webserve::page_problems(root, &config, &protected);
+    for message in problems.iter().chain(&warnings) {
+        eprintln!("warning: {message}");
+        tracing::warn!("{message}");
+    }
+    let router = crate::webserve::router(root.to_path_buf(), config.clone(), protected);
     (router, config)
 }
 
@@ -1273,6 +1298,107 @@ mod tests {
             .expect("a real HTTPS request against run_web's own tls config should succeed");
         assert_eq!(response.status(), 200);
         assert_eq!(response.text().await.unwrap(), "hello from static content");
+
+        // The key, the certificate and frogs' own runtime files are never
+        // served, over the same real TLS listener, in any case spelling.
+        std::fs::create_dir_all(root.join(".frogs")).unwrap();
+        std::fs::write(root.join(".frogs/run.json"), "SECRET-RUN").unwrap();
+        std::fs::create_dir_all(root.join("runtime-logs")).unwrap();
+        std::fs::write(root.join("runtime-logs/frogs.log.2026-10-26"), "SECRET-LOG").unwrap();
+        for target in ["/key.pem", "/KEY.PEM", "/cert.pem", "/.frogs/run.json", "/runtime-logs/frogs.log.2026-10-26"] {
+            let denied = client.get(format!("https://localhost:{port}{target}")).send().await.unwrap();
+            assert_eq!(denied.status(), 404, "{target}");
+            let body = denied.text().await.unwrap();
+            assert!(
+                !body.contains("PRIVATE KEY") && !body.contains("CERTIFICATE") && !body.contains("SECRET-"),
+                "{target} leaked: {body}"
+            );
+        }
+    }
+
+    /// Both roles in one process, wired exactly as `run_both` does (API side
+    /// collects the protected paths, the web side consumes them): the log
+    /// directory re-enters the root through `../../<rootname>/logs`, a TLS key
+    /// sits outside `api/`, a CRL and the SQLite `-wal` sidecar only appear
+    /// after the router is built, and the SQLite URI spells the root in
+    /// another case on Windows.
+    #[tokio::test]
+    async fn both_roles_never_serve_logs_tls_material_sqlite_files_or_api_config_even_for_files_created_after_startup() {
+        let root = scratch_api_project(false);
+        let root = std::fs::canonicalize(&root).unwrap();
+        let rootname = root.file_name().unwrap().to_string_lossy().to_string();
+        std::fs::write(root.join("index.html"), "<html>public</html>").unwrap();
+        std::fs::write(root.join("webserve.json"), r#"{ "startPage": "index.html" }"#).unwrap();
+        std::fs::create_dir_all(root.join("tls")).unwrap();
+        std::fs::write(root.join("tls/key.pem"), "SECRET-KEY").unwrap();
+
+        let plain_root = root.to_string_lossy().trim_start_matches(r"\\?\").replace('\\', "/");
+        let uri_root = if cfg!(windows) { plain_root.to_uppercase() } else { plain_root.clone() };
+        let database = if cfg!(windows) {
+            format!("file:///{uri_root}/data.db?mode=rwc")
+        } else {
+            format!("file://{uri_root}/data.db?mode=rwc")
+        };
+        std::fs::write(
+            root.join("api/config/server.json"),
+            format!(
+                r#"{{
+                    "features": {{ "requestCorrelation": false, "requestValidation": false }},
+                    "logging": {{ "directory": "../../{rootname}/logs" }},
+                    "tls": {{
+                        "mode": "off",
+                        "manual": {{ "certPath": "../tls/cert.pem", "keyPath": "../tls/key.pem" }},
+                        "clientAuth": {{ "mode": "required", "caPath": "../tls/ca.pem", "crlPaths": ["../tls/revoked.crl"] }}
+                    }}
+                }}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("api/config/connections.json"),
+            format!(r#"{{ "main": {{ "driver": "sqlite", "database": "{database}" }} }}"#),
+        )
+        .unwrap();
+        std::fs::write(root.join("api/config/secret.txt"), "SECRET-API").unwrap();
+
+        let (api_router, _server_config, protected) = build_api_router_with_protected(&root, true).await.expect("scratch API project should build");
+        let (web_router, _) = build_web_router(&root, true, protected);
+        let router = api_router.merge(web_router);
+        let addr = crate::server::spawn_served(router, false).await;
+
+        // Appear only after the router was built.
+        std::fs::create_dir_all(root.join("logs")).unwrap();
+        std::fs::write(root.join("logs/x"), "SECRET-LOG").unwrap();
+        std::fs::write(root.join("tls/revoked.crl"), "SECRET-CRL").unwrap();
+        std::fs::write(root.join("tls/cert.pem"), "SECRET-CERT").unwrap();
+        std::fs::write(root.join("tls/ca.pem"), "SECRET-CA").unwrap();
+        std::fs::write(root.join("data.db-wal"), "SECRET-WAL").unwrap();
+
+        let client = reqwest::Client::new();
+        for target in [
+            "/api/config/connections.json",
+            "/api/config/secret.txt",
+            "/logs/x",
+            "/LOGS/x",
+            "/tls/key.pem",
+            "/tls/cert.pem",
+            "/tls/ca.pem",
+            "/tls/revoked.crl",
+            "/TLS/REVOKED.CRL",
+            "/data.db",
+            "/data.db-wal",
+            "/openapi.yaml",
+            "/webserve.json",
+        ] {
+            let response = client.get(format!("http://{addr}{target}")).send().await.unwrap();
+            assert_eq!(response.status(), 404, "{target}");
+            let body = response.bytes().await.unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert!(!text.contains("SECRET-") && !text.starts_with("SQLite format 3"), "{target} leaked: {text:?}");
+        }
+        let ok = client.get(format!("http://{addr}/index.html")).send().await.unwrap();
+        assert_eq!(ok.status(), 200);
+        assert_eq!(ok.text().await.unwrap(), "<html>public</html>");
     }
 
     /// A minimal but complete API-role scratch project — every file
@@ -2059,7 +2185,7 @@ mod m2_7_startup_security_tests {
     #[test]
     fn a_clean_project_with_the_spec_features_off_loads_nothing_into_memory() {
         let root = scratch(FEATURES_OFF, Some(SECURED_SPEC), Some(PROTECTED));
-        let (doc, report) = load_openapi_for_startup_reported(&root, &server(FEATURES_OFF), "", &tree_of(&root)).unwrap();
+        let (doc, report) = load_openapi_for_startup_reported(&root, &server(FEATURES_OFF), "", &tree_of(&root), RootExtras::default()).unwrap();
         assert!(doc.is_none(), "the document must not leak into request validation / docs when those are off");
         assert!(report.unmatched.is_empty() && report.not_loaded.is_none() && report.dropped_issues == 0);
         assert!(load_openapi_for_startup(&root, &server(FEATURES_OFF), &tree_of(&root)).unwrap().is_none());
@@ -2078,7 +2204,7 @@ mod m2_7_startup_security_tests {
         let root = scratch(DEFAULT, Some(OPEN_SPEC), Some(UNPROTECTED));
         std::fs::create_dir_all(root.join("api/datasources/endpoints/ghost")).unwrap();
         std::fs::write(root.join("api/datasources/endpoints/ghost/endpoint.get.json"), UNPROTECTED).unwrap();
-        let (doc, report) = load_openapi_for_startup_reported(&root, &server(DEFAULT), "", &tree_of(&root)).unwrap();
+        let (doc, report) = load_openapi_for_startup_reported(&root, &server(DEFAULT), "", &tree_of(&root), RootExtras::default()).unwrap();
         assert!(doc.is_some());
         assert_eq!(report.unmatched.len(), 1);
         assert!(report.unmatched[0].to_string_lossy().contains("ghost"));
@@ -2089,7 +2215,7 @@ mod m2_7_startup_security_tests {
     fn an_unsafe_path_spec_with_strict_off_reports_the_dropped_operations_summary() {
         let spec = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /x/..:\n    get:\n      operationId: bad\n      responses:\n        '200': { description: ok }\n";
         let root = scratch(FEATURES_OFF, Some(spec), Some(UNPROTECTED));
-        let (_, report) = load_openapi_for_startup_reported(&root, &server(FEATURES_OFF), "", &tree_of(&root)).unwrap();
+        let (_, report) = load_openapi_for_startup_reported(&root, &server(FEATURES_OFF), "", &tree_of(&root), RootExtras::default()).unwrap();
         assert!(report.dropped_issues >= 1);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2097,12 +2223,12 @@ mod m2_7_startup_security_tests {
     #[test]
     fn a_missing_or_unparseable_spec_with_strict_off_starts_with_a_not_checked_report() {
         let missing = scratch(FEATURES_OFF, None, Some(UNPROTECTED));
-        let (doc, report) = load_openapi_for_startup_reported(&missing, &server(FEATURES_OFF), "", &tree_of(&missing)).unwrap();
+        let (doc, report) = load_openapi_for_startup_reported(&missing, &server(FEATURES_OFF), "", &tree_of(&missing), RootExtras::default()).unwrap();
         assert!(doc.is_none());
         assert!(report.not_loaded.is_some());
 
         let broken = scratch(FEATURES_OFF, Some("openapi: [unterminated"), Some(UNPROTECTED));
-        let (doc, report) = load_openapi_for_startup_reported(&broken, &server(FEATURES_OFF), "", &tree_of(&broken)).unwrap();
+        let (doc, report) = load_openapi_for_startup_reported(&broken, &server(FEATURES_OFF), "", &tree_of(&broken), RootExtras::default()).unwrap();
         assert!(doc.is_none());
         assert!(report.not_loaded.is_some());
         let _ = std::fs::remove_dir_all(&missing);

@@ -59,7 +59,7 @@ impl Fx {
     }
 
     fn startup(&self, hint: &str) -> io::Result<(Option<Arc<crate::openapi::OpenApiDocument>>, StartupSecurityReport)> {
-        load_openapi_for_startup_reported(&self.root, &self.server(), hint, &self.tree())
+        load_openapi_for_startup_reported(&self.root, &self.server(), hint, &self.tree(), RootExtras::default())
     }
 }
 
@@ -308,4 +308,89 @@ fn the_same_twice_declared_template_layout_starts_when_the_serving_file_declares
     let fx = Fx::new(QUIET, ITEM_ID_AND_ID);
     fx.endpoint("items/{id}", "get", Some("a"));
     assert!(fx.startup("").is_ok());
+}
+
+// ------------------------------------------------------------------- percent-encoding / web catch-all
+
+const CAFE_SECURED_AND_OPEN_SIBLING: &str = "  /café/menu:\n    get:\n      operationId: menu\n      security: [ { a: [] } ]\n      responses: { '200': { description: ok } }\n  /{p}/menu:\n    get:\n      operationId: byP\n      responses: { '200': { description: ok } }\n";
+const SECURED_ADMIN_ONLY: &str = "  /admin:\n    get:\n      operationId: admin\n      security: [ { a: [] } ]\n      responses: { '200': { description: ok } }\n";
+
+async fn served_status(addr: std::net::SocketAddr, target: &str) -> (u16, String) {
+    let request = format!("GET {target} HTTP/1.1\r\nHost: frogs.test\r\nConnection: close\r\n\r\n");
+    let (status_line, _headers, body, _closed) = crate::server::raw_request(addr, request.as_bytes()).await;
+    (
+        status_line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0),
+        String::from_utf8_lossy(&body).into_owned(),
+    )
+}
+
+#[tokio::test]
+async fn a_secured_non_ascii_route_is_never_answered_by_a_sibling_open_parameter_route_whatever_the_spelling_or_api_root() {
+    for (server_json, prefix) in [
+        (QUIET, ""),
+        (
+            r#"{ "features": { "requestValidation": false, "metrics": false, "readyzCheck": false }, "apiRoot": "/api" }"#,
+            "/api",
+        ),
+    ] {
+        let fx = Fx::new(server_json, CAFE_SECURED_AND_OPEN_SIBLING);
+        fx.endpoint("café/menu", "get", Some("a"));
+        fx.endpoint("{p}/menu", "get", None);
+        let (document, _report) = fx.startup("").expect("an own file for the secured operation means no shadow refusal");
+        let config = Config::load(&fx.root.join("api")).unwrap();
+        let (router, _server) = assemble_api_router(&fx.root, config, Arc::new(HashMap::new()), None, document, fx.tree())
+            .await
+            .unwrap();
+        let addr = crate::server::spawn_served(router, false).await;
+        for target in ["/caf%C3%A9/menu", "/caf%c3%a9/menu"] {
+            let (status, body) = served_status(addr, &format!("{prefix}{target}")).await;
+            assert_ne!(status, 200, "{prefix}{target} must not be answered by the open /{{p}}/menu route: {body}");
+            assert_eq!(status, 503, "{prefix}{target}: {body}");
+            assert!(body.contains("endpoint.unavailable"), "{body}");
+        }
+        assert_eq!(
+            served_status(addr, &format!("{prefix}/cafe/menu")).await.0,
+            200,
+            "the open parameter route still serves other values"
+        );
+    }
+}
+
+fn both_roles_fixture(server_json: &str) -> Fx {
+    let fx = Fx::new(server_json, SECURED_ADMIN_ONLY);
+    std::fs::write(fx.root.join("webserve.json"), r#"{ "startPage": "index.html" }"#).unwrap();
+    std::fs::write(fx.root.join("index.html"), "<html></html>").unwrap();
+    fx
+}
+
+const BOTH_ROLES: RootExtras = RootExtras { web: true, control_plane: false };
+const API_ROOT_API: &str = r#"{ "features": { "requestValidation": false, "metrics": false, "readyzCheck": false }, "apiRoot": "/api" }"#;
+
+#[tokio::test]
+async fn with_both_roles_a_secured_operation_without_a_file_refuses_before_connecting_binding_or_writing_a_pidfile() {
+    for server_json in [QUIET, API_ROOT_API] {
+        let fx = both_roles_fixture(server_json);
+        let err = build_api_router(&fx.root, true)
+            .await
+            .map(|_| ())
+            .expect_err("the static catch-all would serve the secured path unauthenticated");
+        let text = err.to_string();
+        assert!(text.contains("would be answered by a route that does not enforce their security"), "{text}");
+        assert!(!text.to_lowercase().contains("nosuchdriver"), "refusal must precede connecting: {text}");
+        assert!(!fx.root.join(".frogs/run.json").exists());
+        let precheck = precheck_security_for_service(&fx.root).expect_err("registration must refuse the same project");
+        assert!(precheck.to_string().contains("restarts every 5 s"), "{precheck}");
+    }
+}
+
+#[test]
+fn the_same_secured_operation_is_not_a_web_refusal_when_the_project_has_no_web_role_or_has_its_own_file() {
+    let api_only = both_roles_fixture(QUIET);
+    let server = api_only.server();
+    assert!(load_openapi_for_startup_with(&api_only.root, &server, &api_only.tree(), RootExtras::default()).is_ok());
+    assert!(load_openapi_for_startup_with(&api_only.root, &server, &api_only.tree(), BOTH_ROLES).is_err());
+
+    let filed = both_roles_fixture(QUIET);
+    filed.endpoint("admin", "get", Some("a"));
+    assert!(load_openapi_for_startup_with(&filed.root, &filed.server(), &filed.tree(), BOTH_ROLES).is_ok());
 }

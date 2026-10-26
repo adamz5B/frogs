@@ -8,6 +8,12 @@ use std::path::{Path, PathBuf};
 /// themselves.
 pub const MANIFEST_FILE: &str = "openapi.yaml";
 
+/// A static-content project's own config, directly at the project root.
+pub const WEBSERVE_FILE: &str = "webserve.json";
+
+/// The fixed subfolder every API-side file lives under (see `api_base`).
+pub const API_DIR: &str = "api";
+
 /// Files directly inside `dir` (non-recursive — a project's own files, not
 /// its subdirectories' — e.g. `datasources/` is deliberately not walked
 /// into) whose extension is one of `extensions`. Shared by the project-root
@@ -84,7 +90,7 @@ fn find_project_root_within(start: &Path, boundary: Option<&Path>) -> Option<Pat
 /// marker `find_project_root` looks for, so it stays at `root` and is never
 /// looked for under here.
 pub fn api_base(root: &Path) -> PathBuf {
-    root.join("api")
+    root.join(API_DIR)
 }
 
 /// Like `find_project_root`, but exits the process with a helpful message

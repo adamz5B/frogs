@@ -149,13 +149,9 @@ pub(crate) async fn build_mock_router(root: &Path, opts: &TestServerOptions) -> 
     crate::commands::run::announce_method_case(&config.server);
     // Link findings are reported (and refused under strict) with the test-file findings just below.
     let endpoint_tree = Arc::new(crate::commands::run::scan_endpoint_tree(root, &config.server));
-    crate::commands::run::check_route_table(
-        &config.server,
-        &endpoint_tree,
-        crate::endpoint::route_plan::RootExtras { web: false, control_plane: true },
-        "",
-    )?;
-    let openapi_document = crate::commands::run::load_openapi_for_startup(root, &config.server, &endpoint_tree)?;
+    let extras = crate::endpoint::route_plan::RootExtras { web: false, control_plane: true };
+    crate::commands::run::check_route_table(&config.server, &endpoint_tree, extras, "")?;
+    let openapi_document = crate::commands::run::load_openapi_for_startup_with(root, &config.server, &endpoint_tree, extras)?;
     let mode = MethodCase::from_case_sensitive(config.server.case_sensitive_methods());
 
     // Harness-owned codes classify like any other — a project that
@@ -320,7 +316,7 @@ pub async fn record(cwd: &Path, path: &str, method: &str) -> io::Result<()> {
         std::process::exit(1);
     }
     let endpoint_tree = crate::commands::run::startup_endpoint_tree(&root, &config.server)?;
-    crate::commands::run::load_openapi_for_startup(&root, &config.server, &endpoint_tree)?;
+    crate::commands::run::load_openapi_for_startup_with(&root, &config.server, &endpoint_tree, crate::endpoint::route_plan::RootExtras::default())?;
 
     let sql_root = api_root.join("datasources/sql");
     let http_root = api_root.join("datasources/http");
@@ -1842,6 +1838,39 @@ mod test_file_findings_tests {
         .unwrap();
         assert!(build_mock_router(&root, &opts()).await.is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn secured_spec(path: &str) -> String {
+        format!(
+            "openapi: 3.2.0\ninfo: {{ title: t, version: '1' }}\ncomponents:\n  securitySchemes:\n    a: {{ type: apiKey, in: header, name: ka }}\npaths:\n  /things:\n    get:\n      operationId: getThings\n      responses: {{ '200': {{ description: ok }} }}\n  {path}:\n    get:\n      operationId: shadowed\n      security: [ {{ a: [] }} ]\n      responses: {{ '200': {{ description: ok }} }}\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn a_secured_operation_at_the_control_plane_path_refuses_the_mock_server_when_api_root_puts_it_there() {
+        let at_root = project(r#"{ "features": { "requestValidation": false } }"#);
+        std::fs::write(at_root.join("openapi.yaml"), secured_spec("/_frogs/scenario")).unwrap();
+        let err = build_mock_router(&at_root, &opts())
+            .await
+            .err()
+            .expect("must refuse: the control plane would answer it unauthenticated");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("would be answered by a route that does not enforce their security"), "{err}");
+
+        let nested = project(r#"{ "features": { "requestValidation": false }, "apiRoot": "/_frogs" }"#);
+        std::fs::write(nested.join("openapi.yaml"), secured_spec("/scenario")).unwrap();
+        assert!(
+            build_mock_router(&nested, &opts()).await.is_err(),
+            "apiRoot /_frogs places /scenario on the control plane"
+        );
+
+        let apart = project(r#"{ "features": { "requestValidation": false }, "apiRoot": "/api" }"#);
+        std::fs::write(apart.join("openapi.yaml"), secured_spec("/_frogs/scenario")).unwrap();
+        let built = build_mock_router(&apart, &opts()).await;
+        assert!(built.is_ok(), "under /api the same path is not the control plane: {:?}", built.err());
+        for root in [at_root, nested, apart] {
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[tokio::test]

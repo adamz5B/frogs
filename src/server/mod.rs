@@ -102,15 +102,70 @@ where
     }
 }
 
+/// Rewrites the request path to its canonical percent-encoding
+/// (`openapi::path_encoding::canonicalize_path`) before the Router sees it.
+///
+/// RFC 3986 section 6.2.2.2 says `/caf%C3%A9` and `/caf%c3%a9` (and `/%41` and `/A`) name the same resource, but axum 0.7 matches a literal route segment
+/// against the raw wire bytes while handing a `:param` segment its percent-decoded text, so an equivalent spelling of a literal route could fall through to a sibling `{param}` route
+/// or the static-content catch-all. Canonicalizing first gives every resource exactly one spelling, which is what the registered paths (`route_syntax::axum_registration_path`) and
+/// the startup route-shadow analysis assume. Like `NormalizeMethod` it must wrap the assembled Router as a tower Service, never `Router::layer`: a Router layer runs after routing.
+/// A URI that cannot be rebuilt is answered 400, never passed through un-canonicalized.
+#[derive(Clone)]
+pub(crate) struct CanonicalPath<S> {
+    inner: S,
+}
+
+impl<S, B> tower_service::Service<Request<B>> for CanonicalPath<S>
+where
+    S: tower_service::Service<Request<B>, Response = Response, Error = Infallible>,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = futures_util::future::Either<std::future::Ready<Result<Response, Infallible>>, S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<B>) -> Self::Future {
+        use futures_util::future::Either;
+
+        let rewritten = match crate::openapi::path_encoding::canonicalize_path(req.uri().path()) {
+            std::borrow::Cow::Borrowed(_) => None,
+            std::borrow::Cow::Owned(path) => Some(rebuild_uri(req.uri(), &path)),
+        };
+        match rewritten {
+            None => {}
+            Some(Some(uri)) => *req.uri_mut() = uri,
+            Some(None) => {
+                let mut response = Response::new(axum::body::Body::empty());
+                *response.status_mut() = StatusCode::BAD_REQUEST;
+                return Either::Left(std::future::ready(Ok(response)));
+            }
+        }
+        Either::Right(self.inner.call(req))
+    }
+}
+
+fn rebuild_uri(uri: &axum::http::Uri, path: &str) -> Option<axum::http::Uri> {
+    let path_and_query = match uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    };
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(path_and_query.parse().ok()?);
+    axum::http::Uri::from_parts(parts).ok()
+}
+
 /// The one way every listener wraps a Router. See `NormalizeMethod` for why
 /// this cannot be a `Router::layer`. Outermost to innermost the request
-/// passes `IdentityService` (TLS only), `ConnectInfo`, `NormalizeMethod`, the
-/// Router.
-pub(crate) fn served_service(router: Router, case_sensitive: bool) -> IntoMakeServiceWithConnectInfo<NormalizeMethod<Router>, SocketAddr> {
+/// passes `IdentityService` (TLS only), `ConnectInfo`, `NormalizeMethod`,
+/// `CanonicalPath`, the Router.
+pub(crate) fn served_service(router: Router, case_sensitive: bool) -> IntoMakeServiceWithConnectInfo<NormalizeMethod<CanonicalPath<Router>>, SocketAddr> {
     // Request type named only to pick the trait impl; NormalizeMethod is generic
     // over the body, so the result still serves Request<Body> and Request<Incoming>.
-    <NormalizeMethod<Router> as axum::ServiceExt<axum::extract::Request>>::into_make_service_with_connect_info::<SocketAddr>(NormalizeMethod {
-        inner: router,
+    <NormalizeMethod<CanonicalPath<Router>> as axum::ServiceExt<axum::extract::Request>>::into_make_service_with_connect_info::<SocketAddr>(NormalizeMethod {
+        inner: CanonicalPath { inner: router },
         case_sensitive,
     })
 }
@@ -1662,7 +1717,7 @@ mod m3_method_tests {
         use tower_service::Service;
         let probe = Probe::default();
         let mut service = NormalizeMethod {
-            inner: probe.clone(),
+            inner: CanonicalPath { inner: probe.clone() },
             case_sensitive,
         };
         let mut req = Request::builder()
@@ -1711,7 +1766,7 @@ mod m3_method_tests {
         use tower_service::Service;
         let probe = Probe::default();
         let mut service = NormalizeMethod {
-            inner: probe.clone(),
+            inner: CanonicalPath { inner: probe.clone() },
             case_sensitive: false,
         };
         let req = Request::builder().method(Method::CONNECT).uri("/x").body(Body::empty()).unwrap();

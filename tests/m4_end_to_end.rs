@@ -268,3 +268,32 @@ fn validate_exits_non_zero_for_a_wrong_mode_file_and_for_a_mode_switch_mismatch_
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
     let _ = std::fs::remove_dir_all(&clean);
 }
+
+#[test]
+fn a_live_both_roles_server_never_serves_api_config_the_manifest_or_frogs_runtime_files_as_static_content() {
+    let port = free_port();
+    let root = project(EMPTY_SPEC, &server_json(port, false), &[("endpoint.get.json", literal_stub(200))]);
+    std::fs::write(root.join("index.html"), "<html>public</html>").unwrap();
+    std::fs::write(root.join("webserve.json"), r#"{ "startPage": "index.html" }"#).unwrap();
+    std::fs::write(root.join(".env"), "SECRET=1").unwrap();
+    let running = start(root, port);
+
+    assert_eq!(status_of(port, "GET", "/index.html"), 200);
+    assert_eq!(status_of(port, "GET", "/x"), 200, "the API itself is still served");
+    for path in [
+        "/api/config/connections.json",
+        "/api/config/server.json",
+        "/api/security/schemes.json",
+        "/api/datasources/endpoints/x/endpoint.get.json",
+        "/openapi.yaml",
+        "/OPENAPI.YAML",
+        "/webserve.json",
+        "/.frogs/run.json",
+        "/.env",
+        "/API/config/connections.json",
+        "/api%5Cconfig%5Cconnections.json",
+    ] {
+        assert_eq!(status_of(port, "GET", path), 404, "{path}");
+    }
+    stop_cleanly(running);
+}

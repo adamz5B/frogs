@@ -48,7 +48,7 @@ impl Fx {
     fn startup(&self) -> io::Result<(Option<Arc<crate::openapi::OpenApiDocument>>, StartupSecurityReport)> {
         let server = Config::load(&self.root.join("api")).unwrap().server;
         let tree = startup_endpoint_tree(&self.root, &server).unwrap();
-        load_openapi_for_startup_reported(&self.root, &server, " HINT-TEXT", &tree)
+        load_openapi_for_startup_reported(&self.root, &server, " HINT-TEXT", &tree, crate::endpoint::route_plan::RootExtras::default())
     }
 }
 

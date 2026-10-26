@@ -1,6 +1,9 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 use matchit::InsertError;
+
+use super::path_encoding::encode_literal_segment;
 
 pub const PARAM_PROBE: &str = ":frogs-probe";
 const MAX_PROBE_BYTES: usize = 2048;
@@ -20,6 +23,9 @@ pub enum SegmentKind {
 /// axum 0.7 / matchit 0.7 route syntax, where `:` and `*` are special and
 /// `{name}` is frogs's own template convention translated to `:name`.
 pub fn classify_route_segment(seg: &str) -> Result<SegmentKind, String> {
+    if seg.contains('%') {
+        return Err("contains '%', which is ambiguous between a literal percent sign and a percent-encoded character".to_string());
+    }
     if let Some(name) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
         if name.is_empty() {
             return Err("empty parameter name".to_string());
@@ -49,6 +55,23 @@ pub fn axum_style(openapi_path: &str) -> String {
         .map(|segment| match segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
             Some(name) => format!(":{name}"),
             None => segment.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// An axum-style url path (`:name` parameters, decoded literal text) as it must
+/// be registered: axum matches literal segments against the raw wire bytes,
+/// and `CanonicalPath` hands it paths whose non-`pchar` bytes are `%XX`.
+pub fn axum_registration_path(url_path: &str) -> String {
+    url_path
+        .split('/')
+        .map(|segment| {
+            if segment.starts_with(':') {
+                Cow::Borrowed(segment)
+            } else {
+                encode_literal_segment(segment)
+            }
         })
         .collect::<Vec<_>>()
         .join("/")
@@ -94,11 +117,14 @@ pub fn probe_path(raw: &str) -> Result<String, String> {
         if *seg == "." || *seg == ".." {
             return Err(format!("path segment '{seg}' is not allowed"));
         }
+        if seg.contains('%') {
+            return Err("path segment contains '%', which is ambiguous between a literal percent sign and a percent-encoded character".to_string());
+        }
         out.push('/');
         if is_non_literal_segment(seg) {
             out.push_str(PARAM_PROBE);
         } else {
-            out.push_str(seg);
+            out.push_str(&encode_literal_segment(seg));
         }
     }
     Ok(out)
@@ -276,10 +302,11 @@ mod more_tests {
         let cfg_macro = format!("{}!(", "cfg");
         let cfg_attr = format!("#[{}(", "cfg");
         let test_marker = format!("#[{}(test)]", "cfg");
-        let source = include_str!("route_syntax.rs");
-        let production = source.split(test_marker.as_str()).next().unwrap();
-        assert!(!production.contains(&cfg_macro), "{cfg_macro} found");
-        assert!(!production.contains(&cfg_attr), "{cfg_attr} found");
+        for source in [include_str!("route_syntax.rs"), include_str!("path_encoding.rs")] {
+            let production = source.split(test_marker.as_str()).next().unwrap();
+            assert!(!production.contains(&cfg_macro), "{cfg_macro} found");
+            assert!(!production.contains(&cfg_attr), "{cfg_attr} found");
+        }
     }
 
     #[test]

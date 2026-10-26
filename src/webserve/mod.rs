@@ -1,9 +1,14 @@
+mod deny;
 mod serve;
+
+#[cfg(test)]
+mod deny_tests;
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) use deny::{ProtectedPaths, lexically_denied, page_problems};
 pub(crate) use serve::{WEB_ROUTES, router};
 
 use crate::config::TlsConfig;
@@ -16,9 +21,9 @@ fn default_port() -> u16 {
 /// created once by `frogs generate --role web` and never overwritten
 /// afterward (same permanence rule as `connections.json` or a hand-edited
 /// endpoint stub). Its presence at the project root is what `frogs run`
-/// uses to decide a project serves static content rather than an API —
-/// see `commands::run`. A frogs project is one role or the other, never
-/// both (see `commands::generate`'s `--role` handling).
+/// uses to decide a project serves static content — see `commands::run`.
+/// A project can also have an API role alongside it (see
+/// `commands::generate`'s `--role` handling).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WebServeConfig {
     #[serde(rename = "startPage")]

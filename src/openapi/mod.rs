@@ -9,6 +9,7 @@ pub(crate) mod local_ref;
 #[cfg(test)]
 mod local_ref_tests;
 pub mod method_token;
+pub mod path_encoding;
 pub mod path_rules;
 #[cfg(test)]
 mod ref_loader_tests;

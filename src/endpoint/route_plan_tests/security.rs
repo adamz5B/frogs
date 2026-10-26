@@ -14,22 +14,22 @@ impl Drop for Proj {
     }
 }
 
-struct Analysis {
-    check: SecurityCheck,
+pub(super) struct Analysis {
+    pub(super) check: SecurityCheck,
     doc: crate::openapi::OpenApiDocument,
     plan: RoutePlan,
 }
 
-const SEC_A: &str = "[ { a: [] } ]";
+pub(super) const SEC_A: &str = "[ { a: [] } ]";
 
-fn spec(top: &str, paths: &str) -> String {
+pub(super) fn spec(top: &str, paths: &str) -> String {
     format!(
         "openapi: 3.2.0\ninfo: {{ title: t, version: '1' }}\n{top}components:\n  securitySchemes:\n    a: {{ type: apiKey, in: header, name: ka }}\n    b: {{ type: apiKey, in: header, name: kb }}\npaths:\n{paths}"
     )
 }
 
 /// A fixed-method operation under `path`; `sec` is a YAML flow value, empty for none.
-fn fixed(path: &str, method: &str, id: &str, sec: &str) -> String {
+pub(super) fn fixed(path: &str, method: &str, id: &str, sec: &str) -> String {
     let security = if sec.is_empty() { String::new() } else { format!("      security: {sec}\n") };
     // YAML limits implicit keys to 1024 characters; a longer path needs the explicit `? key` form.
     let head = if path.len() > 900 {
@@ -78,7 +78,7 @@ fn analyse_with(project: &Proj, case_sensitive: bool, ctx: &RouteContext) -> Ana
     Analysis { check, doc, plan }
 }
 
-fn analyse(spec_yaml: &str, files: &[(&str, &str, Option<&str>)]) -> Analysis {
+pub(super) fn analyse(spec_yaml: &str, files: &[(&str, &str, Option<&str>)]) -> Analysis {
     analyse_with(&proj(spec_yaml, files), false, &endpoints_only())
 }
 
@@ -86,12 +86,12 @@ fn analyse_exact(spec_yaml: &str, files: &[(&str, &str, Option<&str>)]) -> Analy
     analyse_with(&proj(spec_yaml, files), true, &endpoints_only())
 }
 
-fn analyse_ctx(spec_yaml: &str, files: &[(&str, &str, Option<&str>)], ctx: &RouteContext) -> Analysis {
+pub(super) fn analyse_ctx(spec_yaml: &str, files: &[(&str, &str, Option<&str>)], ctx: &RouteContext) -> Analysis {
     analyse_with(&proj(spec_yaml, files), false, ctx)
 }
 
 /// (shadowed, stale variants, template instances, unverifiable, builtin refusals)
-fn counts(a: &Analysis) -> (usize, usize, usize, usize, usize) {
+pub(super) fn counts(a: &Analysis) -> (usize, usize, usize, usize, usize) {
     (
         a.check.shadowed.len(),
         a.check.stale_variants.len(),
@@ -101,7 +101,7 @@ fn counts(a: &Analysis) -> (usize, usize, usize, usize, usize) {
     )
 }
 
-fn shadow_messages(a: &Analysis) -> Vec<String> {
+pub(super) fn shadow_messages(a: &Analysis) -> Vec<String> {
     a.check.shadowed.iter().map(|s| s.message()).collect()
 }
 

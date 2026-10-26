@@ -364,23 +364,46 @@ fn validate_tls(label: &str, tls: &TlsConfig, tls_base: &Path) -> usize {
 
 fn validate_web(root: &Path) -> usize {
     println!("static-content project at {}", root.display());
-    match crate::webserve::load(&root.join("webserve.json")) {
-        Ok(config) => {
-            println!("  webserve.json: OK (startPage: {})", config.start_page);
-            // With an API role present the single listener is configured by
-            // config/server.json (validated above); webserve.json's own tls
-            // is ignored then, so a dry run of it would only mislead.
-            if root.join(MANIFEST_FILE).is_file() {
-                0
-            } else {
-                validate_tls("webserve.json", &config.tls, root)
-            }
-        }
+    let config = match crate::webserve::load(&root.join(crate::project::WEBSERVE_FILE)) {
+        Ok(config) => config,
         Err(e) => {
             println!("  webserve.json: FAILED — {e}");
-            1
+            return 1;
         }
+    };
+    println!("  webserve.json: OK (startPage: {})", config.start_page);
+
+    let has_api = root.join(MANIFEST_FILE).is_file();
+    let mut protected = crate::webserve::ProtectedPaths::default();
+    protected.add_dir("logging.directory", &crate::server::logging::resolve_log_directory(root, has_api).0);
+    if has_api && let Ok(api_config) = Config::load(&crate::project::api_base(root)) {
+        protected.add_tls(&api_config.server.tls, &crate::project::api_base(root));
+        protected.add_sqlite(&api_config.connections, root);
     }
+
+    let mut problems = 0usize;
+    let (page_problems, page_warnings) = crate::webserve::page_problems(root, &config, &protected);
+    for message in &page_problems {
+        println!("  {message}");
+        problems += 1;
+    }
+    for message in &page_warnings {
+        warn(message);
+    }
+    if root.join(".well-known").is_dir() {
+        warn(".well-known/ at the project root is never served (every dot-prefixed path is denied)");
+    }
+    if !has_api && crate::project::api_base(root).read_dir().is_ok_and(|mut entries| entries.next().is_some()) {
+        warn("api/ in a web-only project is never served");
+    }
+
+    // With an API role present the single listener is configured by
+    // config/server.json (validated above); webserve.json's own tls
+    // is ignored then, so a dry run of it would only mislead.
+    if !has_api {
+        problems += validate_tls("webserve.json", &config.tls, root);
+    }
+    problems
 }
 
 #[cfg(test)]
@@ -530,6 +553,64 @@ mod tests {
         fs::write(root.join("webserve.json"), "{ not valid json").unwrap();
 
         assert_eq!(validate_web(&root), 1);
+    }
+
+    #[test]
+    fn validate_web_counts_a_start_page_that_is_never_served_as_one_problem() {
+        let root = temp_project();
+        fs::create_dir_all(root.join("api/config")).unwrap();
+        fs::write(root.join("api/config/connections.json"), "{}").unwrap();
+        fs::write(root.join("webserve.json"), r#"{ "startPage": "api/config/connections.json" }"#).unwrap();
+
+        assert_eq!(validate_web(&root), 1);
+    }
+
+    #[test]
+    fn validate_web_counts_a_denied_start_page_and_a_denied_not_found_page_separately() {
+        let root = temp_project();
+        fs::write(root.join(".env"), "x").unwrap();
+        fs::write(root.join("webserve.json"), r#"{ "startPage": ".env", "notFoundPage": "openapi.yaml" }"#).unwrap();
+
+        assert_eq!(validate_web(&root), 2);
+    }
+
+    #[test]
+    fn validate_web_counts_a_start_page_that_names_the_web_tls_key_as_a_problem() {
+        let root = temp_project();
+        fs::write(root.join("key.pem"), "x").unwrap();
+        fs::write(
+            root.join("webserve.json"),
+            r#"{ "startPage": "key.pem", "tls": { "mode": "off", "manual": { "certPath": "cert.pem", "keyPath": "key.pem" } } }"#,
+        )
+        .unwrap();
+
+        assert_eq!(validate_web(&root), 1);
+    }
+
+    #[test]
+    fn validate_web_counts_an_unresolvable_protected_path_as_one_problem() {
+        let root = temp_project();
+        fs::write(root.join("index.html"), "x").unwrap();
+        fs::write(
+            root.join("webserve.json"),
+            r#"{ "startPage": "index.html", "tls": { "mode": "off", "manual": { "certPath": "", "keyPath": "key.pem" } } }"#,
+        )
+        .unwrap();
+
+        assert_eq!(validate_web(&root), 1);
+    }
+
+    #[test]
+    fn validate_web_only_warns_about_a_web_only_api_folder_and_a_well_known_folder() {
+        let root = temp_project();
+        fs::write(root.join("index.html"), "x").unwrap();
+        fs::write(root.join("webserve.json"), r#"{ "startPage": "index.html" }"#).unwrap();
+        fs::create_dir_all(root.join("api")).unwrap();
+        fs::write(root.join("api/index.html"), "x").unwrap();
+        fs::create_dir_all(root.join(".well-known")).unwrap();
+        fs::write(root.join(".well-known/security.txt"), "x").unwrap();
+
+        assert_eq!(validate_web(&root), 0);
     }
 
     #[tokio::test]

@@ -11,8 +11,9 @@ use std::path::PathBuf;
 
 use axum::http::Method;
 
+use crate::openapi::path_encoding::is_pchar_str;
 use crate::openapi::path_rules::{unsafe_segment_reason, untrusted};
-use crate::openapi::route_syntax::{SegmentKind, classify_route_segment, find_conflicts, path_for_nested_route};
+use crate::openapi::route_syntax::{SegmentKind, axum_registration_path, classify_route_segment, find_conflicts, path_for_nested_route};
 
 /// How many positions along one route may have both a static and a parameter
 /// sibling before matchit's backtracking per lookup is considered too costly.
@@ -151,6 +152,17 @@ pub(crate) struct PlannedFile {
     pub file: PathBuf,
 }
 
+/// What a secured operation's author can do about a route that answers it without authentication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuiltinRemedy {
+    /// One of the API built-ins: a config switch or `apiRoot` moves it.
+    ConfigSwitch,
+    /// The `webserve.json` catch-all: only an endpoint file of the operation's own beats it.
+    StaticContent,
+    /// The `frogs test` control plane, mounted outside `apiRoot`.
+    ControlPlane,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct BuiltinInfo {
     pub label: &'static str,
@@ -159,12 +171,15 @@ pub(crate) struct BuiltinInfo {
     pub methods: Vec<&'static str>,
     /// `/healthz` and `/readyz`: documenting them under a document-wide security default is common.
     pub inherited_exempt: bool,
+    pub remedy: BuiltinRemedy,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct PlannedRoute {
-    /// apiRoot-relative, axum style.
+    /// apiRoot-relative, axum style, literal segments decoded (the key `owners` and `find_operation` use); a root route (static content, control plane) keeps its absolute path here.
     pub path: String,
+    /// The final path inserted into the probe: apiRoot applied, literal segments percent-encoded the way `build_router` registers them.
+    pub registered: String,
     pub files: Vec<PlannedFile>,
     pub builtin: Option<BuiltinInfo>,
 }
@@ -175,6 +190,8 @@ pub(crate) struct RoutePlan {
     pub routes: Vec<PlannedRoute>,
     probe: matchit::Router<usize>,
     max_segments: usize,
+    api_prefix: Option<String>,
+    has_catch_all: bool,
 }
 
 struct Member {
@@ -195,7 +212,8 @@ fn config_segment_problem(seg: &str) -> Option<String> {
         return Some(reason);
     }
     match classify_route_segment(seg) {
-        Ok(SegmentKind::Literal) => None,
+        Ok(SegmentKind::Literal) if is_pchar_str(seg) => None,
+        Ok(SegmentKind::Literal) => Some("contains a character that is not an unencoded URL path character — use ASCII letters, digits and -._~!$&'()+,;=@".to_string()),
         Ok(_) => Some("contains braces, which the route table does not accept in a prefix".to_string()),
         Err(reason) => Some(reason),
     }
@@ -291,6 +309,7 @@ impl RoutePlan {
         }
 
         let mut groups: BTreeMap<String, Vec<Member>> = BTreeMap::new();
+        let mut display: BTreeMap<String, String> = BTreeMap::new();
         let mut endpoint_paths: BTreeMap<String, Vec<&InventoryEntry>> = BTreeMap::new();
         for (path, entries) in by_path {
             let first = entries[0];
@@ -338,7 +357,9 @@ impl RoutePlan {
             }
             let methods: BTreeSet<String> = entries.iter().flat_map(|e| e.claimed_methods()).collect();
             let custom_fallback = entries.iter().any(|e| matches!(e.kind, Some(RouteKind::Extension(_))));
-            groups.entry(final_of(&path)).or_default().push(Member {
+            let registered = final_of(&axum_registration_path(&path));
+            display.insert(registered.clone(), final_of(&path));
+            groups.entry(registered).or_default().push(Member {
                 origin: RouteOrigin::Endpoint(first.file.clone()),
                 methods,
                 custom_fallback,
@@ -348,6 +369,7 @@ impl RoutePlan {
             endpoint_paths.insert(path, entries);
         }
 
+        let shown = |path: &str| display.get(path).cloned().unwrap_or_else(|| path.to_string());
         let all_get_head = || ["GET", "HEAD"].into_iter().map(String::from).collect::<BTreeSet<String>>();
         let mut builtins: Vec<(String, BuiltinInfo)> = Vec::new();
         if ctx.api_builtins {
@@ -358,6 +380,7 @@ impl RoutePlan {
                     field: None,
                     methods: vec!["GET", "HEAD"],
                     inherited_exempt: true,
+                    remedy: BuiltinRemedy::ConfigSwitch,
                 },
             ));
             if ctx.readyz {
@@ -368,6 +391,7 @@ impl RoutePlan {
                         field: Some("features.readyzCheck"),
                         methods: vec!["GET", "HEAD"],
                         inherited_exempt: true,
+                        remedy: BuiltinRemedy::ConfigSwitch,
                     },
                 ));
             }
@@ -379,6 +403,7 @@ impl RoutePlan {
                         field: Some("features.metrics"),
                         methods: vec!["GET", "HEAD"],
                         inherited_exempt: false,
+                        remedy: BuiltinRemedy::ConfigSwitch,
                     },
                 ));
             }
@@ -391,6 +416,7 @@ impl RoutePlan {
                             field: Some("docsUi.mode"),
                             methods: vec!["GET", "HEAD"],
                             inherited_exempt: false,
+                            remedy: BuiltinRemedy::ConfigSwitch,
                         },
                     ));
                 }
@@ -405,8 +431,19 @@ impl RoutePlan {
                 files: Vec::new(),
             });
         }
+        let mut root_routes: Vec<(String, BuiltinInfo)> = Vec::new();
         if ctx.extras.web {
             for path in crate::webserve::WEB_ROUTES {
+                root_routes.push((
+                    path.to_string(),
+                    BuiltinInfo {
+                        label: "the static-content route (webserve.json)",
+                        field: None,
+                        methods: vec!["GET", "HEAD"],
+                        inherited_exempt: false,
+                        remedy: BuiltinRemedy::StaticContent,
+                    },
+                ));
                 groups.entry(path.to_string()).or_default().push(Member {
                     origin: RouteOrigin::Web,
                     methods: all_get_head(),
@@ -417,6 +454,16 @@ impl RoutePlan {
             }
         }
         if ctx.extras.control_plane {
+            root_routes.push((
+                crate::testing::control_plane::SCENARIO_PATH.to_string(),
+                BuiltinInfo {
+                    label: "the frogs test /_frogs/scenario control plane",
+                    field: None,
+                    methods: vec!["GET", "HEAD", "POST", "DELETE"],
+                    inherited_exempt: false,
+                    remedy: BuiltinRemedy::ControlPlane,
+                },
+            ));
             groups.entry(crate::testing::control_plane::SCENARIO_PATH.to_string()).or_default().push(Member {
                 origin: RouteOrigin::ControlPlane,
                 methods: ["GET", "HEAD", "POST", "DELETE"].into_iter().map(String::from).collect(),
@@ -459,7 +506,7 @@ impl RoutePlan {
                     };
                     problems.push(RouteProblem {
                         kind: RouteProblemKind::MethodOverlap,
-                        message: format!("{first_origin}: {what} {} is also {} — {hint}", untrusted(final_path), second.origin),
+                        message: format!("{first_origin}: {what} {} is also {} — {hint}", untrusted(&shown(final_path)), second.origin),
                     });
                     for member in [a, b] {
                         if let Some(path) = &member.endpoint_path {
@@ -493,16 +540,16 @@ impl RoutePlan {
                         ),
                         _ => format!(
                             "route {} ({}) conflicts with {} ({}): insertion failed due to conflict with a previously registered route",
-                            untrusted(&conflict.a),
+                            untrusted(&shown(&conflict.a)),
                             a_origin.map(|o| o.to_string()).unwrap_or_default(),
-                            untrusted(b),
+                            untrusted(&shown(b)),
                             b_origin.map(|o| o.to_string()).unwrap_or_default()
                         ),
                     }
                 }
                 None => format!(
                     "route {} ({}) conflicts with a route near '{}': insertion failed due to conflict with a previously registered route",
-                    untrusted(&conflict.a),
+                    untrusted(&shown(&conflict.a)),
                     a_origin.map(|o| o.to_string()).unwrap_or_default(),
                     untrusted(conflict.near.as_deref().unwrap_or_default())
                 ),
@@ -515,7 +562,7 @@ impl RoutePlan {
         for (path, text) in &report.unroutable {
             problems.push(RouteProblem {
                 kind: RouteProblemKind::Unroutable,
-                message: format!("route {} can't be registered: {}", untrusted(path), untrusted(text)),
+                message: format!("route {} can't be registered: {}", untrusted(&shown(path)), untrusted(text)),
             });
         }
         for member in report.members.iter().chain(report.unroutable.iter().map(|(p, _)| p)) {
@@ -544,10 +591,12 @@ impl RoutePlan {
             if excluded.contains(path) {
                 continue;
             }
+            let registered = final_of(&axum_registration_path(path));
             planned.insert(
-                path.clone(),
+                registered.clone(),
                 PlannedRoute {
                     path: path.clone(),
+                    registered,
                     files: entries
                         .iter()
                         .map(|e| PlannedFile {
@@ -561,10 +610,23 @@ impl RoutePlan {
             );
         }
         for (path, info) in builtins {
+            let registered = final_of(&path);
+            planned
+                .entry(registered.clone())
+                .or_insert_with(|| PlannedRoute {
+                    path,
+                    registered,
+                    files: Vec::new(),
+                    builtin: None,
+                })
+                .builtin = Some(info);
+        }
+        for (path, info) in root_routes {
             planned
                 .entry(path.clone())
                 .or_insert_with(|| PlannedRoute {
-                    path,
+                    path: path.clone(),
+                    registered: path,
                     files: Vec::new(),
                     builtin: None,
                 })
@@ -574,8 +636,8 @@ impl RoutePlan {
         let mut probe = matchit::Router::new();
         let mut max_segments = 0usize;
         for (index, route) in routes.iter().enumerate() {
-            if probe.insert(route.path.clone(), index).is_ok() {
-                max_segments = max_segments.max(segment_count(&route.path));
+            if probe.insert(route.registered.clone(), index).is_ok() {
+                max_segments = max_segments.max(segment_count(&route.registered));
             }
         }
 
@@ -587,6 +649,8 @@ impl RoutePlan {
             routes,
             probe,
             max_segments,
+            api_prefix,
+            has_catch_all: ctx.extras.web,
         }
     }
 
@@ -602,12 +666,17 @@ impl RoutePlan {
         self.problems.iter().filter(|p| !p.is_refusal(strict)).collect()
     }
 
-    /// The registered route that would answer a request for `probe` (apiRoot-relative), if any.
+    /// The registered route that would answer a request for `probe` (apiRoot-relative, literals percent-encoded), if any.
     pub(crate) fn resolve(&self, probe: &str) -> Option<&PlannedRoute> {
-        if segment_count(probe) > self.max_segments {
+        let absolute = match &self.api_prefix {
+            Some(prefix) => path_for_nested_route(prefix, probe),
+            None => probe.to_string(),
+        };
+        // A catch-all answers any depth, so the depth guard only applies without one.
+        if !self.has_catch_all && segment_count(&absolute) > self.max_segments {
             return None;
         }
-        let found = self.probe.at(probe).ok()?;
+        let found = self.probe.at(&absolute).ok()?;
         self.routes.get(*found.value)
     }
 }

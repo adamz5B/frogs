@@ -328,6 +328,15 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
     security_errors.extend(security.shadowed.iter().map(|m| m.message()));
     security_errors.extend(security.unverifiable.iter().map(|m| m.message()));
     security_errors.extend(security.builtin_refusals.iter().map(|m| m.message()));
+    let known_builtin_refusals: std::collections::HashSet<String> = security.builtin_refusals.iter().map(|m| m.message()).collect();
+    for message in crate::endpoint::security_check_with_routes(&tree, &doc, &with_control_plane)
+        .builtin_refusals
+        .iter()
+        .map(|m| m.message())
+        .filter(|m| !known_builtin_refusals.contains(m))
+    {
+        security_errors.push(format!("{message} (frogs test would refuse to start)"));
+    }
     for message in security_errors {
         eprintln!("error: {message}");
         outcome.errors.push(message);
@@ -499,6 +508,17 @@ fn generate_web(root: &Path, web_files: &[PathBuf]) -> io::Result<()> {
     let mut names: Vec<String> = web_files
         .iter()
         .filter_map(|path| path.file_name().and_then(|n| n.to_str()).map(str::to_string))
+        .filter(|name| match crate::webserve::lexically_denied(root, name) {
+            Some(reason) => {
+                println!(
+                    "note: {} is never served by frogs run ({}) — not considered for startPage/notFoundPage",
+                    name,
+                    reason.as_str()
+                );
+                false
+            }
+            None => true,
+        })
         .collect();
     names.sort();
 
@@ -2218,6 +2238,33 @@ mod tests {
     }
 
     #[test]
+    fn generate_web_never_picks_a_dot_prefixed_html_file_as_the_start_page() {
+        let root = temp_project();
+        let files = vec![touch(&root, ".aaa.html"), touch(&root, "zebra.html")];
+
+        generate_web(&root, &files).unwrap();
+
+        let config = crate::webserve::load(&root.join("webserve.json")).unwrap();
+        assert_eq!(config.start_page, "zebra.html");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn generate_web_never_picks_a_dot_prefixed_404_html_as_the_not_found_page() {
+        let root = temp_project();
+        let files = vec![touch(&root, "index.html"), touch(&root, "404.html"), touch(&root, ".404.html")];
+
+        generate_web(&root, &files).unwrap();
+
+        let config = crate::webserve::load(&root.join("webserve.json")).unwrap();
+        assert_eq!(config.start_page, "index.html");
+        assert_eq!(config.not_found_page, Some("404.html".to_string()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn generate_web_falls_back_to_the_first_html_file_alphabetically_when_theres_no_index() {
         let root = temp_project();
         let files = vec![touch(&root, "zebra.html"), touch(&root, "about.html")];
@@ -2542,14 +2589,11 @@ mod hardening_tests {
         assert!(!outcome.errors.is_empty(), "skipped paths must make generate fail");
         assert!(!outcome.strict_aborted);
 
-        // `/C:/x` has no traversal; it is only Windows-unsafe. The loader skips
-        // it on Windows and keeps it (with a warning) elsewhere, so ask the same
-        // policy the loader uses rather than branching on the OS here.
-        let windows_names_kept = crate::openapi::path_rules::PortabilityPolicy::for_host() == crate::openapi::path_rules::PortabilityPolicy::Warn;
+        // `/C:/x` has no traversal, but ':' is route syntax, so the loader
+        // skips it as UnsafePath under every portability policy (M5).
         let endpoints = root.join("api").join("datasources").join("endpoints");
 
         let mut saw_fine = false;
-        let mut saw_drive_like = false;
         for (name, _) in tree(&root) {
             if name == "openapi.yaml" || SCAFFOLD.contains(&name.as_str()) {
                 continue;
@@ -2558,38 +2602,17 @@ mod hardening_tests {
                 saw_fine = true;
                 continue;
             }
-            if windows_names_kept && name.starts_with("api/datasources/endpoints/C:/x/") {
-                saw_drive_like = true;
-                continue;
-            }
             panic!("unexpected file {name}");
         }
         assert!(saw_fine, "the safe path must still be generated");
 
-        if windows_names_kept {
-            // Kept, but only as a plain folder literally named `C:` inside the
-            // endpoints tree — never a drive, link or anything outside it.
-            // (Joining "C:" is only safe here: on Windows it would be a drive prefix.)
-            assert!(saw_drive_like, "/C:/x is kept with a warning on this host, so its stub must exist");
-            let drive_like = endpoints.join("C:");
-            let meta = std::fs::symlink_metadata(&drive_like).unwrap();
-            assert!(meta.is_dir() && !meta.file_type().is_symlink(), "C: must be a real directory");
-            let real = std::fs::canonicalize(drive_like.join("x").join("endpoint.get.json")).unwrap();
-            assert!(
-                real.starts_with(std::fs::canonicalize(&endpoints).unwrap()),
-                "{} is outside the endpoints folder",
-                real.display()
-            );
-        } else {
-            assert!(!saw_drive_like);
-            // List the folder rather than probing a joined path: `join("C:")`
-            // would point at the real drive here.
-            let names: Vec<String> = std::fs::read_dir(&endpoints)
-                .unwrap()
-                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-                .collect();
-            assert_eq!(names, ["fine"], "only the safe path may get a folder where Windows names are skipped");
-        }
+        // List the folder rather than probing a joined path: on Windows
+        // `join("C:")` would point at the real drive.
+        let names: Vec<String> = std::fs::read_dir(&endpoints)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["fine"], "only the safe path may get a folder");
 
         assert!(!std::env::temp_dir().join(&marker).exists(), "something escaped the project");
         let _ = std::fs::remove_dir_all(&root);
@@ -2628,6 +2651,22 @@ mod hardening_tests {
         }
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_secured_operation_generate_skipped_is_reported_when_the_static_catch_all_would_answer_it() {
+        let root = temp_project();
+        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    a: { type: apiKey, in: header, name: ka }\npaths:\n  '/ad\\min':\n    get:\n      operationId: skipped\n      security: [ { a: [] } ]\n      responses: { '200': { description: ok } }\n";
+        write_spec(&root, yaml);
+        std::fs::write(root.join("webserve.json"), r#"{ "startPage": "index.html" }"#).unwrap();
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(!outcome.errors.is_empty(), "skipped secured op under the web role must make generate fail");
+        let text = outcome.errors.join("\n");
+        assert!(
+            text.contains("fix the path in openapi.yaml") || text.contains("static-content"),
+            "the error must explain the exposure, not just the skip: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

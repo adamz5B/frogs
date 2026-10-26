@@ -31,7 +31,7 @@ use crate::openapi::{Operation, ResponseMode};
 use crate::security::{ClientCertIdentity, SecurityConfig, VerifierCache};
 use crate::server::RequestId;
 use crate::sql::SqlDriver;
-use route_plan::{EntryStatus, InventoryEntry, RouteContext, RouteInventory, RouteKind, RoutePlan};
+use route_plan::{BuiltinRemedy, EntryStatus, InventoryEntry, RouteContext, RouteInventory, RouteKind, RoutePlan};
 use serde_json::{Map, Value};
 
 /// Re-exported for `testing`, the only other module that needs to reach
@@ -380,7 +380,7 @@ pub fn build_router(
             let table = Arc::new(table);
             combined = combined.fallback(move |req: axum::extract::Request| dispatch_extension(table.clone(), allow.clone(), req));
         }
-        router = router.route(&url_path, combined);
+        router = router.route(&crate::openapi::route_syntax::axum_registration_path(&url_path), combined);
     }
     router
 }
@@ -1689,28 +1689,53 @@ pub(crate) struct BuiltinShadow {
     pub field: Option<&'static str>,
     pub inherited: bool,
     pub any_method: bool,
+    pub remedy: BuiltinRemedy,
 }
 
 impl BuiltinShadow {
     pub(crate) fn message(&self) -> String {
         use crate::openapi::{method_token::untrusted_short, untrusted};
-        let head = format!(
-            "{} {} (operationId {}){}: openapi.yaml requires security ({}) but frogs's built-in {} route answers it without authentication",
+        let lead = format!(
+            "{} {} (operationId {}){}: openapi.yaml requires security ({})",
             method_or_every(self.any_method, &self.op_method),
             untrusted(&self.op_path),
             untrusted_short(&self.operation_id),
             origin_note(&self.origin),
             acceptable_display(&self.acceptable, self.unknown),
-            self.label
         );
-        let turn_off = match self.field {
-            Some(field) => format!("turn {field} off, change apiRoot"),
-            None => "change apiRoot".to_string(),
+        let (head, fix, note) = match self.remedy {
+            BuiltinRemedy::ConfigSwitch => (
+                format!("{lead} but frogs's built-in {} route answers it without authentication", self.label),
+                match self.field {
+                    Some(field) => format!("turn {field} off, change apiRoot"),
+                    None => "change apiRoot".to_string(),
+                },
+                "",
+            ),
+            BuiltinRemedy::StaticContent => (
+                format!(
+                    "{lead} but the operation has no endpoint file of its own, so {} would answer it without authentication",
+                    self.label
+                ),
+                match self.origin {
+                    ShadowOrigin::Skipped(_) => "fix the path in openapi.yaml".to_string(),
+                    _ => "run `frogs generate` to create its endpoint file".to_string(),
+                },
+                " (setting apiRoot does not help: axum 0.7 routes unmatched paths under apiRoot to the static catch-all as well)",
+            ),
+            BuiltinRemedy::ControlPlane => (
+                format!(
+                    "{lead} but the operation has no endpoint file of its own, so {} would answer it without authentication",
+                    self.label
+                ),
+                "rename the operation's path, or choose an apiRoot that doesn't place it at /_frogs/scenario".to_string(),
+                "",
+            ),
         };
         if self.inherited {
-            format!("{head} — the security is only the document-wide default: add `security: []` on the operation if the exposure is intended, or {turn_off}")
+            format!("{head} — the security is only the document-wide default: add `security: []` on the operation if the exposure is intended, or {fix}{note}")
         } else {
-            format!("{head} — {turn_off}, or remove security from that operation")
+            format!("{head} — {fix}, or remove security from that operation{note}")
         }
     }
 }
@@ -2106,17 +2131,19 @@ pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::opena
     for view in &views {
         let probe = match crate::openapi::route_syntax::probe_path(&view.path) {
             Ok(probe) => probe,
-            Err(_) => {
-                if let ShadowOrigin::Skipped(reason) = &view.origin {
-                    check.unverifiable.push(UnverifiableSecuredPath {
-                        op_method: view.wire.clone(),
-                        op_path: view.path.clone(),
-                        reason: reason.clone(),
-                        acceptable: view.acceptable.clone(),
-                        unknown: view.unknown,
-                        any_method: view.any_method,
-                    });
-                }
+            Err(why) => {
+                let reason = match &view.origin {
+                    ShadowOrigin::Skipped(reason) => reason.clone(),
+                    _ => format!("path can't be probed: {why}"),
+                };
+                check.unverifiable.push(UnverifiableSecuredPath {
+                    op_method: view.wire.clone(),
+                    op_path: view.path.clone(),
+                    reason,
+                    acceptable: view.acceptable.clone(),
+                    unknown: view.unknown,
+                    any_method: view.any_method,
+                });
                 continue;
             }
         };
@@ -2183,6 +2210,7 @@ pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::opena
                 field: builtin.field,
                 inherited: view.inherited,
                 any_method: view.any_method,
+                remedy: builtin.remedy,
             };
             if view.inherited && builtin.inherited_exempt {
                 check.builtin_warnings.push(shadow.message());

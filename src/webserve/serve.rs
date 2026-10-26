@@ -10,6 +10,8 @@ use axum::routing::get;
 use chrono::{DateTime, Utc};
 
 use super::WebServeConfig;
+use super::deny::{DenyList, DenyReason, ProtectedPaths};
+use crate::openapi::path_rules::untrusted;
 
 /// Extension -> MIME type for what a hand-built static site actually ships.
 /// Not exhaustive by design — anything not listed here falls back to
@@ -65,10 +67,7 @@ struct ServeState {
     /// itself, not a link that resolves outside `root` from a single,
     /// otherwise-innocent-looking segment.
     canonical_root: PathBuf,
-    /// `webserve.json` must never be served, no matter what path resolves
-    /// to it — computed once so every request's containment check is a
-    /// plain comparison instead of a fresh canonicalize + string compare.
-    canonical_webserve_json: Option<PathBuf>,
+    deny: DenyList,
     config: WebServeConfig,
 }
 
@@ -80,13 +79,16 @@ pub(crate) const WEB_ROUTES: [&str; 2] = ["/", "/*path"];
 /// matching file on disk, and a request that doesn't resolve to a real,
 /// contained file gets `config.notFoundPage` (if set and itself resolves)
 /// or a generic 404.
-pub fn router(root: PathBuf, config: WebServeConfig) -> Router {
-    let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
-    let canonical_webserve_json = std::fs::canonicalize(root.join("webserve.json")).ok();
+///
+/// `protected` carries the files and folders other parts of frogs own that
+/// must never be served (see `deny`); `webserve.json`'s own TLS paths are
+/// added here.
+pub fn router(root: PathBuf, config: WebServeConfig, protected: ProtectedPaths) -> Router {
+    let (deny, canonical_root) = DenyList::for_site(&root, &config, &protected);
     let state = Arc::new(ServeState {
         root,
         canonical_root,
-        canonical_webserve_json,
+        deny,
         config,
     });
 
@@ -132,22 +134,47 @@ fn resolve_relative(root: &Path, relative: &str) -> Option<PathBuf> {
     Some(result)
 }
 
-/// Resolves `relative` to a real file strictly inside `state.root`, or
-/// `None` if it doesn't exist, escapes `root` (via a symlink — see
-/// `ServeState::canonical_root`), or is `webserve.json` itself.
+pub(crate) enum Located {
+    Missing,
+    Denied(DenyReason),
+    File(PathBuf),
+}
+
+/// The deny rules run twice: on the request path's own spelling before any
+/// filesystem access, and again on the canonical result so a link inside
+/// `root` can't reach a protected file.
+pub(crate) fn locate(root: &Path, canonical_root: &Path, deny: &DenyList, relative: &str) -> Located {
+    if let Some(reason) = deny.request_verdict(relative) {
+        return Located::Denied(reason);
+    }
+    let Some(candidate) = resolve_relative(root, relative) else {
+        return Located::Missing;
+    };
+    let Ok(canonical) = std::fs::canonicalize(&candidate) else {
+        return Located::Missing;
+    };
+    if !canonical.is_file() || !canonical.starts_with(canonical_root) {
+        return Located::Missing;
+    }
+    if let Some(reason) = deny.canonical_verdict(&canonical) {
+        return Located::Denied(reason);
+    }
+    Located::File(canonical)
+}
+
+/// Resolves `relative` to a real, servable file strictly inside
+/// `state.root`, or `None` if it doesn't exist, escapes `root` (via a
+/// symlink — see `ServeState::canonical_root`) or is denied. A denial and a
+/// missing file take the same path, so a response never reveals which.
 fn safe_existing_file(state: &ServeState, relative: &str) -> Option<PathBuf> {
-    let candidate = resolve_relative(&state.root, relative)?;
-    let canonical = std::fs::canonicalize(&candidate).ok()?;
-    if !canonical.is_file() {
-        return None;
+    match locate(&state.root, &state.canonical_root, &state.deny, relative) {
+        Located::File(path) => Some(path),
+        Located::Denied(reason) => {
+            tracing::debug!("static request denied ({}): {}", reason.as_str(), untrusted(relative));
+            None
+        }
+        Located::Missing => None,
     }
-    if !canonical.starts_with(&state.canonical_root) {
-        return None;
-    }
-    if state.canonical_webserve_json.as_deref() == Some(canonical.as_path()) {
-        return None;
-    }
-    Some(canonical)
 }
 
 /// A weak validator (mtime + size, like nginx/Apache's own defaults) — cheap
@@ -311,7 +338,7 @@ mod tests {
             not_found_page: None,
             tls: Default::default(),
         };
-        let addr = spawn(router(dir.clone(), config)).await;
+        let addr = spawn(router(dir.clone(), config, ProtectedPaths::default())).await;
 
         let response = reqwest::get(format!("http://{addr}/")).await.unwrap();
         assert_eq!(response.status(), 200);
@@ -333,7 +360,7 @@ mod tests {
             not_found_page: None,
             tls: Default::default(),
         };
-        let addr = spawn(router(dir.clone(), config)).await;
+        let addr = spawn(router(dir.clone(), config, ProtectedPaths::default())).await;
 
         let response = reqwest::get(format!("http://{addr}/css/style.css")).await.unwrap();
         assert_eq!(response.status(), 200);
@@ -353,7 +380,7 @@ mod tests {
             not_found_page: None,
             tls: Default::default(),
         };
-        let addr = spawn(router(dir.clone(), config)).await;
+        let addr = spawn(router(dir.clone(), config, ProtectedPaths::default())).await;
 
         let response = reqwest::get(format!("http://{addr}/nope.html")).await.unwrap();
         assert_eq!(response.status(), 404);
@@ -373,7 +400,7 @@ mod tests {
             not_found_page: Some("404.html".to_string()),
             tls: Default::default(),
         };
-        let addr = spawn(router(dir.clone(), config)).await;
+        let addr = spawn(router(dir.clone(), config, ProtectedPaths::default())).await;
 
         let response = reqwest::get(format!("http://{addr}/nope.html")).await.unwrap();
         assert_eq!(response.status(), 404);
@@ -405,7 +432,7 @@ mod tests {
             not_found_page: None,
             tls: Default::default(),
         };
-        let addr = spawn(router(dir.clone(), config)).await;
+        let addr = spawn(router(dir.clone(), config, ProtectedPaths::default())).await;
 
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         stream
@@ -432,7 +459,7 @@ mod tests {
             not_found_page: None,
             tls: Default::default(),
         };
-        let addr = spawn(router(dir.clone(), config)).await;
+        let addr = spawn(router(dir.clone(), config, ProtectedPaths::default())).await;
 
         let response = reqwest::get(format!("http://{addr}/webserve.json")).await.unwrap();
         assert_eq!(response.status(), 404);
@@ -451,7 +478,7 @@ mod tests {
             not_found_page: None,
             tls: Default::default(),
         };
-        let addr = spawn(router(dir.clone(), config)).await;
+        let addr = spawn(router(dir.clone(), config, ProtectedPaths::default())).await;
 
         let response = reqwest::get(format!("http://{addr}/css")).await.unwrap();
         assert_eq!(response.status(), 404);
@@ -503,7 +530,7 @@ mod tests {
             not_found_page: None,
             tls: Default::default(),
         };
-        let addr = spawn(router(dir.clone(), config)).await;
+        let addr = spawn(router(dir.clone(), config, ProtectedPaths::default())).await;
 
         let response = reqwest::get(format!("http://{addr}/")).await.unwrap();
         assert_eq!(response.status(), 200);
@@ -524,7 +551,7 @@ mod tests {
             not_found_page: None,
             tls: Default::default(),
         };
-        let addr = spawn(router(dir.clone(), config)).await;
+        let addr = spawn(router(dir.clone(), config, ProtectedPaths::default())).await;
         let client = reqwest::Client::new();
 
         let first = client.get(format!("http://{addr}/")).send().await.unwrap();
@@ -548,7 +575,7 @@ mod tests {
             not_found_page: None,
             tls: Default::default(),
         };
-        let addr = spawn(router(dir.clone(), config)).await;
+        let addr = spawn(router(dir.clone(), config, ProtectedPaths::default())).await;
         let client = reqwest::Client::new();
 
         let response = client
@@ -573,7 +600,7 @@ mod tests {
             not_found_page: None,
             tls: Default::default(),
         };
-        let addr = spawn(router(dir.clone(), config)).await;
+        let addr = spawn(router(dir.clone(), config, ProtectedPaths::default())).await;
         let client = reqwest::Client::new();
 
         let first = client.get(format!("http://{addr}/")).send().await.unwrap();
@@ -600,7 +627,7 @@ mod tests {
             not_found_page: None,
             tls: Default::default(),
         };
-        let addr = spawn(router(dir.clone(), config)).await;
+        let addr = spawn(router(dir.clone(), config, ProtectedPaths::default())).await;
         let client = reqwest::Client::new();
 
         let response = client
@@ -629,7 +656,7 @@ mod tests {
             not_found_page: None,
             tls: Default::default(),
         };
-        let addr = spawn(router(dir.clone(), config)).await;
+        let addr = spawn(router(dir.clone(), config, ProtectedPaths::default())).await;
         let client = reqwest::Client::new();
 
         let first = client.get(format!("http://{addr}/")).send().await.unwrap();

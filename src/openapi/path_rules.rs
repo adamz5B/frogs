@@ -6,7 +6,7 @@ use super::{IssueKind, Severity};
 
 const MAX_SEGMENT_BYTES: usize = 255;
 const MAX_PATH_BYTES: usize = 2048;
-const RESERVED_DIR: &str = "_backups";
+pub(crate) const RESERVED_DIR: &str = "_backups";
 
 /// What to do with a path whose segments would be unusable as a Windows file
 /// name. `for_host` is the only host-OS branch in the whole path-hardening

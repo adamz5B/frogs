@@ -5,6 +5,7 @@ use super::route_plan::{EntryStatus, InventoryEntry, RootExtras, RouteContext, R
 use super::*;
 use crate::openapi::endpoint_tree::tree_for_tests;
 
+mod encoding;
 mod refs;
 mod security;
 
@@ -693,14 +694,14 @@ async fn the_probe_router_answers_exactly_like_a_real_axum_router_built_from_the
 
         let mut real = Router::new();
         for route in &plan.routes {
-            let label = route.path.clone();
-            real = real.route(&route.path, axum::routing::any(move || async move { label }));
+            let label = route.registered.clone();
+            real = real.route(&route.registered, axum::routing::any(move || async move { label }));
         }
         let mut probes: Vec<String> = plan
             .routes
             .iter()
             .map(|r| {
-                r.path
+                r.registered
                     .split('/')
                     .map(|s| if s.starts_with(':') { ":frogs-probe" } else { s })
                     .collect::<Vec<_>>()
@@ -716,7 +717,7 @@ async fn the_probe_router_answers_exactly_like_a_real_axum_router_built_from_the
         }
         for probe in probes {
             let (status, body) = call(&real, "GET", &probe).await;
-            let planned = plan.resolve(&probe).map(|r| r.path.clone());
+            let planned = plan.resolve(&probe).map(|r| r.registered.clone());
             compared += 1;
             match planned {
                 Some(path) => {
@@ -922,8 +923,10 @@ async fn the_plans_routed_set_equals_what_the_real_router_answers_and_placeholde
     }
     if dup_entries == 2 {
         let dups: Vec<_> = inventory.entries.iter().filter(|e| e.url_path == "/dup").collect();
-        assert_eq!(dups.iter().filter(|e| e.status == EntryStatus::Routed).count(), 1, "first file wins");
-        assert_eq!(dups.iter().filter(|e| e.status == EntryStatus::Duplicate).count(), 1);
+        // `endpoint.GET.json` is a non-canonical token for a standard method
+        // (M3): it never enters the inventory, so it can't compete as a duplicate.
+        assert_eq!(dups.len(), 1, "{dups:?}");
+        assert_eq!(dups[0].status, EntryStatus::Routed, "only the canonical file is routed");
     }
 }
 
