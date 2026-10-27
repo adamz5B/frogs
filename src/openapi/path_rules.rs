@@ -113,7 +113,7 @@ pub(crate) fn unsafe_segment_reason(seg: &str, is_file_name: bool) -> Option<Str
     None
 }
 
-fn windows_reason(seg: &str) -> Option<String> {
+pub(crate) fn windows_reason(seg: &str) -> Option<String> {
     if seg.chars().any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*')) {
         return Some("contains a character Windows does not allow in file names (<>:\"|?*)".to_string());
     }

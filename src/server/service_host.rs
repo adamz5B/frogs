@@ -166,7 +166,11 @@ fn run_service(arguments: Vec<OsString>) -> io::Result<()> {
     };
     let result = runtime.block_on(crate::commands::run::run_direct_with_shutdown(&project_root, shutdown));
 
-    let exit_code = if result.is_ok() {
+    // The SCM's recovery actions cannot be limited to particular service-specific
+    // codes, so a configuration refusal (restarting cannot fix it) is reported as
+    // a clean stop; the message is in frogs's own log. Every other error stays a
+    // failure and is restarted per the registered `--restart-policy`.
+    let exit_code = if result.as_ref().map_or_else(crate::exit_codes::is_config_refusal, |_| true) {
         ServiceExitCode::NO_ERROR
     } else {
         ServiceExitCode::ServiceSpecific(1)

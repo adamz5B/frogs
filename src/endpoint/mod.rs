@@ -430,6 +430,20 @@ pub(crate) fn route_inventory(tree: &EndpointTree, mode: MethodCase) -> RouteInv
     RouteInventory { entries }
 }
 
+/// The NFC spellings of every non-ASCII literal segment among the routed endpoint
+/// folders: what `ServeShape` lets a differently-normalised request spelling be
+/// rewritten to (parameter segments are never in it).
+pub(crate) fn canonical_literal_set(inventory: &RouteInventory) -> std::collections::BTreeSet<String> {
+    inventory
+        .entries
+        .iter()
+        .filter(|entry| entry.status == EntryStatus::Routed)
+        .flat_map(|entry| entry.url_path.split('/'))
+        .filter(|segment| !segment.starts_with(':'))
+        .filter_map(crate::openapi::path_encoding::nfc_literal_key)
+        .collect()
+}
+
 /// What a skipped (unservable) endpoint file answers instead of letting its
 /// requests fall through to another route. Holds only the registry: it reads
 /// `endpoint.unavailable` if the project defines it, never records a
@@ -1937,6 +1951,11 @@ fn is_template_instance(view: &SecuredView, url_path: &str) -> bool {
                 return false;
             }
         } else if !file_seg.starts_with(':') {
+            // A partial template (`report.{ext}`) only covers folder names that fit it.
+            let partial = op_seg.contains(['{', '}']) && !op_seg.contains([':', '*']);
+            if partial && !crate::openapi::route_syntax::partial_template_matches(op_seg, file_seg) {
+                return false;
+            }
             template_vs_literal = true;
         }
     }
@@ -2147,75 +2166,82 @@ pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::opena
                 continue;
             }
         };
-        let Some(route) = plan.resolve(&probe) else { continue };
-        let planned_files: Vec<&route_plan::PlannedFile> = if view.any_method {
-            route.files.iter().collect()
-        } else {
-            route
-                .files
-                .iter()
-                .find(|f| f.wire == view.wire || (view.wire == "HEAD" && f.wire == "GET"))
-                .into_iter()
-                .collect()
-        };
-        if !planned_files.is_empty() {
-            for planned in planned_files {
-                if matches!(view.origin, ShadowOrigin::Served)
-                    && owners
-                        .get(&(route.path.clone(), planned.token.clone()))
-                        .is_some_and(|ops| ops.iter().any(|(wire, path)| *wire == view.wire && *path == view.path))
-                {
+        let mut targets: Vec<&route_plan::PlannedRoute> = plan.resolve(&probe).into_iter().collect();
+        for extra in plan.partial_instances(&view.path) {
+            if !targets.iter().any(|t| t.registered == extra.registered) {
+                targets.push(extra);
+            }
+        }
+        for route in targets {
+            let planned_files: Vec<&route_plan::PlannedFile> = if view.any_method {
+                route.files.iter().collect()
+            } else {
+                route
+                    .files
+                    .iter()
+                    .find(|f| f.wire == view.wire || (view.wire == "HEAD" && f.wire == "GET"))
+                    .into_iter()
+                    .collect()
+            };
+            if !planned_files.is_empty() {
+                for planned in planned_files {
+                    if matches!(view.origin, ShadowOrigin::Served)
+                        && owners
+                            .get(&(route.path.clone(), planned.token.clone()))
+                            .is_some_and(|ops| ops.iter().any(|(wire, path)| *wire == view.wire && *path == view.path))
+                    {
+                        continue;
+                    }
+                    let Ok(contents) = std::fs::read_to_string(&planned.file) else { continue };
+                    let Ok(endpoint) = serde_json::from_str::<EndpointFile>(&contents) else { continue };
+                    if !stub_fails(&endpoint.security, view) {
+                        continue;
+                    }
+                    if !seen.insert((view.any_method, view.wire.clone(), view.path.clone(), planned.file.clone())) {
+                        continue;
+                    }
+                    check.shadowed.push(SecurityShadow {
+                        op_method: view.wire.clone(),
+                        op_path: view.path.clone(),
+                        operation_id: view.operation_id.clone(),
+                        origin: view.origin.clone(),
+                        served_route: route.path.clone(),
+                        file: planned.file.clone(),
+                        file_security: endpoint.security,
+                        acceptable: view.acceptable.clone(),
+                        unknown: view.unknown,
+                        same_template: matches!(view.origin, ShadowOrigin::Served) && match_key(&axum_style_path(&view.path)) == match_key(&route.path),
+                        any_method: view.any_method,
+                    });
+                }
+            } else if let Some(builtin) = &route.builtin
+                && (if view.any_method {
+                    !builtin.methods.is_empty()
+                } else {
+                    builtin.methods.contains(&view.wire.as_str())
+                })
+            {
+                if !seen_builtin.insert((view.any_method, view.wire.clone(), view.path.clone(), builtin.label)) {
                     continue;
                 }
-                let Ok(contents) = std::fs::read_to_string(&planned.file) else { continue };
-                let Ok(endpoint) = serde_json::from_str::<EndpointFile>(&contents) else { continue };
-                if !stub_fails(&endpoint.security, view) {
-                    continue;
-                }
-                if !seen.insert((view.any_method, view.wire.clone(), view.path.clone(), planned.file.clone())) {
-                    continue;
-                }
-                check.shadowed.push(SecurityShadow {
+                let shadow = BuiltinShadow {
                     op_method: view.wire.clone(),
                     op_path: view.path.clone(),
                     operation_id: view.operation_id.clone(),
                     origin: view.origin.clone(),
-                    served_route: route.path.clone(),
-                    file: planned.file.clone(),
-                    file_security: endpoint.security,
                     acceptable: view.acceptable.clone(),
                     unknown: view.unknown,
-                    same_template: matches!(view.origin, ShadowOrigin::Served) && match_key(&axum_style_path(&view.path)) == match_key(&route.path),
+                    label: builtin.label,
+                    field: builtin.field,
+                    inherited: view.inherited,
                     any_method: view.any_method,
-                });
-            }
-        } else if let Some(builtin) = &route.builtin
-            && (if view.any_method {
-                !builtin.methods.is_empty()
-            } else {
-                builtin.methods.contains(&view.wire.as_str())
-            })
-        {
-            if !seen_builtin.insert((view.any_method, view.wire.clone(), view.path.clone(), builtin.label)) {
-                continue;
-            }
-            let shadow = BuiltinShadow {
-                op_method: view.wire.clone(),
-                op_path: view.path.clone(),
-                operation_id: view.operation_id.clone(),
-                origin: view.origin.clone(),
-                acceptable: view.acceptable.clone(),
-                unknown: view.unknown,
-                label: builtin.label,
-                field: builtin.field,
-                inherited: view.inherited,
-                any_method: view.any_method,
-                remedy: builtin.remedy,
-            };
-            if view.inherited && builtin.inherited_exempt {
-                check.builtin_warnings.push(shadow.message());
-            } else {
-                check.builtin_refusals.push(shadow);
+                    remedy: builtin.remedy,
+                };
+                if view.inherited && builtin.inherited_exempt {
+                    check.builtin_warnings.push(shadow.message());
+                } else {
+                    check.builtin_refusals.push(shadow);
+                }
             }
         }
     }
@@ -6127,21 +6153,21 @@ mod m4_router_tests {
         // hyper accepts any RFC 9110 token as a method (up to its own limits); frogs routes the exact
         // bytes (default mode uppercases first). These are the observed outcomes, pinned deliberately.
         let root = temp_root();
-        write_endpoint(&root, "t", &"A".repeat(64), &ep(201, None));
+        write_endpoint(&root, "t", &"A".repeat(32), &ep(201, None));
         write_endpoint(&root, "t", "M-SEARCH", &ep(202, None));
         write_endpoint(&root, "t", "~_58_2e_59", &ep(203, None));
         write_endpoint(&root, "t", "~_41_2a_42", &ep(204, None));
         write_endpoint(&root, "t", "get", &ep(200, None));
-        let long64 = "A".repeat(64);
-        let long65 = "A".repeat(65);
-        let lower64 = "a".repeat(64);
+        let long_max = "A".repeat(32);
+        let long_over = "A".repeat(33);
+        let lower_max = "a".repeat(32);
         let table: [(MethodCase, Vec<(&str, u16)>); 2] = [
             (
                 MethodCase::Default,
                 vec![
-                    (&long64, 201),
-                    (&long65, 405),
-                    (&lower64, 201),
+                    (&long_max, 201),
+                    (&long_over, 405),
+                    (&lower_max, 201),
                     ("M-SEARCH", 202),
                     ("m-search", 202),
                     ("X.Y", 203),
@@ -6154,9 +6180,9 @@ mod m4_router_tests {
             (
                 MethodCase::Exact,
                 vec![
-                    (&long64, 201),
-                    (&long65, 405),
-                    (&lower64, 405),
+                    (&long_max, 201),
+                    (&long_over, 405),
+                    (&lower_max, 405),
                     ("M-SEARCH", 202),
                     ("m-search", 405),
                     ("X.Y", 203),
@@ -6174,7 +6200,7 @@ mod m4_router_tests {
                 assert_eq!(status, expected, "{mode:?} {method}");
                 if expected == 405 {
                     let allow = allow_header(&headers);
-                    for listed in ["GET", "HEAD", "M-SEARCH", "X.Y", "A*B", long64.as_str()] {
+                    for listed in ["GET", "HEAD", "M-SEARCH", "X.Y", "A*B", long_max.as_str()] {
                         assert!(allow.split(',').any(|m| m == listed), "{mode:?} {method}: {listed} missing from Allow {allow}");
                     }
                 }

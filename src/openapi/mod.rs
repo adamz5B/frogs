@@ -81,7 +81,7 @@ pub struct Operation {
     pub method: String,
     /// The method sent on the wire (`GET`, `QUERY`, `PURGE`, ...). For an
     /// `additionalOperations` entry this is spec text, validated as an RFC 9110
-    /// token (1-64 bytes) before it ever lands here.
+    /// token (1-32 bytes) before it ever lands here.
     pub http_method: String,
     pub operation_id: String,
     pub response_schema: Option<Value>,
@@ -805,6 +805,8 @@ pub enum IssueKind {
     TrailingSlashNormalised,
     TrailingSlashCollision,
     UnsafeComponentName,
+    /// `components/schemas` names whose cache files would share one name (letter case or Unicode normalisation).
+    ComponentNameCollision,
     MediaTypeRefUnresolved,
     DefaultMappingUnresolved,
     SecurityRequirementUnresolved,
@@ -849,6 +851,7 @@ impl IssueKind {
             | IssueKind::TrailingSlashNormalised
             | IssueKind::TrailingSlashCollision
             | IssueKind::UnsafeComponentName
+            | IssueKind::ComponentNameCollision
             | IssueKind::MediaTypeRefUnresolved
             | IssueKind::DefaultMappingUnresolved
             | IssueKind::PartialPathTemplate
@@ -1475,7 +1478,7 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, options: 
             IssueKind::CaseOnlyPathCollision,
             Severity::Error,
             format!(
-                "paths differ only by letter case and would share one folder on a case-insensitive filesystem: {} — all skipped",
+                "paths differ only by letter case or Unicode normalisation and would share one folder on a case-insensitive or normalising filesystem: {} — all skipped",
                 names.join(", ")
             ),
         ));
@@ -1526,6 +1529,25 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, options: 
                 unwritable_components.insert(name.clone());
             }
         }
+    }
+    // Same rule as colliding paths: names whose cache files would share one
+    // file (case or Unicode normalisation) are all left unwritten, so the
+    // result doesn't depend on which filesystem generate happens to run on.
+    let mut by_folded: BTreeMap<String, Vec<&String>> = BTreeMap::new();
+    for name in component_schemas.keys() {
+        by_folded.entry(dir_index::fold(name)).or_default().push(name);
+    }
+    for members in by_folded.values().filter(|members| members.len() > 1) {
+        let names: Vec<String> = members.iter().map(|name| format!("'{}'", untrusted(name))).collect();
+        issues.push(LoadIssue::new(
+            IssueKind::ComponentNameCollision,
+            Severity::Error,
+            format!(
+                "components/schemas names differ only by letter case or Unicode normalisation and would share one cache file: {} — their cache files are not written",
+                names.join(", ")
+            ),
+        ));
+        unwritable_components.extend(members.iter().map(|name| (*name).clone()));
     }
 
     let security_scheme_types = scheme_names
@@ -2318,6 +2340,27 @@ info: {{ title: t, version: 1 }}
         assert_eq!(doc.unwritable_components.iter().cloned().collect::<Vec<_>>(), vec!["../../x".to_string()]);
         assert!(doc.issues.iter().any(|i| i.kind == IssueKind::UnsafeComponentName && i.severity == Severity::Error));
         assert!(!doc.unwritable_components.contains("Fine"));
+    }
+
+    #[test]
+    fn component_names_colliding_by_case_or_normalisation_are_all_unwritable_but_stay_resolvable() {
+        let yaml = "openapi: 3.1.0\ninfo: { title: t, version: 1 }\npaths: {}\ncomponents:\n  schemas:\n    Car:\n      type: object\n    car:\n      type: object\n    \"Caf\\u00e9\":\n      type: object\n    \"Cafe\\u0301\":\n      type: object\n    Fine:\n      type: object\n";
+        let doc = load_yaml(yaml);
+        assert_eq!(doc.component_schemas.len(), 5);
+        assert_eq!(doc.unwritable_components.len(), 4);
+        assert!(!doc.unwritable_components.contains("Fine"));
+        let issues: Vec<&LoadIssue> = doc.issues.iter().filter(|i| i.kind == IssueKind::ComponentNameCollision).collect();
+        assert_eq!(issues.len(), 2);
+        assert!(issues.iter().all(|i| i.severity == Severity::Error));
+        assert!(IssueKind::ComponentNameCollision.is_strict_error());
+    }
+
+    #[test]
+    fn composed_and_decomposed_unicode_paths_collide_like_case_variants() {
+        let doc = load_yaml(&spec_with_paths(&["/caf\u{e9}", "/cafe\u{301}"]));
+        assert_eq!(doc.ambiguous.len(), 2);
+        assert!(doc.operations.is_empty());
+        assert_eq!(kinds(&doc), vec![IssueKind::CaseOnlyPathCollision]);
     }
 
     #[test]

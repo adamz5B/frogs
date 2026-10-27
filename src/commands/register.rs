@@ -13,6 +13,7 @@ use crate::server::service::{self, RestartPolicy, ServiceScope, StartType};
 /// `account`/`description` are both Windows-only (which account the service
 /// runs as, and its `services.msc`/`sc qdescription` description text) —
 /// ignored on every other platform.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     cwd: &Path,
     name: Option<&str>,
@@ -21,7 +22,12 @@ pub fn run(
     description: Option<&str>,
     start_type: StartType,
     restart_policy: RestartPolicy,
+    restart_delay_ms: Option<u32>,
 ) -> io::Result<()> {
+    if restart_policy == RestartPolicy::Never && restart_delay_ms.is_some() {
+        eprintln!("error: --restart-delay-ms has no meaning with --restart-policy never");
+        std::process::exit(1);
+    }
     let root = require_project_root(cwd);
 
     if let Err(e) = crate::commands::run::precheck_security_for_service(&root) {
@@ -83,7 +89,7 @@ pub fn run(
         }
     }
 
-    let record = service::install(&service_name, scope, &root, account, description, start_type, restart_policy)?;
+    let record = service::install(&service_name, scope, &root, account, description, start_type, restart_policy, restart_delay_ms)?;
     service::write_record(&root, &record)?;
 
     let boot_note = match start_type {
@@ -91,8 +97,11 @@ pub fn run(
         StartType::Manual => "it will NOT start automatically at boot/login — start it explicitly with `frogs run` or the platform's own tool when needed",
     };
     let restart_note = match restart_policy {
-        RestartPolicy::OnFailure => "crash recovery: it will restart automatically if it exits with a failure",
-        RestartPolicy::Never => "crash recovery: disabled — it will NOT restart automatically if it exits with a failure",
+        RestartPolicy::OnFailure => match restart_delay_ms {
+            Some(ms) => format!("crash recovery: it will restart automatically {ms} ms after it exits with a failure"),
+            None => "crash recovery: it will restart automatically if it exits with a failure".to_string(),
+        },
+        RestartPolicy::Never => "crash recovery: disabled — it will NOT restart automatically if it exits with a failure".to_string(),
     };
     println!("registered and started {service_name} via {} — {boot_note}", service::backend_label(record.backend));
     println!("{restart_note}");

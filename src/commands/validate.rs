@@ -149,6 +149,14 @@ async fn validate_api(root: &Path) -> usize {
                 println!("  error: {}", error.message);
             }
             problems += plan.errors.len();
+            for item in &plan.archive {
+                warn(&format!(
+                    "{}: orphaned {} will be moved into _backups/ by frogs generate (never deleted) — {}",
+                    item.dir.display(),
+                    crate::openapi::untrusted(&item.name),
+                    item.reason
+                ));
+            }
             for message in &plan.wrong_mode {
                 println!("  error: {message}");
                 problems += 1;
@@ -390,8 +398,13 @@ fn validate_web(root: &Path) -> usize {
     for message in &page_warnings {
         warn(message);
     }
-    if root.join(".well-known").is_dir() {
-        warn(".well-known/ at the project root is never served (every dot-prefixed path is denied)");
+    for message in crate::webserve::site_identity_warnings(root, &config, &protected) {
+        warn(&message);
+    }
+    if root.join(".well-known").is_dir() && config.allow_dot_paths.is_empty() {
+        warn(
+            ".well-known/ at the project root is never served (every dot-prefixed path is denied); to serve part of it, list the paths in webserve.json's \"allowDotPaths\", e.g. [\".well-known/acme-challenge\"]",
+        );
     }
     if !has_api && crate::project::api_base(root).read_dir().is_ok_and(|mut entries| entries.next().is_some()) {
         warn("api/ in a web-only project is never served");
@@ -1005,6 +1018,16 @@ mod m3_validate_tests {
     }
 
     #[tokio::test]
+    async fn a_case_twin_orphan_is_only_a_warning_in_validate_because_generate_archives_it() {
+        let root = project("{}");
+        let dir = root.join("api/datasources/endpoints/things");
+        fs::write(dir.join("_endpoint.GET.json"), r#"{ "operationId": "old", "sources": {}, "response": {} }"#).unwrap();
+        fs::remove_file(dir.join("endpoint.get.json")).unwrap();
+        assert_eq!(validate_api(&root).await, 0, "an archivable orphan twin is not a problem");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn a_non_canonical_stub_name_is_a_warning_normally_and_a_problem_under_strict() {
         let root = project("{}");
         add_non_canonical(&root);
@@ -1142,3 +1165,94 @@ mod symlink_tests;
 
 #[cfg(test)]
 mod route_tests;
+
+#[cfg(test)]
+mod m5_route_validate_tests {
+    use super::*;
+    use std::fs;
+
+    const OPEN: &str = r#"{ "operationId": "x", "sources": {}, "response": {} }"#;
+
+    fn project(spec_paths: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-validate-m5-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(root.join("api/config")).unwrap();
+        fs::create_dir_all(root.join("api/security")).unwrap();
+        fs::write(root.join("api/config/server.json"), "{}").unwrap();
+        fs::write(root.join("api/security/schemes.json"), "{}").unwrap();
+        fs::write(
+            root.join(MANIFEST_FILE),
+            format!(
+                "openapi: 3.2.0\ninfo: {{ title: t, version: '1' }}\ncomponents:\n  securitySchemes:\n    a: {{ type: apiKey, in: header, name: k }}\npaths:\n{spec_paths}"
+            ),
+        )
+        .unwrap();
+        root
+    }
+
+    fn endpoint(root: &Path, folder: &str) {
+        let dir = root.join("api/datasources/endpoints").join(folder);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("endpoint.get.json"), OPEN).unwrap();
+    }
+
+    fn get_op(path: &str, id: &str, secured: bool) -> String {
+        let security = if secured { "      security: [ { a: [] } ]\n" } else { "" };
+        format!("  '{path}':\n    get:\n      operationId: {id}\n{security}      responses: {{ '200': {{ description: ok }} }}\n")
+    }
+
+    #[tokio::test]
+    async fn an_unroutable_percent_folder_is_a_validate_problem() {
+        let root = project(&get_op("/ok", "ok", false));
+        endpoint(&root, "ok");
+        assert_eq!(validate_api(&root).await, 0, "baseline");
+        endpoint(&root, "a%41");
+        assert!(validate_api(&root).await >= 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn conflicting_parameter_names_at_one_position_are_a_validate_problem() {
+        let root = project(&get_op("/ok", "ok", false));
+        endpoint(&root, "ok");
+        endpoint(&root, "cars/{id}");
+        assert_eq!(validate_api(&root).await, 0, "one parameter name is fine");
+        endpoint(&root, "cars/{vin}");
+        assert!(validate_api(&root).await >= 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_secured_operation_answered_by_an_open_parameter_route_is_a_validate_problem() {
+        let paths = get_op("/cars/admin", "adm", true) + &get_op("/cars/{id}", "byId", false);
+        let root = project(&paths);
+        endpoint(&root, "cars/{id}");
+        assert!(validate_api(&root).await >= 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_secured_partial_template_with_a_fitting_open_literal_folder_is_a_validate_problem() {
+        let root = project(&get_op("/files/report.{ext}", "rep", true));
+        endpoint(&root, "files/other.pdf");
+        assert_eq!(validate_api(&root).await, 0, "a folder that does not fit the template is no problem");
+        endpoint(&root, "files/report.pdf");
+        assert!(validate_api(&root).await >= 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_secured_operation_without_a_file_is_a_problem_once_a_web_catch_all_would_answer_it() {
+        let root = project(&(get_op("/ok", "ok", false) + &get_op("/admin", "adm", true)));
+        endpoint(&root, "ok");
+        assert_eq!(validate_api(&root).await, 0, "API only: nothing answers /admin");
+        fs::write(root.join("webserve.json"), "{}").unwrap();
+        assert!(validate_api(&root).await >= 1, "the static catch-all would answer /admin without security");
+        let _ = fs::remove_dir_all(&root);
+    }
+}

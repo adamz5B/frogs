@@ -141,6 +141,34 @@ fn a_shadowing_route_declaring_the_wrong_scheme_is_still_a_shadow() {
 }
 
 #[test]
+fn a_literal_folder_that_fits_a_secured_partial_template_is_examined_beyond_the_sentinel() {
+    let spec = spec("", &fixed("/files/report.{ext}", "get", "rep", SEC_A));
+    let a = analyse(&spec, &[("files/report.pdf", "get", None)]);
+    assert_eq!(a.check.shadowed.len(), 1, "{:?}", shadow_messages(&a));
+    assert_eq!(a.check.shadowed[0].served_route, "/files/report.pdf");
+
+    let secured = analyse(&spec, &[("files/report.pdf", "get", Some("a"))]);
+    assert_eq!(secured.check.shadowed.len(), 0);
+
+    let unrelated = analyse(&spec, &[("files/other.pdf", "get", None)]);
+    assert_eq!(unrelated.check.shadowed.len(), 0);
+}
+
+#[test]
+fn partial_template_matching_treats_each_group_as_one_or_more_characters() {
+    use crate::openapi::route_syntax::partial_template_matches as m;
+    assert!(m("report.{ext}", "report.pdf"));
+    assert!(!m("report.{ext}", "report."));
+    assert!(!m("report.{ext}", "summary.pdf"));
+    assert!(m("{a}-{b}", "x-y"));
+    assert!(m("{a}-{b}", "x-y-z"));
+    assert!(!m("{a}-{b}", "-y"));
+    assert!(m("a{b", "a{b"), "an unclosed brace is ordinary text");
+    assert!(m("v{n}.json", "v12.json"));
+    assert!(!m("v{n}.json", "v.json"));
+}
+
+#[test]
 fn a_secured_operation_nothing_routes_to_is_not_reported() {
     let spec = spec("", &fixed("/cars/admin", "get", "adm", SEC_A));
     let a = analyse(&spec, &[("other", "get", None)]);

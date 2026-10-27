@@ -97,7 +97,7 @@ pub async fn run(cwd: &Path, opts: TestServerOptions) -> io::Result<()> {
         port,
         &server_config.tls,
         &api_dir,
-        server_config.case_sensitive_methods(),
+        crate::server::ServeShape::of(&server_config),
         shutdown_signal(),
     )
     .await;
@@ -541,10 +541,11 @@ pub(crate) fn resolve_record_target(
 }
 
 /// Splits a CLI-supplied path into its path and query parts, e.g.
-/// `/cars?maker=Honda` -> (`/cars`, {"maker": "Honda"}). Deliberately plain
-/// splitting, no percent-decoding — a CLI argument typed at a real
-/// terminal is already in its literal form, unlike a URL a browser or HTTP
-/// client would encode.
+/// `/cars?maker=Honda` -> (`/cars`, {"maker": "Honda"}). Plain splitting; the
+/// query is taken as typed (a CLI argument is already in its literal form),
+/// while the path is percent-decoded segment by segment later, in
+/// `find_endpoint_file`, because a literal folder is matched on the server
+/// by its decoded spelling.
 fn split_path_and_query(path: &str) -> (String, HashMap<String, String>) {
     let Some((request_path, query_string)) = path.split_once('?') else {
         return (path.to_string(), HashMap::new());
@@ -574,7 +575,17 @@ fn find_endpoint_file(tree: &EndpointTree, concrete_path: &str, method: &str) ->
         .map(|file| (display_path(tree.endpoints_root(), &file.logical), file.logical.clone()))
         .collect();
 
-    let concrete_segments: Vec<&str> = concrete_path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    // Same reading of the argument as the server's of a request path: a literal
+    // segment matches after percent-decoding and NFC (so `caf%C3%A9`, `café`
+    // and a decomposed `café` all name one folder), and a parameter receives
+    // the decoded text exactly as spelled, never NFC-rewritten.
+    let decoded_segments: Vec<String> = concrete_path
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| percent_encoding::percent_decode_str(s).decode_utf8_lossy().into_owned())
+        .collect();
+    let concrete_segments: Vec<&str> = decoded_segments.iter().map(String::as_str).collect();
     for (template, endpoint_file) in &routes {
         let template_segments: Vec<&str> = template.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
         if template_segments.len() != concrete_segments.len() {
@@ -588,7 +599,7 @@ fn find_endpoint_file(tree: &EndpointTree, concrete_path: &str, method: &str) ->
                 Some(name) => {
                     params.insert(name.to_string(), c.to_string());
                 }
-                None if t == c => {}
+                None if t == c || crate::openapi::path_encoding::encode_literal_segment(t) == crate::openapi::path_encoding::encode_literal_segment(c) => {}
                 None => {
                     matched = false;
                     break;
@@ -2353,6 +2364,22 @@ mod m4_tests {
         let root = endpoints_with(&[("cars/{vin}", "endpoint.LINK.json")]);
         let (_, _, params) = resolve_record_target(&tree_for_tests(&root), "/cars/ABC123", "link", MethodCase::Default).unwrap();
         assert_eq!(params.get("vin").map(String::as_str), Some("ABC123"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn record_percent_decodes_the_path_and_matches_literal_folders_up_to_nfc() {
+        let root = endpoints_with(&[("caf\u{e9}/{id}", "endpoint.get.json")]);
+        for spelling in ["/caf%C3%A9/a%20b", "/caf\u{e9}/a%20b", "/cafe\u{301}/a%20b", "/cafe%CC%81/a%20b"] {
+            let (_, _, params) = resolve_record_target(&tree_for_tests(&root), spelling, "get", MethodCase::Default).unwrap();
+            assert_eq!(params.get("id").map(String::as_str), Some("a b"), "{spelling}");
+        }
+        // A parameter keeps the spelling it was given.
+        let (_, _, params) = resolve_record_target(&tree_for_tests(&root), "/caf%C3%A9/cafe%CC%81", "get", MethodCase::Default).unwrap();
+        assert_eq!(params.get("id").map(String::as_str), Some("cafe\u{301}"));
+        // A malformed escape stays literal, as on the server.
+        let (_, _, params) = resolve_record_target(&tree_for_tests(&root), "/caf%C3%A9/100%", "get", MethodCase::Default).unwrap();
+        assert_eq!(params.get("id").map(String::as_str), Some("100%"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

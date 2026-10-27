@@ -3,6 +3,7 @@
 //! router sees it. Pure byte logic; no routing types.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode, percent_encode};
 
@@ -41,20 +42,53 @@ pub fn is_pchar_str(s: &str) -> bool {
 }
 
 /// Percent-encodes one literal (already decoded) segment; never decodes.
+/// Non-ASCII text is put in NFC first, so a folder stored decomposed (macOS)
+/// is registered under the one spelling `canonicalize_path_with` rewrites
+/// matching request segments to.
 pub fn encode_literal_segment(seg: &str) -> Cow<'_, str> {
     if is_pchar_str(seg) {
         Cow::Borrowed(seg)
     } else {
-        Cow::Owned(percent_encode(seg.as_bytes(), PCHAR_ENCODE).to_string())
+        use unicode_normalization::UnicodeNormalization;
+        let composed: String = seg.nfc().collect();
+        Cow::Owned(percent_encode(composed.as_bytes(), PCHAR_ENCODE).to_string())
     }
+}
+
+/// The NFC spelling of `seg` when it contains non-ASCII text, else `None`:
+/// the key under which a registered literal is remembered for
+/// `canonicalize_path_with`.
+pub fn nfc_literal_key(seg: &str) -> Option<String> {
+    use unicode_normalization::UnicodeNormalization;
+    (!seg.is_ascii()).then(|| seg.nfc().collect())
 }
 
 /// One wire segment in canonical form: leniently decoded (a `%` not followed
 /// by two hex digits stays literal, as in axum), then re-encoded so only
 /// `pchar` bytes stay bare. A decoded `.` or `..` stays encoded: this never
 /// creates a dot segment that was not literally on the wire.
+#[cfg(test)]
 pub fn canonicalize_segment(raw: &[u8]) -> Cow<'_, str> {
-    let decoded = percent_decode(raw).collect::<Vec<u8>>();
+    canonicalize_segment_with(raw, &BTreeSet::new())
+}
+
+/// `canonicalize_segment`, plus: a decoded non-ASCII segment that is not in NFC
+/// is rewritten to its NFC spelling when (and only when) that spelling is one
+/// of `literals`. Axum matches literal segments byte for byte, so without this
+/// a decomposed spelling of a literal folder would fall through to a sibling
+/// `{param}` route; limiting it to registered literals leaves every parameter
+/// value exactly as the client sent it.
+pub fn canonicalize_segment_with<'a>(raw: &'a [u8], literals: &BTreeSet<String>) -> Cow<'a, str> {
+    let mut decoded = percent_decode(raw).collect::<Vec<u8>>();
+    if !literals.is_empty()
+        && !decoded.is_ascii()
+        && let Ok(text) = std::str::from_utf8(&decoded)
+        && let Some(composed) = nfc_literal_key(text)
+        && composed != text
+        && literals.contains(&composed)
+    {
+        decoded = composed.into_bytes();
+    }
     let canonical = match decoded.as_slice() {
         b"." => "%2E".to_string(),
         b".." => "%2E%2E".to_string(),
@@ -73,14 +107,20 @@ fn already_canonical(raw: &str) -> bool {
 /// The canonical form of a whole request path, slashes (including empty
 /// segments) preserved exactly. A path that does not start with `/` (`*`
 /// from `OPTIONS *`) is returned as is. Borrowed when nothing changes.
+#[cfg(test)]
 pub fn canonicalize_path(raw: &str) -> Cow<'_, str> {
+    canonicalize_path_with(raw, &BTreeSet::new())
+}
+
+/// `canonicalize_path` with the registered-literal NFC rewrite of `canonicalize_segment_with`.
+pub fn canonicalize_path_with<'a>(raw: &'a str, literals: &BTreeSet<String>) -> Cow<'a, str> {
     if !raw.starts_with('/') || already_canonical(&raw[1..]) {
         return Cow::Borrowed(raw);
     }
     let mut out = String::with_capacity(raw.len());
     for seg in raw[1..].split('/') {
         out.push('/');
-        out.push_str(&canonicalize_segment(seg.as_bytes()));
+        out.push_str(&canonicalize_segment_with(seg.as_bytes(), literals));
     }
     if out == raw { Cow::Borrowed(raw) } else { Cow::Owned(out) }
 }
@@ -261,6 +301,24 @@ mod tests {
         assert_eq!(canonicalize_path("/%2E%2E%2Fsecret"), "/..%2Fsecret");
         assert_eq!(canonicalize_path("/..%5Csecret"), "/..%5Csecret");
         assert_eq!(canonicalize_path("/a/%2e%2e/%2e%2e/secret"), "/a/%2E%2E/%2E%2E/secret");
+    }
+
+    #[test]
+    fn a_decomposed_spelling_becomes_nfc_only_when_that_is_a_registered_literal() {
+        let literals: BTreeSet<String> = ["caf\u{e9}".to_string()].into();
+        let decomposed = "/cafe\u{301}/menu";
+        assert_eq!(canonicalize_path_with(decomposed, &literals), "/caf%C3%A9/menu");
+        assert_eq!(canonicalize_path_with("/cafe%CC%81/menu", &literals), "/caf%C3%A9/menu");
+        // No registered literal: the value is left exactly as sent, so a parameter keeps its spelling.
+        assert_eq!(canonicalize_path_with(decomposed, &BTreeSet::new()), "/cafe%CC%81/menu");
+        assert_eq!(canonicalize_path_with("/nai\u{308}ve", &literals), "/nai%CC%88ve");
+    }
+
+    #[test]
+    fn encode_literal_segment_puts_non_ascii_in_nfc() {
+        assert_eq!(encode_literal_segment("cafe\u{301}"), encode_literal_segment("caf\u{e9}"));
+        assert_eq!(nfc_literal_key("cafe\u{301}").as_deref(), Some("caf\u{e9}"));
+        assert_eq!(nfc_literal_key("cafe"), None);
     }
 
     #[test]

@@ -16,6 +16,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 axum = "0.7"
+unicode-normalization = "0.1"
 # Already compiled in via axum 0.7.9; a direct dependency so the route-table
 # probe (`endpoint::route_plan`) has exactly the router's matching semantics.
 # Pinned: axum 0.8 changes the parameter syntax, so re-check on any axum upgrade.
@@ -150,6 +151,9 @@ tower-service = "0.3"
 # 0.8.x's newer `windows-sys` bump, to keep this dependency's own transitive
 # footprint as small as reasonably possible.
 windows-service = "0.7.0"
+# Already in the tree through windows-service (same 0.52 line, so no new package): `webserve::deny` asks the
+# OS for a file's identity (volume serial + file index) to catch hard links to protected files.
+windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
 
 [dev-dependencies]
 # Generates a self-signed cert + key entirely in-memory at test time — no

@@ -13,7 +13,7 @@ use axum::http::Method;
 
 use crate::openapi::path_encoding::is_pchar_str;
 use crate::openapi::path_rules::{unsafe_segment_reason, untrusted};
-use crate::openapi::route_syntax::{SegmentKind, axum_registration_path, classify_route_segment, find_conflicts, path_for_nested_route};
+use crate::openapi::route_syntax::{SegmentKind, axum_registration_path, classify_route_segment, find_conflicts, partial_template_matches, path_for_nested_route};
 
 /// How many positions along one route may have both a static and a parameter
 /// sibling before matchit's backtracking per lookup is considered too costly.
@@ -664,6 +664,54 @@ impl RoutePlan {
 
     pub(crate) fn warnings(&self, strict: bool) -> Vec<&RouteProblem> {
         self.problems.iter().filter(|p| !p.is_refusal(strict)).collect()
+    }
+
+    /// Endpoint routes (other than the sentinel probe's own answer) that serve a
+    /// concrete instance of a spec path containing partial-template segments
+    /// such as `report.{ext}`: the sentinel only finds the parameter route at
+    /// that position, so a literal folder like `report.pdf` would otherwise go
+    /// unexamined. A route qualifies when every segment is compatible and at
+    /// least one partial-template segment lines up with a literal folder name
+    /// that fits it; routes that only reach it through a parameter are what
+    /// the sentinel already covers.
+    pub(crate) fn partial_instances(&self, spec_path: &str) -> Vec<&PlannedRoute> {
+        let spec: Vec<&str> = spec_path.trim_start_matches('/').split('/').collect();
+        let kinds: Vec<Option<SegmentKind>> = spec.iter().map(|seg| classify_route_segment(seg).ok()).collect();
+        if !kinds.iter().any(|k| matches!(k, Some(SegmentKind::PartialTemplate))) {
+            return Vec::new();
+        }
+        self.routes
+            .iter()
+            .filter(|route| !route.files.is_empty())
+            .filter(|route| {
+                let folders: Vec<&str> = route.path.trim_start_matches('/').split('/').collect();
+                if folders.len() != spec.len() {
+                    return false;
+                }
+                let mut literal_fit = false;
+                for ((spec_seg, kind), folder) in spec.iter().zip(&kinds).zip(&folders) {
+                    let folder_is_param = folder.starts_with(':');
+                    match kind {
+                        Some(SegmentKind::Literal) => {
+                            if !folder_is_param && folder != spec_seg {
+                                return false;
+                            }
+                        }
+                        Some(SegmentKind::Param(_)) => {}
+                        Some(SegmentKind::PartialTemplate) => {
+                            if !folder_is_param {
+                                if !partial_template_matches(spec_seg, folder) {
+                                    return false;
+                                }
+                                literal_fit = true;
+                            }
+                        }
+                        None => return false,
+                    }
+                }
+                literal_fit
+            })
+            .collect()
     }
 
     /// The registered route that would answer a request for `probe` (apiRoot-relative, literals percent-encoded), if any.

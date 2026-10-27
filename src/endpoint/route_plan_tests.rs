@@ -5,6 +5,7 @@ use super::route_plan::{EntryStatus, InventoryEntry, RootExtras, RouteContext, R
 use super::*;
 use crate::openapi::endpoint_tree::tree_for_tests;
 
+mod axum_contract;
 mod encoding;
 mod refs;
 mod security;

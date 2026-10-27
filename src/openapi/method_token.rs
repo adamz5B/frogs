@@ -22,7 +22,10 @@ pub const ROUTABLE_FIXED: [&str; 6] = ["get", "post", "put", "patch", "delete", 
 const REJECT_ANY_CASE: [&str; 5] = ["CONNECT", "TRACE", "TRACK", "OPTIONS", "HEAD"];
 const FIXED_UPPER: [&str; 6] = ["GET", "PUT", "POST", "DELETE", "PATCH", "QUERY"];
 
-const MAX_METHOD_BYTES: usize = 64;
+/// Real HTTP extension methods are short (the longest registered ones are under 20 bytes). The cap keeps the
+/// longest method file name (`endpoint.<token>.<timestamp>.json`) near 130 bytes instead of 228, clear of
+/// MAX_PATH trouble in other tools.
+const MAX_METHOD_BYTES: usize = 32;
 const MAX_ENCODED_TOKEN_BYTES: usize = 1 + 3 * MAX_METHOD_BYTES;
 
 /// How `additionalOperations` keys and method file tokens are interpreted.
@@ -45,7 +48,7 @@ impl MethodCase {
     }
 }
 
-/// A validated extension method (RFC 9110 token, 1-64 bytes, never a method
+/// A validated extension method (RFC 9110 token, 1-32 bytes, never a method
 /// frogs refuses to serve). The field is private: only this module can build one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExtensionMethod(String);
@@ -101,7 +104,7 @@ fn is_tchar(b: u8) -> bool {
         )
 }
 
-/// RFC 9110 `token`, 1-64 bytes.
+/// RFC 9110 `token`, 1-32 bytes.
 pub fn is_method_token(s: &str) -> bool {
     !s.is_empty() && s.len() <= MAX_METHOD_BYTES && s.bytes().all(is_tchar)
 }
@@ -708,11 +711,11 @@ mod m4_tests {
     }
 
     #[test]
-    fn a_64_byte_key_is_accepted_and_a_65_byte_key_the_empty_key_and_non_token_characters_are_s3() {
-        let max = "A".repeat(64);
+    fn a_32_byte_key_is_accepted_and_a_33_byte_key_the_empty_key_and_non_token_characters_are_s3() {
+        let max = "A".repeat(32);
         for mode in [MethodCase::Default, MethodCase::Exact] {
             is_accept(&max, mode, &max, &max, None);
-            assert_eq!(rejected(&"A".repeat(65), mode), Some(RejectKind::S3));
+            assert_eq!(rejected(&"A".repeat(33), mode), Some(RejectKind::S3));
             assert_eq!(rejected("", mode), Some(RejectKind::S3));
             for bad in ["A B", "A/B", "A(B", "A:B", "A\u{e9}B", "A\nB", "A\0B", "A,B", "A\"B", "A=B"] {
                 assert_eq!(rejected(bad, mode), Some(RejectKind::S3), "{bad:?} {mode:?}");
@@ -794,13 +797,13 @@ mod m4_tests {
     }
 
     #[test]
-    fn the_longest_legal_method_encodes_to_193_bytes_and_one_byte_more_is_rejected() {
-        let worst = "_".repeat(64);
+    fn the_longest_legal_method_encodes_to_97_bytes_and_one_byte_more_is_rejected() {
+        let worst = "_".repeat(32);
         let encoded = encode_extension(&worst);
-        assert_eq!(encoded.len(), 193);
+        assert_eq!(encoded.len(), 97);
         assert_eq!(decode_token(&encoded).as_deref(), Some(worst.as_str()));
         assert_eq!(valid(&encoded, MethodCase::Exact).wire(), worst.as_str());
-        let too_long = format!("~{}", "a".repeat(65));
+        let too_long = format!("~{}", "a".repeat(33));
         assert_eq!(parse_file_token(&too_long, MethodCase::Exact), TokenStatus::Invalid);
         assert_eq!(decode_token(&format!("~{}", "a".repeat(200))), None);
     }
@@ -832,7 +835,7 @@ mod m4_tests {
         let narrow: Vec<char> = "ABCabc012-_.~*X".chars().collect();
         let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
         for i in 0..20_000 {
-            let len = 3 + (rng.next() % 62) as usize;
+            let len = 3 + (rng.next() % 30) as usize;
             let alphabet: &[char] = if i % 2 == 0 { &chars } else { &narrow };
             out.push((0..len).map(|_| alphabet[(rng.next() % alphabet.len() as u64) as usize]).collect());
         }
@@ -853,7 +856,7 @@ mod m4_tests {
             if let Some(previous) = by_token.insert(token.clone(), wire.clone()) {
                 assert_eq!(&previous, wire, "token {token:?} produced by two different methods");
             }
-            assert!(token.len() <= MAX_ENCODED_TOKEN_BYTES && token.len() <= 193, "{token:?}");
+            assert!(token.len() <= MAX_ENCODED_TOKEN_BYTES && token.len() <= 97, "{token:?}");
             assert!(!token.contains('.') && !token.contains('/') && !token.contains('\\'), "{token:?}");
             if let Some(escaped) = token.strip_prefix('~') {
                 assert!(
@@ -947,7 +950,7 @@ mod m4_tests {
         assert_eq!(normalize_cli_method("Track", d), Err(CliMethodError::NotServable));
         assert_eq!(normalize_cli_method("A B", d), Err(CliMethodError::InvalidToken));
         assert_eq!(normalize_cli_method("", d), Err(CliMethodError::InvalidToken));
-        assert_eq!(normalize_cli_method(&"A".repeat(65), d), Err(CliMethodError::InvalidToken));
+        assert_eq!(normalize_cli_method(&"A".repeat(33), d), Err(CliMethodError::InvalidToken));
         let dotted = normalize_cli_method("get.reference", d).unwrap();
         assert!(!dotted.file_token().contains('.'), "a dotted argument can never become a sibling-file name");
     }
@@ -1037,13 +1040,13 @@ mod m4_hostile_tests {
         .map(|s| s.to_string())
         .collect();
         // over-long encodings
-        out.push(format!("~{}", "a".repeat(64)));
-        out.push(format!("~{}", "a".repeat(65)));
-        out.push(format!("~{}", "_41".repeat(64)));
-        out.push(format!("~{}", "_41".repeat(65)));
-        out.push(format!("~{}", "_5f".repeat(64)));
-        out.push("A".repeat(64));
-        out.push("A".repeat(65));
+        out.push(format!("~{}", "a".repeat(32)));
+        out.push(format!("~{}", "a".repeat(33)));
+        out.push(format!("~{}", "_41".repeat(32)));
+        out.push(format!("~{}", "_41".repeat(33)));
+        out.push(format!("~{}", "_5f".repeat(32)));
+        out.push("A".repeat(32));
+        out.push("A".repeat(33));
         out.push(format!("~{}", "a".repeat(400)));
         out.push("A".repeat(400));
 
@@ -1083,7 +1086,7 @@ mod m4_hostile_tests {
     }
 
     fn valid_wire(wire: &str) -> bool {
-        is_method_token(wire) && wire.len() <= 64
+        is_method_token(wire) && wire.len() <= 32
     }
 
     #[test]
@@ -1131,7 +1134,7 @@ mod m4_hostile_tests {
                     assert!(valid_wire(&method.wire()), "{input:?}");
                     let token = method.file_token().into_owned();
                     assert!(!forbidden_in_file_name(&token), "{input:?} -> {token:?}");
-                    assert!(token.len() <= 193, "{input:?}");
+                    assert!(token.len() <= 97, "{input:?}");
                     assert_eq!(parse_file_token(&token, mode), TokenStatus::Valid(method), "{input:?}");
                 }
 
@@ -1140,7 +1143,7 @@ mod m4_hostile_tests {
                     assert!(valid_wire(&token.wire()), "{input:?}");
                     let file = token.file_token().into_owned();
                     assert!(!forbidden_in_file_name(&file), "{input:?} -> {file:?}");
-                    assert!(file.len() <= 193);
+                    assert!(file.len() <= 97);
                 }
             }
         }

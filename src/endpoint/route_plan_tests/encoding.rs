@@ -628,3 +628,22 @@ fn a_secured_operation_at_the_control_plane_path_is_refused_when_the_api_root_pu
     assert_eq!(no_file("/_frogs", "/scenario").len(), 1);
     assert!(no_file("/api", "/_frogs/scenario").is_empty());
 }
+
+#[tokio::test]
+async fn a_decomposed_spelling_reaches_the_literal_folder_but_a_parameter_value_keeps_its_spelling() {
+    use crate::server::ServeShape;
+    let shape = ServeShape {
+        case_sensitive_methods: false,
+        literals: std::sync::Arc::new(["caf\u{e9}".to_string()].into()),
+    };
+    let addr = spawn_served(registered_router(&["/café/menu", "/:p/menu"]), shape.clone()).await;
+    for target in ["/cafe%CC%81/menu", "/cafe\u{301}/menu", "/caf%C3%A9/menu"] {
+        assert_eq!(fetch(addr, target).await, (200, "/café/menu".to_string()), "{target}");
+    }
+    // Without the registered literal nothing is rewritten, so the sibling parameter route answers.
+    let plain = spawn_served(registered_router(&["/café/menu", "/:p/menu"]), false).await;
+    assert_eq!(fetch(plain, "/cafe%CC%81/menu").await, (200, "/:p/menu".to_string()));
+    // A segment that is not a registered literal is never normalised.
+    let other = spawn_served(registered_router(&["/x/:p"]), shape).await;
+    assert_eq!(fetch(other, "/x/cafe%CC%81").await, (200, "/x/:p".to_string()));
+}

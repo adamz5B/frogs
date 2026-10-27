@@ -815,8 +815,10 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "unicode-normalization",
  "uuid",
  "windows-service",
+ "windows-sys 0.52.0",
  "x509-parser",
 ]
 

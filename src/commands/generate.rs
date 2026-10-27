@@ -8,13 +8,13 @@ use crate::config::EndpointSymlinks;
 use crate::config::{Config, ServerConfig};
 use crate::openapi::dir_index::{
     DirIndex, DirState, EndpointFsError, EntryKind, FileState, Lookup, check_file, check_file_with, copy_into_checked, create_dir_checked, create_dirs_checked,
-    create_endpoint_dir, create_new_checked, create_new_file, fold, rename_checked_with, resolve_endpoint_dir, write_existing_file,
+    create_endpoint_dir, create_new_checked, create_new_file, fold, move_into_checked, rename_checked_with, resolve_endpoint_dir, write_existing_file,
 };
 #[cfg(test)]
 use crate::openapi::endpoint_tree::tree_for_tests;
 use crate::openapi::endpoint_tree::{EndpointTree, LeafRule, LinkContext, LinkFindingKind, ProjectBoundary};
 use crate::openapi::method_token::{self, MethodCase, TokenStatus};
-use crate::openapi::path_rules::is_single_normal_component;
+use crate::openapi::path_rules::{PortabilityPolicy, is_single_normal_component, windows_reason};
 use crate::openapi::{
     LoadIssue, OpenApiDocument, Operation, ResponseMode, Severity, StreamSpec, content_hash, merge_stub_response, stub_from_descriptor, untrusted, walk_response_schema,
 };
@@ -221,6 +221,7 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
         );
     }
 
+    archive_orphans(&ctx.boundary, &plan.archive, &mut file_errors);
     let restored = restore_orphaned_endpoints(&ctx, &api_root, &doc, &plan.skip, &mut file_errors)?;
     for (path, method) in &restored {
         println!(
@@ -543,6 +544,7 @@ fn generate_web(root: &Path, web_files: &[PathBuf]) -> io::Result<()> {
     let not_found_page = names.iter().find(|name| name.as_str() == "404.html").cloned();
 
     let config = crate::webserve::WebServeConfig {
+        allow_dot_paths: Vec::new(),
         start_page,
         port: 8080,
         not_found_page,
@@ -605,10 +607,11 @@ fn resolve_and_write_components(
         let file_name = format!("{name}.json");
         let path = dir.join(&file_name);
 
-        // Component names are allowed to differ only by case (a non-goal to
-        // police), so a case variant is treated as "absent" here rather than
-        // the conflict `check_file` would report; `create_new` still refuses
-        // to clobber it on a case-insensitive filesystem.
+        // Names that collide with each other were already made unwritable at
+        // load. A case variant that is a leftover file from an earlier run is
+        // treated as "absent" here rather than the conflict `check_file` would
+        // report; `create_new` still refuses to clobber it on a
+        // case-insensitive filesystem.
         let existing = match DirIndex::read(&dir)?.lookup(&file_name) {
             Lookup::Exact(EntryKind::File) => true,
             Lookup::Exact(EntryKind::Symlink) => {
@@ -680,10 +683,28 @@ fn read_json(path: &Path) -> Option<Value> {
 /// `/` is zero segments, the leading slash is dropped, and braces stay
 /// literal per the design doc's file-naming decision.
 fn endpoint_segments(path: &str) -> Result<Vec<&str>, EndpointFsError> {
+    endpoint_segments_with(path, PortabilityPolicy::for_host())
+}
+
+/// `endpoint_segments` under an explicit portability policy. Under `Skip` (the
+/// Windows host) a segment Windows cannot store as written is refused here too,
+/// not only at load: a trailing dot or space, a reserved device name, or one of
+/// `<>:"|?*` would be silently renamed or opened as a device. Under `Warn` the
+/// loader has already warned and the folder is created as named.
+fn endpoint_segments_with(path: &str, policy: PortabilityPolicy) -> Result<Vec<&str>, EndpointFsError> {
     if path == "/" {
         return Ok(Vec::new());
     }
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    if policy == PortabilityPolicy::Skip
+        && let Some(seg) = segments.iter().find(|seg| windows_reason(seg).is_some())
+    {
+        return Err(EndpointFsError::Containment(format!(
+            "path '{}' has segment '{}' that Windows cannot store as a folder name",
+            untrusted(path),
+            untrusted(seg)
+        )));
+    }
     for seg in &segments {
         let bad = seg.is_empty()
             || *seg == "."
@@ -766,6 +787,17 @@ pub(crate) struct Plan {
     /// `(folded path, token)` of files `generate` must never orphan: case-only
     /// mismatches with a spec operation, and methods the loader set aside.
     pub protected_files: HashSet<(String, String)>,
+    /// Orphaned (`_`-prefixed) files that would block or be stranded by the files `generate`
+    /// is about to write; `archive_orphans` moves them into the folder's `_backups/`.
+    pub archive: Vec<ArchiveItem>,
+}
+
+/// One orphaned file to be moved into its folder's `_backups/`, never deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArchiveItem {
+    pub dir: PathBuf,
+    pub name: String,
+    pub reason: String,
 }
 
 /// A read-only pass over everything `generate` would write to: finds case
@@ -939,6 +971,7 @@ pub(crate) fn plan_endpoint_files(api_root: &Path, doc: &OpenApiDocument, tree: 
         case_mismatch_pass(&dir, path, &ops_here, mode, &mut plan, &mut mismatch_files);
 
         for op in ops_here {
+            wrong_mode_orphans(&dir, op, mode, &mut plan.archive);
             let names = [
                 format!("endpoint.{}.json", op.method),
                 format!("endpoint.{}.reference.json", op.method),
@@ -953,6 +986,18 @@ pub(crate) fn plan_endpoint_files(api_root: &Path, doc: &OpenApiDocument, tree: 
                     check_file(&dir, name)
                 };
                 if let Err(e) = checked {
+                    // A differently-cased orphan twin (`_endpoint.GET.json` next to the wanted
+                    // `_endpoint.get.json`) must not block the operation: it is archived, not an error.
+                    if position >= 2
+                        && let EndpointFsError::CaseConflict { found, .. } = &e
+                    {
+                        plan.archive.push(ArchiveItem {
+                            dir: dir.clone(),
+                            name: found.clone(),
+                            reason: format!("differs only by letter case from {name}, which this operation needs"),
+                        });
+                        continue;
+                    }
                     plan.errors.push(PlanError {
                         strict: e.is_strict_error(),
                         message: format!("{} {}: {e}", op.http_method, untrusted(&op.path)),
@@ -1481,6 +1526,80 @@ fn write_one_endpoint(
     Ok(())
 }
 
+/// Orphans (`_endpoint.<token>.json` and its `.reference.json`) stored under the other
+/// `caseSensitiveMethods` mode's token for an operation that has no active stub now: that stub
+/// is created fresh, so the old mappings would sit stranded under a name nothing restores.
+/// They are archived to `_backups/` with a reason, so the user can see and reuse them.
+fn wrong_mode_orphans(dir: &Path, op: &Operation, mode: MethodCase, out: &mut Vec<ArchiveItem>) {
+    let Ok(index) = DirIndex::read(dir) else { return };
+    if !matches!(index.lookup(&format!("endpoint.{}.json", op.method)), Lookup::Absent) {
+        return;
+    }
+    for (name, kind) in index.entries() {
+        if kind != EntryKind::File {
+            continue;
+        }
+        let Some(rest) = name.strip_prefix("_endpoint.").and_then(|r| r.strip_suffix(".json")) else {
+            continue;
+        };
+        let token = rest.strip_suffix(".reference").unwrap_or(rest);
+        if token.contains('.') {
+            continue;
+        }
+        if let TokenStatus::WrongMode { wire } = method_token::parse_file_token(token, mode)
+            && wire.eq_ignore_ascii_case(&op.http_method)
+        {
+            let item = ArchiveItem {
+                dir: dir.to_path_buf(),
+                name: name.to_string(),
+                reason: format!(
+                    "it was stored under '{token}', a token valid only under the other caseSensitiveMethods setting, so {} {} starts from a fresh stub",
+                    op.http_method,
+                    untrusted(&op.path)
+                ),
+            };
+            if !out.contains(&item) {
+                out.push(item);
+            }
+        }
+    }
+}
+
+/// Moves each planned orphan into its folder's `_backups/` as
+/// `orphan.<name>.<timestamp>.json` (never deleted, never overwritten) and says where it went.
+/// `dir` entries that vanished since the plan was made are skipped.
+fn archive_orphans(boundary: &ProjectBoundary, items: &[ArchiveItem], errors: &mut Vec<String>) {
+    let mut seen: HashSet<(PathBuf, String)> = HashSet::new();
+    for item in items {
+        if !seen.insert((item.dir.clone(), item.name.clone())) {
+            continue;
+        }
+        let outcome = (|| -> Result<String, EndpointFsError> {
+            let backups_dir = ensure_backups_dir(boundary, &item.dir)?;
+            let stem = item.name.trim_start_matches('_').trim_end_matches(".json");
+            let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ");
+            for attempt in 0..100 {
+                let suffix = if attempt == 0 { String::new() } else { format!(".{attempt}") };
+                let dest = format!("orphan.{stem}.{timestamp}{suffix}.json");
+                match move_into_checked(boundary, &item.dir, &item.name, &backups_dir, &dest) {
+                    Err(EndpointFsError::AlreadyExists { .. }) => continue,
+                    other => return other.map(|()| dest),
+                }
+            }
+            Err(EndpointFsError::AlreadyExists { at: backups_dir })
+        })();
+        match outcome {
+            Ok(dest) => println!(
+                "  moved orphaned {} to {} ({}) — nothing deleted",
+                untrusted(&item.name),
+                untrusted(&format!("{}/_backups/{dest}", item.dir.display())),
+                item.reason
+            ),
+            Err(e) => errors.push(format!("{}: could not archive orphaned {}: {e}", item.dir.display(), untrusted(&item.name))),
+        }
+    }
+}
+
 /// Whether a stored reference file already carries this operation's `request` and
 /// `availableParameterSources`. Parameters can come from a `$ref`'d component whose edit changes
 /// neither the response-schema hash nor the stub, so this is the only signal that the reference
@@ -1490,11 +1609,8 @@ fn reference_parameter_details_match(stored: Option<&Value>, op: &Operation) -> 
     stored.get("request") == Some(&op.request_sources()) && stored.get("availableParameterSources") == Some(&serde_json::json!(op.available_parameter_sources()))
 }
 
-/// Copies the current stub into `_backups/` (inside the path's own folder,
-/// alongside its other methods — never a shared directory) before
-/// migration touches anything, so a bad automatic migration is always
-/// trivially reversible by hand.
-fn backup_stub(boundary: &ProjectBoundary, dir: &Path, method: &str, stub_path: &Path) -> Result<(), EndpointFsError> {
+/// The path folder's `_backups/`, created when absent; refuses a link, a non-folder or a differently-cased twin.
+fn ensure_backups_dir(boundary: &ProjectBoundary, dir: &Path) -> Result<PathBuf, EndpointFsError> {
     let backups_dir = dir.join("_backups");
     match DirIndex::read(dir)?.lookup("_backups") {
         Lookup::Exact(EntryKind::Dir) => {}
@@ -1509,6 +1625,15 @@ fn backup_stub(boundary: &ProjectBoundary, dir: &Path, method: &str, stub_path: 
             });
         }
     }
+    Ok(backups_dir)
+}
+
+/// Copies the current stub into `_backups/` (inside the path's own folder,
+/// alongside its other methods — never a shared directory) before
+/// migration touches anything, so a bad automatic migration is always
+/// trivially reversible by hand.
+fn backup_stub(boundary: &ProjectBoundary, dir: &Path, method: &str, stub_path: &Path) -> Result<(), EndpointFsError> {
+    let backups_dir = ensure_backups_dir(boundary, dir)?;
     let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ");
     let backup_name = format!("endpoint.{method}.{timestamp}.json");
     copy_into_checked(boundary, stub_path, &backups_dir, &backup_name)
@@ -2479,6 +2604,45 @@ mod ref_tests;
 mod hardening_tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn the_second_guard_refuses_windows_unstorable_segments_under_skip_on_every_os() {
+        for path in [
+            "/cars/a.",
+            "/cars/a ",
+            "/CON",
+            "/cars/nul.txt",
+            "/Aux",
+            "/lpt1",
+            "/COM\u{b2}",
+            "/a/b?c",
+            "/a<b",
+            "/cars/{id}.",
+        ] {
+            assert!(endpoint_segments_with(path, PortabilityPolicy::Skip).is_err(), "{path}");
+            assert!(
+                endpoint_segments_with(path, PortabilityPolicy::Warn).is_ok(),
+                "{path}: Warn leaves it to the loader's warning"
+            );
+        }
+        for path in ["/", "/cars", "/cars/{id}/parts", "/console", "/a.b", "/COM10", "/lpt"] {
+            assert!(endpoint_segments_with(path, PortabilityPolicy::Skip).is_ok(), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_second_guard_always_refuses_traversal_and_separators_whatever_the_policy() {
+        for policy in [PortabilityPolicy::Skip, PortabilityPolicy::Warn] {
+            for path in ["/a/../b", "/a//b", "/./a", "/a\\b", "/a\u{0}b"] {
+                assert!(endpoint_segments_with(path, policy).is_err(), "{path} {policy:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_host_guard_follows_the_host_policy() {
+        assert_eq!(endpoint_segments("/CON").is_err(), cfg!(windows));
+    }
 
     fn temp_project() -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3746,7 +3910,9 @@ mod m4_generate_tests {
             assert_eq!(names_in(&dir), [format!("_{file}"), file.to_string()], "{folder}");
         }
 
-        // The spec now declares get on /g1, but the orphan twin `_endpoint.GET.json` blocks the name: nothing is restored or created.
+        // The spec now declares get on /g1. The orphan twin `_endpoint.GET.json` differs only by case from the
+        // `_endpoint.get.json` this operation needs, so it is moved into `_backups/` (never deleted) and the
+        // operation gets its stub.
         let spec = "openapi: 3.2.0
 info: { title: t, version: '1' }
 paths:
@@ -3759,16 +3925,60 @@ paths:
         let dir = root.join("api/datasources/endpoints/g1");
         std::fs::remove_file(dir.join("endpoint.GET.json")).unwrap();
         let outcome = generate_api_inner(&root).unwrap();
-        assert!(
-            outcome
-                .errors
-                .iter()
-                .any(|e| e.contains("_endpoint.GET.json exists where _endpoint.get.json is needed")),
-            "{:?}",
-            outcome.errors
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(names_in(&dir), ["_backups", "endpoint.get.json", "endpoint.get.reference.json"]);
+        let archived = names_in(&dir.join("_backups"));
+        assert_eq!(archived.len(), 1, "{archived:?}");
+        assert!(archived[0].starts_with("orphan.endpoint.GET.") && archived[0].ends_with(".json"), "{archived:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("_backups").join(&archived[0])).unwrap(),
+            STUB,
+            "the hand-written mappings survive byte for byte"
         );
-        assert_eq!(names_in(&dir), ["_endpoint.GET.json"], "the invalid orphan twin is neither restored nor renamed");
-        assert_eq!(std::fs::read_to_string(dir.join("_endpoint.GET.json")).unwrap(), STUB);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_orphan_stored_under_the_other_modes_token_is_archived_when_its_operation_starts_from_a_fresh_stub() {
+        // Generated under exact mode as the lowercase extension method `purge`, then removed from the spec: orphaned as `_endpoint.~purge.json`.
+        let root = project(&spec_x(&additional(&[("purge", "p")])), EXACT);
+        generate_api_inner(&root).unwrap();
+        let dir = dir_x(&root);
+        std::fs::write(dir.join("endpoint.~purge.json"), STUB).unwrap();
+        std::fs::write(root.join("openapi.yaml"), spec_x(&fixed_op("get", "g"))).unwrap();
+        generate_api_inner(&root).unwrap();
+        assert!(dir.join("_endpoint.~purge.json").is_file(), "{:?}", names_in(&dir));
+
+        // The mode flips and the spec asks for PURGE: `~purge` is the other mode's token, so it is not restored.
+        std::fs::write(root.join("api/config/server.json"), DEFAULT).unwrap();
+        std::fs::write(root.join("openapi.yaml"), spec_x(&additional(&[("purge", "p")]))).unwrap();
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(dir.join("endpoint.PURGE.json").is_file(), "a fresh stub is created: {:?}", names_in(&dir));
+        assert!(
+            !dir.join("_endpoint.~purge.json").exists(),
+            "the stranded orphan moved out of the way: {:?}",
+            names_in(&dir)
+        );
+        let archived: Vec<String> = names_in(&dir.join("_backups")).into_iter().filter(|n| n.starts_with("orphan.")).collect();
+        assert_eq!(archived.len(), 2, "the stub and its reference file move together: {archived:?}");
+        let stub = archived.iter().find(|n| !n.contains(".reference.")).unwrap_or_else(|| panic!("{archived:?}"));
+        assert!(stub.starts_with("orphan.endpoint.~purge."), "{archived:?}");
+        assert!(archived.iter().any(|n| n.starts_with("orphan.endpoint.~purge.reference.")), "{archived:?}");
+        assert_eq!(std::fs::read_to_string(dir.join("_backups").join(stub)).unwrap(), STUB);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_orphan_under_the_other_modes_token_is_left_alone_while_its_operation_still_has_an_active_stub() {
+        let root = project(&spec_x(&additional(&[("purge", "p")])), DEFAULT);
+        generate_api_inner(&root).unwrap();
+        let dir = dir_x(&root);
+        std::fs::write(dir.join("_endpoint.~purge.json"), STUB).unwrap();
+        let outcome = generate_api_inner(&root).unwrap();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(dir.join("_endpoint.~purge.json").is_file(), "{:?}", names_in(&dir));
+        assert!(!dir.join("_backups").exists() || names_in(&dir.join("_backups")).iter().all(|n| !n.starts_with("orphan.")));
         let _ = std::fs::remove_dir_all(&root);
     }
 

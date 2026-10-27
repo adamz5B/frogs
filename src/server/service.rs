@@ -589,6 +589,7 @@ pub fn probe_existing(name: &str, scope: ServiceScope) -> Option<ExistingDefinit
 /// `start_type` and `restart_policy` both apply on every platform (see
 /// their own doc comments) — `frogs register` still starts the service once
 /// regardless of either choice.
+#[allow(clippy::too_many_arguments)]
 pub fn install(
     name: &str,
     scope: ServiceScope,
@@ -597,6 +598,7 @@ pub fn install(
     description: Option<&str>,
     start_type: StartType,
     restart_policy: RestartPolicy,
+    restart_delay_ms: Option<u32>,
 ) -> io::Result<ServiceRecord> {
     reject_unsafe_path(root)?;
 
@@ -605,7 +607,9 @@ pub fn install(
         let _ = (account, description);
         (
             Backend::Systemd,
-            systemd::install(name, scope, root, start_type, restart_policy)?.to_string_lossy().into_owned(),
+            systemd::install(name, scope, root, start_type, restart_policy, restart_delay_ms)?
+                .to_string_lossy()
+                .into_owned(),
             None,
             None,
         )
@@ -620,7 +624,7 @@ pub fn install(
         reject_unsafe_path(&log_dir)?;
         (
             Backend::Launchd,
-            launchd::install(name, scope, root, &log_dir.to_string_lossy(), start_type, restart_policy)?
+            launchd::install(name, scope, root, &log_dir.to_string_lossy(), start_type, restart_policy, restart_delay_ms)?
                 .to_string_lossy()
                 .into_owned(),
             None,
@@ -630,7 +634,7 @@ pub fn install(
     #[cfg(windows)]
     let (backend, definition_path, resolved_account, resolved_description) = {
         let _ = scope;
-        windows_svc::install(name, root, account, description, start_type, restart_policy)?;
+        windows_svc::install(name, root, account, description, start_type, restart_policy, restart_delay_ms)?;
         (
             Backend::WindowsService,
             name.to_string(),
@@ -640,7 +644,7 @@ pub fn install(
     };
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     let (backend, definition_path, resolved_account, resolved_description): (Backend, String, Option<String>, Option<String>) = {
-        let _ = (name, scope, account, description, start_type, restart_policy);
+        let _ = (name, scope, account, description, start_type, restart_policy, restart_delay_ms);
         return Err(io::Error::new(io::ErrorKind::Unsupported, "frogs register is not supported on this platform"));
     };
 
@@ -790,7 +794,7 @@ mod systemd {
         }
     }
 
-    pub fn render_unit(name: &str, exe: &Path, root: &Path, scope: ServiceScope, restart_policy: RestartPolicy) -> String {
+    pub fn render_unit(name: &str, exe: &Path, root: &Path, scope: ServiceScope, restart_policy: RestartPolicy, restart_delay_ms: Option<u32>) -> String {
         let exec_start = format!(
             "{} {} {}",
             escape_systemd_exec_arg(&exe.to_string_lossy()),
@@ -830,8 +834,17 @@ mod systemd {
         // a failure, so it never triggers a restart regardless of this
         // setting.
         let restart = match restart_policy {
-            RestartPolicy::OnFailure => "Restart=on-failure\nRestartSec=5\n",
-            RestartPolicy::Never => "Restart=no\n",
+            // systemd time spans accept an `ms` suffix; absent a user-chosen
+            // delay the original fixed 5 s is kept.
+            RestartPolicy::OnFailure => match restart_delay_ms {
+                // A configuration refusal exits with `CONFIG_REFUSED`; restarting cannot fix it, so systemd must not.
+                Some(ms) => format!(
+                    "Restart=on-failure\nRestartSec={ms}ms\nRestartPreventExitStatus={}\n",
+                    crate::exit_codes::CONFIG_REFUSED
+                ),
+                None => format!("Restart=on-failure\nRestartSec=5\nRestartPreventExitStatus={}\n", crate::exit_codes::CONFIG_REFUSED),
+            },
+            RestartPolicy::Never => "Restart=no\n".to_string(),
         };
         format!(
             "# Managed-by={FROGS_MARKER}\n\
@@ -871,7 +884,14 @@ mod systemd {
         }
     }
 
-    pub fn install(name: &str, scope: ServiceScope, root: &Path, start_type: StartType, restart_policy: RestartPolicy) -> io::Result<PathBuf> {
+    pub fn install(
+        name: &str,
+        scope: ServiceScope,
+        root: &Path,
+        start_type: StartType,
+        restart_policy: RestartPolicy,
+        restart_delay_ms: Option<u32>,
+    ) -> io::Result<PathBuf> {
         let exe = std::env::current_exe()?;
         reject_unsafe_path(&exe)?;
 
@@ -879,7 +899,7 @@ mod systemd {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, render_unit(name, &exe, root, scope, restart_policy))?;
+        fs::write(&path, render_unit(name, &exe, root, scope, restart_policy, restart_delay_ms))?;
 
         run_systemctl(scope, &["daemon-reload"])?;
         match start_type {
@@ -942,7 +962,7 @@ mod systemd {
         #[test]
         fn render_unit_carries_the_frogs_marker_and_escapes_a_percent_in_the_working_directory() {
             let root = Path::new("/srv/100%weird&project");
-            let unit = render_unit("frogs-test", Path::new("/usr/bin/frogs"), root, ServiceScope::User, RestartPolicy::OnFailure);
+            let unit = render_unit("frogs-test", Path::new("/usr/bin/frogs"), root, ServiceScope::User, RestartPolicy::OnFailure, None);
 
             assert!(unit.contains(&format!("# Managed-by={FROGS_MARKER}")));
             assert!(
@@ -956,10 +976,10 @@ mod systemd {
             let root = Path::new("/srv/project");
             let exe = Path::new("/usr/bin/frogs");
 
-            let user_unit = render_unit("frogs-test", exe, root, ServiceScope::User, RestartPolicy::OnFailure);
+            let user_unit = render_unit("frogs-test", exe, root, ServiceScope::User, RestartPolicy::OnFailure, None);
             assert!(user_unit.contains("WantedBy=default.target"));
 
-            let system_unit = render_unit("frogs-test", exe, root, ServiceScope::System, RestartPolicy::OnFailure);
+            let system_unit = render_unit("frogs-test", exe, root, ServiceScope::System, RestartPolicy::OnFailure, None);
             assert!(system_unit.contains("WantedBy=multi-user.target"));
         }
 
@@ -968,9 +988,32 @@ mod systemd {
             let root = Path::new("/srv/project");
             let exe = Path::new("/usr/bin/frogs");
 
-            let unit = render_unit("frogs-test", exe, root, ServiceScope::User, RestartPolicy::OnFailure);
+            let unit = render_unit("frogs-test", exe, root, ServiceScope::User, RestartPolicy::OnFailure, None);
             assert!(unit.contains("Restart=on-failure"));
             assert!(unit.contains("RestartSec=5"));
+        }
+
+        #[test]
+        fn render_unit_never_restarts_after_a_configuration_refusal() {
+            let root = Path::new("/srv/project");
+            let exe = Path::new("/usr/bin/frogs");
+
+            for delay in [None, Some(30000)] {
+                let unit = render_unit("frogs-test", exe, root, ServiceScope::User, RestartPolicy::OnFailure, delay);
+                assert!(unit.contains("RestartPreventExitStatus=78\n"), "{unit}");
+            }
+            let never = render_unit("frogs-test", exe, root, ServiceScope::User, RestartPolicy::Never, None);
+            assert!(!never.contains("RestartPreventExitStatus"));
+        }
+
+        #[test]
+        fn render_unit_uses_the_requested_restart_delay_in_milliseconds() {
+            let root = Path::new("/srv/project");
+            let exe = Path::new("/usr/bin/frogs");
+
+            let unit = render_unit("frogs-test", exe, root, ServiceScope::User, RestartPolicy::OnFailure, Some(30000));
+            assert!(unit.contains("RestartSec=30000ms"));
+            assert!(!unit.contains("RestartSec=5\n"));
         }
 
         #[test]
@@ -978,7 +1021,7 @@ mod systemd {
             let root = Path::new("/srv/project");
             let exe = Path::new("/usr/bin/frogs");
 
-            let unit = render_unit("frogs-test", exe, root, ServiceScope::User, RestartPolicy::Never);
+            let unit = render_unit("frogs-test", exe, root, ServiceScope::User, RestartPolicy::Never, None);
             assert!(unit.contains("Restart=no"));
             assert!(!unit.contains("RestartSec"));
         }
@@ -988,11 +1031,11 @@ mod systemd {
             let root = Path::new("/srv/project");
             let exe = Path::new("/usr/bin/frogs");
 
-            let user_unit = render_unit("frogs-test", exe, root, ServiceScope::User, RestartPolicy::OnFailure);
+            let user_unit = render_unit("frogs-test", exe, root, ServiceScope::User, RestartPolicy::OnFailure, None);
             assert!(user_unit.contains("After=network-online.target"));
             assert!(user_unit.contains("Wants=network-online.target"));
 
-            let system_unit = render_unit("frogs-test", exe, root, ServiceScope::System, RestartPolicy::OnFailure);
+            let system_unit = render_unit("frogs-test", exe, root, ServiceScope::System, RestartPolicy::OnFailure, None);
             assert!(system_unit.contains("After=network-online.target"));
             assert!(system_unit.contains("Wants=network-online.target"));
         }
@@ -1027,7 +1070,17 @@ mod launchd {
     /// `frogs.log.<date>` — those are two independently-buffered writers,
     /// and pointing both at the same path would race each other's file
     /// offsets.
-    pub fn render_plist(name: &str, exe: &Path, root: &Path, log_dir: &str, scope: ServiceScope, start_type: StartType, restart_policy: RestartPolicy) -> String {
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_plist(
+        name: &str,
+        exe: &Path,
+        root: &Path,
+        log_dir: &str,
+        scope: ServiceScope,
+        start_type: StartType,
+        restart_policy: RestartPolicy,
+        restart_delay_ms: Option<u32>,
+    ) -> String {
         let _ = scope; // KeepAlive is identical for both scopes — only the install path differs.
         let exe_esc = escape_xml(&exe.to_string_lossy());
         let root_esc = escape_xml(&root.to_string_lossy());
@@ -1056,6 +1109,16 @@ mod launchd {
             RestartPolicy::OnFailure => "<dict>\n\t\t<key>SuccessfulExit</key>\n\t\t<false/>\n\t</dict>".to_string(),
             RestartPolicy::Never => "<false/>".to_string(),
         };
+        // launchd's minimum gap between restarts is `ThrottleInterval`, in
+        // whole seconds (its own default is 10), so a millisecond delay is
+        // rounded up. Only emitted when the user asked for a delay.
+        // launchd cannot exempt one exit status from `SuccessfulExit=false`, so the
+        // definition passes `--config-refusal-exit 0` (see `ProgramArguments` below):
+        // a configuration refusal is then a clean exit, which launchd does not restart.
+        let throttle = match (restart_policy, restart_delay_ms) {
+            (RestartPolicy::OnFailure, Some(ms)) => format!("\t<key>ThrottleInterval</key>\n\t<integer>{}</integer>\n", ms.div_ceil(1000)),
+            _ => String::new(),
+        };
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
              <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -1070,6 +1133,8 @@ mod launchd {
              \t\t<string>{exe_esc}</string>\n\
              \t\t<string>run</string>\n\
              \t\t<string>--service-managed</string>\n\
+             \t\t<string>--config-refusal-exit</string>\n\
+             \t\t<string>0</string>\n\
              \t</array>\n\
              \t<key>WorkingDirectory</key>\n\
              \t<string>{root_esc}</string>\n\
@@ -1081,6 +1146,7 @@ mod launchd {
              \t<{run_at_load}/>\n\
              \t<key>KeepAlive</key>\n\
              \t{keep_alive}\n\
+             {throttle}\
              </dict>\n\
              </plist>\n"
         )
@@ -1131,7 +1197,17 @@ mod launchd {
         }
     }
 
-    pub fn install(name: &str, scope: ServiceScope, root: &Path, log_dir: &str, start_type: StartType, restart_policy: RestartPolicy) -> io::Result<PathBuf> {
+    #[allow(clippy::too_many_arguments)]
+
+    pub fn install(
+        name: &str,
+        scope: ServiceScope,
+        root: &Path,
+        log_dir: &str,
+        start_type: StartType,
+        restart_policy: RestartPolicy,
+        restart_delay_ms: Option<u32>,
+    ) -> io::Result<PathBuf> {
         let exe = std::env::current_exe()?;
         reject_unsafe_path(&exe)?;
 
@@ -1139,7 +1215,7 @@ mod launchd {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&path, render_plist(name, &exe, root, log_dir, scope, start_type, restart_policy))?;
+        fs::write(&path, render_plist(name, &exe, root, log_dir, scope, start_type, restart_policy, restart_delay_ms))?;
 
         // `restart` (unload-ignore-fail + `load -w`) loads the definition;
         // with `RunAtLoad=true` (Automatic) that alone starts it. With
@@ -1203,6 +1279,7 @@ mod launchd {
                 ServiceScope::User,
                 StartType::Automatic,
                 RestartPolicy::OnFailure,
+                None,
             );
 
             assert!(plist.contains(&format!("<string>{FROGS_MARKER}</string>")));
@@ -1228,6 +1305,7 @@ mod launchd {
                 ServiceScope::User,
                 StartType::Automatic,
                 RestartPolicy::OnFailure,
+                None,
             );
             assert!(automatic.contains("<key>RunAtLoad</key>\n\t<true/>"));
 
@@ -1239,6 +1317,7 @@ mod launchd {
                 ServiceScope::User,
                 StartType::Manual,
                 RestartPolicy::OnFailure,
+                None,
             );
             assert!(manual.contains("<key>RunAtLoad</key>\n\t<false/>"));
         }
@@ -1256,6 +1335,7 @@ mod launchd {
                 ServiceScope::User,
                 StartType::Automatic,
                 RestartPolicy::OnFailure,
+                None,
             );
             assert!(plist.contains("<key>SuccessfulExit</key>"));
             assert!(plist.contains("<key>KeepAlive</key>\n\t<dict>"));
@@ -1274,9 +1354,61 @@ mod launchd {
                 ServiceScope::User,
                 StartType::Automatic,
                 RestartPolicy::Never,
+                None,
             );
             assert!(plist.contains("<key>KeepAlive</key>\n\t<false/>"));
             assert!(!plist.contains("SuccessfulExit"));
+        }
+
+        #[test]
+        fn render_plist_makes_a_configuration_refusal_a_clean_exit() {
+            let root = Path::new("/Users/x/project");
+            let exe = Path::new("/usr/local/bin/frogs");
+
+            let plist = render_plist(
+                "frogs-test",
+                exe,
+                root,
+                "/Users/x/logs",
+                ServiceScope::User,
+                StartType::Automatic,
+                RestartPolicy::OnFailure,
+                None,
+            );
+            assert!(
+                plist.contains("<string>--service-managed</string>\n\t\t<string>--config-refusal-exit</string>\n\t\t<string>0</string>"),
+                "{plist}"
+            );
+        }
+
+        #[test]
+        fn render_plist_rounds_the_restart_delay_up_to_whole_seconds_for_throttle_interval() {
+            let root = Path::new("/Users/x/project");
+            let exe = Path::new("/usr/local/bin/frogs");
+
+            let with_delay = render_plist(
+                "frogs-test",
+                exe,
+                root,
+                "/Users/x/logs",
+                ServiceScope::User,
+                StartType::Automatic,
+                RestartPolicy::OnFailure,
+                Some(1500),
+            );
+            assert!(with_delay.contains("<key>ThrottleInterval</key>\n\t<integer>2</integer>"));
+
+            let without_delay = render_plist(
+                "frogs-test",
+                exe,
+                root,
+                "/Users/x/logs",
+                ServiceScope::User,
+                StartType::Automatic,
+                RestartPolicy::OnFailure,
+                None,
+            );
+            assert!(!without_delay.contains("ThrottleInterval"));
         }
 
         /// `StandardOutPath`/`StandardErrorPath` must both be present,
@@ -1296,6 +1428,7 @@ mod launchd {
                 ServiceScope::User,
                 StartType::Automatic,
                 RestartPolicy::OnFailure,
+                None,
             );
 
             assert!(
@@ -1568,7 +1701,15 @@ pub mod windows_svc {
     /// real Windows Service with no console handle, means a total logging
     /// blackout, not just a warning. Not checked as part of `register`
     /// today; recommended for a future pass.
-    pub fn install(name: &str, root: &Path, account: Option<&str>, description: Option<&str>, start_type: StartType, restart_policy: RestartPolicy) -> io::Result<()> {
+    pub fn install(
+        name: &str,
+        root: &Path,
+        account: Option<&str>,
+        description: Option<&str>,
+        start_type: StartType,
+        restart_policy: RestartPolicy,
+        restart_delay_ms: Option<u32>,
+    ) -> io::Result<()> {
         let resolved = resolve_account(account);
         let (account_name, account_password) = account_credentials(&resolved)?;
         let resolved_description = resolve_description(description, root);
@@ -1610,7 +1751,7 @@ pub mod windows_svc {
                 ))
             })?;
 
-        configure_failure_actions(&service, restart_policy)?;
+        configure_failure_actions(&service, restart_policy, restart_delay_ms)?;
         // `SERVICE_CONFIG_DESCRIPTION` via `set_description` — not part of
         // `ServiceInfo`/`create_service` itself, a separate
         // `ChangeServiceConfig2` call, same as failure actions above. Best
@@ -1642,12 +1783,12 @@ pub mod windows_svc {
     /// stop`/`frogs unregister`, which requests `SERVICE_CONTROL_STOP`
     /// before the process reports `Stopped` with a *success* code) is never
     /// treated as a failure by the SCM regardless of this configuration.
-    fn configure_failure_actions(service: &windows_service::service::Service, restart_policy: RestartPolicy) -> io::Result<()> {
+    fn configure_failure_actions(service: &windows_service::service::Service, restart_policy: RestartPolicy, restart_delay_ms: Option<u32>) -> io::Result<()> {
         let (actions, on_non_crash) = match restart_policy {
             RestartPolicy::OnFailure => (
                 Some(vec![ServiceAction {
                     action_type: ServiceActionType::Restart,
-                    delay: std::time::Duration::from_secs(5),
+                    delay: restart_delay_ms.map_or(std::time::Duration::from_secs(5), |ms| std::time::Duration::from_millis(u64::from(ms))),
                 }]),
                 true,
             ),
@@ -2474,6 +2615,7 @@ mod tests {
                 None,
                 StartType::Automatic,
                 RestartPolicy::OnFailure,
+                None,
             )
             .expect_err(&format!(
                 "a logging.directory containing an embedded {label} byte must be rejected, not smuggled into the rendered plist"

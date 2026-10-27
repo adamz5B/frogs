@@ -159,6 +159,9 @@ pub(crate) fn locate(root: &Path, canonical_root: &Path, deny: &DenyList, relati
     if let Some(reason) = deny.canonical_verdict(&canonical) {
         return Located::Denied(reason);
     }
+    if let Some(reason) = deny.identity_verdict(&canonical, canonical_root) {
+        return Located::Denied(reason);
+    }
     Located::File(canonical)
 }
 
@@ -333,6 +336,7 @@ mod tests {
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "<html>hi</html>").unwrap();
         let config = WebServeConfig {
+            allow_dot_paths: Vec::new(),
             start_page: "index.html".to_string(),
             port: 8080,
             not_found_page: None,
@@ -355,6 +359,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("css")).unwrap();
         std::fs::write(dir.join("css/style.css"), "body { color: red; }").unwrap();
         let config = WebServeConfig {
+            allow_dot_paths: Vec::new(),
             start_page: "index.html".to_string(),
             port: 8080,
             not_found_page: None,
@@ -375,6 +380,7 @@ mod tests {
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "home").unwrap();
         let config = WebServeConfig {
+            allow_dot_paths: Vec::new(),
             start_page: "index.html".to_string(),
             port: 8080,
             not_found_page: None,
@@ -395,6 +401,7 @@ mod tests {
         std::fs::write(dir.join("index.html"), "home").unwrap();
         std::fs::write(dir.join("404.html"), "<html>not here</html>").unwrap();
         let config = WebServeConfig {
+            allow_dot_paths: Vec::new(),
             start_page: "index.html".to_string(),
             port: 8080,
             not_found_page: Some("404.html".to_string()),
@@ -427,6 +434,7 @@ mod tests {
         // served root — proves containment, not just the `..` string check.
         std::fs::write(dir.join("../frogs-webserve-outside-secret.txt"), "top secret").unwrap();
         let config = WebServeConfig {
+            allow_dot_paths: Vec::new(),
             start_page: "index.html".to_string(),
             port: 8080,
             not_found_page: None,
@@ -454,6 +462,7 @@ mod tests {
         std::fs::write(dir.join("index.html"), "home").unwrap();
         std::fs::write(dir.join("webserve.json"), r#"{"startPage":"index.html"}"#).unwrap();
         let config = WebServeConfig {
+            allow_dot_paths: Vec::new(),
             start_page: "index.html".to_string(),
             port: 8080,
             not_found_page: None,
@@ -473,6 +482,7 @@ mod tests {
         std::fs::write(dir.join("index.html"), "home").unwrap();
         std::fs::create_dir_all(dir.join("css")).unwrap();
         let config = WebServeConfig {
+            allow_dot_paths: Vec::new(),
             start_page: "index.html".to_string(),
             port: 8080,
             not_found_page: None,
@@ -525,6 +535,7 @@ mod tests {
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "home").unwrap();
         let config = WebServeConfig {
+            allow_dot_paths: Vec::new(),
             start_page: "index.html".to_string(),
             port: 8080,
             not_found_page: None,
@@ -546,6 +557,7 @@ mod tests {
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "home").unwrap();
         let config = WebServeConfig {
+            allow_dot_paths: Vec::new(),
             start_page: "index.html".to_string(),
             port: 8080,
             not_found_page: None,
@@ -570,6 +582,7 @@ mod tests {
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "home").unwrap();
         let config = WebServeConfig {
+            allow_dot_paths: Vec::new(),
             start_page: "index.html".to_string(),
             port: 8080,
             not_found_page: None,
@@ -595,6 +608,7 @@ mod tests {
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "home").unwrap();
         let config = WebServeConfig {
+            allow_dot_paths: Vec::new(),
             start_page: "index.html".to_string(),
             port: 8080,
             not_found_page: None,
@@ -622,6 +636,7 @@ mod tests {
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "home").unwrap();
         let config = WebServeConfig {
+            allow_dot_paths: Vec::new(),
             start_page: "index.html".to_string(),
             port: 8080,
             not_found_page: None,
@@ -651,6 +666,7 @@ mod tests {
         let dir = temp_site();
         std::fs::write(dir.join("index.html"), "home").unwrap();
         let config = WebServeConfig {
+            allow_dot_paths: Vec::new(),
             start_page: "index.html".to_string(),
             port: 8080,
             not_found_page: None,

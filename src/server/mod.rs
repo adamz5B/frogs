@@ -113,6 +113,8 @@ where
 #[derive(Clone)]
 pub(crate) struct CanonicalPath<S> {
     inner: S,
+    /// NFC spellings of the non-ASCII literal segments the router registers; see `canonicalize_path_with`.
+    literals: Arc<std::collections::BTreeSet<String>>,
 }
 
 impl<S, B> tower_service::Service<Request<B>> for CanonicalPath<S>
@@ -130,7 +132,7 @@ where
     fn call(&mut self, mut req: Request<B>) -> Self::Future {
         use futures_util::future::Either;
 
-        let rewritten = match crate::openapi::path_encoding::canonicalize_path(req.uri().path()) {
+        let rewritten = match crate::openapi::path_encoding::canonicalize_path_with(req.uri().path(), &self.literals) {
             std::borrow::Cow::Borrowed(_) => None,
             std::borrow::Cow::Owned(path) => Some(rebuild_uri(req.uri(), &path)),
         };
@@ -157,16 +159,49 @@ fn rebuild_uri(uri: &axum::http::Uri, path: &str) -> Option<axum::http::Uri> {
     axum::http::Uri::from_parts(parts).ok()
 }
 
+/// How a listener shapes requests before the Router sees them: whether method
+/// names are matched case-sensitively, and which non-ASCII literal route
+/// segments (NFC) a differently-normalised request spelling is rewritten to.
+/// A bare `bool` converts to a shape with no literals.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ServeShape {
+    pub case_sensitive_methods: bool,
+    pub literals: Arc<std::collections::BTreeSet<String>>,
+}
+
+impl ServeShape {
+    /// The shape for a listener serving the API described by `config`.
+    pub(crate) fn of(config: &crate::config::ServerConfig) -> Self {
+        ServeShape {
+            case_sensitive_methods: config.case_sensitive_methods(),
+            literals: config.canonical_literals.clone(),
+        }
+    }
+}
+
+impl From<bool> for ServeShape {
+    fn from(case_sensitive_methods: bool) -> Self {
+        ServeShape {
+            case_sensitive_methods,
+            literals: Arc::default(),
+        }
+    }
+}
+
 /// The one way every listener wraps a Router. See `NormalizeMethod` for why
 /// this cannot be a `Router::layer`. Outermost to innermost the request
 /// passes `IdentityService` (TLS only), `ConnectInfo`, `NormalizeMethod`,
 /// `CanonicalPath`, the Router.
-pub(crate) fn served_service(router: Router, case_sensitive: bool) -> IntoMakeServiceWithConnectInfo<NormalizeMethod<CanonicalPath<Router>>, SocketAddr> {
+pub(crate) fn served_service(router: Router, shape: impl Into<ServeShape>) -> IntoMakeServiceWithConnectInfo<NormalizeMethod<CanonicalPath<Router>>, SocketAddr> {
+    let shape = shape.into();
     // Request type named only to pick the trait impl; NormalizeMethod is generic
     // over the body, so the result still serves Request<Body> and Request<Incoming>.
     <NormalizeMethod<CanonicalPath<Router>> as axum::ServiceExt<axum::extract::Request>>::into_make_service_with_connect_info::<SocketAddr>(NormalizeMethod {
-        inner: CanonicalPath { inner: router },
-        case_sensitive,
+        inner: CanonicalPath {
+            inner: router,
+            literals: shape.literals,
+        },
+        case_sensitive: shape.case_sensitive_methods,
     })
 }
 
@@ -791,11 +826,12 @@ async fn correlation_id_middleware(mut req: Request, next: Next) -> Response {
 /// Binds an ephemeral port and serves `router` through the real
 /// `served_service` wrapper, never a bare `axum::serve(listener, router)`.
 #[cfg(test)]
-pub(crate) async fn spawn_served(router: Router, case_sensitive: bool) -> SocketAddr {
+pub(crate) async fn spawn_served(router: Router, shape: impl Into<ServeShape>) -> SocketAddr {
+    let shape = shape.into();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, served_service(router, case_sensitive)).await.unwrap();
+        axum::serve(listener, served_service(router, shape)).await.unwrap();
     });
     addr
 }
@@ -1717,7 +1753,10 @@ mod m3_method_tests {
         use tower_service::Service;
         let probe = Probe::default();
         let mut service = NormalizeMethod {
-            inner: CanonicalPath { inner: probe.clone() },
+            inner: CanonicalPath {
+                inner: probe.clone(),
+                literals: Default::default(),
+            },
             case_sensitive,
         };
         let mut req = Request::builder()
@@ -1766,7 +1805,10 @@ mod m3_method_tests {
         use tower_service::Service;
         let probe = Probe::default();
         let mut service = NormalizeMethod {
-            inner: CanonicalPath { inner: probe.clone() },
+            inner: CanonicalPath {
+                inner: probe.clone(),
+                literals: Default::default(),
+            },
             case_sensitive: false,
         };
         let req = Request::builder().method(Method::CONNECT).uri("/x").body(Body::empty()).unwrap();

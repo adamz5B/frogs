@@ -27,6 +27,8 @@ struct Harness {
     pki: Pki,
     port: u16,
     case_sensitive: bool,
+    /// Overrides `case_sensitive` when a test serves with the shape a real `frogs run` would (registered literals included).
+    shape: Option<crate::server::ServeShape>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<io::Result<()>>>,
 }
@@ -45,6 +47,7 @@ impl Harness {
             pki,
             port: free_port(),
             case_sensitive: false,
+            shape: None,
             stop: None,
             task: None,
         }
@@ -65,9 +68,10 @@ impl Harness {
     async fn start(&mut self, router: Router, tls: TlsConfig) {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         self.stop = Some(tx);
-        let (root, api_dir, port, case_sensitive) = (self.root.clone(), self.api_dir.clone(), self.port, self.case_sensitive);
+        let (root, api_dir, port) = (self.root.clone(), self.api_dir.clone(), self.port);
+        let shape = self.shape.clone().unwrap_or_else(|| self.case_sensitive.into());
         self.task = Some(tokio::spawn(async move {
-            serve(&root, router, IpAddr::V4(Ipv4Addr::LOCALHOST), port, &tls, &api_dir, case_sensitive, async {
+            serve(&root, router, IpAddr::V4(Ipv4Addr::LOCALHOST), port, &tls, &api_dir, shape, async {
                 let _ = rx.await;
             })
             .await
@@ -632,6 +636,11 @@ fn write_api_project(h: &Harness, client_auth: &str, verifier_json: &str, extra_
 
 async fn start_api(h: &mut Harness) {
     let (router, server_config) = build_api_router(&h.root, false).await.expect("scratch project should build");
+    // Method case stays whatever the test set on the harness; only the registered literals come from the config.
+    h.shape = Some(crate::server::ServeShape {
+        case_sensitive_methods: h.case_sensitive,
+        ..crate::server::ServeShape::of(&server_config)
+    });
     h.start(router, server_config.tls).await;
 }
 
@@ -993,4 +1002,59 @@ async fn a_lowercase_query_is_accepted_over_mtls_when_matching_is_case_insensiti
     start_query_api(&mut exact, REQUIRED).await;
     assert_eq!(send_method(&exact, Some(&LeafSpec::valid()), "query", "/protected").await.unwrap().0, 405);
     assert_eq!(send_method(&exact, Some(&LeafSpec::valid()), "QUERY", "/protected").await.unwrap().0, 200);
+}
+
+// ---------------------------------------------------------------------
+// Request-path canonicalisation through the real TLS listener
+// ---------------------------------------------------------------------
+
+/// A secured `café/menu` folder next to an open `{p}/menu` sibling: if any
+/// spelling of the literal slipped past canonicalisation it would be answered
+/// by the open parameter route (200) instead of demanding a certificate (401).
+fn write_cafe_project(h: &Harness) {
+    write_api_project(h, OPTIONAL, MTLS_ORDERS, serde_json::json!({}));
+    std::fs::write(
+        h.root.join("openapi.yaml"),
+        "openapi: 3.1.0\ninfo: { title: t, version: '1' }\n\
+         paths:\n  /protected:\n    get:\n      operationId: getProtected\n      security: [{ certAuth: [] }]\n      responses: { '200': { description: ok } }\n  \
+         /open:\n    get:\n      operationId: getOpen\n      responses: { '200': { description: ok } }\n  \
+         /caf\u{e9}/menu:\n    get:\n      operationId: getCafe\n      security: [{ certAuth: [] }]\n      responses: { '200': { description: ok } }\n  \
+         /{p}/menu:\n    get:\n      operationId: getAny\n      responses: { '200': { description: ok } }\n\
+         components:\n  securitySchemes:\n    certAuth: { type: mutualTLS }\n",
+    )
+    .unwrap();
+    let endpoints = h.api_dir.join("datasources/endpoints");
+    for (folder, body) in [
+        (
+            "caf\u{e9}/menu",
+            r#"{ "operationId": "getCafe", "security": "certAuth", "sources": {}, "response": {} }"#,
+        ),
+        ("{p}/menu", r#"{ "operationId": "getAny", "sources": {}, "response": {} }"#),
+    ] {
+        std::fs::create_dir_all(endpoints.join(folder)).unwrap();
+        std::fs::write(endpoints.join(folder).join("endpoint.get.json"), body).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn every_spelling_of_a_secured_literal_folder_demands_a_certificate_over_tls() {
+    let mut h = Harness::new();
+    write_cafe_project(&h);
+    start_api(&mut h).await;
+    for path in [
+        "/caf%C3%A9/menu",
+        "/caf%c3%a9/menu",
+        "/caf%C3%a9/menu",
+        "/%63af%C3%A9/menu",
+        "/cafe%CC%81/menu",
+        "/cafe%cc%81/menu",
+    ] {
+        let (status, body) = h.get_as(None, path).await.unwrap();
+        assert_eq!(status, 401, "{path} must not be answered by the open {{p}} route: {body}");
+        assert_eq!(json(&body)["name"], "auth.client_cert_missing", "{path}");
+    }
+    let (status, _) = h.get_as(None, "/cafe/menu").await.unwrap();
+    assert_eq!(status, 200, "an unrelated value still reaches the open parameter route");
+    let (status, _) = h.get_as(Some(&LeafSpec::valid()), "/cafe%CC%81/menu").await.unwrap();
+    assert_eq!(status, 200, "with a valid certificate the decomposed spelling reaches the literal folder");
 }

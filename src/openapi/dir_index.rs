@@ -8,12 +8,15 @@ use super::endpoint_tree::{Access, LeafRule, LinkContext, LinkFindingKind, LinkK
 use super::path_rules::{is_single_normal_component, untrusted};
 use crate::config::EndpointSymlinks;
 
-/// Case folding used for every "do these two names collide" question. The
-/// upper-then-lower round trip makes `Straße` and `STRASSE` fold together;
-/// it is deliberately the same on every OS so results never depend on the
-/// host filesystem's own case rules.
+/// Folding used for every "do these two names collide" question. NFC first,
+/// so canonically-equivalent spellings (`é` as one code point vs `e` plus a
+/// combining accent, which APFS treats as the same name) fold together; then
+/// the upper-then-lower round trip makes `Straße` and `STRASSE` fold
+/// together. It is deliberately the same on every OS so results never depend
+/// on the host filesystem's own case or normalisation rules.
 pub fn fold(s: &str) -> String {
-    s.to_uppercase().to_lowercase()
+    use unicode_normalization::UnicodeNormalization;
+    s.nfc().collect::<String>().to_uppercase().to_lowercase()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -497,6 +500,27 @@ pub fn copy_into_checked(boundary: &ProjectBoundary, src: &Path, dest_dir: &Path
     }
 }
 
+/// Moves the regular file `dir/name` into `dest_dir` as `dest_name` (a folder on the same
+/// filesystem, e.g. the endpoint's own `_backups/`), refusing when the destination exists
+/// in any casing, when the source is not a plain file, or when either folder resolves
+/// outside the project. Nothing is overwritten and nothing is deleted.
+pub fn move_into_checked(boundary: &ProjectBoundary, dir: &Path, name: &str, dest_dir: &Path, dest_name: &str) -> Result<(), EndpointFsError> {
+    check_segments(&[name, dest_name])?;
+    match check_file(dir, name)? {
+        FileState::Present(_) => {}
+        _ => return Err(io::Error::new(io::ErrorKind::NotFound, format!("{} does not exist", dir.join(name).display())).into()),
+    }
+    match DirIndex::read(dest_dir)?.lookup(dest_name) {
+        Lookup::Absent => {}
+        Lookup::Exact(_) => return Err(EndpointFsError::AlreadyExists { at: dest_dir.join(dest_name) }),
+        Lookup::CaseConflict { found } => return Err(case_conflict(dest_name, found, dest_dir)),
+    }
+    boundary.check_write_target(dir, LeafRule::Dir)?;
+    boundary.check_write_target(dest_dir, LeafRule::Dir)?;
+    fs::rename(dir.join(name), dest_dir.join(dest_name))?;
+    Ok(())
+}
+
 /// Renames `dir/from` to `dir/to`, refusing when the target exists in any
 /// casing (a plain `fs::rename` silently overwrites on every OS). The source
 /// must be a regular file.
@@ -568,6 +592,13 @@ mod tests {
         assert_eq!(fold("Straße"), fold("STRASSE"));
         assert_eq!(fold("Cars"), "cars");
         assert_ne!(fold("cars"), fold("cart"));
+    }
+
+    #[test]
+    fn fold_makes_composed_and_decomposed_unicode_collide() {
+        assert_eq!(fold("caf\u{e9}"), fold("cafe\u{301}"));
+        assert_eq!(fold("CAF\u{c9}"), fold("cafe\u{301}"));
+        assert_ne!(fold("cafe"), fold("cafe\u{301}"));
     }
 
     #[test]

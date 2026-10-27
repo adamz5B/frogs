@@ -8,7 +8,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) use deny::{ProtectedPaths, lexically_denied, page_problems};
+pub(crate) use deny::{ProtectedPaths, lexically_denied, page_problems, site_identity_warnings};
 pub(crate) use serve::{WEB_ROUTES, router};
 
 use crate::config::TlsConfig;
@@ -44,6 +44,13 @@ pub struct WebServeConfig {
     /// project to nest them under).
     #[serde(default)]
     pub tls: TlsConfig,
+    /// Root-relative paths under `.well-known/` that are served despite the
+    /// rule that denies every dot-prefixed path, e.g. `.well-known/acme-challenge`
+    /// (ACME http-01) or `.well-known/security.txt`. Only `.well-known` entries
+    /// are accepted (anything else is reported and ignored), and an entry exempts
+    /// just its own segments: its children must still pass every other rule.
+    #[serde(rename = "allowDotPaths", default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_dot_paths: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -100,6 +107,7 @@ mod tests {
     #[test]
     fn a_missing_not_found_page_is_omitted_from_the_written_file() {
         let config = WebServeConfig {
+            allow_dot_paths: Vec::new(),
             start_page: "index.html".to_string(),
             port: 8080,
             not_found_page: None,
@@ -112,6 +120,7 @@ mod tests {
     #[test]
     fn round_trips_through_save_to() {
         let config = WebServeConfig {
+            allow_dot_paths: Vec::new(),
             start_page: "index.html".to_string(),
             port: 8081,
             not_found_page: Some("404.html".to_string()),

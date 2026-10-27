@@ -440,6 +440,11 @@ pub struct ServerConfig {
     /// startup only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint_symlinks: Option<EndpointSymlinks>,
+    /// Runtime only, never read from or written to `server.json`: the NFC spellings of the
+    /// non-ASCII literal route segments `assemble_api_router` registered, which `ServeShape`
+    /// hands to the request-path canonicaliser.
+    #[serde(skip)]
+    pub(crate) canonical_literals: std::sync::Arc<std::collections::BTreeSet<String>>,
 }
 
 /// `config/server.json`'s `endpointSymlinks`: `contained` follows a link only
@@ -482,6 +487,7 @@ impl Default for ServerConfig {
             strict_open_api: Some(false),
             case_sensitive_methods: Some(false),
             endpoint_symlinks: Some(EndpointSymlinks::Contained),
+            canonical_literals: Default::default(),
         }
     }
 }

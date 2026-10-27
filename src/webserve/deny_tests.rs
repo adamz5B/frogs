@@ -418,15 +418,24 @@ fn a_root_that_could_not_be_canonicalised_is_a_problem_and_outside_paths_become_
 }
 
 #[test]
-fn a_protected_path_with_non_ascii_components_warns_but_still_protects_its_literal_spelling() {
+fn a_protected_path_with_non_ascii_components_is_protected_under_composed_and_decomposed_spellings() {
     let root = temp_root();
     let mut protected = ProtectedPaths::default();
     protected.add_path("tls.manual.keyPath", &root, "s\u{e9}cret/key.pem");
     let list = list_for(&root, &protected);
-    assert_eq!(list.warnings().len(), 1, "{:?}", list.warnings());
-    assert!(list.warnings()[0].contains("non-ASCII"));
-    assert!(list.problems().is_empty());
+    assert!(
+        list.warnings().is_empty() && list.problems().is_empty(),
+        "{:?} {:?}",
+        list.warnings(),
+        list.problems()
+    );
     assert_eq!(list.request_verdict("s\u{e9}cret/key.pem"), Some(DenyReason::Protected));
+    assert_eq!(
+        list.request_verdict("se\u{301}cret/key.pem"),
+        Some(DenyReason::Protected),
+        "the decomposed spelling folds to the same name"
+    );
+    assert_eq!(list.request_verdict("S\u{c9}CRET/key.pem"), Some(DenyReason::Protected));
 }
 
 #[test]
@@ -493,6 +502,7 @@ fn page_problems_flags_a_denied_start_page_and_not_found_page_once_each() {
     let root = temp_root();
     std::fs::write(root.join("index.html"), "x").unwrap();
     let config = WebServeConfig {
+        allow_dot_paths: Vec::new(),
         start_page: "api/config/connections.json".to_string(),
         port: 8080,
         not_found_page: Some(".frogs/run.json".to_string()),
@@ -512,6 +522,7 @@ fn page_problems_is_silent_for_servable_pages() {
     std::fs::write(root.join("index.html"), "x").unwrap();
     std::fs::write(root.join("404.html"), "x").unwrap();
     let config = WebServeConfig {
+        allow_dot_paths: Vec::new(),
         start_page: "index.html".to_string(),
         port: 8080,
         not_found_page: Some("404.html".to_string()),
@@ -525,6 +536,7 @@ fn page_problems_is_silent_for_servable_pages() {
 fn page_problems_counts_a_start_page_naming_the_webserve_json_tls_key() {
     let root = temp_root();
     let config = WebServeConfig {
+        allow_dot_paths: Vec::new(),
         start_page: "key.pem".to_string(),
         port: 8080,
         not_found_page: None,
@@ -592,6 +604,7 @@ fn protected_for(root: &Path) -> ProtectedPaths {
 
 fn config_for(start_page: &str, not_found: Option<&str>) -> WebServeConfig {
     WebServeConfig {
+        allow_dot_paths: Vec::new(),
         start_page: start_page.to_string(),
         port: 8080,
         not_found_page: not_found.map(str::to_string),
@@ -824,4 +837,170 @@ async fn a_denied_not_found_page_falls_back_to_the_generic_404_for_missing_paths
         let denied = send(addr, "GET", "/api/config/secret.txt").await;
         assert_eq!(denied, reply, "{not_found}");
     }
+}
+
+// ------------------------------------------------- allowDotPaths (.well-known)
+
+fn list_allowing(root: &Path, entries: &[&str]) -> DenyList {
+    let mut list = plain_list(root);
+    list.set_dot_allow(&entries.iter().map(|e| e.to_string()).collect::<Vec<_>>());
+    list
+}
+
+#[test]
+fn an_allow_entry_exempts_only_its_own_segments_from_the_dot_rule() {
+    let root = temp_root();
+    let list = list_allowing(&root, &[".well-known/acme-challenge", ".well-known/security.txt"]);
+    assert!(list.problems().is_empty(), "{:?}", list.problems());
+    for allowed in [
+        ".well-known/acme-challenge/token",
+        ".well-known/acme-challenge/a/b",
+        ".well-known/security.txt",
+        ".Well-Known/ACME-CHALLENGE/x",
+    ] {
+        assert_eq!(list.request_verdict(allowed), None, "{allowed}");
+    }
+    for denied in [
+        ".well-known",
+        ".well-known/",
+        ".well-known/other",
+        ".well-known/acme-challenge/.hidden",
+        ".well-known/security.txt/.x",
+        ".git/config",
+        ".frogs/run.json",
+        "x/.well-known/acme-challenge/t",
+    ] {
+        assert_eq!(list.request_verdict(denied), Some(DenyReason::DotSegment), "{denied}");
+    }
+}
+
+#[test]
+fn without_an_allow_entry_well_known_stays_denied() {
+    let root = temp_root();
+    let list = plain_list(&root);
+    assert_eq!(list.request_verdict(".well-known/security.txt"), Some(DenyReason::DotSegment));
+}
+
+#[test]
+fn allow_entries_that_could_open_anything_but_well_known_are_reported_and_ignored() {
+    let root = temp_root();
+    let bad = [
+        "",
+        ".git",
+        ".git/config",
+        ".well-known/../.git",
+        ".well-known/.secret",
+        "docs",
+        "..",
+        ".well-known//x",
+        ".well-known/_backups",
+    ];
+    let list = list_allowing(&root, &bad);
+    assert_eq!(list.problems().len(), bad.len(), "{:?}", list.problems());
+    assert!(
+        list.problems().iter().all(|p| p.starts_with("allowDotPaths entry ") && p.contains("is ignored")),
+        "{:?}",
+        list.problems()
+    );
+    for target in [".git/config", ".well-known/anything", ".well-known/.secret"] {
+        assert_eq!(list.request_verdict(target), Some(DenyReason::DotSegment), "{target}");
+    }
+}
+
+#[test]
+fn an_allowed_path_is_still_subject_to_the_protected_path_and_reserved_name_rules() {
+    let root = temp_root();
+    let mut protected = ProtectedPaths::default();
+    protected.add_path("tls.manual.keyPath", &root, ".well-known/acme-challenge/server.key");
+    let mut list = list_for(&root, &protected);
+    list.set_dot_allow(&[".well-known/acme-challenge".to_string()]);
+    assert_eq!(list.request_verdict(".well-known/acme-challenge/server.key"), Some(DenyReason::Protected));
+    assert_eq!(list.request_verdict(".well-known/acme-challenge/token"), None);
+    assert_eq!(list.request_verdict(".well-known/acme-challenge/_backups/x"), Some(DenyReason::Backups));
+}
+
+#[test]
+fn the_canonical_layer_applies_the_same_exemption() {
+    let root = temp_root();
+    let list = list_allowing(&root, &[".well-known/acme-challenge"]);
+    assert_eq!(list.canonical_verdict(&root.join(".well-known/acme-challenge/token")), None);
+    assert_eq!(list.canonical_verdict(&root.join(".well-known/other")), Some(DenyReason::DotSegment));
+    assert_eq!(list.canonical_verdict(&root.join(".well-known/acme-challenge/.x")), Some(DenyReason::DotSegment));
+}
+
+#[tokio::test]
+async fn a_served_site_answers_an_allowed_well_known_file_and_still_404s_everything_else_dotted() {
+    let root = temp_root();
+    std::fs::create_dir_all(root.join(".well-known/acme-challenge")).unwrap();
+    std::fs::write(root.join("index.html"), "home").unwrap();
+    std::fs::write(root.join(".well-known/acme-challenge/token"), "ACME-TOKEN").unwrap();
+    std::fs::write(root.join(".well-known/other.txt"), "NOT-ALLOWED").unwrap();
+    std::fs::write(root.join(".env"), "SECRET").unwrap();
+    let mut config = config_for("index.html", None);
+    config.allow_dot_paths = vec![".well-known/acme-challenge".to_string()];
+    let addr = spawn_served(router(root.clone(), config, ProtectedPaths::default()), false).await;
+
+    let ok = send(addr, "GET", "/.well-known/acme-challenge/token").await;
+    assert!(ok.status_line.contains("200"), "{ok:?}");
+    assert_eq!(ok.body, b"ACME-TOKEN");
+    let missing = send(addr, "GET", "/no-such-file").await;
+    for target in ["/.well-known/other.txt", "/.env", "/.well-known/"] {
+        assert_denied_like_missing(addr, target, &missing).await;
+    }
+}
+
+#[test]
+fn allow_dot_paths_round_trips_through_webserve_json_and_is_omitted_when_empty() {
+    let config: WebServeConfig = serde_json::from_str(r#"{ "startPage": "i.html", "allowDotPaths": [".well-known/security.txt"] }"#).unwrap();
+    assert_eq!(config.allow_dot_paths, vec![".well-known/security.txt".to_string()]);
+    assert!(serde_json::to_string(&config).unwrap().contains("allowDotPaths"));
+    let plain: WebServeConfig = serde_json::from_str(r#"{ "startPage": "i.html" }"#).unwrap();
+    assert!(plain.allow_dot_paths.is_empty());
+    assert!(!serde_json::to_string(&plain).unwrap().contains("allowDotPaths"));
+}
+
+#[test]
+fn page_problems_reports_a_bad_allow_entry() {
+    let root = temp_root();
+    std::fs::write(root.join("index.html"), "x").unwrap();
+    let mut config = config_for("index.html", None);
+    config.allow_dot_paths = vec![".git".to_string()];
+    let (problems, _) = page_problems(&root, &config, &ProtectedPaths::default());
+    assert_eq!(problems.len(), 1, "{problems:?}");
+}
+
+// ------------------------------------------ hard links and aliases
+
+#[tokio::test]
+async fn a_hard_link_to_a_protected_file_is_denied_like_a_missing_file() {
+    let root = temp_root();
+    std::fs::create_dir_all(root.join("tls")).unwrap();
+    std::fs::write(root.join("index.html"), "home").unwrap();
+    std::fs::write(root.join("tls/server.key"), "PRIVATE-KEY").unwrap();
+    std::fs::hard_link(root.join("tls/server.key"), root.join("innocent.txt")).unwrap();
+    std::fs::write(root.join("plain.txt"), "fine").unwrap();
+    let mut protected = ProtectedPaths::default();
+    protected.add_path("tls.manual.keyPath", &root, "tls/server.key");
+    let addr = spawn_served(router(root.clone(), config_for("index.html", None), protected), false).await;
+
+    let missing = send(addr, "GET", "/no-such-file").await;
+    assert_denied_like_missing(addr, "/tls/server.key", &missing).await;
+    assert_denied_like_missing(addr, "/innocent.txt", &missing).await;
+    let fine = send(addr, "GET", "/plain.txt").await;
+    assert!(fine.status_line.contains("200"), "{fine:?}");
+}
+
+#[test]
+fn a_hard_link_to_a_protected_sqlite_sidecar_is_denied_too() {
+    let root = temp_root();
+    std::fs::write(root.join("data.db"), "x").unwrap();
+    std::fs::write(root.join("data.db-wal"), "wal").unwrap();
+    std::fs::hard_link(root.join("data.db-wal"), root.join("copy.txt")).unwrap();
+    let mut protected = ProtectedPaths::default();
+    protected.add_sqlite(&connection(&root.join("data.db").to_string_lossy()), &root);
+    let list = list_for(&root, &protected);
+    assert_eq!(list.identity_verdict(&root.join("copy.txt"), &root), Some(DenyReason::Protected));
+    assert_eq!(list.identity_verdict(&root.join("data.db-wal"), &root), Some(DenyReason::Protected));
+    std::fs::write(root.join("other.txt"), "x").unwrap();
+    assert_eq!(list.identity_verdict(&root.join("other.txt"), &root), None);
 }

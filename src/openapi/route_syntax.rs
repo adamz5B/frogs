@@ -48,6 +48,59 @@ pub fn is_non_literal_segment(seg: &str) -> bool {
     seg.contains(['{', '}', ':', '*'])
 }
 
+/// Whether `text` is one possible instance of a partial-template segment such
+/// as `report.{ext}` or `{a}-{b}`: every `{...}` group stands for one or more
+/// characters, everything else must match exactly. A stray `{` or `}` with no
+/// partner is ordinary text.
+pub fn partial_template_matches(template: &str, text: &str) -> bool {
+    enum Piece {
+        Text(char),
+        Group,
+    }
+    let mut pieces = Vec::new();
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            let mut rest = chars.clone();
+            if rest.any(|n| n == '}') {
+                for n in chars.by_ref() {
+                    if n == '}' {
+                        break;
+                    }
+                }
+                pieces.push(Piece::Group);
+                continue;
+            }
+        }
+        pieces.push(Piece::Text(c));
+    }
+    let text: Vec<char> = text.chars().collect();
+    // reachable[j]: the pieces consumed so far can end exactly after text[..j].
+    let mut reachable = vec![false; text.len() + 1];
+    reachable[0] = true;
+    for piece in &pieces {
+        let mut next = vec![false; text.len() + 1];
+        match piece {
+            Piece::Text(c) => {
+                for j in 0..text.len() {
+                    if reachable[j] && text[j] == *c {
+                        next[j + 1] = true;
+                    }
+                }
+            }
+            Piece::Group => {
+                let mut open = false;
+                for j in 1..=text.len() {
+                    open |= reachable[j - 1];
+                    next[j] = open;
+                }
+            }
+        }
+        reachable = next;
+    }
+    reachable[text.len()]
+}
+
 /// `{name}` -> `:name`, segment by segment, applied to an OpenAPI path string.
 pub fn axum_style(openapi_path: &str) -> String {
     openapi_path
