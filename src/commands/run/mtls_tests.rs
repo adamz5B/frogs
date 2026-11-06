@@ -1058,3 +1058,63 @@ async fn every_spelling_of_a_secured_literal_folder_demands_a_certificate_over_t
     let (status, _) = h.get_as(Some(&LeafSpec::valid()), "/cafe%CC%81/menu").await.unwrap();
     assert_eq!(status, 200, "with a valid certificate the decomposed spelling reaches the literal folder");
 }
+
+// ---------------------------------------------------------------------
+// web-only projects (`webserve.json` owns the listener)
+// ---------------------------------------------------------------------
+
+/// A web-only project has no `config/server.json`: `run_web` hands
+/// `webserve.json`'s own `tls` (clientAuth included) to the same `serve` the
+/// API role uses, with paths resolving against the project root — which is
+/// also the served directory, so the key and CA bundle must stay undisclosed.
+#[tokio::test]
+async fn a_web_only_project_enforces_client_auth_from_webserve_json_and_never_serves_its_tls_files() {
+    let mut h = Harness::new();
+    // Web-only layout: TLS material beside webserve.json, no `api/` folder.
+    write_basic_tls_files(&h.root, &h.pki);
+    std::fs::write(h.root.join("index.html"), "hello from static content").unwrap();
+    std::fs::write(
+        h.root.join("webserve.json"),
+        format!(
+            r#"{{ "startPage": "index.html", "port": {}, "tls": {{ "mode": "manual", "manual": {{ "certPath": "cert.pem", "keyPath": "key.pem" }}, "clientAuth": {REQUIRED} }} }}"#,
+            h.port
+        ),
+    )
+    .unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    h.stop = Some(tx);
+    let root = h.root.clone();
+    h.task = Some(tokio::spawn(async move {
+        run_web(&root, async {
+            let _ = rx.await;
+        })
+        .await
+    }));
+    for _ in 0..100 {
+        if h.task.as_ref().unwrap().is_finished() {
+            panic!("run_web ended before listening: {:?}", h.task.take().unwrap().await);
+        }
+        if TcpStream::connect(("127.0.0.1", h.port)).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(h.get_as(None, "/").await.is_err(), "no certificate must fail the handshake on a web-only listener");
+    let valid = h.leaf(&LeafSpec::valid());
+    let wrong_ca = build_leaf(&h.pki.wrong_ca, &LeafSpec::valid());
+    assert!(
+        h.get(&h.client(Some(&wrong_ca.identity_pem())), "/").await.is_err(),
+        "a certificate from an unrelated CA must be rejected"
+    );
+
+    let client = h.client(Some(&valid.identity_pem()));
+    let (status, body) = h.get(&client, "/").await.unwrap();
+    assert_eq!((status, body.as_str()), (200, "hello from static content"));
+    for protected in ["/key.pem", "/client-ca.pem", "/cert.pem", "/webserve.json"] {
+        let (status, body) = h.get(&client, protected).await.unwrap();
+        assert_eq!(status, 404, "{protected} must not be served");
+        assert!(!body.contains("PRIVATE KEY") && !body.contains("BEGIN CERTIFICATE"), "{protected} leaked: {body}");
+    }
+}
