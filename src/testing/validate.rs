@@ -73,7 +73,7 @@ pub fn validate_corpus(files: &[LoadedTestFile], routable: &HashMap<RouteKey, En
     let mut untested: Vec<String> = routable
         .iter()
         .filter(|(route, endpoint)| !endpoint.sources.is_empty() && !files.iter().any(|f| &f.route == *route))
-        .map(|(route, _)| format!("{} {}", route.method.to_uppercase(), route.path))
+        .map(|(route, _)| format!("{} {}", crate::openapi::method_token::display_token(&route.method), route.path))
         .collect();
     untested.sort();
     for route in untested {

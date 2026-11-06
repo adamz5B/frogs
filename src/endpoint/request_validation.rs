@@ -126,9 +126,10 @@ fn validate_value(value: &Value, schema: &Value, components: &Map<String, Value>
     };
 
     if let Some(ref_str) = schema_obj.get("$ref").and_then(Value::as_str) {
-        let Some(name) = ref_str.strip_prefix("#/components/schemas/") else {
+        let Some(Ok(name)) = crate::openapi::local_ref::component_name(ref_str, "schemas") else {
             return Ok(());
         };
+        let name: &str = &name;
         let Some(component_schema) = components.get(name) else {
             return Ok(());
         };
@@ -250,12 +251,14 @@ mod tests {
         Operation {
             path: "/test".to_string(),
             method: "post".to_string(),
+            http_method: "POST".to_string(),
             operation_id: "test".to_string(),
             response_schema: None,
             parameters,
             request_body,
             response_status_codes: vec![200],
             security: None,
+            ..Default::default()
         }
     }
 
@@ -508,5 +511,172 @@ mod tests {
         let body = serde_json::json!({ "year": 2020.5 });
         let err = validate_request(&operation, &Map::new(), &HashMap::new(), &HashMap::new(), &HeaderMap::new(), &body).unwrap_err();
         assert_eq!(err.code, INVALID_TYPE);
+    }
+}
+
+#[cfg(test)]
+mod m2_media_type_ref_tests {
+    use super::*;
+
+    fn load_op(yaml: &str) -> (Operation, Map<String, Value>) {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "frogs-reqval-m2-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("openapi.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let doc = crate::openapi::load(&path, crate::openapi::LoadOptions::default()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (doc.operations[0].clone(), doc.component_schemas.clone())
+    }
+
+    fn spec(media_types: &str, request_json_entry: &str) -> String {
+        format!(
+            "openapi: 3.2.0\ninfo: {{ title: t, version: '1' }}\ncomponents:\n  mediaTypes:\n{media_types}\n  schemas:\n    Owner: {{ type: object, required: [name], properties: {{ name: {{ type: string }} }} }}\npaths:\n  /cars:\n    post:\n      operationId: createCar\n      requestBody:\n        required: true\n        content:\n          application/json: {request_json_entry}\n      responses:\n        '200': {{ description: ok }}\n"
+        )
+    }
+
+    const CAR_BODY: &str = "    CarBody: { schema: { type: object, required: [vin], properties: { vin: { type: string }, year: { type: integer } } } }";
+
+    #[test]
+    fn a_body_declared_through_a_media_type_ref_rejects_a_wrong_typed_field() {
+        let (operation, comps) = load_op(&spec(CAR_BODY, "{ $ref: '#/components/mediaTypes/CarBody' }"));
+        let body = serde_json::json!({ "vin": "V1", "year": "nineteen" });
+        let err = validate_request(&operation, &comps, &HashMap::new(), &HashMap::new(), &HeaderMap::new(), &body).unwrap_err();
+        assert_eq!(err.code, INVALID_TYPE);
+    }
+
+    #[test]
+    fn a_body_declared_through_a_media_type_ref_rejects_a_missing_required_field() {
+        let (operation, comps) = load_op(&spec(CAR_BODY, "{ $ref: '#/components/mediaTypes/CarBody' }"));
+        let body = serde_json::json!({ "year": 1999 });
+        assert!(validate_request(&operation, &comps, &HashMap::new(), &HashMap::new(), &HeaderMap::new(), &body).is_err());
+    }
+
+    #[test]
+    fn a_body_declared_through_a_media_type_ref_accepts_a_valid_payload() {
+        let (operation, comps) = load_op(&spec(CAR_BODY, "{ $ref: '#/components/mediaTypes/CarBody' }"));
+        let body = serde_json::json!({ "vin": "V1", "year": 1999 });
+        assert!(validate_request(&operation, &comps, &HashMap::new(), &HashMap::new(), &HeaderMap::new(), &body).is_ok());
+    }
+
+    #[test]
+    fn an_unresolved_required_body_still_rejects_a_missing_body_but_accepts_any_present_one() {
+        let (operation, comps) = load_op(&spec(CAR_BODY, "{ $ref: '#/components/mediaTypes/Missing' }"));
+        assert!(operation.request_body_unresolved.is_some());
+        let missing = validate_request(&operation, &comps, &HashMap::new(), &HashMap::new(), &HeaderMap::new(), &Value::Null);
+        assert!(missing.is_err(), "presence of a required body is still enforced");
+        let any_shape = serde_json::json!({ "whatever": [1, 2, 3] });
+        assert!(validate_request(&operation, &comps, &HashMap::new(), &HashMap::new(), &HeaderMap::new(), &any_shape).is_ok());
+    }
+
+    #[test]
+    fn a_content_only_integer_parameter_is_now_type_checked() {
+        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  mediaTypes:\n    I: { schema: { type: integer } }\npaths:\n  /cars:\n    get:\n      operationId: l\n      parameters:\n        - { name: limit, in: query, content: { application/json: { $ref: '#/components/mediaTypes/I' } } }\n      responses:\n        '200': { description: ok }\n";
+        let (operation, comps) = load_op(yaml);
+        let bad = HashMap::from([("limit".to_string(), "abc".to_string())]);
+        assert_eq!(
+            validate_request(&operation, &comps, &HashMap::new(), &bad, &HeaderMap::new(), &Value::Null)
+                .unwrap_err()
+                .code,
+            INVALID_TYPE
+        );
+        let good = HashMap::from([("limit".to_string(), "5".to_string())]);
+        assert!(validate_request(&operation, &comps, &HashMap::new(), &good, &HeaderMap::new(), &Value::Null).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod m6_ref_tests {
+    use super::*;
+
+    fn load_doc(components: &str, operation: &str) -> crate::openapi::OpenApiDocument {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "frogs-reqval-m6-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("openapi.yaml");
+        std::fs::write(
+            &path,
+            format!("openapi: 3.2.0\ninfo: {{ title: t, version: '1' }}\ncomponents:\n{components}paths:\n  /cars:\n    post:\n      operationId: createCar\n{operation}      responses:\n        '200': {{ description: ok }}\n"),
+        )
+        .unwrap();
+        let doc = crate::openapi::load(&path, crate::openapi::LoadOptions::default()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        doc
+    }
+
+    fn check(doc: &crate::openapi::OpenApiDocument, query: &[(&str, &str)], body: &Value) -> Result<(), ValidationProblem> {
+        let query: HashMap<String, String> = query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        validate_request(&doc.operations[0], &doc.component_schemas, &HashMap::new(), &query, &HeaderMap::new(), body)
+    }
+
+    #[test]
+    fn a_required_query_parameter_declared_through_a_parameter_ref_is_enforced() {
+        let doc = load_doc(
+            "  parameters:\n    Limit: { name: limit, in: query, required: true, schema: { type: integer } }\n",
+            "      parameters:\n        - $ref: '#/components/parameters/Limit'\n",
+        );
+        assert_eq!(check(&doc, &[], &Value::Null).unwrap_err().code, MISSING_PARAMETER);
+        assert_eq!(check(&doc, &[("limit", "abc")], &Value::Null).unwrap_err().code, INVALID_TYPE);
+        assert!(check(&doc, &[("limit", "5")], &Value::Null).is_ok());
+    }
+
+    #[test]
+    fn a_required_body_declared_through_a_request_body_ref_is_enforced_and_its_shape_checked() {
+        let doc = load_doc(
+            "  requestBodies:\n    Car: { required: true, content: { application/json: { schema: { type: object, required: [make], properties: { make: { type: string } } } } } }\n",
+            "      requestBody: { $ref: '#/components/requestBodies/Car' }\n",
+        );
+        assert!(check(&doc, &[], &Value::Null).is_err(), "required body must not be absent");
+        assert!(check(&doc, &[], &serde_json::json!({})).is_err());
+        assert!(check(&doc, &[], &serde_json::json!({ "make": "vw" })).is_ok());
+    }
+
+    #[test]
+    fn an_unresolved_request_body_ref_still_requires_a_body_to_be_present() {
+        let doc = load_doc("", "      requestBody: { $ref: '#/components/requestBodies/Gone' }\n");
+        assert!(check(&doc, &[], &Value::Null).is_err(), "fail closed: presence of the body is still enforced");
+        assert!(check(&doc, &[], &serde_json::json!({ "anything": 1 })).is_ok());
+    }
+
+    #[test]
+    fn an_unresolved_parameter_ref_leaves_nothing_to_enforce_and_the_operation_records_it() {
+        let doc = load_doc("", "      parameters:\n        - $ref: '#/components/parameters/Gone'\n");
+        assert!(check(&doc, &[], &Value::Null).is_ok());
+        assert_eq!(doc.operations[0].unresolved_parameter_refs, vec!["#/components/parameters/Gone".to_string()]);
+    }
+
+    #[test]
+    fn a_body_schema_ref_with_an_escaped_slash_is_followed_to_the_component_with_a_slash_in_its_name() {
+        let doc = load_doc(
+            "  schemas:\n    a/b: { type: object, required: [id], properties: { id: { type: integer } } }\n",
+            "      requestBody:\n        required: true\n        content:\n          application/json: { schema: { $ref: '#/components/schemas/a~1b' } }\n",
+        );
+        assert!(
+            check(&doc, &[], &serde_json::json!({})).is_err(),
+            "the referenced object's required property must be enforced"
+        );
+        assert!(check(&doc, &[], &serde_json::json!({ "id": 1 })).is_ok());
+        assert!(check(&doc, &[], &serde_json::json!({ "id": "x" })).is_err());
+    }
+
+    #[test]
+    fn a_body_schema_ref_with_a_bad_escape_or_a_deep_pointer_stays_permissive_like_any_unknown_ref() {
+        for reference in ["#/components/schemas/a~2b", "#/components/schemas/a/properties"] {
+            let doc = load_doc(
+                "  schemas:\n    a: { type: object, required: [id] }\n",
+                &format!("      requestBody:\n        required: true\n        content:\n          application/json: {{ schema: {{ $ref: '{reference}' }} }}\n"),
+            );
+            assert!(check(&doc, &[], &serde_json::json!({})).is_ok(), "{reference}");
+        }
     }
 }

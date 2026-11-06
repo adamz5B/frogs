@@ -4,25 +4,34 @@ mod format;
 pub(crate) mod mock;
 mod request_validation;
 mod resolve;
+pub(crate) mod route_plan;
+#[cfg(test)]
+mod route_plan_tests;
 mod schema;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Extension, Path as AxumPath, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{MethodRouter, any, delete, get, patch, post, put};
 use axum::{Json, Router};
 
 use crate::config::ConnectionConfig;
 use crate::errors::{DiscoveredErrors, ErrorRegistry};
-use crate::openapi::Operation;
+#[cfg(test)]
+use crate::openapi::endpoint_tree::tree_for_tests;
+use crate::openapi::endpoint_tree::{EndpointTree, parse_error_summary};
+use crate::openapi::method_token::{self, MethodCase, TokenStatus};
+use crate::openapi::route_syntax::axum_style as axum_style_path;
+use crate::openapi::{Operation, ResponseMode};
 use crate::security::{ClientCertIdentity, SecurityConfig, VerifierCache};
 use crate::server::RequestId;
 use crate::sql::SqlDriver;
+use route_plan::{BuiltinRemedy, EntryStatus, InventoryEntry, RouteContext, RouteInventory, RouteKind, RoutePlan};
 use serde_json::{Map, Value};
 
 /// Re-exported for `testing`, the only other module that needs to reach
@@ -39,11 +48,6 @@ use mock::{InboundRequest, MockProvider, MockSelection, RouteKey, Served};
 pub(crate) use resolve::{MockOutcome, nested_many_parent};
 use schema::{Cardinality, ErrorOverride};
 pub(crate) use schema::{EndpointFile, SourceDef};
-
-/// The HTTP methods frogs actually routes — an `endpoint.<method>.json`
-/// file for anything else (or one of OpenAPI's non-request-body-shaped
-/// verbs like `options`/`head`/`trace`) is never discovered as a route.
-const ROUTABLE_METHODS: &[&str] = &["get", "post", "put", "patch", "delete"];
 
 /// Everything one route's handler needs, baked in at startup so the handler
 /// function itself can stay generic and shared across every route.
@@ -94,10 +98,38 @@ struct RouteState {
     /// (see `mock::MockProvider`). `frogs run` always passes `None`, so its
     /// request path is byte-for-byte the pre-mock-server one.
     mock_provider: Option<Arc<dyn MockProvider>>,
+    /// Copied from the matched `openapi.yaml` operation (`Single` when there
+    /// is none). Only ever a seam today: every mode is served as one JSON
+    /// response.
+    response_mode: ResponseMode,
 }
 
-/// Scans `datasources/endpoints/` for `endpoint.<method>.json` files (one
-/// of `ROUTABLE_METHODS`) and registers one axum route per file found.
+/// Whether an endpoint file declares the top-level `"stream"` key, which is
+/// reserved for streaming support this version doesn't have. Presence is
+/// enough (a `null` value counts); nested `stream` keys don't.
+pub(crate) fn has_reserved_stream_key(contents: &str) -> bool {
+    serde_json::from_str::<Value>(contents).is_ok_and(|v| v.as_object().is_some_and(|obj| obj.contains_key("stream")))
+}
+
+pub(crate) fn reserved_stream_key_files(tree: &EndpointTree, mode: MethodCase) -> Vec<PathBuf> {
+    discover_endpoint_files(tree, mode)
+        .into_iter()
+        .filter(|(_, _, file_path)| std::fs::read_to_string(file_path).is_ok_and(|contents| has_reserved_stream_key(&contents)))
+        .map(|(_, _, file_path)| file_path)
+        .collect()
+}
+
+/// Parses an endpoint file's JSON. A file reached through a link may be
+/// arbitrary bytes from elsewhere on disk, so its failure is reported by
+/// position and category only — serde's own message can quote the content.
+pub(crate) fn parse_endpoint_json(contents: &str, via_link: bool) -> Result<EndpointFile, String> {
+    serde_json::from_str(contents).map_err(|e| if via_link { parse_error_summary(&e) } else { format!("invalid JSON: {e}") })
+}
+
+/// Registers one axum route per distinct path for the `endpoint.<method>.json`
+/// files (one of `method_token::ROUTABLE_FIXED`) in `endpoint_tree`, the scan
+/// of `datasources/endpoints/` the caller already made and reported on (QUERY
+/// lives in a per-path dispatch table, see `dispatch_extension`).
 /// `drivers` is already `Arc`-wrapped by the caller (`commands::run`), not
 /// built fresh here, so the same connection pool can be shared with
 /// `server::router`'s `/readyz` check rather than each holding its own copy.
@@ -108,6 +140,7 @@ struct RouteState {
 #[allow(clippy::too_many_arguments)]
 pub fn build_router(
     project_root: &Path,
+    endpoint_tree: &EndpointTree,
     drivers: Arc<HashMap<String, Box<dyn SqlDriver>>>,
     connections: &HashMap<String, ConnectionConfig>,
     errors: Arc<ErrorRegistry>,
@@ -132,10 +165,12 @@ pub fn build_router(
     // it could never succeed, and "no certificate required" must never be
     // what an unreachable cert-dependent route silently degrades to.
     client_identity_available: bool,
+    // Must agree with how `openapi_document` (if any) was loaded; the caller
+    // (`commands::run::assemble_api_router`) refuses a mismatch.
+    method_case: MethodCase,
 ) -> Router {
     let sql_root = project_root.join("datasources/sql");
     let http_root = project_root.join("datasources/http");
-    let endpoints_root = project_root.join("datasources/endpoints");
     let discovered_errors_path = project_root.join("config/errors.discovered.json");
     // One shared client for every route — reuses connection pooling across
     // requests instead of paying a fresh-connection cost per call.
@@ -143,128 +178,344 @@ pub fn build_router(
     let verifier_cache = Arc::new(VerifierCache::new());
     let component_schemas = Arc::new(openapi_document.map(|doc| doc.component_schemas.clone()).unwrap_or_default());
 
+    for finding in method_file_findings(endpoint_tree, method_case) {
+        tracing::warn!("{}", finding.message(method_case));
+    }
+
+    let inventory = route_inventory(endpoint_tree, method_case);
+    let plan = RoutePlan::from_inventory(&inventory, &RouteContext::endpoints_only());
+    for problem in plan.refusals(true) {
+        tracing::error!("route table: {}", problem.message());
+    }
+    let unavailable = Arc::new(UnavailableState { errors: errors.clone() });
+
+    let mut by_path: BTreeMap<String, PathRoutes> = BTreeMap::new();
+    for entry in &inventory.entries {
+        let (url_path, method, file_path, wire) = (&entry.url_path, &entry.token, &entry.file, entry.wire.as_str());
+        match &entry.status {
+            EntryStatus::NotRouted(reason) => {
+                tracing::warn!("skipping {}: {reason}", crate::openapi::untrusted(&file_path.display().to_string()));
+                continue;
+            }
+            EntryStatus::Duplicate => {
+                tracing::warn!(
+                    "skipping {}: {wire} {} is already registered by another endpoint file",
+                    crate::openapi::untrusted(&file_path.display().to_string()),
+                    crate::openapi::untrusted(url_path)
+                );
+                continue;
+            }
+            EntryStatus::Routed => {}
+        }
+        if plan.is_excluded(url_path) {
+            tracing::error!(
+                "not serving {}: {wire} {} is part of a route-table problem (see the error above)",
+                crate::openapi::untrusted(&file_path.display().to_string()),
+                crate::openapi::untrusted(url_path)
+            );
+            continue;
+        }
+        let Some(kind) = entry.kind.clone() else { continue };
+        let via_link = endpoint_tree.is_via_link(file_path);
+        let built: Result<MethodRouter<()>, String> = (|| {
+            let contents = std::fs::read_to_string(file_path).map_err(|e| e.to_string())?;
+            let endpoint: EndpointFile = parse_endpoint_json(&contents, via_link)?;
+
+            // A declared scheme that `security/schemes.json` doesn't actually
+            // define is a config mistake — fail closed by refusing to serve
+            // the route at all rather than accidentally leaving it open, the
+            // same "skip with a loud warning" posture used for a malformed
+            // endpoint file above.
+            if let Some(scheme) = &endpoint.security
+                && !security.verifiers.contains_key(scheme)
+            {
+                return Err(format!("security scheme '{scheme}' has no matching entry in security/schemes.json"));
+            }
+
+            if let Some(scheme) = &endpoint.security
+                && let Some(verifier) = security.verifiers.get(scheme)
+                && verifier.requires_client_cert()
+                && !client_identity_available
+            {
+                return Err(format!(
+                    "security scheme '{scheme}' needs a client certificate, but this server's TLS listener doesn't request one \
+                 (set tls.mode to \"manual\" and enable tls.clientAuth in config/server.json)"
+                ));
+            }
+
+            let mut source_problems = validate_nested_many(&endpoint, connections);
+            source_problems.extend(validate_source_call_timeout(&endpoint));
+            if !source_problems.is_empty() {
+                return Err(source_problems.join("; "));
+            }
+
+            tracing::info!("{wire} {url_path} -> {} (operationId: {})", file_path.display(), endpoint.operation_id);
+
+            if has_reserved_stream_key(&contents) {
+                tracing::warn!(
+                    "{}: \"stream\" is reserved for streaming responses, which this frogs version does not implement — serving a single JSON response",
+                    file_path.display()
+                );
+            }
+
+            let operation = openapi_document.and_then(|doc| find_operation(doc, url_path, method));
+            if openapi_document.is_some() && operation.is_none() {
+                tracing::warn!(
+                    "{}: no matching operation found in openapi.yaml — request validation skipped for this route",
+                    file_path.display()
+                );
+            }
+            if let Some(op) = operation {
+                if let ResponseMode::Stream(spec) = &op.response_mode {
+                    tracing::warn!(
+                        "{wire} {url_path}: declares a streaming response ({}); frogs does not serve streaming responses — serving a single JSON response",
+                        crate::openapi::untrusted(&spec.media_type)
+                    );
+                }
+                if let Some(reason) = &op.request_body_unresolved {
+                    tracing::warn!("{wire} {url_path}: request body schema unresolved ({reason}) — body validation skipped for this route");
+                }
+                if !op.unresolved_parameter_refs.is_empty() {
+                    tracing::warn!(
+                        "{wire} {url_path}: openapi.yaml declares parameter(s) frogs could not resolve ({}) — request validation for this route is incomplete",
+                        unresolved_parameter_ref_list(&op.unresolved_parameter_refs)
+                    );
+                }
+            }
+            let response_mode = operation.map(|op| op.response_mode.clone()).unwrap_or_default();
+
+            // Each route gets its own `RouteState` baked in via `with_state` —
+            // this is what lets one shared `handle_request` function serve
+            // every endpoint file: axum's `State` extractor pulls out whichever
+            // `Arc<RouteState>` this particular route was registered with.
+            let state = Arc::new(RouteState {
+                endpoint,
+                route: RouteKey {
+                    method: method.clone(),
+                    path: mock::openapi_style_path(url_path),
+                },
+                sql_root: sql_root.clone(),
+                http_root: http_root.clone(),
+                drivers: drivers.clone(),
+                http_client: http_client.clone(),
+                errors: errors.clone(),
+                security: security.clone(),
+                services: services.clone(),
+                verifier_cache: verifier_cache.clone(),
+                discovered_errors: discovered_errors.clone(),
+                discovered_errors_path: discovered_errors_path.clone(),
+                debug_mode,
+                operation: operation.cloned(),
+                component_schemas: component_schemas.clone(),
+                source_call_timeout_ms,
+                mock_provider: mock_provider.clone(),
+                response_mode,
+            });
+            // Read back out before `state` moves into `.with_state` below —
+            // this endpoint's own `rateLimit`, if it declared one, gets its own
+            // dedicated bucket layered onto just this route (in addition to,
+            // not instead of, the global bucket `apply_rate_limit` applies to
+            // the whole router in `commands::run`).
+            let rate_limit_override = state.endpoint.rate_limit.clone();
+
+            let mut method_router: MethodRouter<()> = match &kind {
+                RouteKind::Standard(Method::GET) => get(handle_request).with_state(state),
+                RouteKind::Standard(Method::POST) => post(handle_request).with_state(state),
+                RouteKind::Standard(Method::PUT) => put(handle_request).with_state(state),
+                RouteKind::Standard(Method::PATCH) => patch(handle_request).with_state(state),
+                RouteKind::Standard(Method::DELETE) => delete(handle_request).with_state(state),
+                _ => any(handle_request).with_state(state),
+            };
+            if let Some(rate_limit) = rate_limit_override {
+                let limiter = Arc::new(crate::server::RateLimiter::new(rate_limit.requests_per_second, rate_limit.burst));
+                method_router = crate::server::apply_rate_limit_to_route(method_router, limiter);
+            }
+            Ok(method_router)
+        })();
+
+        // A file that can't be served keeps its slot with a 503, so its requests can't fall through to a sibling `{param}` route.
+        let method_router = match built {
+            Ok(method_router) => method_router,
+            Err(message) => {
+                tracing::warn!(
+                    "skipping {}: {} — answering 503 so requests can't fall through to another route",
+                    crate::openapi::untrusted(&file_path.display().to_string()),
+                    crate::openapi::untrusted(&message)
+                );
+                match &kind {
+                    RouteKind::Standard(Method::GET) => get(handle_unavailable).with_state(unavailable.clone()),
+                    RouteKind::Standard(Method::POST) => post(handle_unavailable).with_state(unavailable.clone()),
+                    RouteKind::Standard(Method::PUT) => put(handle_unavailable).with_state(unavailable.clone()),
+                    RouteKind::Standard(Method::PATCH) => patch(handle_unavailable).with_state(unavailable.clone()),
+                    RouteKind::Standard(Method::DELETE) => delete(handle_unavailable).with_state(unavailable.clone()),
+                    _ => any(handle_unavailable).with_state(unavailable.clone()),
+                }
+            }
+        };
+
+        let routes = by_path.entry(url_path.clone()).or_default();
+        match kind {
+            RouteKind::Standard(_) => {
+                routes.standard_names.push(wire.to_string());
+                routes.standard = Some(match routes.standard.take() {
+                    Some(existing) => existing.merge(method_router),
+                    None => method_router,
+                });
+            }
+            RouteKind::Extension(wire_method) => {
+                routes.table.insert(wire_method, method_router);
+            }
+        }
+    }
+
+    // axum merges per-path method routers but rejects a second fallback, so the
+    // extension-method dispatcher can only be attached once everything for the
+    // path is merged — hence one `router.route` per path, not per file.
     let mut router = Router::new();
-    for (url_path, method, file_path) in discover_endpoint_files(&endpoints_root) {
-        let contents = match std::fs::read_to_string(&file_path) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("skipping {}: {e}", file_path.display());
-                continue;
-            }
-        };
-        let endpoint: EndpointFile = match serde_json::from_str(&contents) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!("skipping {}: invalid JSON: {e}", file_path.display());
-                continue;
-            }
-        };
-
-        // A declared scheme that `security/schemes.json` doesn't actually
-        // define is a config mistake — fail closed by refusing to serve
-        // the route at all rather than accidentally leaving it open, the
-        // same "skip with a loud warning" posture used for a malformed
-        // endpoint file above.
-        if let Some(scheme) = &endpoint.security
-            && !security.verifiers.contains_key(scheme)
-        {
-            tracing::warn!(
-                "skipping {}: security scheme '{scheme}' has no matching entry in security/schemes.json",
-                file_path.display()
-            );
-            continue;
+    for (url_path, routes) in by_path {
+        let PathRoutes { standard, standard_names, table } = routes;
+        let mut combined = standard.unwrap_or_default();
+        if !table.is_empty() {
+            let allow = allow_header_value(&standard_names, &table);
+            let table = Arc::new(table);
+            combined = combined.fallback(move |req: axum::extract::Request| dispatch_extension(table.clone(), allow.clone(), req));
         }
-
-        if let Some(scheme) = &endpoint.security
-            && let Some(verifier) = security.verifiers.get(scheme)
-            && verifier.requires_client_cert()
-            && !client_identity_available
-        {
-            tracing::warn!(
-                "skipping {}: security scheme '{scheme}' needs a client certificate, but this server's TLS listener doesn't request one \
-                 (set tls.mode to \"manual\" and enable tls.clientAuth in config/server.json)",
-                file_path.display()
-            );
-            continue;
-        }
-
-        let mut source_problems = validate_nested_many(&endpoint, connections);
-        source_problems.extend(validate_source_call_timeout(&endpoint));
-        if !source_problems.is_empty() {
-            for problem in &source_problems {
-                tracing::warn!("skipping {}: {problem}", file_path.display());
-            }
-            continue;
-        }
-
-        tracing::info!(
-            "{} {url_path} -> {} (operationId: {})",
-            method.to_uppercase(),
-            file_path.display(),
-            endpoint.operation_id
-        );
-
-        let operation = openapi_document.and_then(|doc| find_operation(doc, &url_path, &method));
-        if openapi_document.is_some() && operation.is_none() {
-            tracing::warn!(
-                "{}: no matching operation found in openapi.yaml — request validation skipped for this route",
-                file_path.display()
-            );
-        }
-
-        // Each route gets its own `RouteState` baked in via `with_state` —
-        // this is what lets one shared `handle_request` function serve
-        // every endpoint file: axum's `State` extractor pulls out whichever
-        // `Arc<RouteState>` this particular route was registered with.
-        let state = Arc::new(RouteState {
-            endpoint,
-            route: RouteKey {
-                method: method.clone(),
-                path: mock::openapi_style_path(&url_path),
-            },
-            sql_root: sql_root.clone(),
-            http_root: http_root.clone(),
-            drivers: drivers.clone(),
-            http_client: http_client.clone(),
-            errors: errors.clone(),
-            security: security.clone(),
-            services: services.clone(),
-            verifier_cache: verifier_cache.clone(),
-            discovered_errors: discovered_errors.clone(),
-            discovered_errors_path: discovered_errors_path.clone(),
-            debug_mode,
-            operation: operation.cloned(),
-            component_schemas: component_schemas.clone(),
-            source_call_timeout_ms,
-            mock_provider: mock_provider.clone(),
-        });
-        // Read back out before `state` moves into `.with_state` below —
-        // this endpoint's own `rateLimit`, if it declared one, gets its own
-        // dedicated bucket layered onto just this route (in addition to,
-        // not instead of, the global bucket `apply_rate_limit` applies to
-        // the whole router in `commands::run`).
-        let rate_limit_override = state.endpoint.rate_limit.clone();
-
-        // `Router::route` merges method routers registered for the same
-        // path across separate calls (a GET and a PUT on the same path
-        // each get their own call here), so looping one method at a time
-        // is enough — it doesn't overwrite a sibling method already
-        // registered for this same `url_path`.
-        let mut method_router = match method.as_str() {
-            "get" => get(handle_request).with_state(state),
-            "post" => post(handle_request).with_state(state),
-            "put" => put(handle_request).with_state(state),
-            "patch" => patch(handle_request).with_state(state),
-            "delete" => delete(handle_request).with_state(state),
-            other => unreachable!("discover_endpoint_files only yields ROUTABLE_METHODS, got '{other}'"),
-        };
-        if let Some(rate_limit) = rate_limit_override {
-            let limiter = Arc::new(crate::server::RateLimiter::new(rate_limit.requests_per_second, rate_limit.burst));
-            method_router = crate::server::apply_rate_limit_to_route(method_router, limiter);
-        }
-        router = router.route(&url_path, method_router);
+        router = router.route(&crate::openapi::route_syntax::axum_registration_path(&url_path), combined);
     }
     router
+}
+
+/// Every endpoint file the tree holds, decided once the way `build_router`
+/// registers it: the plan and the router both read this, so they can't diverge.
+/// A duplicate wire on one path keeps the first file in discovery order.
+pub(crate) fn route_inventory(tree: &EndpointTree, mode: MethodCase) -> RouteInventory {
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+    for (url_path, token_text, file) in discover_endpoint_files(tree, mode) {
+        let segments: Vec<String> = file
+            .parent()
+            .and_then(|dir| dir.strip_prefix(tree.endpoints_root()).ok())
+            .map(|relative| relative.components().filter_map(|c| c.as_os_str().to_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let mut entry = InventoryEntry {
+            url_path: url_path.clone(),
+            token: token_text.clone(),
+            wire: String::new(),
+            kind: None,
+            file,
+            segments,
+            status: EntryStatus::Routed,
+        };
+        let TokenStatus::Valid(token) = method_token::parse_file_token(&token_text, mode) else {
+            entry.status = EntryStatus::NotRouted("not a method frogs routes".to_string());
+            entries.push(entry);
+            continue;
+        };
+        entry.wire = token.wire().into_owned();
+        entry.kind = match token.standard_method() {
+            Some(method) => Some(RouteKind::Standard(method)),
+            None => match Method::from_bytes(entry.wire.as_bytes()) {
+                Ok(method) => Some(RouteKind::Extension(method)),
+                Err(_) => {
+                    entry.status = EntryStatus::NotRouted(format!("{} is not a valid HTTP method", crate::openapi::untrusted(&entry.wire)));
+                    None
+                }
+            },
+        };
+        if entry.status == EntryStatus::Routed && !seen.insert((url_path, entry.wire.clone())) {
+            entry.status = EntryStatus::Duplicate;
+        }
+        entries.push(entry);
+    }
+    RouteInventory { entries }
+}
+
+/// The NFC spellings of every non-ASCII literal segment among the routed endpoint
+/// folders: what `ServeShape` lets a differently-normalised request spelling be
+/// rewritten to (parameter segments are never in it).
+pub(crate) fn canonical_literal_set(inventory: &RouteInventory) -> std::collections::BTreeSet<String> {
+    inventory
+        .entries
+        .iter()
+        .filter(|entry| entry.status == EntryStatus::Routed)
+        .flat_map(|entry| entry.url_path.split('/'))
+        .filter(|segment| !segment.starts_with(':'))
+        .filter_map(crate::openapi::path_encoding::nfc_literal_key)
+        .collect()
+}
+
+/// What a skipped (unservable) endpoint file answers instead of letting its
+/// requests fall through to another route. Holds only the registry: it reads
+/// `endpoint.unavailable` if the project defines it, never records a
+/// discovered error, and never echoes file content.
+struct UnavailableState {
+    errors: Arc<ErrorRegistry>,
+}
+
+async fn handle_unavailable(State(state): State<Arc<UnavailableState>>) -> Response {
+    let (status, expose_detail) = match state.errors.get("endpoint.unavailable") {
+        Some(definition) => (definition.http_status, definition.expose_detail),
+        None => (503, false),
+    };
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+    let mut body = serde_json::json!({ "code": status.as_u16(), "name": "endpoint.unavailable" });
+    if expose_detail {
+        body["detail"] = Value::String("this endpoint is configured but could not be loaded".to_string());
+    }
+    (status, Json(body)).into_response()
+}
+
+#[derive(Default)]
+struct PathRoutes {
+    standard: Option<MethodRouter<()>>,
+    standard_names: Vec<String>,
+    table: HashMap<Method, MethodRouter<()>>,
+}
+
+/// Same comma-separated, no-space format axum builds for its own `Allow`.
+/// Never OPTIONS: frogs doesn't route it.
+fn allow_header_value(standard_names: &[String], table: &HashMap<Method, MethodRouter<()>>) -> HeaderValue {
+    let has = |name: &str| standard_names.iter().any(|n| n == name);
+    let mut parts: Vec<String> = Vec::new();
+    for name in ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"] {
+        let present = if name == "HEAD" { has("GET") } else { has(name) };
+        if present {
+            parts.push(name.to_string());
+        }
+    }
+    let mut extension: Vec<&str> = table.keys().map(Method::as_str).collect();
+    extension.sort_unstable();
+    parts.extend(extension.into_iter().map(str::to_string));
+    HeaderValue::from_str(&parts.join(",")).unwrap_or_else(|_| HeaderValue::from_static(""))
+}
+
+/// Serves the methods axum's `MethodFilter` can't express (QUERY today). The
+/// lookup is an exact, case-sensitive match on the method as it reached the
+/// router; the request is handed on untouched and its body is never read here.
+async fn dispatch_extension(table: Arc<HashMap<Method, MethodRouter<()>>>, allow: HeaderValue, req: axum::extract::Request) -> Response {
+    use tower_service::Service;
+
+    let Some(entry) = table.get(req.method()) else {
+        let mut response = Response::new(axum::body::Body::empty());
+        *response.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+        response.headers_mut().insert(header::ALLOW, allow);
+        return response;
+    };
+    let mut service = entry.clone();
+    let ready = std::future::poll_fn(|cx| Service::<axum::extract::Request>::poll_ready(&mut service, cx)).await;
+    let mut response = match ready {
+        Ok(()) => match service.call(req).await {
+            Ok(response) => response,
+            Err(infallible) => match infallible {},
+        },
+        Err(infallible) => match infallible {},
+    };
+    // axum's per-path fallback fills in a partial (or empty) Allow on every
+    // response that lacks one, 200s included — set the full list ourselves.
+    if !response.headers().contains_key(header::ALLOW) {
+        response.headers_mut().insert(header::ALLOW, allow);
+    }
+    response
 }
 
 /// Parses every discovered endpoint file and reports problems without
@@ -276,16 +527,18 @@ pub fn build_router(
 /// is small enough that duplicating it here stays cheaper than
 /// restructuring `build_router` to serve both callers.
 pub(crate) fn validate_endpoint_files(
-    endpoints_root: &Path,
+    endpoint_tree: &EndpointTree,
     security: &SecurityConfig,
     connections: &HashMap<String, ConnectionConfig>,
     client_identity_available: bool,
+    mode: MethodCase,
 ) -> (usize, Vec<String>) {
-    let discovered = discover_endpoint_files(endpoints_root);
+    let discovered = discover_endpoint_files(endpoint_tree, mode);
     let count = discovered.len();
     let mut problems = Vec::new();
 
     for (_, _, file_path) in discovered {
+        let via_link = endpoint_tree.is_via_link(&file_path);
         let contents = match std::fs::read_to_string(&file_path) {
             Ok(c) => c,
             Err(e) => {
@@ -293,10 +546,10 @@ pub(crate) fn validate_endpoint_files(
                 continue;
             }
         };
-        let endpoint: EndpointFile = match serde_json::from_str(&contents) {
+        let endpoint: EndpointFile = match parse_endpoint_json(&contents, via_link) {
             Ok(e) => e,
-            Err(e) => {
-                problems.push(format!("{}: invalid JSON: {e}", file_path.display()));
+            Err(message) => {
+                problems.push(format!("{}: {message}", file_path.display()));
                 continue;
             }
         };
@@ -552,6 +805,22 @@ async fn handle_request(
     let transaction_id = transaction_id.map(|Extension(RequestId(id))| id).unwrap_or_default();
     let client_cert = client_cert.map(|Extension(identity)| identity);
 
+    match &state.response_mode {
+        ResponseMode::Single => respond_single(&state, &headers, client_cert.as_deref(), &path_params, &query_params, &body, &transaction_id).await,
+        // The seam for a future stream executor; today a declared stream is still one JSON response.
+        ResponseMode::Stream(_) => respond_single(&state, &headers, client_cert.as_deref(), &path_params, &query_params, &body, &transaction_id).await,
+    }
+}
+
+async fn respond_single(
+    state: &RouteState,
+    headers: &HeaderMap,
+    client_cert: Option<&ClientCertIdentity>,
+    path_params: &HashMap<String, String>,
+    query_params: &HashMap<String, String>,
+    body: &Value,
+    transaction_id: &str,
+) -> Response {
     let (http_status, response_body) = match &state.mock_provider {
         None => {
             resolve_request(
@@ -567,12 +836,12 @@ async fn handle_request(
                 &state.discovered_errors_path,
                 state.debug_mode,
                 &state.verifier_cache,
-                &headers,
-                client_cert.as_deref(),
-                &path_params,
-                &query_params,
-                &body,
-                &transaction_id,
+                headers,
+                client_cert,
+                path_params,
+                query_params,
+                body,
+                transaction_id,
                 &HashMap::new(),
                 state.operation.as_ref(),
                 &state.component_schemas,
@@ -580,19 +849,7 @@ async fn handle_request(
             )
             .await
         }
-        Some(provider) => {
-            handle_mocked(
-                &state,
-                provider.as_ref(),
-                &headers,
-                client_cert.as_deref(),
-                &path_params,
-                &query_params,
-                &body,
-                &transaction_id,
-            )
-            .await
-        }
+        Some(provider) => handle_mocked(state, provider.as_ref(), headers, client_cert, path_params, query_params, body, transaction_id).await,
     };
 
     let status = StatusCode::from_u16(http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1107,39 +1364,88 @@ fn record_discovered_error(discovered_errors: &Mutex<DiscoveredErrors>, path: &P
     }
 }
 
-pub(crate) fn discover_endpoint_files(root: &Path) -> Vec<(String, String, PathBuf)> {
-    let mut out = Vec::new();
-    walk(root, root, &mut out);
-    out
+/// Routable files only; `_backups/` and links the policy refuses never reach
+/// the tree, so nothing here touches the filesystem.
+pub(crate) fn discover_endpoint_files(tree: &EndpointTree, mode: MethodCase) -> Vec<(String, String, PathBuf)> {
+    tree.files()
+        .iter()
+        .filter_map(|file| {
+            let method = routable_method(&file.logical, mode)?;
+            let url_path = url_path_for(tree.endpoints_root(), &file.logical)?;
+            Some((url_path, method, file.logical.clone()))
+        })
+        .collect()
 }
 
-fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String, PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            // `_backups/` holds history, not live config — never routable.
-            if path.file_name().and_then(|n| n.to_str()) == Some("_backups") {
-                continue;
-            }
-            walk(root, &path, out);
-        } else if let Some(method) = routable_method(&path)
-            && let Some(url_path) = url_path_for(root, &path)
-        {
-            out.push((url_path, method.to_string(), path.clone()));
+/// The file token of an `endpoint.<token>.json` file whose token is valid and
+/// routable under `mode` — `None` for a `.reference.json`/`.test.json`
+/// sibling (whose token segment would contain a `.`), an underscore-prefixed
+/// orphaned file, a non-canonical or wrong-mode extension token, a case
+/// variant like `endpoint.GET.json`, or a currently-unrouted method like
+/// `options`/`head`/`trace`.
+fn routable_method(path: &Path, mode: MethodCase) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let token_text = method_token::stub_file_token(name)?;
+    let TokenStatus::Valid(token) = method_token::parse_file_token(token_text, mode) else {
+        return None;
+    };
+    method_token::is_routable(&token).then(|| token_text.to_string())
+}
+
+pub(crate) enum MethodFileKind {
+    /// Not a canonical token for any method: never served.
+    NonCanonical { hint: Option<String> },
+    /// A canonical token that only means a method under the other `caseSensitiveMethods` setting.
+    WrongMode { wire: String },
+}
+
+#[allow(dead_code)] // url_path/token are part of the finding for callers that group by route
+pub(crate) struct MethodFileFinding {
+    pub file: PathBuf,
+    pub url_path: String,
+    pub token: String,
+    pub kind: MethodFileKind,
+}
+
+impl MethodFileFinding {
+    pub(crate) fn message(&self, mode: MethodCase) -> String {
+        let file = crate::openapi::untrusted(&self.file.display().to_string());
+        match &self.kind {
+            MethodFileKind::NonCanonical { hint: Some(hint) } => format!("{file} is not served; rename it to endpoint.{hint}.json"),
+            MethodFileKind::NonCanonical { hint: None } => format!("{file} is not served: its name is not a canonical method token"),
+            MethodFileKind::WrongMode { wire } => format!(
+                "skipping {file}: method '{}' is case-distinct, but caseSensitiveMethods is {} — this file was generated under the other setting",
+                crate::openapi::method_token::untrusted_short(wire),
+                mode.case_sensitive()
+            ),
         }
     }
 }
 
-/// The HTTP method an `endpoint.<method>.json` file represents, if it's one
-/// of `ROUTABLE_METHODS` — `None` for a `.reference.json`/`.test.json`
-/// sibling (whose "method" segment would contain a `.` after stripping),
-/// an underscore-prefixed orphaned file, or a currently-unsupported method
-/// like `options`/`head`/`trace`.
-fn routable_method(path: &Path) -> Option<&'static str> {
-    let name = path.file_name()?.to_str()?;
-    let method = name.strip_prefix("endpoint.")?.strip_suffix(".json")?;
-    ROUTABLE_METHODS.iter().find(|&&m| m == method).copied()
+/// `endpoint.<token>.json` files under `endpoints_root` that are never served
+/// although they look like endpoint files: a token that is not canonical
+/// (`endpoint.GET.json`, `endpoint.purge.json`) or that is valid only under the
+/// other `caseSensitiveMethods` setting. Never renamed, only reported.
+pub(crate) fn method_file_findings(tree: &EndpointTree, mode: MethodCase) -> Vec<MethodFileFinding> {
+    let mut out = Vec::new();
+    for file in tree.files() {
+        let Some(token) = method_token::stub_file_token(&file.name) else { continue };
+        let kind = match method_token::parse_file_token(token, mode) {
+            TokenStatus::Valid(_) => continue,
+            TokenStatus::WrongMode { wire } => MethodFileKind::WrongMode { wire },
+            TokenStatus::Invalid => MethodFileKind::NonCanonical {
+                hint: method_token::canonical_hint(token, mode),
+            },
+        };
+        out.push(MethodFileFinding {
+            url_path: url_path_for(tree.endpoints_root(), &file.logical).unwrap_or_default(),
+            token: token.to_string(),
+            file: file.logical.clone(),
+            kind,
+        });
+    }
+    out.sort_by(|a, b| a.file.cmp(&b.file));
+    out
 }
 
 /// Finds the `openapi.yaml` operation matching an already-registered
@@ -1148,23 +1454,813 @@ fn routable_method(path: &Path) -> Option<&'static str> {
 /// way `url_path_for` converts a folder path, so the two naming
 /// conventions actually meet in the middle. `None` if nothing matches
 /// (a spec/filesystem drift this project otherwise tolerates — see
-/// `commands::generate`'s own orphaned-endpoint handling).
+/// `commands::generate`'s own orphaned-endpoint handling). `Operation.path`
+/// is the loader's normalised form (no trailing slash), and paths the loader
+/// set aside as case-ambiguous are still searched, by exact bytes, so an
+/// existing project that serves both `/Cars` and `/cars` keeps validating both.
 fn find_operation<'a>(doc: &'a crate::openapi::OpenApiDocument, url_path: &str, method: &str) -> Option<&'a Operation> {
-    doc.operations.iter().find(|op| op.method == method && axum_style_path(&op.path) == url_path)
+    doc.operations
+        .iter()
+        .chain(doc.ambiguous_operations.iter())
+        .find(|op| op.method == method && axum_style_path(&op.path) == url_path)
 }
 
-/// `{name}` -> `:name`, segment by segment — the same conversion
-/// `url_path_for` does for a filesystem path, applied directly to an
-/// OpenAPI path string instead.
-fn axum_style_path(openapi_path: &str) -> String {
-    openapi_path
+const MAX_LISTED_UNRESOLVED_PARAMETER_REFS: usize = 5;
+
+/// The raw `$ref` texts of unresolved parameters for a message: escaped here (they are stored
+/// raw), at most five, then an ellipsis.
+pub(crate) fn unresolved_parameter_ref_list(refs: &[String]) -> String {
+    let mut shown: Vec<String> = refs
+        .iter()
+        .take(MAX_LISTED_UNRESOLVED_PARAMETER_REFS)
+        .map(|r| crate::openapi::method_token::untrusted_short(r))
+        .collect();
+    if refs.len() > MAX_LISTED_UNRESOLVED_PARAMETER_REFS {
+        shown.push("…".to_string());
+    }
+    shown.join(", ")
+}
+
+/// One message per routed endpoint file whose exactly-matching `openapi.yaml` operation has a
+/// parameter `$ref` frogs could not resolve: request validation for that route would silently
+/// miss a parameter the spec declares. Files without a matching operation are not reported.
+pub(crate) fn unresolved_parameter_routes(tree: &EndpointTree, doc: &crate::openapi::OpenApiDocument) -> Vec<String> {
+    let mut out = Vec::new();
+    for (url_path, method, _file) in discover_endpoint_files(tree, doc.method_case) {
+        let Some(op) = find_operation(doc, &url_path, &method) else { continue };
+        if op.unresolved_parameter_refs.is_empty() {
+            continue;
+        }
+        out.push(format!(
+            "{} {}: openapi.yaml declares parameter(s) frogs could not resolve ({}) — request validation for this route would be incomplete",
+            crate::openapi::untrusted(&op.http_method),
+            crate::openapi::untrusted(&op.path),
+            unresolved_parameter_ref_list(&op.unresolved_parameter_refs)
+        ));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// An endpoint file whose `security` doesn't agree with what `openapi.yaml`
+/// requires for the matching operation(s). `acceptable` is the intersection of
+/// every requiring operation's acceptable schemes.
+pub(crate) struct SecurityMismatch {
+    pub method: String,
+    pub url_path: String,
+    pub file: PathBuf,
+    pub stub: Option<String>,
+    pub matched: Vec<(String, String)>,
+    pub acceptable: Vec<String>,
+}
+
+fn quoted_names(names: &[String]) -> String {
+    names.iter().map(|n| format!("'{}'", crate::openapi::untrusted(n))).collect::<Vec<_>>().join(", ")
+}
+
+impl SecurityMismatch {
+    pub(crate) fn message(&self) -> String {
+        use crate::openapi::untrusted;
+        let head = format!(
+            "{} {} ({})",
+            method_token::display_token(&self.method),
+            untrusted(&self.url_path),
+            untrusted(&self.file.display().to_string())
+        );
+        let acceptable = quoted_names(&self.acceptable);
+        let mut message = match &self.stub {
+            None => {
+                format!("{head}: openapi.yaml requires security ({acceptable}) but the endpoint file declares no \"security\" — the route would be served unprotected")
+            }
+            Some(stub) => format!(
+                "{head}: endpoint file declares security '{}', which is not one openapi.yaml allows for this operation (acceptable: {acceptable})",
+                untrusted(stub)
+            ),
+        };
+        if self.matched.len() > 1 {
+            let ops: Vec<String> = self.matched.iter().map(|(m, p)| format!("{m} {}", untrusted(p))).collect();
+            message.push_str(&format!(
+                " (matched by parameter-name/case-insensitive comparison against: {}; it must satisfy all of them)",
+                ops.join(", ")
+            ));
+        }
+        message
+    }
+}
+
+/// A routable-looking endpoint file whose `(path, token)` the spec declares through
+/// `additionalOperations` keys that differ only in case — none of them is served.
+pub(crate) struct AmbiguousMethodFile {
+    pub method: String,
+    pub url_path: String,
+    pub file: PathBuf,
+    pub spellings: Vec<String>,
+}
+
+impl AmbiguousMethodFile {
+    pub(crate) fn message(&self) -> String {
+        use crate::openapi::{method_token::untrusted_short, untrusted};
+        format!(
+            "{}: openapi.yaml declares {} on {} more than once with keys differing only in case ({}) — not served; fix openapi.yaml",
+            untrusted(&self.file.display().to_string()),
+            method_token::display_token(&self.method),
+            untrusted(&self.url_path),
+            self.spellings.iter().map(|k| format!("'{}'", untrusted_short(k))).collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
+/// An endpoint file that declares security the spec doesn't ask for.
+pub(crate) struct SecurityStricter {
+    pub method: String,
+    pub url_path: String,
+    pub file: PathBuf,
+    pub stub: String,
+}
+
+impl SecurityStricter {
+    pub(crate) fn message(&self) -> String {
+        use crate::openapi::untrusted;
+        format!(
+            "{} {} ({}): declares security '{}' but openapi.yaml declares none for this operation",
+            method_token::display_token(&self.method),
+            untrusted(&self.url_path),
+            untrusted(&self.file.display().to_string()),
+            untrusted(&self.stub)
+        )
+    }
+}
+
+/// Where a secured operation that a route would shadow came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShadowOrigin {
+    Served,
+    /// The spec path was skipped at load (the message says why).
+    Skipped(String),
+    /// An `additionalOperations` entry the loader dropped.
+    Dropped,
+}
+
+fn acceptable_display(acceptable: &[String], unknown: bool) -> String {
+    if unknown {
+        "unknown — the security value in openapi.yaml is malformed".to_string()
+    } else {
+        quoted_names(acceptable)
+    }
+}
+
+fn method_or_every(any_method: bool, wire: &str) -> String {
+    if any_method {
+        "every method".to_string()
+    } else {
+        method_token::display_token(wire)
+    }
+}
+
+fn origin_note(origin: &ShadowOrigin) -> String {
+    match origin {
+        ShadowOrigin::Served => String::new(),
+        ShadowOrigin::Skipped(reason) => format!(" [path skipped at load: {reason}]"),
+        ShadowOrigin::Dropped => " [operation dropped at load]".to_string(),
+    }
+}
+
+/// A secured operation with no file of its own that a different, less-protected route answers.
+pub(crate) struct SecurityShadow {
+    pub op_method: String,
+    pub op_path: String,
+    pub operation_id: String,
+    pub origin: ShadowOrigin,
+    pub served_route: String,
+    pub file: PathBuf,
+    pub file_security: Option<String>,
+    pub acceptable: Vec<String>,
+    pub unknown: bool,
+    pub same_template: bool,
+    pub any_method: bool,
+}
+
+impl SecurityShadow {
+    pub(crate) fn message(&self) -> String {
+        use crate::openapi::{method_token::untrusted_short, untrusted};
+        let declares = match &self.file_security {
+            Some(scheme) => format!("security '{}'", untrusted(scheme)),
+            None => "no \"security\"".to_string(),
+        };
+        let file = untrusted(&self.file.display().to_string());
+        let remedy = if self.same_template {
+            format!(
+                "openapi.yaml declares this path template twice with different parameter names (e.g. both /items/{{itemId}} and /items/{{id}}) — fix openapi.yaml, or make {file} declare an acceptable scheme"
+            )
+        } else {
+            format!("run frogs generate to create its own file, or make {file} declare an acceptable scheme")
+        };
+        format!(
+            "{} {} (operationId {}){}: openapi.yaml requires security ({}) but the request would be served by route {} ({file}), which declares {declares} — {remedy}",
+            method_or_every(self.any_method, &self.op_method),
+            untrusted(&self.op_path),
+            untrusted_short(&self.operation_id),
+            origin_note(&self.origin),
+            acceptable_display(&self.acceptable, self.unknown),
+            untrusted(&self.served_route),
+        )
+    }
+}
+
+/// A skipped secured path whose raw text can't be turned into a probe request.
+pub(crate) struct UnverifiableSecuredPath {
+    pub op_method: String,
+    pub op_path: String,
+    pub reason: String,
+    pub acceptable: Vec<String>,
+    pub unknown: bool,
+    pub any_method: bool,
+}
+
+impl UnverifiableSecuredPath {
+    pub(crate) fn message(&self) -> String {
+        use crate::openapi::untrusted;
+        format!(
+            "openapi.yaml path '{}' ({}, security {}) was skipped ({}) and frogs can't determine which route would serve it — fix the path in openapi.yaml",
+            untrusted(&self.op_path),
+            method_or_every(self.any_method, &self.op_method),
+            acceptable_display(&self.acceptable, self.unknown),
+            self.reason
+        )
+    }
+}
+
+/// A secured operation that one of frogs's own built-in routes answers without authentication.
+pub(crate) struct BuiltinShadow {
+    pub op_method: String,
+    pub op_path: String,
+    pub operation_id: String,
+    pub origin: ShadowOrigin,
+    pub acceptable: Vec<String>,
+    pub unknown: bool,
+    pub label: &'static str,
+    pub field: Option<&'static str>,
+    pub inherited: bool,
+    pub any_method: bool,
+    pub remedy: BuiltinRemedy,
+}
+
+impl BuiltinShadow {
+    pub(crate) fn message(&self) -> String {
+        use crate::openapi::{method_token::untrusted_short, untrusted};
+        let lead = format!(
+            "{} {} (operationId {}){}: openapi.yaml requires security ({})",
+            method_or_every(self.any_method, &self.op_method),
+            untrusted(&self.op_path),
+            untrusted_short(&self.operation_id),
+            origin_note(&self.origin),
+            acceptable_display(&self.acceptable, self.unknown),
+        );
+        let (head, fix, note) = match self.remedy {
+            BuiltinRemedy::ConfigSwitch => (
+                format!("{lead} but frogs's built-in {} route answers it without authentication", self.label),
+                match self.field {
+                    Some(field) => format!("turn {field} off, change apiRoot"),
+                    None => "change apiRoot".to_string(),
+                },
+                "",
+            ),
+            BuiltinRemedy::StaticContent => (
+                format!(
+                    "{lead} but the operation has no endpoint file of its own, so {} would answer it without authentication",
+                    self.label
+                ),
+                match self.origin {
+                    ShadowOrigin::Skipped(_) => "fix the path in openapi.yaml".to_string(),
+                    _ => "run `frogs generate` to create its endpoint file".to_string(),
+                },
+                " (setting apiRoot does not help: axum 0.7 routes unmatched paths under apiRoot to the static catch-all as well)",
+            ),
+            BuiltinRemedy::ControlPlane => (
+                format!(
+                    "{lead} but the operation has no endpoint file of its own, so {} would answer it without authentication",
+                    self.label
+                ),
+                "rename the operation's path, or choose an apiRoot that doesn't place it at /_frogs/scenario".to_string(),
+                "",
+            ),
+        };
+        if self.inherited {
+            format!("{head} — the security is only the document-wide default: add `security: []` on the operation if the exposure is intended, or {fix}{note}")
+        } else {
+            format!("{head} — {fix}, or remove security from that operation{note}")
+        }
+    }
+}
+
+/// An unmatched endpoint file whose method spelling differs only in case from a secured operation on its path.
+pub(crate) struct StaleVariant {
+    pub method: String,
+    pub url_path: String,
+    pub file: PathBuf,
+    pub file_security: Option<String>,
+    pub operations: Vec<String>,
+    pub acceptable: Vec<String>,
+    pub unknown: bool,
+}
+
+impl StaleVariant {
+    pub(crate) fn message(&self) -> String {
+        unmatched_refusal_message(
+            "a spelling of this method that differs only in letter case",
+            &self.method,
+            &self.url_path,
+            &self.file,
+            &self.file_security,
+            &self.operations,
+            &self.acceptable,
+            self.unknown,
+        )
+    }
+}
+
+/// An unmatched endpoint file that textually instantiates a secured operation's path template.
+pub(crate) struct TemplateInstance {
+    pub method: String,
+    pub url_path: String,
+    pub file: PathBuf,
+    pub file_security: Option<String>,
+    pub operations: Vec<String>,
+    pub acceptable: Vec<String>,
+    pub unknown: bool,
+}
+
+impl TemplateInstance {
+    pub(crate) fn message(&self) -> String {
+        unmatched_refusal_message(
+            "a path template this file's folder is an instance of",
+            &self.method,
+            &self.url_path,
+            &self.file,
+            &self.file_security,
+            &self.operations,
+            &self.acceptable,
+            self.unknown,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn unmatched_refusal_message(
+    relation: &str,
+    method: &str,
+    url_path: &str,
+    file: &Path,
+    file_security: &Option<String>,
+    operations: &[String],
+    acceptable: &[String],
+    unknown: bool,
+) -> String {
+    use crate::openapi::untrusted;
+    let declares = match file_security {
+        Some(scheme) => format!("security '{}'", untrusted(scheme)),
+        None => "no \"security\"".to_string(),
+    };
+    let file = untrusted(&file.display().to_string());
+    format!(
+        "{} {} ({file}): openapi.yaml secures {} ({}) — {relation} — but this file declares {declares}; make {file} declare an acceptable scheme, or fix the file name/folder",
+        method_token::display_token(method),
+        untrusted(url_path),
+        operations.join(", "),
+        acceptable_display(acceptable, unknown)
+    )
+}
+
+#[derive(Default)]
+pub(crate) struct SecurityCheck {
+    pub mismatches: Vec<SecurityMismatch>,
+    pub stricter: Vec<SecurityStricter>,
+    pub unmatched: Vec<PathBuf>,
+    pub ambiguous: Vec<AmbiguousMethodFile>,
+    pub stale_variants: Vec<StaleVariant>,
+    pub template_instances: Vec<TemplateInstance>,
+    pub shadowed: Vec<SecurityShadow>,
+    pub unverifiable: Vec<UnverifiableSecuredPath>,
+    pub builtin_refusals: Vec<BuiltinShadow>,
+    pub builtin_warnings: Vec<String>,
+}
+
+/// One secured operation (served, dropped or skipped) as the routing checks see it.
+struct SecuredView {
+    wire: String,
+    path: String,
+    operation_id: String,
+    acceptable: Vec<String>,
+    /// The security value was malformed: secured, nothing acceptable.
+    unknown: bool,
+    inherited: bool,
+    origin: ShadowOrigin,
+    /// An unresolvable path item: stands for every method, `wire` is empty and never compared.
+    any_method: bool,
+}
+
+fn secured_views(doc: &crate::openapi::OpenApiDocument) -> Vec<SecuredView> {
+    let mut views = Vec::new();
+    for op in doc.operations.iter().chain(&doc.ambiguous_operations) {
+        if let Some(acceptable) = acceptable_schemes(op) {
+            views.push(SecuredView {
+                wire: op.http_method.clone(),
+                path: op.path.clone(),
+                operation_id: op.operation_id.clone(),
+                acceptable,
+                unknown: false,
+                inherited: op.security_inherited,
+                origin: ShadowOrigin::Served,
+                any_method: false,
+            });
+        }
+    }
+    let secured = |alternatives: &[Vec<String>], unparseable: bool| -> Option<(Vec<String>, bool)> {
+        if unparseable {
+            return Some((Vec::new(), true));
+        }
+        acceptable_from_alternatives(alternatives).map(|a| (a, false))
+    };
+    for dropped in &doc.dropped_operations {
+        if let Some((acceptable, unknown)) = secured(&dropped.security_alternatives, dropped.security_unparseable) {
+            views.push(SecuredView {
+                wire: dropped.wire.clone(),
+                path: dropped.path.clone(),
+                operation_id: String::new(),
+                acceptable,
+                unknown,
+                inherited: dropped.security_inherited,
+                origin: ShadowOrigin::Dropped,
+                any_method: false,
+            });
+        }
+    }
+    for skipped in &doc.skipped_operations {
+        if let Some((acceptable, unknown)) = secured(&skipped.security_alternatives, skipped.security_unparseable) {
+            views.push(SecuredView {
+                wire: skipped.method_wire.clone(),
+                path: skipped.raw_path.clone(),
+                operation_id: skipped.operation_id.clone(),
+                acceptable,
+                unknown,
+                inherited: skipped.security_inherited,
+                origin: ShadowOrigin::Skipped(skipped.reason.clone()),
+                any_method: skipped.any_method,
+            });
+        }
+    }
+    views
+}
+
+fn path_segments(path: &str) -> Vec<&str> {
+    let trimmed = path.strip_prefix('/').unwrap_or(path);
+    if trimmed.is_empty() { Vec::new() } else { trimmed.split('/').collect() }
+}
+
+fn view_matches_path(view: &SecuredView, url_path: &str) -> bool {
+    let axum_path = axum_style_path(&view.path);
+    axum_path == url_path || match_key(&axum_path) == match_key(url_path)
+}
+
+fn view_label(view: &SecuredView) -> String {
+    format!("{} {}", method_or_every(view.any_method, &view.wire), crate::openapi::untrusted(&view.path))
+}
+
+fn stub_fails(stub: &Option<String>, view: &SecuredView) -> bool {
+    view.unknown || !stub.as_ref().is_some_and(|s| view.acceptable.contains(s))
+}
+
+/// Whether a file at `url_path` is a textual instance of the view's path template: same
+/// number of segments, equal literals, and at least one template segment of the operation
+/// facing a literal segment of the file.
+fn is_template_instance(view: &SecuredView, url_path: &str) -> bool {
+    let op_path = match view.origin {
+        ShadowOrigin::Skipped(_) => view.path.clone(),
+        _ => axum_style_path(&view.path),
+    };
+    let op_segments = path_segments(&op_path);
+    let file_segments = path_segments(url_path);
+    if op_segments.len() != file_segments.len() {
+        return false;
+    }
+    let mut template_vs_literal = false;
+    for (op_seg, file_seg) in op_segments.iter().zip(&file_segments) {
+        if !crate::openapi::route_syntax::is_non_literal_segment(op_seg) {
+            if op_seg != file_seg {
+                return false;
+            }
+        } else if !file_seg.starts_with(':') {
+            // A partial template (`report.{ext}`) only covers folder names that fit it.
+            let partial = op_seg.contains(['{', '}']) && !op_seg.contains([':', '*']);
+            if partial && !crate::openapi::route_syntax::partial_template_matches(op_seg, file_seg) {
+                return false;
+            }
+            template_vs_literal = true;
+        }
+    }
+    template_vs_literal
+}
+
+fn joined_acceptable(failing: &[&SecuredView]) -> (Vec<String>, bool) {
+    let mut out: Vec<String> = Vec::new();
+    for view in failing {
+        for name in &view.acceptable {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+    }
+    (out, failing.iter().any(|v| v.unknown))
+}
+
+pub(crate) fn unmatched_security_message(file: &Path) -> String {
+    format!(
+        "{}: no matching operation in openapi.yaml — endpoint security was not checked for this route",
+        crate::openapi::untrusted(&file.display().to_string())
+    )
+}
+
+/// Parameter names and letter case don't matter for the fallback match: a
+/// `:`-prefixed segment becomes `{}` and the whole path is case-folded.
+fn match_key(axum_path: &str) -> String {
+    let normalised = axum_path
         .split('/')
-        .map(|segment| match segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-            Some(name) => format!(":{name}"),
-            None => segment.to_string(),
-        })
+        .map(|segment| if segment.starts_with(':') { "{}" } else { segment })
         .collect::<Vec<_>>()
-        .join("/")
+        .join("/");
+    crate::openapi::dir_index::fold(&normalised)
+}
+
+/// The schemes an operation accepts from an endpoint file: the sole key of a
+/// single-key requirement, the first key of a multi-key one (frogs enforces
+/// only that), in spec order, deduped. `None` when the operation requires no
+/// security at all.
+fn acceptable_schemes(op: &Operation) -> Option<Vec<String>> {
+    acceptable_from_alternatives(&op.security_alternatives)
+}
+
+fn acceptable_from_alternatives(alternatives: &[Vec<String>]) -> Option<Vec<String>> {
+    if !alternatives.iter().any(|alt| !alt.is_empty()) {
+        return None;
+    }
+    let mut out: Vec<String> = Vec::new();
+    for first in alternatives.iter().filter_map(|alt| alt.first()) {
+        if !out.contains(first) {
+            out.push(first.clone());
+        }
+    }
+    Some(out)
+}
+
+/// Compares every readable endpoint file's `security` against what
+/// `openapi.yaml` requires for the operation it maps to. Read-only; opens no
+/// connections.
+#[cfg(test)]
+pub(crate) fn security_check(tree: &EndpointTree, doc: &crate::openapi::OpenApiDocument) -> SecurityCheck {
+    let plan = RoutePlan::build(tree, doc.method_case, &RouteContext::endpoints_only());
+    security_check_with_routes(tree, doc, &plan)
+}
+
+/// `security_check` plus the routing questions: which less-protected route or built-in
+/// would answer a secured operation that has no file of its own, and which unmatched
+/// files stand in for a secured operation under another spelling or template.
+pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::openapi::OpenApiDocument, plan: &RoutePlan) -> SecurityCheck {
+    let mut check = SecurityCheck::default();
+    let views = secured_views(doc);
+    let mut owners: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+    for (url_path, method, file) in discover_endpoint_files(tree, doc.method_case) {
+        let Ok(contents) = std::fs::read_to_string(&file) else { continue };
+        let Ok(endpoint) = serde_json::from_str::<EndpointFile>(&contents) else { continue };
+        let stub = endpoint.security;
+
+        let mut matched: Vec<&Operation> = doc
+            .operations
+            .iter()
+            .chain(doc.ambiguous_operations.iter())
+            .filter(|op| op.method == method && axum_style_path(&op.path) == url_path)
+            .collect();
+        if matched.is_empty() {
+            if let Some(spellings) = ambiguous_spellings(doc, &url_path, &method) {
+                check.ambiguous.push(AmbiguousMethodFile {
+                    method,
+                    url_path,
+                    file,
+                    spellings: spellings.clone(),
+                });
+                continue;
+            }
+            let key = match_key(&url_path);
+            matched = doc
+                .operations
+                .iter()
+                .chain(doc.ambiguous_operations.iter())
+                .filter(|op| op.method == method && match_key(&axum_style_path(&op.path)) == key)
+                .collect();
+        }
+        if matched.is_empty() {
+            let wire = match method_token::parse_file_token(&method, doc.method_case) {
+                TokenStatus::Valid(token) => token.wire().into_owned(),
+                _ => method.to_ascii_uppercase(),
+            };
+            let stale: Vec<&SecuredView> = views
+                .iter()
+                .filter(|v| {
+                    matches!(v.origin, ShadowOrigin::Served | ShadowOrigin::Dropped)
+                        && view_matches_path(v, &url_path)
+                        && v.wire.eq_ignore_ascii_case(&wire)
+                        && (v.wire != wire || matches!(v.origin, ShadowOrigin::Dropped))
+                })
+                .collect();
+            let instances: Vec<&SecuredView> = views
+                .iter()
+                .filter(|v| {
+                    (v.any_method || v.wire == wire || (v.wire == "HEAD" && wire == "GET"))
+                        && match &v.origin {
+                            ShadowOrigin::Skipped(_) => crate::openapi::route_syntax::probe_path(&v.path).is_ok(),
+                            _ => true,
+                        }
+                        && is_template_instance(v, &url_path)
+                })
+                .collect();
+            let mut refused = false;
+            let failing_stale: Vec<&SecuredView> = stale.iter().copied().filter(|v| stub_fails(&stub, v)).collect();
+            if !failing_stale.is_empty() {
+                let (acceptable, unknown) = joined_acceptable(&failing_stale);
+                check.stale_variants.push(StaleVariant {
+                    method: method.clone(),
+                    url_path: url_path.clone(),
+                    file: file.clone(),
+                    file_security: stub.clone(),
+                    operations: failing_stale.iter().map(|v| view_label(v)).collect(),
+                    acceptable,
+                    unknown,
+                });
+                refused = true;
+            }
+            let failing_instances: Vec<&SecuredView> = instances.iter().copied().filter(|v| stub_fails(&stub, v)).collect();
+            if !failing_instances.is_empty() {
+                let (acceptable, unknown) = joined_acceptable(&failing_instances);
+                check.template_instances.push(TemplateInstance {
+                    method: method.clone(),
+                    url_path: url_path.clone(),
+                    file: file.clone(),
+                    file_security: stub.clone(),
+                    operations: failing_instances.iter().map(|v| view_label(v)).collect(),
+                    acceptable,
+                    unknown,
+                });
+                refused = true;
+            }
+            if !refused {
+                check.unmatched.push(file);
+            }
+            continue;
+        }
+
+        owners
+            .entry((url_path.clone(), method.clone()))
+            .or_default()
+            .extend(matched.iter().map(|op| (op.http_method.clone(), op.path.clone())));
+
+        let requiring: Vec<Vec<String>> = matched.iter().filter_map(|op| acceptable_schemes(op)).collect();
+        if requiring.is_empty() {
+            if let Some(stub) = stub {
+                check.stricter.push(SecurityStricter { method, url_path, file, stub });
+            }
+            continue;
+        }
+        let mut acceptable = requiring[0].clone();
+        acceptable.retain(|name| requiring.iter().all(|other| other.contains(name)));
+        let ok = stub.as_ref().is_some_and(|s| requiring.iter().all(|other| other.contains(s)));
+        if !ok {
+            check.mismatches.push(SecurityMismatch {
+                method,
+                url_path,
+                file,
+                stub,
+                matched: matched.iter().map(|op| (op.http_method.clone(), op.path.clone())).collect(),
+                acceptable,
+            });
+        }
+    }
+
+    let mut seen: std::collections::HashSet<(bool, String, String, PathBuf)> = std::collections::HashSet::new();
+    let mut seen_builtin: std::collections::HashSet<(bool, String, String, &'static str)> = std::collections::HashSet::new();
+    for view in &views {
+        let probe = match crate::openapi::route_syntax::probe_path(&view.path) {
+            Ok(probe) => probe,
+            Err(why) => {
+                let reason = match &view.origin {
+                    ShadowOrigin::Skipped(reason) => reason.clone(),
+                    _ => format!("path can't be probed: {why}"),
+                };
+                check.unverifiable.push(UnverifiableSecuredPath {
+                    op_method: view.wire.clone(),
+                    op_path: view.path.clone(),
+                    reason,
+                    acceptable: view.acceptable.clone(),
+                    unknown: view.unknown,
+                    any_method: view.any_method,
+                });
+                continue;
+            }
+        };
+        let mut targets: Vec<&route_plan::PlannedRoute> = plan.resolve(&probe).into_iter().collect();
+        for extra in plan.partial_instances(&view.path) {
+            if !targets.iter().any(|t| t.registered == extra.registered) {
+                targets.push(extra);
+            }
+        }
+        for route in targets {
+            let planned_files: Vec<&route_plan::PlannedFile> = if view.any_method {
+                route.files.iter().collect()
+            } else {
+                route
+                    .files
+                    .iter()
+                    .find(|f| f.wire == view.wire || (view.wire == "HEAD" && f.wire == "GET"))
+                    .into_iter()
+                    .collect()
+            };
+            if !planned_files.is_empty() {
+                for planned in planned_files {
+                    if matches!(view.origin, ShadowOrigin::Served)
+                        && owners
+                            .get(&(route.path.clone(), planned.token.clone()))
+                            .is_some_and(|ops| ops.iter().any(|(wire, path)| *wire == view.wire && *path == view.path))
+                    {
+                        continue;
+                    }
+                    let Ok(contents) = std::fs::read_to_string(&planned.file) else { continue };
+                    let Ok(endpoint) = serde_json::from_str::<EndpointFile>(&contents) else { continue };
+                    if !stub_fails(&endpoint.security, view) {
+                        continue;
+                    }
+                    if !seen.insert((view.any_method, view.wire.clone(), view.path.clone(), planned.file.clone())) {
+                        continue;
+                    }
+                    check.shadowed.push(SecurityShadow {
+                        op_method: view.wire.clone(),
+                        op_path: view.path.clone(),
+                        operation_id: view.operation_id.clone(),
+                        origin: view.origin.clone(),
+                        served_route: route.path.clone(),
+                        file: planned.file.clone(),
+                        file_security: endpoint.security,
+                        acceptable: view.acceptable.clone(),
+                        unknown: view.unknown,
+                        same_template: matches!(view.origin, ShadowOrigin::Served) && match_key(&axum_style_path(&view.path)) == match_key(&route.path),
+                        any_method: view.any_method,
+                    });
+                }
+            } else if let Some(builtin) = &route.builtin
+                && (if view.any_method {
+                    !builtin.methods.is_empty()
+                } else {
+                    builtin.methods.contains(&view.wire.as_str())
+                })
+            {
+                if !seen_builtin.insert((view.any_method, view.wire.clone(), view.path.clone(), builtin.label)) {
+                    continue;
+                }
+                let shadow = BuiltinShadow {
+                    op_method: view.wire.clone(),
+                    op_path: view.path.clone(),
+                    operation_id: view.operation_id.clone(),
+                    origin: view.origin.clone(),
+                    acceptable: view.acceptable.clone(),
+                    unknown: view.unknown,
+                    label: builtin.label,
+                    field: builtin.field,
+                    inherited: view.inherited,
+                    any_method: view.any_method,
+                    remedy: builtin.remedy,
+                };
+                if view.inherited && builtin.inherited_exempt {
+                    check.builtin_warnings.push(shadow.message());
+                } else {
+                    check.builtin_refusals.push(shadow);
+                }
+            }
+        }
+    }
+    check.shadowed.sort_by_key(SecurityShadow::message);
+    check.unverifiable.sort_by_key(UnverifiableSecuredPath::message);
+    check.builtin_refusals.sort_by_key(BuiltinShadow::message);
+    check.stale_variants.sort_by_key(StaleVariant::message);
+    check.template_instances.sort_by_key(TemplateInstance::message);
+    check.builtin_warnings.sort();
+    check
+}
+
+/// The case-only-duplicate spellings the spec declares for this file's path and token, if any.
+fn ambiguous_spellings<'a>(doc: &'a crate::openapi::OpenApiDocument, url_path: &str, token: &str) -> Option<&'a Vec<String>> {
+    let key = match_key(url_path);
+    doc.ambiguous_methods
+        .iter()
+        .find(|((path, t), _)| t == token && (axum_style_path(path) == url_path || match_key(&axum_style_path(path)) == key))
+        .map(|(_, spellings)| spellings)
 }
 
 /// Converts a folder path under `datasources/endpoints/` into an axum route,
@@ -1233,7 +2329,10 @@ mod tests {
         std::fs::write(root.join("cars/{vin}/endpoint.get.test.json"), "{}").unwrap();
         std::fs::write(root.join("cars/{vin}/_backups/endpoint.get.2026-07-30T15-45-40Z.json"), "{}").unwrap();
 
-        let mut found: Vec<(String, String)> = discover_endpoint_files(&root).into_iter().map(|(path, method, _)| (path, method)).collect();
+        let mut found: Vec<(String, String)> = discover_endpoint_files(&tree_for_tests(&root), MethodCase::Default)
+            .into_iter()
+            .map(|(path, method, _)| (path, method))
+            .collect();
         found.sort();
         let _ = std::fs::remove_dir_all(&root);
 
@@ -1250,22 +2349,25 @@ mod tests {
     #[test]
     fn routable_method_recognizes_every_supported_verb() {
         let root = Path::new("/proj/datasources/endpoints/cars");
-        for method in ROUTABLE_METHODS {
-            assert_eq!(routable_method(&root.join(format!("endpoint.{method}.json"))), Some(*method));
+        for method in method_token::ROUTABLE_FIXED {
+            assert_eq!(
+                routable_method(&root.join(format!("endpoint.{method}.json")), MethodCase::Default),
+                Some(method.to_string())
+            );
         }
     }
 
     #[test]
     fn routable_method_ignores_reference_and_test_siblings() {
         let root = Path::new("/proj/datasources/endpoints/cars");
-        assert_eq!(routable_method(&root.join("endpoint.get.reference.json")), None);
-        assert_eq!(routable_method(&root.join("endpoint.get.test.json")), None);
+        assert_eq!(routable_method(&root.join("endpoint.get.reference.json"), MethodCase::Default), None);
+        assert_eq!(routable_method(&root.join("endpoint.get.test.json"), MethodCase::Default), None);
     }
 
     #[test]
     fn routable_method_ignores_an_unsupported_http_method() {
         let root = Path::new("/proj/datasources/endpoints/cars");
-        assert_eq!(routable_method(&root.join("endpoint.options.json")), None);
+        assert_eq!(routable_method(&root.join("endpoint.options.json"), MethodCase::Default), None);
     }
 
     #[test]
@@ -1274,7 +2376,7 @@ mod tests {
         // `strip_prefix("endpoint.")`, so this already falls through
         // naturally rather than needing a dedicated check.
         let root = Path::new("/proj/datasources/endpoints/cars");
-        assert_eq!(routable_method(&root.join("_endpoint.get.json")), None);
+        assert_eq!(routable_method(&root.join("_endpoint.get.json"), MethodCase::Default), None);
     }
 
     /// The roadmap's own Phase 3 exit criterion, proven against a real
@@ -1372,6 +2474,7 @@ mod tests {
             component_schemas: Arc::new(Map::new()),
             source_call_timeout_ms: test_call_timeout(),
             mock_provider: None,
+            response_mode: ResponseMode::Single,
         });
 
         let router = Router::new().route("/secret", get(handle_request)).with_state(state);
@@ -1421,6 +2524,7 @@ mod tests {
         let security = Arc::new(SecurityConfig::default());
         let router = build_router(
             &root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(drivers),
             &HashMap::new(),
             errors,
@@ -1432,6 +2536,7 @@ mod tests {
             None,
             test_call_timeout(),
             false,
+            MethodCase::Default,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1486,6 +2591,7 @@ mod tests {
         // `features.rateLimiting` layer, which isn't part of `build_router`.
         let router = build_router(
             &root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(drivers),
             &HashMap::new(),
             errors,
@@ -1497,6 +2603,7 @@ mod tests {
             None,
             test_call_timeout(),
             false,
+            MethodCase::Default,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1578,6 +2685,7 @@ mod tests {
         let security = Arc::new(SecurityConfig::default());
         let router = build_router(
             &root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(drivers),
             &HashMap::new(),
             errors,
@@ -1589,6 +2697,7 @@ mod tests {
             None,
             test_call_timeout(),
             false,
+            MethodCase::Default,
         );
         let router = crate::server::apply_middleware(router);
 
@@ -2084,6 +3193,7 @@ mod tests {
         let security = Arc::new(SecurityConfig::default());
         let router = build_router(
             &root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(drivers),
             &HashMap::new(),
             errors,
@@ -2095,6 +3205,7 @@ mod tests {
             None,
             test_call_timeout(),
             false,
+            MethodCase::Default,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2393,6 +3504,7 @@ mod tests {
         let security = Arc::new(SecurityConfig::default());
         let router = build_router(
             &root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(drivers),
             &HashMap::new(),
             errors,
@@ -2404,6 +3516,7 @@ mod tests {
             None,
             test_call_timeout(),
             false,
+            MethodCase::Default,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2714,6 +3827,7 @@ mod tests {
             Operation {
                 path: "/test".to_string(),
                 method: "get".to_string(),
+                http_method: "GET".to_string(),
                 operation_id: "test".to_string(),
                 response_schema: None,
                 parameters: vec![ParameterInfo {
@@ -2725,6 +3839,7 @@ mod tests {
                 request_body: None,
                 response_status_codes: vec![200],
                 security: None,
+                ..Default::default()
             }
         }
 
@@ -3354,6 +4469,7 @@ mod tests {
         let security = Arc::new(SecurityConfig::default());
         let router = build_router(
             &root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(drivers),
             &HashMap::new(),
             errors,
@@ -3365,6 +4481,7 @@ mod tests {
             None,
             test_call_timeout(),
             false,
+            MethodCase::Default,
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3375,9 +4492,15 @@ mod tests {
 
         let client = reqwest::Client::new();
         let resp = client.get(format!("http://{addr}/pricing")).send().await.unwrap();
-        assert_eq!(resp.status(), 404, "an invalid nested-many config must mean the route was never registered at all");
+        assert_eq!(resp.status(), 503, "an invalid nested-many config keeps the route's slot with a 503 placeholder");
 
-        let (count, problems) = validate_endpoint_files(&root.join("datasources/endpoints"), &SecurityConfig::default(), &HashMap::new(), false);
+        let (count, problems) = validate_endpoint_files(
+            &tree_for_tests(&root.join("datasources/endpoints")),
+            &SecurityConfig::default(),
+            &HashMap::new(),
+            false,
+            MethodCase::Default,
+        );
         assert_eq!(count, 1, "the file was still discovered — just invalid");
         assert!(
             problems.iter().any(|p| p.contains("maxConcurrency")),
@@ -3447,6 +4570,7 @@ mod tests {
         let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
         let router = build_router(
             &root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
             Arc::new(drivers),
             &HashMap::new(),
             Arc::new(errors),
@@ -3458,6 +4582,7 @@ mod tests {
             Some(provider),
             test_call_timeout(),
             false,
+            MethodCase::Default,
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3603,3 +4728,1860 @@ mod tests {
 
 #[cfg(test)]
 mod mtls_tests;
+
+#[cfg(test)]
+mod symlink_tests;
+
+#[cfg(test)]
+mod m2_tests {
+    use super::*;
+
+    fn temp_root() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-endpoint-m2-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_endpoint(root: &Path, dir: &str, method: &str, json: &str) {
+        let d = root.join("datasources/endpoints").join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(format!("endpoint.{method}.json")), json).unwrap();
+    }
+
+    async fn serve(root: &Path, doc: Option<&crate::openapi::OpenApiDocument>) -> String {
+        let errors = Arc::new(ErrorRegistry::load(&root.join("does-not-exist")).unwrap());
+        let router = build_router(
+            root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
+            Arc::new(HashMap::new()),
+            &HashMap::new(),
+            errors,
+            Arc::new(SecurityConfig::default()),
+            Arc::new(HashMap::new()),
+            Arc::new(Mutex::new(DiscoveredErrors::default())),
+            false,
+            doc,
+            None,
+            NonZeroU64::new(5_000).unwrap(),
+            false,
+            MethodCase::Default,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn has_reserved_stream_key_matches_only_a_top_level_stream_member() {
+        let cases: &[(&str, bool)] = &[
+            (r#"{"stream":{}}"#, true),
+            (r#"{"stream":null}"#, true),
+            (r#"{"stream":"x"}"#, true),
+            (r#"{"operationId":"a","response":{"stream":"sources.a.b"}}"#, false),
+            (r#"{"sources":{"stream":{}}}"#, false),
+            (r#"{"Stream":{}}"#, false),
+            ("{ not json", false),
+            ("[]", false),
+            ("", false),
+        ];
+        for (json, expected) in cases {
+            assert_eq!(has_reserved_stream_key(json), *expected, "{json}");
+        }
+    }
+
+    #[test]
+    fn reserved_stream_key_files_lists_exactly_the_files_with_a_top_level_stream_key() {
+        let root = temp_root();
+        write_endpoint(&root, "a", "get", r#"{ "operationId": "a", "stream": {}, "sources": {}, "response": {} }"#);
+        write_endpoint(&root, "b", "get", r#"{ "operationId": "b", "sources": {}, "response": { "stream": "sources.x.y" } }"#);
+        write_endpoint(&root, "c", "post", r#"{ "operationId": "c", "stream": null, "sources": {}, "response": {} }"#);
+        let mut files = reserved_stream_key_files(&tree_for_tests(&root.join("datasources/endpoints")), MethodCase::Default);
+        files.sort();
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert!(files[0].ends_with("a/endpoint.get.json") || files[0].to_string_lossy().contains('a'));
+        assert!(
+            files
+                .iter()
+                .all(|f| !f.to_string_lossy().contains(&format!("{}b{}", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR)))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_endpoint_file_with_a_top_level_stream_key_still_deserializes() {
+        let parsed: Result<EndpointFile, _> = serde_json::from_str(r#"{ "operationId": "a", "stream": { "anything": 1 }, "sources": {}, "response": {} }"#);
+        assert!(parsed.is_ok(), "{:?}", parsed.err());
+    }
+
+    #[tokio::test]
+    async fn a_stream_keyed_endpoint_is_still_registered_and_served_as_one_json_response() {
+        let root = temp_root();
+        write_endpoint(
+            &root,
+            "things",
+            "get",
+            r#"{ "operationId": "getThings", "stream": {}, "sources": {}, "response": {} }"#,
+        );
+        let base = serve(&root, None).await;
+        let resp = reqwest::get(format!("{base}/things")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_route_for_a_streaming_operation_serves_the_same_json_as_a_non_streaming_one() {
+        let root = temp_root();
+        std::fs::write(
+            root.join("openapi.yaml"),
+            "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /events:\n    get:\n      operationId: events\n      responses:\n        '200':\n          description: ok\n          content:\n            text/event-stream: { itemSchema: { type: string } }\n  /plain:\n    get:\n      operationId: plain\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { schema: { type: object } }\n",
+        )
+        .unwrap();
+        let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
+        assert!(matches!(
+            doc.operations.iter().find(|o| o.path == "/events").unwrap().response_mode,
+            ResponseMode::Stream(_)
+        ));
+
+        let literal = r#"{ "operationId": "x", "sources": {}, "response": {} }"#;
+        write_endpoint(&root, "events", "get", literal);
+        write_endpoint(&root, "plain", "get", literal);
+        let base = serve(&root, Some(&doc)).await;
+
+        let streaming = reqwest::get(format!("{base}/events")).await.unwrap();
+        let plain = reqwest::get(format!("{base}/plain")).await.unwrap();
+        assert_eq!(streaming.status(), 200);
+        assert_eq!(plain.status(), 200);
+        assert_eq!(streaming.headers().get("content-type"), plain.headers().get("content-type"));
+        assert!(streaming.headers().get("content-type").unwrap().to_str().unwrap().starts_with("application/json"));
+        assert_eq!(streaming.text().await.unwrap(), plain.text().await.unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_route_whose_security_names_an_unresolvable_scheme_is_never_registered() {
+        let root = temp_root();
+        write_endpoint(
+            &root,
+            "ref",
+            "get",
+            r##"{ "operationId": "a", "security": "#/components/securitySchemes/Nope", "sources": {}, "response": {} }"##,
+        );
+        write_endpoint(
+            &root,
+            "uri",
+            "get",
+            r#"{ "operationId": "b", "security": "https://x/y", "sources": {}, "response": {} }"#,
+        );
+        write_endpoint(&root, "open", "get", r#"{ "operationId": "c", "sources": {}, "response": {} }"#);
+        let base = serve(&root, None).await;
+        assert_eq!(reqwest::get(format!("{base}/ref")).await.unwrap().status(), 503);
+        assert_eq!(reqwest::get(format!("{base}/uri")).await.unwrap().status(), 503);
+        assert_eq!(reqwest::get(format!("{base}/open")).await.unwrap().status(), 200);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m2_7_security_check_tests {
+    use super::*;
+
+    fn temp_root() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-endpoint-m27-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    const SCHEMES: &str = "components:\n  securitySchemes:\n    a: { type: apiKey, in: header, name: k }\n    b: { type: apiKey, in: header, name: k2 }\n    c: { type: apiKey, in: header, name: k3 }\n";
+
+    /// `ops` is `(spec path, method, security yaml line or "")`.
+    fn spec(top: &str, ops: &[(&str, &str, &str)]) -> String {
+        let mut yaml = format!("openapi: 3.2.0\ninfo: {{ title: t, version: 1 }}\n{top}{SCHEMES}paths:\n");
+        for (i, (path, method, security)) in ops.iter().enumerate() {
+            yaml.push_str(&format!("  '{path}':\n    {method}:\n      operationId: op{i}\n"));
+            if !security.is_empty() {
+                yaml.push_str(&format!("      security: {security}\n"));
+            }
+            yaml.push_str("      responses:\n        '200': { description: ok }\n");
+        }
+        yaml
+    }
+
+    fn endpoint(security: Option<&str>) -> String {
+        match security {
+            Some(s) => format!(
+                r#"{{ "operationId": "x", "security": {}, "sources": {{}}, "response": {{}} }}"#,
+                serde_json::to_string(s).unwrap()
+            ),
+            None => r#"{ "operationId": "x", "sources": {}, "response": {} }"#.to_string(),
+        }
+    }
+
+    /// Builds a project and runs the check. `files` is `(folder under endpoints, method, file contents)`.
+    fn run(spec_yaml: &str, files: &[(&str, &str, String)]) -> SecurityCheck {
+        let root = temp_root();
+        std::fs::write(root.join("openapi.yaml"), spec_yaml).unwrap();
+        let endpoints = root.join("datasources/endpoints");
+        for (dir, method, contents) in files {
+            let d = endpoints.join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(format!("endpoint.{method}.json")), contents).unwrap();
+        }
+        let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
+        let check = security_check(&tree_for_tests(&endpoints), &doc);
+        let _ = std::fs::remove_dir_all(&root);
+        check
+    }
+
+    fn one(security_yaml: &str, stub: Option<&str>) -> SecurityCheck {
+        run(&spec("", &[("/p", "get", security_yaml)]), &[("p", "get", endpoint(stub))])
+    }
+
+    #[test]
+    fn a_required_scheme_with_no_security_in_the_file_is_an_unprotected_mismatch() {
+        let check = one("[ { a: [] } ]", None);
+        assert_eq!(check.mismatches.len(), 1);
+        let m = &check.mismatches[0];
+        assert_eq!(m.stub, None);
+        assert_eq!(m.acceptable, vec!["a".to_string()]);
+        let msg = m.message();
+        assert!(msg.starts_with("GET /p ("), "{msg}");
+        assert!(
+            msg.contains("openapi.yaml requires security ('a') but the endpoint file declares no \"security\" — the route would be served unprotected"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_different_scheme_in_the_file_is_a_mismatch_listing_the_acceptable_one() {
+        let check = one("[ { a: [] } ]", Some("b"));
+        assert_eq!(check.mismatches.len(), 1);
+        let msg = check.mismatches[0].message();
+        assert!(
+            msg.contains("endpoint file declares security 'b', which is not one openapi.yaml allows for this operation (acceptable: 'a')"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn the_matching_scheme_is_ok() {
+        let check = one("[ { a: [] } ]", Some("a"));
+        assert!(check.mismatches.is_empty() && check.stricter.is_empty() && check.unmatched.is_empty());
+    }
+
+    #[test]
+    fn with_alternatives_any_single_key_one_is_accepted_and_an_outsider_lists_all() {
+        assert!(one("[ { a: [] }, { b: [] } ]", Some("b")).mismatches.is_empty());
+        assert!(one("[ { a: [] }, { b: [] } ]", Some("a")).mismatches.is_empty());
+        let check = one("[ { a: [] }, { b: [] } ]", Some("c"));
+        assert_eq!(check.mismatches.len(), 1);
+        assert!(check.mismatches[0].message().contains("(acceptable: 'a', 'b')"));
+    }
+
+    #[test]
+    fn for_an_and_requirement_only_the_first_key_is_acceptable() {
+        assert!(one("[ { a: [], b: [] } ]", Some("a")).mismatches.is_empty());
+        let check = one("[ { a: [], b: [] } ]", Some("b"));
+        assert_eq!(check.mismatches.len(), 1);
+        assert_eq!(check.mismatches[0].acceptable, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn a_mix_of_and_and_single_alternatives_accepts_the_first_of_each() {
+        assert!(one("[ { a: [], b: [] }, { c: [] } ]", Some("c")).mismatches.is_empty());
+        assert!(one("[ { a: [], b: [] }, { c: [] } ]", Some("a")).mismatches.is_empty());
+        assert_eq!(one("[ { a: [], b: [] }, { c: [] } ]", Some("b")).mismatches.len(), 1);
+    }
+
+    #[test]
+    fn an_empty_alternative_never_makes_no_security_acceptable_while_a_real_one_exists() {
+        let check = one("[ {}, { a: [] } ]", None);
+        assert_eq!(check.mismatches.len(), 1);
+        assert!(one("[ {}, { a: [] } ]", Some("a")).mismatches.is_empty());
+    }
+
+    #[test]
+    fn a_spec_with_only_an_empty_requirement_object_requires_nothing() {
+        let check = one("[ {} ]", None);
+        assert!(check.mismatches.is_empty() && check.stricter.is_empty());
+    }
+
+    #[test]
+    fn a_file_with_security_where_the_spec_has_none_is_stricter_not_a_mismatch() {
+        for security_yaml in ["[]", ""] {
+            let check = one(security_yaml, Some("b"));
+            assert!(check.mismatches.is_empty(), "{security_yaml}");
+            assert_eq!(check.stricter.len(), 1, "{security_yaml}");
+            assert!(
+                check.stricter[0]
+                    .message()
+                    .ends_with("): declares security 'b' but openapi.yaml declares none for this operation")
+            );
+        }
+        assert!(one("", None).mismatches.is_empty());
+    }
+
+    #[test]
+    fn an_operation_inheriting_the_document_default_is_checked_against_it() {
+        let yaml = spec("security: [ { a: [] } ]\n", &[("/p", "get", "")]);
+        let check = run(&yaml, &[("p", "get", endpoint(None))]);
+        assert_eq!(check.mismatches.len(), 1);
+        let ok = run(&yaml, &[("p", "get", endpoint(Some("a")))]);
+        assert!(ok.mismatches.is_empty());
+    }
+
+    #[test]
+    fn the_uri_form_of_a_scheme_in_the_spec_equals_the_plain_name_in_the_file() {
+        assert!(one("[ { '#/components/securitySchemes/a': [] } ]", Some("a")).mismatches.is_empty());
+        assert_eq!(one("[ { '#/components/securitySchemes/a': [] } ]", None).mismatches.len(), 1);
+    }
+
+    #[test]
+    fn invalid_json_and_non_matching_methods_are_ignored_or_unmatched() {
+        let yaml = spec("", &[("/p", "get", "[ { a: [] } ]")]);
+        let check = run(&yaml, &[("p", "get", "{ not json".to_string())]);
+        assert!(check.mismatches.is_empty() && check.unmatched.is_empty());
+        let check = run(&yaml, &[("p", "post", endpoint(None))]);
+        assert!(check.mismatches.is_empty());
+        assert_eq!(check.unmatched.len(), 1, "a POST file has no POST operation in the spec");
+    }
+
+    #[test]
+    fn a_file_with_no_matching_operation_is_unmatched_with_the_documented_message() {
+        let yaml = spec("", &[("/p", "get", "[ { a: [] } ]")]);
+        let check = run(&yaml, &[("other", "get", endpoint(None))]);
+        assert!(check.mismatches.is_empty());
+        assert_eq!(check.unmatched.len(), 1);
+        let msg = unmatched_security_message(&check.unmatched[0]);
+        assert!(
+            msg.ends_with(": no matching operation in openapi.yaml — endpoint security was not checked for this route"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn a_renamed_path_parameter_still_matches_by_position() {
+        let yaml = spec("", &[("/cars/{vin}", "get", "[ { a: [] } ]")]);
+        let bad = run(&yaml, &[("cars/{id}", "get", endpoint(None))]);
+        assert_eq!(bad.mismatches.len(), 1, "{}", bad.unmatched.len());
+        let good = run(&yaml, &[("cars/{id}", "get", endpoint(Some("a")))]);
+        assert!(good.mismatches.is_empty() && good.unmatched.is_empty());
+    }
+
+    #[test]
+    fn a_case_drifted_folder_still_matches_the_spec_path() {
+        let yaml = spec("", &[("/cars", "get", "[ { a: [] } ]")]);
+        let check = run(&yaml, &[("Cars", "get", endpoint(None))]);
+        assert_eq!(check.mismatches.len(), 1);
+        assert!(check.unmatched.is_empty());
+    }
+
+    #[test]
+    fn a_trailing_slash_spec_path_matches_its_folder() {
+        let yaml = spec("", &[("/cars/", "get", "[ { a: [] } ]")]);
+        let check = run(&yaml, &[("cars", "get", endpoint(None))]);
+        assert_eq!(check.mismatches.len(), 1);
+        assert!(check.unmatched.is_empty());
+    }
+
+    #[test]
+    fn several_fallback_matches_must_all_be_satisfied_and_the_message_lists_them() {
+        let yaml = spec("", &[("/a/{x}", "get", "[ { a: [] } ]"), ("/a/{y}", "get", "[ { b: [] } ]")]);
+        let check = run(&yaml, &[("a/{z}", "get", endpoint(Some("a")))]);
+        assert_eq!(check.mismatches.len(), 1);
+        let msg = check.mismatches[0].message();
+        assert!(msg.contains("it must satisfy all of them"), "{msg}");
+        assert!(msg.contains("GET /a/{x}") && msg.contains("GET /a/{y}"), "{msg}");
+
+        let both = spec("", &[("/a/{x}", "get", "[ { a: [] }, { b: [] } ]"), ("/a/{y}", "get", "[ { b: [] } ]")]);
+        assert!(run(&both, &[("a/{z}", "get", endpoint(Some("b")))]).mismatches.is_empty());
+        let none_file = run(&yaml, &[("a/{z}", "get", endpoint(None))]);
+        assert_eq!(none_file.mismatches.len(), 1, "no security is a mismatch if any matched op requires");
+    }
+
+    #[test]
+    fn a_requiring_and_a_non_requiring_fallback_match_still_fail_closed_for_no_security() {
+        let yaml = spec("", &[("/a/{x}", "get", "[ { a: [] } ]"), ("/a/{y}", "get", "[]")]);
+        let check = run(&yaml, &[("a/{z}", "get", endpoint(None))]);
+        assert_eq!(check.mismatches.len(), 1);
+    }
+
+    #[test]
+    fn case_colliding_spec_paths_are_still_checked_by_exact_bytes() {
+        let yaml = spec("", &[("/Cars", "get", "[ { a: [] } ]"), ("/cars", "get", "[ { a: [] } ]")]);
+        let check = run(&yaml, &[("cars", "get", endpoint(None)), ("Cars", "get", endpoint(Some("a")))]);
+        // On a case-insensitive filesystem both files share one folder; either way the unprotected one is caught.
+        assert!(check.mismatches.len() <= 1);
+        let solo = run(&yaml, &[("cars", "get", endpoint(None))]);
+        assert_eq!(solo.mismatches.len(), 1);
+    }
+
+    #[test]
+    fn hostile_scheme_names_and_file_names_are_escaped_in_every_message() {
+        let yaml = spec("", &[("/p", "get", "[ { a: [] } ]")]);
+        let check = run(&yaml, &[("p", "get", endpoint(Some("evil\u{1b}[31m\nname")))]);
+        assert_eq!(check.mismatches.len(), 1);
+        let msg = check.mismatches[0].message();
+        assert!(!msg.contains('\u{1b}') && !msg.contains('\n'), "{msg:?}");
+
+        let hostile_spec = spec("", &[("/p", "get", "[ { \"x\\u001b[0m\": [] } ]")]);
+        let check = run(&hostile_spec, &[("p", "get", endpoint(None))]);
+        assert_eq!(check.mismatches.len(), 1);
+        let msg = check.mismatches[0].message();
+        assert!(!msg.contains('\u{1b}'), "{msg:?}");
+
+        let mismatch = SecurityMismatch {
+            method: "get".into(),
+            url_path: "/p".into(),
+            file: PathBuf::from("dir/evil\u{1b}[2Jfile.json"),
+            stub: None,
+            matched: vec![("get".into(), "/p".into())],
+            acceptable: vec!["a".into()],
+        };
+        assert!(!mismatch.message().contains('\u{1b}'));
+        assert!(!unmatched_security_message(Path::new("x/\u{1b}[2Jy.json")).contains('\u{1b}'));
+    }
+
+    #[test]
+    fn match_key_ignores_parameter_names_and_case_but_not_literal_segments_or_arity() {
+        assert_eq!(match_key("/cars/:vin"), match_key("/CARS/:id"));
+        assert_ne!(match_key("/cars/:vin"), match_key("/cars/:vin/owners"));
+        assert_ne!(match_key("/cars/:vin"), match_key("/cars/vin"));
+    }
+}
+
+#[cfg(test)]
+mod m3_router_tests {
+    use super::*;
+    use crate::server::{raw_request, spawn_served};
+    use crate::sql::{SqlError, SqlValue};
+
+    fn temp_root() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-endpoint-m3-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_endpoint(root: &Path, dir: &str, token: &str, json: &str) {
+        let d = root.join("datasources/endpoints").join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(format!("endpoint.{token}.json")), json).unwrap();
+    }
+
+    const LITERAL: &str = r#"{ "operationId": "x", "sources": {}, "response": { "ok": "literal" } }"#;
+
+    /// Answers the verifier (any call that carries a `key` parameter) with `active = (key == "good")`
+    /// and every other call with a row echoing the bound `maker` parameter.
+    #[derive(Debug)]
+    struct TestDriver;
+
+    #[async_trait::async_trait]
+    impl SqlDriver for TestDriver {
+        async fn query(&self, _script: &str, params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
+            if let Some(key) = params.get("key") {
+                return Ok(vec![HashMap::from([(
+                    "active".to_string(),
+                    SqlValue::Bool(*key == SqlValue::Text("good".to_string())),
+                )])]);
+            }
+            let maker = params.get("maker").cloned().unwrap_or(SqlValue::Null);
+            Ok(vec![HashMap::from([("maker".to_string(), maker)])])
+        }
+    }
+
+    fn router_for(root: &Path) -> Router {
+        std::fs::create_dir_all(root.join("datasources/sql/db")).unwrap();
+        std::fs::write(root.join("datasources/sql/db/q.sql"), "SELECT 1").unwrap();
+        std::fs::write(root.join("datasources/sql/db/verify.sql"), "SELECT 1").unwrap();
+        let sec = root.join("sec");
+        std::fs::create_dir_all(sec.join("verifiers")).unwrap();
+        std::fs::write(sec.join("schemes.json"), r#"{ "keyAuth": { "verifier": "key.json" } }"#).unwrap();
+        std::fs::write(
+            sec.join("verifiers/key.json"),
+            r#"{ "type": "sql", "connection": "db", "script": "verify.sql", "parameters": [{ "name": "key", "from": "header.X-Api-Key" }], "validIf": "row.active = true" }"#,
+        )
+        .unwrap();
+        let errs = root.join("errs");
+        std::fs::create_dir_all(&errs).unwrap();
+        std::fs::write(
+            errs.join("core.json"),
+            r#"{ "auth.invalid_credentials": { "httpStatus": 401, "exposeDetail": true }, "auth.verifier_unavailable": { "httpStatus": 500, "exposeDetail": false } }"#,
+        )
+        .unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), Box::new(TestDriver));
+        build_router(
+            root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
+            Arc::new(drivers),
+            &HashMap::new(),
+            Arc::new(ErrorRegistry::load(&errs).unwrap()),
+            Arc::new(SecurityConfig::load(&sec).unwrap()),
+            Arc::new(HashMap::new()),
+            Arc::new(Mutex::new(DiscoveredErrors::default())),
+            false,
+            None,
+            None,
+            NonZeroU64::new(5_000).unwrap(),
+            false,
+            MethodCase::Default,
+        )
+    }
+
+    async fn serve_root(root: &Path) -> String {
+        format!("http://{}", spawn_served(router_for(root), false).await)
+    }
+
+    fn query_method() -> reqwest::Method {
+        reqwest::Method::from_bytes(b"QUERY").unwrap()
+    }
+
+    fn allow_of(resp: &reqwest::Response) -> String {
+        resp.headers().get("allow").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_query_request_with_a_json_body_reaches_a_source_parameter_and_the_response() {
+        let root = temp_root();
+        write_endpoint(
+            &root,
+            "cars",
+            "query",
+            r#"{ "operationId": "searchCars", "sources": { "car": { "type": "sql", "connection": "db", "script": "q.sql", "cardinality": "one",
+               "parameters": [{ "name": "maker", "from": "body.maker" }] } }, "response": { "maker": "sources.car.maker" } }"#,
+        );
+        let base = serve_root(&root).await;
+        let resp = reqwest::Client::new()
+            .request(query_method(), format!("{base}/cars"))
+            .json(&serde_json::json!({ "maker": "Honda" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["maker"], "Honda");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_query_request_with_no_body_at_all_is_served_like_a_bodyless_post() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "query", LITERAL);
+        let base = serve_root(&root).await;
+        let resp = reqwest::Client::new().request(query_method(), format!("{base}/things")).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn get_and_query_on_one_path_both_work_and_have_independent_rate_limit_buckets() {
+        let root = temp_root();
+        let limited = r#"{ "operationId": "x", "sources": {}, "response": {}, "rateLimit": { "requestsPerSecond": 1, "burst": 1 } }"#;
+        write_endpoint(&root, "things", "get", limited);
+        write_endpoint(&root, "things", "query", limited);
+        let base = serve_root(&root).await;
+        let client = reqwest::Client::new();
+        let get = |c: &reqwest::Client| c.get(format!("{base}/things")).send();
+        let query = |c: &reqwest::Client| c.request(query_method(), format!("{base}/things")).send();
+        assert_eq!(get(&client).await.unwrap().status(), 200);
+        assert_eq!(get(&client).await.unwrap().status(), 429, "GET bucket exhausted");
+        assert_eq!(query(&client).await.unwrap().status(), 200, "QUERY has its own bucket, untouched by GET");
+        assert_eq!(query(&client).await.unwrap().status(), 429);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_two_mib_default_is_413_for_post_and_query_alike() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "post", LITERAL);
+        write_endpoint(&root, "things", "query", LITERAL);
+        let base = serve_root(&root).await;
+        let big = vec![b'a'; 2 * 1024 * 1024 + 1024];
+        let client = reqwest::Client::new();
+        let post = client.post(format!("{base}/things")).body(big.clone()).send().await.unwrap();
+        let query = client.request(query_method(), format!("{base}/things")).body(big).send().await.unwrap();
+        assert_eq!(post.status(), 413);
+        assert_eq!(query.status(), 413);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_protected_query_route_rejects_missing_and_wrong_credentials_exactly_like_get() {
+        let root = temp_root();
+        let protected = r#"{ "operationId": "x", "security": "keyAuth", "sources": {}, "response": {} }"#;
+        write_endpoint(&root, "secret", "get", protected);
+        write_endpoint(&root, "secret", "query", protected);
+        let base = serve_root(&root).await;
+        let client = reqwest::Client::new();
+        for method in [reqwest::Method::GET, query_method()] {
+            let req = |key: Option<&str>| {
+                let mut r = client.request(method.clone(), format!("{base}/secret"));
+                if let Some(k) = key {
+                    r = r.header("X-Api-Key", k);
+                }
+                r.send()
+            };
+            assert_eq!(req(None).await.unwrap().status(), 401, "{method}: no credential");
+            assert_eq!(req(Some("bad")).await.unwrap().status(), 401, "{method}: wrong credential");
+            assert_eq!(req(Some("good")).await.unwrap().status(), 200, "{method}: right credential");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_standard_only_path_keeps_axums_own_405_and_allow_header() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "get", LITERAL);
+        let base = serve_root(&root).await;
+        let client = reqwest::Client::new();
+        let put = client.put(format!("{base}/things")).send().await.unwrap();
+        assert_eq!(put.status(), 405);
+        assert_eq!(allow_of(&put), "GET,HEAD");
+        let query = client.request(query_method(), format!("{base}/things")).send().await.unwrap();
+        assert_eq!(query.status(), 405, "no QUERY file, no QUERY route");
+        assert_eq!(allow_of(&query), "GET,HEAD");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn put_on_a_get_plus_query_path_is_405_listing_query_in_allow() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "get", LITERAL);
+        write_endpoint(&root, "things", "query", LITERAL);
+        let base = serve_root(&root).await;
+        let resp = reqwest::Client::new().put(format!("{base}/things")).send().await.unwrap();
+        assert_eq!(resp.status(), 405);
+        assert_eq!(allow_of(&resp), "GET,HEAD,QUERY");
+        assert!(resp.bytes().await.unwrap().is_empty(), "the dispatcher's 405 body is empty");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_successful_query_response_carries_a_complete_allow_header_never_an_empty_one() {
+        let root = temp_root();
+        write_endpoint(&root, "both", "get", LITERAL);
+        write_endpoint(&root, "both", "post", LITERAL);
+        write_endpoint(&root, "both", "query", LITERAL);
+        write_endpoint(&root, "only", "query", LITERAL);
+        let base = serve_root(&root).await;
+        let client = reqwest::Client::new();
+
+        let both = client.request(query_method(), format!("{base}/both")).send().await.unwrap();
+        assert_eq!(both.status(), 200);
+        assert_eq!(allow_of(&both), "GET,HEAD,POST,QUERY");
+
+        let only = client.request(query_method(), format!("{base}/only")).send().await.unwrap();
+        assert_eq!(only.status(), 200);
+        assert_eq!(allow_of(&only), "QUERY");
+
+        let wrong = client.get(format!("{base}/only")).send().await.unwrap();
+        assert_eq!(wrong.status(), 405);
+        assert_eq!(allow_of(&wrong), "QUERY");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_extension_method_on_a_query_path_is_a_bare_405_with_the_full_allow() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "query", LITERAL);
+        let base = serve_root(&root).await;
+        let resp = reqwest::Client::new()
+            .request(reqwest::Method::from_bytes(b"PURGE").unwrap(), format!("{base}/things"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 405);
+        assert_eq!(allow_of(&resp), "QUERY");
+        // Lowercase is a different method to the exact-match dispatcher when nothing normalizes it.
+        let strict_addr = spawn_served(router_for(&root), true).await;
+        let lower = reqwest::Client::new()
+            .request(reqwest::Method::from_bytes(b"query").unwrap(), format!("http://{strict_addr}/things"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(lower.status(), 405);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn query_is_served_when_the_router_is_nested_under_an_api_root() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "query", LITERAL);
+        write_endpoint(&root, "things", "get", LITERAL);
+        let nested = Router::new().nest("/api", router_for(&root));
+        let addr = spawn_served(nested, false).await;
+        let resp = reqwest::Client::new()
+            .request(query_method(), format!("http://{addr}/api/things"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(allow_of(&resp), "GET,HEAD,QUERY");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn router_level_layers_wrap_a_query_response_with_cors_and_a_correlation_id() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "query", LITERAL);
+        let router = crate::server::apply_cors(crate::server::apply_middleware(router_for(&root)), &["https://app.example".to_string()]);
+        let addr = spawn_served(router, false).await;
+        let resp = reqwest::Client::new()
+            .request(query_method(), format!("http://{addr}/things"))
+            .header("origin", "https://app.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.headers().get("access-control-allow-origin").is_some());
+        assert!(resp.headers().get("x-request-id").is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn lowercase_query_is_served_when_case_insensitive_and_405_when_case_sensitive() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "query", LITERAL);
+        write_endpoint(&root, "things", "get", LITERAL);
+        let request = b"query /things HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+        let insensitive = spawn_served(router_for(&root), false).await;
+        let (line, headers, _, _) = raw_request(insensitive, request).await;
+        assert!(line.contains(" 200 "), "{line}");
+        assert!(headers.iter().any(|(k, v)| k == "allow" && v == "GET,HEAD,QUERY"), "{headers:?}");
+
+        let sensitive = spawn_served(router_for(&root), true).await;
+        let (line, headers, _, _) = raw_request(sensitive, request).await;
+        assert!(line.contains(" 405 "), "{line}");
+        assert!(headers.iter().any(|(k, v)| k == "allow" && v == "GET,HEAD,QUERY"), "{headers:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_non_canonical_stub_name_is_never_routed_and_is_listed_by_non_canonical_method_files() {
+        let root = temp_root();
+        write_endpoint(&root, "upper", "GET", LITERAL);
+        write_endpoint(&root, "mixed", "Query", LITERAL);
+        write_endpoint(&root, "fine", "get", LITERAL);
+        write_endpoint(&root, "other", "purge", LITERAL);
+        let base = serve_root(&root).await;
+        let client = reqwest::Client::new();
+        for path in ["/upper", "/mixed", "/other"] {
+            assert_eq!(client.get(format!("{base}{path}")).send().await.unwrap().status(), 404, "{path}");
+            assert_eq!(client.request(query_method(), format!("{base}{path}")).send().await.unwrap().status(), 404, "{path}");
+        }
+        assert_eq!(client.get(format!("{base}/fine")).send().await.unwrap().status(), 200);
+
+        let found = method_file_findings(&tree_for_tests(&root.join("datasources/endpoints")), MethodCase::Default);
+        let mut names: Vec<_> = found
+            .iter()
+            .map(|f| {
+                let hint = match &f.kind {
+                    MethodFileKind::NonCanonical { hint } => hint.clone(),
+                    MethodFileKind::WrongMode { .. } => None,
+                };
+                (f.file.file_name().unwrap().to_str().unwrap().to_string(), hint)
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                ("endpoint.GET.json".to_string(), Some("get".to_string())),
+                ("endpoint.Query.json".to_string(), Some("query".to_string())),
+                ("endpoint.purge.json".to_string(), Some("PURGE".to_string())),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn non_canonical_method_files_ignores_siblings_backups_and_canonical_files() {
+        let root = temp_root();
+        let ep = root.join("datasources/endpoints");
+        write_endpoint(&root, "a", "get", LITERAL);
+        std::fs::write(ep.join("a/endpoint.GET.reference.json"), "{}").unwrap();
+        std::fs::write(ep.join("a/endpoint.GET.test.json"), "{}").unwrap();
+        std::fs::write(ep.join("a/_endpoint.GET.json"), "{}").unwrap();
+        std::fs::create_dir_all(ep.join("a/_backups")).unwrap();
+        std::fs::write(ep.join("a/_backups/endpoint.GET.json"), "{}").unwrap();
+        assert!(method_file_findings(&tree_for_tests(&ep), MethodCase::Default).is_empty());
+        assert!(method_file_findings(&tree_for_tests(&root.join("nope")), MethodCase::Default).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn options_head_and_trace_stub_files_stay_unrouted() {
+        let root = temp_root();
+        write_endpoint(&root, "o", "options", LITERAL);
+        write_endpoint(&root, "h", "head", LITERAL);
+        write_endpoint(&root, "t", "trace", LITERAL);
+        let base = serve_root(&root).await;
+        for path in ["/o", "/h", "/t"] {
+            assert_eq!(reqwest::get(format!("{base}{path}")).await.unwrap().status(), 404, "{path}");
+        }
+        assert!(method_file_findings(&tree_for_tests(&root.join("datasources/endpoints")), MethodCase::Default).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn many_paths_register_deterministically_and_each_gets_its_own_allow_list() {
+        let root = temp_root();
+        for dir in ["z", "a", "m"] {
+            write_endpoint(&root, dir, "get", LITERAL);
+            write_endpoint(&root, dir, "query", LITERAL);
+        }
+        write_endpoint(&root, "a", "delete", LITERAL);
+        let first = serve_root(&root).await;
+        let second = serve_root(&root).await;
+        let client = reqwest::Client::new();
+        for base in [&first, &second] {
+            for (path, expected) in [("/a", "GET,HEAD,DELETE,QUERY"), ("/m", "GET,HEAD,QUERY"), ("/z", "GET,HEAD,QUERY")] {
+                let resp = client.put(format!("{base}{path}")).send().await.unwrap();
+                assert_eq!(allow_of(&resp), expected, "{path}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn path_parameters_work_for_query_routes() {
+        let root = temp_root();
+        write_endpoint(&root, "cars/{vin}", "query", LITERAL);
+        let base = serve_root(&root).await;
+        let resp = reqwest::Client::new().request(query_method(), format!("{base}/cars/ABC")).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m4_router_tests {
+    use super::*;
+    use crate::server::{raw_request, spawn_served};
+    use crate::sql::{SqlError, SqlValue};
+
+    fn temp_root() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-endpoint-m4-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_endpoint(root: &Path, dir: &str, token: &str, json: &str) {
+        let d = root.join("datasources/endpoints").join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(format!("endpoint.{token}.json")), json).unwrap();
+    }
+
+    /// An endpoint whose `successStatus` tells the tests which file answered.
+    fn ep(status: u16, security: Option<&str>) -> String {
+        match security {
+            Some(s) => format!(r#"{{ "operationId": "x", "successStatus": {status}, "security": "{s}", "sources": {{}}, "response": {{}} }}"#),
+            None => format!(r#"{{ "operationId": "x", "successStatus": {status}, "sources": {{}}, "response": {{}} }}"#),
+        }
+    }
+
+    #[derive(Debug)]
+    struct KeyDriver;
+
+    #[async_trait::async_trait]
+    impl SqlDriver for KeyDriver {
+        async fn query(&self, _script: &str, params: &HashMap<String, SqlValue>) -> Result<Vec<HashMap<String, SqlValue>>, SqlError> {
+            let good = params.get("key") == Some(&SqlValue::Text("good".to_string()));
+            Ok(vec![HashMap::from([("active".to_string(), SqlValue::Bool(good))])])
+        }
+    }
+
+    fn router_for(root: &Path, mode: MethodCase) -> Router {
+        std::fs::create_dir_all(root.join("datasources/sql/db")).unwrap();
+        std::fs::write(root.join("datasources/sql/db/verify.sql"), "SELECT 1").unwrap();
+        let sec = root.join("sec");
+        std::fs::create_dir_all(sec.join("verifiers")).unwrap();
+        std::fs::write(sec.join("schemes.json"), r#"{ "keyAuth": { "verifier": "key.json" } }"#).unwrap();
+        std::fs::write(
+            sec.join("verifiers/key.json"),
+            r#"{ "type": "sql", "connection": "db", "script": "verify.sql", "parameters": [{ "name": "key", "from": "header.X-Api-Key" }], "validIf": "row.active = true" }"#,
+        )
+        .unwrap();
+        let errs = root.join("errs");
+        std::fs::create_dir_all(&errs).unwrap();
+        std::fs::write(
+            errs.join("core.json"),
+            r#"{ "auth.invalid_credentials": { "httpStatus": 401, "exposeDetail": true }, "auth.verifier_unavailable": { "httpStatus": 500, "exposeDetail": false } }"#,
+        )
+        .unwrap();
+        let mut drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
+        drivers.insert("db".to_string(), Box::new(KeyDriver));
+        build_router(
+            root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
+            Arc::new(drivers),
+            &HashMap::new(),
+            Arc::new(ErrorRegistry::load(&errs).unwrap()),
+            Arc::new(SecurityConfig::load(&sec).unwrap()),
+            Arc::new(HashMap::new()),
+            Arc::new(Mutex::new(DiscoveredErrors::default())),
+            false,
+            None,
+            None,
+            NonZeroU64::new(5_000).unwrap(),
+            false,
+            mode,
+        )
+    }
+
+    async fn serve(root: &Path, mode: MethodCase) -> String {
+        format!("http://{}", spawn_served(router_for(root, mode), mode == MethodCase::Exact).await)
+    }
+
+    async fn call(base: &str, method: &str, path: &str, key: Option<&str>) -> (u16, String) {
+        let mut req = reqwest::Client::new().request(reqwest::Method::from_bytes(method.as_bytes()).unwrap(), format!("{base}{path}"));
+        if let Some(k) = key {
+            req = req.header("X-Api-Key", k);
+        }
+        let resp = req.send().await.unwrap();
+        let allow = resp.headers().get("allow").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+        (resp.status().as_u16(), allow)
+    }
+
+    fn allow_list(allow: &str) -> Vec<String> {
+        allow.split(',').map(str::to_string).collect()
+    }
+
+    #[tokio::test]
+    async fn default_mode_serves_purge_in_any_request_spelling_from_endpoint_upper_purge_and_not_other_methods() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "PURGE", &ep(201, None));
+        let base = serve(&root, MethodCase::Default).await;
+        for method in ["PURGE", "purge", "Purge", "pUrGe"] {
+            assert_eq!(call(&base, method, "/things", None).await.0, 201, "{method}");
+        }
+        assert_eq!(call(&base, "GET", "/things", None).await.0, 405);
+        assert_eq!(call(&base, "get", "/things", None).await.0, 405);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn default_mode_serves_lowercase_get_as_get_and_link_next_to_it() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "get", &ep(200, None));
+        write_endpoint(&root, "things", "LINK", &ep(202, None));
+        let base = serve(&root, MethodCase::Default).await;
+        assert_eq!(call(&base, "get", "/things", None).await.0, 200);
+        assert_eq!(call(&base, "link", "/things", None).await.0, 202);
+        assert_eq!(call(&base, "LINK", "/things", None).await.0, 202);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn exact_mode_routes_each_spelling_to_its_own_file_and_everything_else_is_405() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "~purge", &ep(201, None));
+        write_endpoint(&root, "things", "PURGE", &ep(202, None));
+        write_endpoint(&root, "things", "get", &ep(203, None));
+        let base = serve(&root, MethodCase::Exact).await;
+        assert_eq!(call(&base, "purge", "/things", None).await.0, 201, "purge reaches only ~purge");
+        assert_eq!(call(&base, "PURGE", "/things", None).await.0, 202, "PURGE reaches only PURGE");
+        assert_eq!(call(&base, "Purge", "/things", None).await.0, 405, "an unlisted spelling is 405");
+        assert_eq!(call(&base, "GET", "/things", None).await.0, 203);
+        assert_eq!(call(&base, "get", "/things", None).await.0, 405, "get never reaches GET");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn exact_mode_with_only_purge_upper_answers_lowercase_purge_with_405() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "PURGE", &ep(202, None));
+        let base = serve(&root, MethodCase::Exact).await;
+        assert_eq!(call(&base, "PURGE", "/things", None).await.0, 202);
+        assert_eq!(call(&base, "purge", "/things", None).await.0, 405);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn exact_mode_lowercase_get_never_reaches_a_protected_get_route_and_reaches_only_the_open_tilde_get() {
+        let root = temp_root();
+        write_endpoint(&root, "vault", "get", &ep(200, Some("keyAuth")));
+        write_endpoint(&root, "vault", "~get", &ep(201, None));
+        let base = serve(&root, MethodCase::Exact).await;
+        assert_eq!(call(&base, "get", "/vault", None).await.0, 201, "the lowercase method reaches the open ~get route");
+        assert_eq!(call(&base, "get", "/vault", Some("bad")).await.0, 201);
+        assert_eq!(call(&base, "GET", "/vault", None).await.0, 401, "GET without credentials is rejected");
+        assert_eq!(call(&base, "GET", "/vault", Some("bad")).await.0, 401);
+        assert_eq!(call(&base, "GET", "/vault", Some("good")).await.0, 200);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn exact_mode_lowercase_get_with_no_tilde_get_file_is_405_not_the_protected_route() {
+        let root = temp_root();
+        write_endpoint(&root, "vault", "get", &ep(200, Some("keyAuth")));
+        let base = serve(&root, MethodCase::Exact).await;
+        assert_eq!(call(&base, "get", "/vault", None).await.0, 405);
+        assert_eq!(call(&base, "get", "/vault", Some("good")).await.0, 405);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_extension_method_is_405_with_an_allow_header_naming_standard_and_extension_methods() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "get", &ep(200, None));
+        write_endpoint(&root, "things", "query", &ep(200, None));
+        write_endpoint(&root, "things", "PURGE", &ep(200, None));
+        write_endpoint(&root, "things", "LINK", &ep(200, None));
+        let base = serve(&root, MethodCase::Default).await;
+        let (status, allow) = call(&base, "UNLINK", "/things", None).await;
+        assert_eq!(status, 405);
+        let methods = allow_list(&allow);
+        for expected in ["GET", "HEAD", "QUERY", "PURGE", "LINK"] {
+            assert!(methods.iter().any(|m| m == expected), "{expected} missing from Allow: {allow}");
+        }
+
+        let root2 = temp_root();
+        write_endpoint(&root2, "things", "get", &ep(200, None));
+        write_endpoint(&root2, "things", "~purge", &ep(200, None));
+        write_endpoint(&root2, "things", "PURGE", &ep(200, None));
+        let base2 = serve(&root2, MethodCase::Exact).await;
+        let (status, allow) = call(&base2, "UNLINK", "/things", None).await;
+        assert_eq!(status, 405);
+        let methods = allow_list(&allow);
+        for expected in ["GET", "HEAD", "purge", "PURGE"] {
+            assert!(methods.iter().any(|m| m == expected), "{expected} missing from Allow: {allow}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    #[tokio::test]
+    async fn a_successful_extension_response_carries_the_full_allow_header() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "get", &ep(200, None));
+        write_endpoint(&root, "things", "PURGE", &ep(202, None));
+        let base = serve(&root, MethodCase::Default).await;
+        let (status, allow) = call(&base, "PURGE", "/things", None).await;
+        assert_eq!(status, 202);
+        let methods = allow_list(&allow);
+        assert!(methods.iter().any(|m| m == "GET") && methods.iter().any(|m| m == "PURGE"), "{allow}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_cors_preflight_for_purge_succeeds_in_default_mode_and_for_lowercase_purge_in_exact_mode() {
+        for (mode, requested, file) in [(MethodCase::Default, "PURGE", "PURGE"), (MethodCase::Exact, "purge", "~purge")] {
+            let root = temp_root();
+            write_endpoint(&root, "things", file, &ep(202, None));
+            let router = crate::server::apply_cors(router_for(&root, mode), &["https://app.example".to_string()]);
+            let addr = spawn_served(router, mode == MethodCase::Exact).await;
+            let preflight = reqwest::Client::new()
+                .request(reqwest::Method::OPTIONS, format!("http://{addr}/things"))
+                .header("origin", "https://app.example")
+                .header("access-control-request-method", requested)
+                .send()
+                .await
+                .unwrap();
+            assert!(preflight.status().is_success(), "{mode:?}: {}", preflight.status());
+            assert!(preflight.headers().get("access-control-allow-origin").is_some(), "{mode:?}");
+            let allowed = preflight
+                .headers()
+                .get("access-control-allow-methods")
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default();
+            assert!(allowed.contains(requested), "{mode:?}: allow-methods {allowed:?}");
+
+            let actual = reqwest::Client::new()
+                .request(reqwest::Method::from_bytes(requested.as_bytes()).unwrap(), format!("http://{addr}/things"))
+                .header("origin", "https://app.example")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(actual.status(), 202, "{mode:?}");
+            assert!(actual.headers().get("access-control-allow-origin").is_some(), "{mode:?}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wrong_mode_file_is_never_routed_in_either_direction() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "~purge", &ep(201, None));
+        let base = serve(&root, MethodCase::Default).await;
+        for method in ["PURGE", "purge"] {
+            assert_eq!(
+                call(&base, method, "/things", None).await.0,
+                404,
+                "default mode must skip endpoint.~purge.json: {method}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        // `~get` is valid under exact mode; under default it is a WrongMode file and `get` is plain GET.
+        let root = temp_root();
+        write_endpoint(&root, "things", "~get", &ep(201, None));
+        let base = serve(&root, MethodCase::Default).await;
+        assert_eq!(call(&base, "get", "/things", None).await.0, 404);
+        assert_eq!(call(&base, "GET", "/things", None).await.0, 404);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn invalid_token_files_are_never_routed_in_either_mode() {
+        for mode in [MethodCase::Default, MethodCase::Exact] {
+            let root = temp_root();
+            // one folder per spelling so the fixture is unique after case folding
+            write_endpoint(&root, "a", "GET", &ep(200, None));
+            write_endpoint(&root, "b", "Get", &ep(200, None));
+            write_endpoint(&root, "c", "purge", &ep(200, None));
+            write_endpoint(&root, "d", "~_47_45_54", &ep(200, None));
+            write_endpoint(&root, "e", "~_4c_49_4e_4b", &ep(200, None));
+            let base = serve(&root, mode).await;
+            for (path, methods) in [
+                ("/a", ["GET", "get"]),
+                ("/b", ["GET", "get"]),
+                ("/c", ["purge", "PURGE"]),
+                ("/d", ["GET", "get"]),
+                ("/e", ["LINK", "link"]),
+            ] {
+                for method in methods {
+                    assert_eq!(call(&base, method, path, None).await.0, 404, "{mode:?} {method} {path}");
+                }
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[tokio::test]
+    async fn extension_routes_work_with_path_parameters() {
+        let root = temp_root();
+        write_endpoint(&root, "cars/{vin}", "LINK", &ep(202, None));
+        let base = serve(&root, MethodCase::Default).await;
+        assert_eq!(call(&base, "LINK", "/cars/ABC", None).await.0, 202);
+        assert_eq!(call(&base, "link", "/cars/ABC", None).await.0, 202);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_protected_extension_route_rejects_missing_and_wrong_credentials() {
+        let root = temp_root();
+        write_endpoint(&root, "secret", "LINK", &ep(202, Some("keyAuth")));
+        let base = serve(&root, MethodCase::Default).await;
+        assert_eq!(call(&base, "LINK", "/secret", None).await.0, 401);
+        assert_eq!(call(&base, "LINK", "/secret", Some("bad")).await.0, 401);
+        assert_eq!(call(&base, "link", "/secret", Some("good")).await.0, 202);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discovery_over_a_mixed_tree_returns_exactly_the_valid_routable_files_for_the_mode() {
+        let root = temp_root();
+        write_endpoint(&root, "a", "get", &ep(200, None));
+        write_endpoint(&root, "a", "LINK", &ep(200, None));
+        write_endpoint(&root, "b", "query", &ep(200, None));
+        write_endpoint(&root, "c", "~purge", &ep(200, None));
+        write_endpoint(&root, "d", "PURGE", &ep(200, None));
+        write_endpoint(&root, "e", "GET", &ep(200, None));
+        write_endpoint(&root, "f", "options", &ep(200, None));
+        write_endpoint(&root, "g", "purge", &ep(200, None));
+        write_endpoint(&root, "h", "~_4c_49_4e_4b", &ep(200, None));
+        let ep_root = root.join("datasources/endpoints");
+        std::fs::write(ep_root.join("a/endpoint.LINK.reference.json"), "{}").unwrap();
+        std::fs::write(ep_root.join("a/endpoint.LINK.test.json"), "{}").unwrap();
+        std::fs::write(ep_root.join("a/_endpoint.LINK.json"), "{}").unwrap();
+        std::fs::create_dir_all(ep_root.join("a/_backups")).unwrap();
+        std::fs::write(ep_root.join("a/_backups/endpoint.LINK.json"), "{}").unwrap();
+
+        let found = |mode| {
+            let mut v: Vec<(String, String)> = discover_endpoint_files(&tree_for_tests(&ep_root), mode).into_iter().map(|(p, m, _)| (p, m)).collect();
+            v.sort();
+            v
+        };
+        let pair = |p: &str, m: &str| (p.to_string(), m.to_string());
+        assert_eq!(
+            found(MethodCase::Default),
+            vec![pair("/a", "LINK"), pair("/a", "get"), pair("/b", "query"), pair("/d", "PURGE")]
+        );
+        assert_eq!(
+            found(MethodCase::Exact),
+            vec![pair("/a", "LINK"), pair("/a", "get"), pair("/b", "query"), pair("/c", "~purge"), pair("/d", "PURGE")]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn method_file_findings_classify_non_canonical_and_wrong_mode_files_and_hint_only_accepted_spellings() {
+        let root = temp_root();
+        write_endpoint(&root, "a", "purge", &ep(200, None));
+        write_endpoint(&root, "b", "~purge", &ep(200, None));
+        write_endpoint(&root, "c", "foo", &ep(200, None));
+        write_endpoint(&root, "d", "GET", &ep(200, None));
+        write_endpoint(&root, "e", "~_4c_49_4e_4b", &ep(200, None));
+        write_endpoint(&root, "f", "LINK", &ep(200, None));
+        let ep_root = root.join("datasources/endpoints");
+        let describe = |mode| {
+            let mut v: Vec<(String, String)> = method_file_findings(&tree_for_tests(&ep_root), mode)
+                .into_iter()
+                .map(|f| {
+                    let what = match &f.kind {
+                        MethodFileKind::NonCanonical { hint } => format!("noncanonical:{}", hint.clone().unwrap_or_default()),
+                        MethodFileKind::WrongMode { wire } => format!("wrongmode:{wire}"),
+                    };
+                    (f.file.file_name().unwrap().to_str().unwrap().to_string(), what)
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        let s = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            describe(MethodCase::Default),
+            vec![
+                s("endpoint.GET.json", "noncanonical:get"),
+                s("endpoint.foo.json", "noncanonical:FOO"),
+                s("endpoint.purge.json", "noncanonical:PURGE"),
+                s("endpoint.~_4c_49_4e_4b.json", "noncanonical:LINK"),
+                s("endpoint.~purge.json", "wrongmode:purge"),
+            ]
+        );
+        let exact = describe(MethodCase::Exact);
+        assert!(exact.contains(&s("endpoint.purge.json", "noncanonical:~purge")), "{exact:?}");
+        assert!(exact.contains(&s("endpoint.GET.json", "noncanonical:get")), "{exact:?}");
+        assert!(
+            !exact.iter().any(|(name, _)| name == "endpoint.~purge.json" || name == "endpoint.LINK.json"),
+            "{exact:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_wrong_mode_finding_message_uses_the_documented_wording() {
+        let root = temp_root();
+        write_endpoint(&root, "b", "~purge", &ep(200, None));
+        let findings = method_file_findings(&tree_for_tests(&root.join("datasources/endpoints")), MethodCase::Default);
+        assert_eq!(findings.len(), 1);
+        let message = findings[0].message(MethodCase::Default);
+        assert!(message.contains("method 'purge' is case-distinct, but caseSensitiveMethods is false"), "{message}");
+        assert!(message.contains("this file was generated under the other setting"), "{message}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---------------------------------------------------------------- routed set == security-checked set
+
+    fn spec_yaml(mode_ops: &[(&str, &str)]) -> String {
+        let mut yaml = String::from(
+            "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    keyAuth: { type: apiKey, in: header, name: X-Api-Key }\npaths:\n",
+        );
+        for (path, key) in mode_ops {
+            let responses = "      security: [ { keyAuth: [] } ]\n      responses: { '200': { description: ok } }\n";
+            if ["get", "query"].contains(key) {
+                yaml.push_str(&format!("  {path}:\n    {key}:\n      operationId: op{}\n{responses}", path.trim_start_matches('/')));
+            } else {
+                yaml.push_str(&format!(
+                    "  {path}:\n    additionalOperations:\n      '{key}':\n        operationId: op{}\n        security: [ {{ keyAuth: [] }} ]\n        responses: {{ '200': {{ description: ok }} }}\n",
+                    path.trim_start_matches('/')
+                ));
+            }
+        }
+        yaml
+    }
+
+    #[tokio::test]
+    async fn the_set_of_routed_files_equals_the_set_security_check_looks_at_in_both_modes() {
+        for mode in [MethodCase::Default, MethodCase::Exact] {
+            let root = temp_root();
+            // Valid in default mode: a get, b PURGE, c query, d LINK. Valid in exact only: g ~purge.
+            write_endpoint(&root, "a", "get", &ep(200, None));
+            write_endpoint(&root, "b", "PURGE", &ep(200, None));
+            write_endpoint(&root, "c", "query", &ep(200, None));
+            write_endpoint(&root, "d", "LINK", &ep(200, None));
+            // Never served in either mode.
+            write_endpoint(&root, "e", "GET", &ep(200, None));
+            write_endpoint(&root, "f", "purge", &ep(200, None));
+            write_endpoint(&root, "h", "options", &ep(200, None));
+            // Served in exactly one mode.
+            write_endpoint(&root, "g", "~purge", &ep(200, None));
+
+            let spec_ops: Vec<(&str, &str)> = vec![
+                ("/a", "get"),
+                ("/b", "PURGE"),
+                ("/c", "query"),
+                ("/d", "LINK"),
+                ("/e", "get"),
+                ("/f", "PURGE"),
+                ("/g", if mode == MethodCase::Exact { "purge" } else { "PURGE" }),
+            ];
+            std::fs::write(root.join("openapi.yaml"), spec_yaml(&spec_ops)).unwrap();
+            let doc = crate::openapi::load(
+                &root.join("openapi.yaml"),
+                crate::openapi::LoadOptions {
+                    case_sensitive_methods: mode == MethodCase::Exact,
+                },
+            )
+            .unwrap();
+            let check = security_check(&tree_for_tests(&root.join("datasources/endpoints")), &doc);
+            assert!(check.ambiguous.is_empty() && check.unmatched.is_empty(), "{mode:?}");
+            let mut checked: Vec<(String, String)> = check
+                .mismatches
+                .iter()
+                .map(|m| (m.url_path.clone(), method_token::display_token(&m.method)))
+                .collect();
+            checked.sort();
+
+            let base = serve(&root, mode).await;
+            let mut routed: Vec<(String, String)> = Vec::new();
+            for path in ["/a", "/b", "/c", "/d", "/e", "/f", "/g", "/h"] {
+                for method in ["GET", "get", "QUERY", "PURGE", "purge", "LINK", "OPTIONS"] {
+                    // Skip the case-folded duplicates default mode would answer identically.
+                    if mode == MethodCase::Default && method.chars().any(|c| c.is_ascii_lowercase()) {
+                        continue;
+                    }
+                    let (status, _) = call(&base, method, path, None).await;
+                    if status == 200 {
+                        routed.push((path.to_string(), method.to_string()));
+                    }
+                }
+            }
+            routed.sort();
+            assert_eq!(routed, checked, "{mode:?}: routing and the startup security check must see the same files");
+            assert_eq!(checked.len(), if mode == MethodCase::Default { 4 } else { 5 }, "{mode:?}: {checked:?}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn a_file_whose_spec_keys_differ_only_in_case_is_reported_ambiguous_and_never_a_mismatch_or_unmatched() {
+        let root = temp_root();
+        write_endpoint(&root, "x", "PURGE", &ep(200, None));
+        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    keyAuth: { type: apiKey, in: header, name: k }\npaths:\n  /x:\n    additionalOperations:\n      purge:\n        operationId: a\n        security: [ { keyAuth: [] } ]\n        responses: { '200': { description: ok } }\n      PURGE:\n        operationId: b\n        responses: { '200': { description: ok } }\n";
+        std::fs::write(root.join("openapi.yaml"), yaml).unwrap();
+        let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
+        let check = security_check(&tree_for_tests(&root.join("datasources/endpoints")), &doc);
+        assert_eq!(check.ambiguous.len(), 1);
+        assert!(check.mismatches.is_empty() && check.unmatched.is_empty() && check.stricter.is_empty());
+        let message = check.ambiguous[0].message();
+        assert!(
+            message.contains("'purge'") && message.contains("'PURGE'") && message.contains("not served"),
+            "{message}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stale_get_stub_with_a_spec_that_only_declares_an_exact_mode_lowercase_get_is_a_mismatch() {
+        let root = temp_root();
+        write_endpoint(&root, "x", "get", &ep(200, None));
+        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    keyAuth: { type: apiKey, in: header, name: k }\npaths:\n  /x:\n    additionalOperations:\n      get:\n        operationId: lower\n        security: [ { keyAuth: [] } ]\n        responses: { '200': { description: ok } }\n";
+        std::fs::write(root.join("openapi.yaml"), yaml).unwrap();
+        let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions { case_sensitive_methods: true }).unwrap();
+        let check = security_check(&tree_for_tests(&root.join("datasources/endpoints")), &doc);
+        // endpoint.get.json is the GET route; the spec declares no GET, only an exact-mode lowercase get.
+        assert!(check.mismatches.is_empty(), "no spec operation maps to the GET file's token");
+        assert_eq!(
+            check.stale_variants.len(),
+            1,
+            "the stale GET file is never silently matched to the lowercase get; it is a stale variant of a secured operation"
+        );
+        assert!(check.unmatched.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_stub_for_an_exact_mode_lowercase_get_is_checked_against_that_operation_only() {
+        let root = temp_root();
+        write_endpoint(&root, "x", "~get", &ep(200, None));
+        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    keyAuth: { type: apiKey, in: header, name: k }\npaths:\n  /x:\n    get:\n      operationId: upper\n      responses: { '200': { description: ok } }\n    additionalOperations:\n      get:\n        operationId: lower\n        security: [ { keyAuth: [] } ]\n        responses: { '200': { description: ok } }\n";
+        std::fs::write(root.join("openapi.yaml"), yaml).unwrap();
+        let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions { case_sensitive_methods: true }).unwrap();
+        let check = security_check(&tree_for_tests(&root.join("datasources/endpoints")), &doc);
+        assert_eq!(check.mismatches.len(), 1, "the ~get stub must satisfy the lowercase get operation's security");
+        assert_eq!(check.mismatches[0].matched, vec![("get".to_string(), "/x".to_string())]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ================================================================== round 2: edge methods
+
+    fn fs_is_case_sensitive(dir: &Path) -> bool {
+        std::fs::create_dir_all(dir).unwrap();
+        let probe = dir.join("case_probe_a");
+        std::fs::write(&probe, b"").unwrap();
+        let sensitive = !dir.join("CASE_PROBE_A").exists();
+        std::fs::remove_file(&probe).unwrap();
+        sensitive
+    }
+
+    async fn raw_status(addr: std::net::SocketAddr, method: &str, path: &str, extra: &str) -> (u16, Vec<(String, String)>) {
+        let req = format!("{method} {path} HTTP/1.1\r\nHost: l\r\nConnection: close\r\n{extra}\r\n");
+        let (line, headers, _, _) = raw_request(addr, req.as_bytes()).await;
+        let status = line
+            .split(' ')
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("no status line for {method}: {line:?}"));
+        (status, headers)
+    }
+
+    fn allow_header(headers: &[(String, String)]) -> String {
+        headers.iter().find(|(k, _)| k == "allow").map(|(_, v)| v.clone()).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn long_and_punctuated_methods_on_the_wire_are_pinned_in_both_modes() {
+        // hyper accepts any RFC 9110 token as a method (up to its own limits); frogs routes the exact
+        // bytes (default mode uppercases first). These are the observed outcomes, pinned deliberately.
+        let root = temp_root();
+        write_endpoint(&root, "t", &"A".repeat(32), &ep(201, None));
+        write_endpoint(&root, "t", "M-SEARCH", &ep(202, None));
+        write_endpoint(&root, "t", "~_58_2e_59", &ep(203, None));
+        write_endpoint(&root, "t", "~_41_2a_42", &ep(204, None));
+        write_endpoint(&root, "t", "get", &ep(200, None));
+        let long_max = "A".repeat(32);
+        let long_over = "A".repeat(33);
+        let lower_max = "a".repeat(32);
+        let table: [(MethodCase, Vec<(&str, u16)>); 2] = [
+            (
+                MethodCase::Default,
+                vec![
+                    (&long_max, 201),
+                    (&long_over, 405),
+                    (&lower_max, 201),
+                    ("M-SEARCH", 202),
+                    ("m-search", 202),
+                    ("X.Y", 203),
+                    ("x.y", 203),
+                    ("A*B", 204),
+                    ("a*b", 204),
+                    ("UNLINK", 405),
+                ],
+            ),
+            (
+                MethodCase::Exact,
+                vec![
+                    (&long_max, 201),
+                    (&long_over, 405),
+                    (&lower_max, 405),
+                    ("M-SEARCH", 202),
+                    ("m-search", 405),
+                    ("X.Y", 203),
+                    ("x.y", 405),
+                    ("A*B", 204),
+                    ("a*b", 405),
+                    ("UNLINK", 405),
+                ],
+            ),
+        ];
+        for (mode, rows) in table {
+            let addr = spawn_served(router_for(&root, mode), mode == MethodCase::Exact).await;
+            for (method, expected) in rows {
+                let (status, headers) = raw_status(addr, method, "/t", "").await;
+                assert_eq!(status, expected, "{mode:?} {method}");
+                if expected == 405 {
+                    let allow = allow_header(&headers);
+                    for listed in ["GET", "HEAD", "M-SEARCH", "X.Y", "A*B", long_max.as_str()] {
+                        assert!(allow.split(',').any(|m| m == listed), "{mode:?} {method}: {listed} missing from Allow {allow}");
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn an_enormous_method_token_never_panics_the_server_and_never_reaches_a_route() {
+        let root = temp_root();
+        write_endpoint(&root, "t", "get", &ep(200, None));
+        let addr = spawn_served(router_for(&root, MethodCase::Default), false).await;
+        let huge = "A".repeat(5_000);
+        let req = format!("{huge} /t HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n");
+        let (line, _, _, _) = raw_request(addr, req.as_bytes()).await;
+        assert!(line.is_empty() || line.starts_with("HTTP/1.1 4"), "got {line:?}");
+        assert_eq!(raw_status(addr, "GET", "/t", "").await.0, 200, "the server is still healthy afterwards");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn exact_mode_odd_case_get_never_reaches_a_protected_get_even_with_a_tilde_get_beside_it() {
+        for with_tilde in [false, true] {
+            let root = temp_root();
+            write_endpoint(&root, "vault", "get", &ep(200, Some("keyAuth")));
+            if with_tilde {
+                write_endpoint(&root, "vault", "~get", &ep(201, None));
+            }
+            let addr = spawn_served(router_for(&root, MethodCase::Exact), true).await;
+            for method in ["gEt", "Get", "gET", "GEt"] {
+                let (status, _) = raw_status(addr, method, "/vault", "").await;
+                assert_eq!(status, 405, "with_tilde={with_tilde}: {method} must be 405, never the protected GET (200) nor ~get");
+            }
+            let (status, _) = raw_status(addr, "get", "/vault", "").await;
+            assert_eq!(status, if with_tilde { 201 } else { 405 }, "with_tilde={with_tilde}");
+            assert_eq!(raw_status(addr, "GET", "/vault", "").await.0, 401);
+            assert_eq!(raw_status(addr, "GET", "/vault", "X-Api-Key: good\r\n").await.0, 200);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[tokio::test]
+    async fn head_connect_and_exact_connect_behave_as_before_when_extension_routes_share_the_path() {
+        let root = temp_root();
+        write_endpoint(&root, "t", "get", &ep(200, None));
+        write_endpoint(&root, "t", "LINK", &ep(202, None));
+        for mode in [MethodCase::Default, MethodCase::Exact] {
+            let addr = spawn_served(router_for(&root, mode), mode == MethodCase::Exact).await;
+            assert_eq!(raw_status(addr, "HEAD", "/t", "").await.0, 200, "{mode:?}: HEAD is GET's implicit companion");
+            let (status, headers) = raw_status(addr, "head", "/t", "").await;
+            assert_eq!(status, 405, "{mode:?}: lowercase head is not normalised to HEAD");
+            assert!(
+                allow_header(&headers).split(',').any(|m| m == "LINK"),
+                "{mode:?}: Allow lists the extension: {headers:?}"
+            );
+            assert_eq!(raw_status(addr, "connect", "/t", "").await.0, 405, "{mode:?}");
+            assert_eq!(raw_status(addr, "CONNECT", "/t", "").await.0, 501, "{mode:?}: CONNECT is refused before routing");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn router_with_doc(root: &Path, mode: MethodCase, doc: &crate::openapi::OpenApiDocument) -> Router {
+        std::fs::create_dir_all(root.join("datasources/sql/db")).unwrap();
+        let sec = root.join("sec");
+        std::fs::create_dir_all(sec.join("verifiers")).unwrap();
+        std::fs::write(sec.join("schemes.json"), "{}").unwrap();
+        let errs = root.join("errs");
+        std::fs::create_dir_all(&errs).unwrap();
+        std::fs::write(
+            errs.join("core.json"),
+            r#"{ "validation.missing_parameter": { "httpStatus": 400, "exposeDetail": true }, "validation.invalid_type": { "httpStatus": 400, "exposeDetail": true } }"#,
+        )
+        .unwrap();
+        build_router(
+            root,
+            &tree_for_tests(&root.join("datasources/endpoints")),
+            Arc::new(HashMap::new()),
+            &HashMap::new(),
+            Arc::new(ErrorRegistry::load(&errs).unwrap()),
+            Arc::new(SecurityConfig::load(&sec).unwrap()),
+            Arc::new(HashMap::new()),
+            Arc::new(Mutex::new(DiscoveredErrors::default())),
+            false,
+            Some(doc),
+            None,
+            NonZeroU64::new(5_000).unwrap(),
+            false,
+            mode,
+        )
+    }
+
+    const BODY_SPEC_OP: &str = "        operationId: op\n        requestBody:\n          required: true\n          content:\n            application/json:\n              schema:\n                type: object\n                required: [name]\n                properties:\n                  name: { type: string }\n        responses: { '200': { description: ok } }\n";
+
+    #[tokio::test]
+    async fn an_extension_method_body_over_two_mib_is_413_and_request_validation_applies_to_its_body_schema() {
+        for (mode, key, token, wire) in [(MethodCase::Default, "LINK", "LINK", "link"), (MethodCase::Exact, "purge", "~purge", "purge")] {
+            let root = temp_root();
+            write_endpoint(&root, "t", token, &ep(201, None));
+            std::fs::write(
+                root.join("openapi.yaml"),
+                format!("openapi: 3.2.0\ninfo: {{ title: t, version: '1' }}\npaths:\n  /t:\n    additionalOperations:\n      '{key}':\n{BODY_SPEC_OP}"),
+            )
+            .unwrap();
+            let doc = crate::openapi::load(
+                &root.join("openapi.yaml"),
+                crate::openapi::LoadOptions {
+                    case_sensitive_methods: mode == MethodCase::Exact,
+                },
+            )
+            .unwrap();
+            assert_eq!(doc.operations.len(), 1, "{:?}", doc.issues);
+            let addr = spawn_served(router_with_doc(&root, mode, &doc), mode == MethodCase::Exact).await;
+            let url = format!("http://{addr}/t");
+            let client = reqwest::Client::new();
+            let method = reqwest::Method::from_bytes(wire.as_bytes()).unwrap();
+
+            let ok = client.request(method.clone(), &url).json(&serde_json::json!({ "name": "x" })).send().await.unwrap();
+            assert_eq!(ok.status(), 201, "{mode:?}: a valid body is served");
+            let wrong_type = client.request(method.clone(), &url).json(&serde_json::json!({ "name": 5 })).send().await.unwrap();
+            assert_eq!(
+                wrong_type.status(),
+                400,
+                "{mode:?}: a body that breaks the schema is rejected for an extension operation too"
+            );
+            let missing = client.request(method.clone(), &url).send().await.unwrap();
+            assert_eq!(missing.status(), 400, "{mode:?}: a required body that is absent is rejected");
+
+            let big = vec![b'a'; 2 * 1024 * 1024 + 1024];
+            let huge = client.request(method, &url).body(big).send().await.unwrap();
+            assert_eq!(huge.status(), 413, "{mode:?}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    // ================================================================== round 2: CORS and pinned gaps
+
+    #[tokio::test]
+    async fn exact_mode_preflight_mirrors_the_requested_method_spelling_exactly() {
+        let root = temp_root();
+        write_endpoint(&root, "things", "~purge", &ep(202, None));
+        let router = crate::server::apply_cors(router_for(&root, MethodCase::Exact), &["https://app.example".to_string()]);
+        let addr = spawn_served(router, true).await;
+        for requested in ["purge", "PURGE"] {
+            let resp = reqwest::Client::new()
+                .request(reqwest::Method::OPTIONS, format!("http://{addr}/things"))
+                .header("origin", "https://app.example")
+                .header("access-control-request-method", requested)
+                .send()
+                .await
+                .unwrap();
+            assert!(resp.status().is_success(), "{requested}: {}", resp.status());
+            let allowed = resp.headers().get("access-control-allow-methods").map(|v| v.to_str().unwrap().to_string());
+            assert_eq!(allowed.as_deref(), Some(requested), "the preflight answer mirrors the request spelling byte for byte");
+        }
+        // Deliberate: the preflight is generic (mirror_request), so it is "allowed" for PURGE too,
+        // while the real PURGE request is 405 because only `purge` is routed.
+        let (status, _) = raw_status(addr, "PURGE", "/things", "Origin: https://app.example\r\n").await;
+        assert_eq!(status, 405);
+        assert_eq!(raw_status(addr, "purge", "/things", "Origin: https://app.example\r\n").await.0, 202);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn secured_spec(key: &str) -> String {
+        format!(
+            "openapi: 3.2.0\ninfo: {{ title: t, version: '1' }}\ncomponents:\n  securitySchemes:\n    keyAuth: {{ type: apiKey, in: header, name: X-Api-Key }}\npaths:\n  /x:\n    additionalOperations:\n      '{key}':\n        operationId: op\n        security: [ {{ keyAuth: [] }} ]\n        responses: {{ '200': {{ description: ok }} }}\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn an_open_stale_upper_purge_file_is_a_stale_variant_refusal_in_exact_mode() {
+        // In exact mode the spec declares a *secured* `purge` (token `~purge`). A leftover open
+        // endpoint.PURGE.json has no operation in the spec, but differs from it only by case: the startup
+        // check reports it as a stale variant (a refusal); the router itself still serves it.
+        let root = temp_root();
+        write_endpoint(&root, "x", "PURGE", &ep(202, None));
+        std::fs::write(root.join("openapi.yaml"), secured_spec("purge")).unwrap();
+        let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions { case_sensitive_methods: true }).unwrap();
+        let check = security_check(&tree_for_tests(&root.join("datasources/endpoints")), &doc);
+        assert!(check.mismatches.is_empty(), "no refusal at startup");
+        assert_eq!(check.stale_variants.len(), 1, "a stale-variant refusal");
+        assert!(check.unmatched.is_empty());
+        let addr = spawn_served(router_for(&root, MethodCase::Exact), true).await;
+        assert_eq!(raw_status(addr, "PURGE", "/x", "").await.0, 202, "the stale open route is served without credentials");
+        assert_eq!(raw_status(addr, "purge", "/x", "").await.0, 405, "the secured spelling has no file yet");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn an_operation_dropped_for_a_missing_operation_id_makes_its_open_hand_made_file_a_stale_variant_refusal() {
+        // An additionalOperations entry without an operationId is skipped at load (S3); its security is
+        // still read, so a hand-made open endpoint.LINK.json is a stale-variant refusal, not just "unmatched".
+        let root = temp_root();
+        write_endpoint(&root, "x", "LINK", &ep(202, None));
+        let yaml = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    keyAuth: { type: apiKey, in: header, name: X-Api-Key }\npaths:\n  /x:\n    additionalOperations:\n      LINK:\n        security: [ { keyAuth: [] } ]\n        responses: { '200': { description: ok } }\n";
+        std::fs::write(root.join("openapi.yaml"), yaml).unwrap();
+        let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
+        assert!(doc.operations.is_empty());
+        assert!(doc.issues.iter().any(|i| i.kind == crate::openapi::IssueKind::InvalidAdditionalOperation));
+        let check = security_check(&tree_for_tests(&root.join("datasources/endpoints")), &doc);
+        assert!(check.mismatches.is_empty());
+        assert_eq!(check.stale_variants.len(), 1);
+        assert!(check.unmatched.is_empty());
+        let addr = spawn_served(router_for(&root, MethodCase::Default), false).await;
+        assert_eq!(raw_status(addr, "LINK", "/x", "").await.0, 202);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ================================================================== round 2: case-sensitive filesystems only
+
+    #[tokio::test]
+    async fn coexisting_purge_and_upper_purge_files_route_only_the_canonical_one_in_each_mode() {
+        let root = temp_root();
+        if !fs_is_case_sensitive(&root) {
+            eprintln!("skipping: this filesystem is case-insensitive, endpoint.purge.json and endpoint.PURGE.json cannot coexist");
+            return;
+        }
+        write_endpoint(&root, "t", "PURGE", &ep(202, None));
+        write_endpoint(&root, "t", "purge", &ep(201, None));
+        for mode in [MethodCase::Default, MethodCase::Exact] {
+            let addr = spawn_served(router_for(&root, mode), mode == MethodCase::Exact).await;
+            assert_eq!(raw_status(addr, "PURGE", "/t", "").await.0, 202, "{mode:?}");
+            let lower = raw_status(addr, "purge", "/t", "").await.0;
+            assert_eq!(
+                lower,
+                if mode == MethodCase::Default { 202 } else { 405 },
+                "{mode:?}: endpoint.purge.json is never what answers a request"
+            );
+            let findings = method_file_findings(&tree_for_tests(&root.join("datasources/endpoints")), mode);
+            assert_eq!(findings.len(), 1, "{mode:?}");
+            assert!(findings[0].file.ends_with("endpoint.purge.json"));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn coexisting_get_and_upper_get_files_route_only_the_lowercase_one() {
+        let root = temp_root();
+        if !fs_is_case_sensitive(&root) {
+            eprintln!("skipping: this filesystem is case-insensitive, endpoint.get.json and endpoint.GET.json cannot coexist");
+            return;
+        }
+        write_endpoint(&root, "t", "get", &ep(200, None));
+        write_endpoint(&root, "t", "GET", &ep(201, None));
+        for mode in [MethodCase::Default, MethodCase::Exact] {
+            let addr = spawn_served(router_for(&root, mode), mode == MethodCase::Exact).await;
+            assert_eq!(raw_status(addr, "GET", "/t", "").await.0, 200, "{mode:?}");
+            let found: Vec<_> = discover_endpoint_files(&tree_for_tests(&root.join("datasources/endpoints")), mode)
+                .into_iter()
+                .map(|(_, m, _)| m)
+                .collect();
+            assert_eq!(found, ["get"], "{mode:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m4_security_tests {
+    use super::*;
+
+    fn temp_root() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-endpoint-m4sec-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    const HEAD: &str = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    a: { type: apiKey, in: header, name: ka }\n    b: { type: apiKey, in: header, name: kb }\npaths:\n";
+
+    fn check(yaml: &str, file_token: &str, security: Option<&str>, mode: MethodCase) -> (SecurityCheck, crate::openapi::OpenApiDocument) {
+        let root = temp_root();
+        std::fs::write(root.join("openapi.yaml"), format!("{HEAD}{yaml}")).unwrap();
+        let dir = root.join("datasources/endpoints/x");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = match security {
+            Some(s) => format!(r#"{{ "operationId": "x", "security": "{s}", "sources": {{}}, "response": {{}} }}"#),
+            None => r#"{ "operationId": "x", "sources": {}, "response": {} }"#.to_string(),
+        };
+        std::fs::write(dir.join(format!("endpoint.{file_token}.json")), body).unwrap();
+        let doc = crate::openapi::load(
+            &root.join("openapi.yaml"),
+            crate::openapi::LoadOptions {
+                case_sensitive_methods: mode == MethodCase::Exact,
+            },
+        )
+        .unwrap();
+        let result = security_check(&tree_for_tests(&root.join("datasources/endpoints")), &doc);
+        let _ = std::fs::remove_dir_all(&root);
+        (result, doc)
+    }
+
+    #[test]
+    fn two_fallback_matching_extension_operations_must_both_be_satisfied_and_the_message_lists_both_methods() {
+        let yaml = "  /a/{x}:
+    additionalOperations:
+      LINK:
+        operationId: one
+        security: [ { a: [] } ]
+        responses: { '200': { description: ok } }
+  /a/{y}:
+    additionalOperations:
+      LINK:
+        operationId: two
+        security: [ { b: [] } ]
+        responses: { '200': { description: ok } }
+";
+        let root = temp_root();
+        std::fs::write(root.join("openapi.yaml"), format!("{HEAD}{yaml}")).unwrap();
+        let dir = root.join("datasources/endpoints/a/{z}");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("endpoint.LINK.json"),
+            r#"{ "operationId": "x", "security": "a", "sources": {}, "response": {} }"#,
+        )
+        .unwrap();
+        let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions::default()).unwrap();
+        let result = security_check(&tree_for_tests(&root.join("datasources/endpoints")), &doc);
+        assert_eq!(result.mismatches.len(), 1);
+        let message = result.mismatches[0].message();
+        assert!(
+            message.contains("LINK /a/{x}") && message.contains("LINK /a/{y}") && message.contains("it must satisfy all of them"),
+            "{message}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    const LINK_OR: &str = "  /x:
+    additionalOperations:
+      LINK:
+        operationId: one
+        security: [ { a: [] }, { b: [] } ]
+        responses: { '200': { description: ok } }
+";
+
+    #[test]
+    fn an_extension_operation_with_alternatives_accepts_any_single_key_alternative_and_rejects_an_unprotected_file() {
+        assert!(check(LINK_OR, "LINK", Some("a"), MethodCase::Default).0.mismatches.is_empty());
+        assert!(check(LINK_OR, "LINK", Some("b"), MethodCase::Default).0.mismatches.is_empty());
+        let (none, _) = check(LINK_OR, "LINK", None, MethodCase::Default);
+        assert_eq!(none.mismatches.len(), 1);
+        assert!(none.mismatches[0].message().starts_with("LINK /x ("), "{}", none.mismatches[0].message());
+    }
+
+    #[test]
+    fn a_stricter_extension_stub_is_reported_as_stricter_not_as_a_mismatch() {
+        let open = "  /x:
+    additionalOperations:
+      LINK:
+        operationId: one
+        responses: { '200': { description: ok } }
+";
+        let (result, _) = check(open, "LINK", Some("a"), MethodCase::Default);
+        assert!(result.mismatches.is_empty());
+        assert_eq!(result.stricter.len(), 1);
+    }
+
+    #[test]
+    fn an_exact_mode_tilde_stub_is_checked_against_its_lowercase_operation_and_named_by_its_wire_method() {
+        let yaml = "  /x:
+    additionalOperations:
+      purge:
+        operationId: one
+        security: [ { a: [] } ]
+        responses: { '200': { description: ok } }
+";
+        let (bad, _) = check(yaml, "~purge", None, MethodCase::Exact);
+        assert_eq!(bad.mismatches.len(), 1);
+        assert!(bad.mismatches[0].message().starts_with("purge /x ("), "{}", bad.mismatches[0].message());
+        let (good, _) = check(yaml, "~purge", Some("a"), MethodCase::Exact);
+        assert!(good.mismatches.is_empty() && good.unmatched.is_empty());
+        // An uppercase PURGE stub has no operation under exact mode: never silently checked against `purge`
+        // (not a mismatch), but an open one is a stale variant of the secured `purge`.
+        let (other, _) = check(yaml, "PURGE", None, MethodCase::Exact);
+        assert!(other.mismatches.is_empty());
+        assert_eq!(other.stale_variants.len(), 1);
+        assert!(other.unmatched.is_empty());
+    }
+}

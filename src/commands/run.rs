@@ -1,18 +1,21 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Router;
 
 use crate::config::{Config, ServerConfig, TlsConfig, TlsMode};
 use crate::endpoint::mock::MockProvider;
+use crate::endpoint::route_plan::{RootExtras, RouteContext, RoutePlan};
+use crate::openapi::endpoint_tree::{EndpointTree, LinkContext};
+use crate::openapi::method_token::MethodCase;
 use crate::project::{MANIFEST_FILE, require_project_root};
 use crate::server::pidfile;
 use crate::server::service::{self, RunDecision, ServiceRecord};
 use crate::sql::SqlDriver;
-use crate::webserve::WebServeConfig;
+use crate::webserve::{ProtectedPaths, WebServeConfig};
 
 /// `service_managed` is the hidden, internal-only flag baked into every
 /// registered service definition's own command line (`run
@@ -57,6 +60,10 @@ pub async fn run_direct(root: &Path) -> io::Result<()> {
 /// always runs as the separately-supervised `--service-managed` process.
 async fn run_registered(root: &Path, record: &ServiceRecord, restart_requested: bool) -> io::Result<()> {
     if let Err(e) = service::revalidate(record, root) {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = precheck_security_for_service(root) {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
@@ -152,10 +159,10 @@ pub(crate) fn refuse_if_already_running(root: &Path) -> io::Result<()> {
 
 async fn run_api(root: &Path, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> io::Result<()> {
     println!("project root: {}", root.display());
-    let (router, server_config) = build_api_router(root).await?;
+    let (router, server_config, _) = build_api_router_with_protected(root, false).await?;
 
     println!(
-        "serving GET/POST/PUT/PATCH/DELETE endpoints discovered under datasources/endpoints/ (see log output \
+        "serving GET/POST/PUT/PATCH/DELETE/QUERY endpoints discovered under datasources/endpoints/ (see log output \
          above) plus {}",
         operational_routes_display(&server_config).join(", ")
     );
@@ -169,6 +176,7 @@ async fn run_api(root: &Path, shutdown: impl std::future::Future<Output = ()> + 
         server_config.port,
         &server_config.tls,
         &api_dir,
+        crate::server::ServeShape::of(&server_config),
         shutdown,
     )
     .await
@@ -195,7 +203,7 @@ fn operational_routes_display(server_config: &ServerConfig) -> Vec<String> {
 
 async fn run_web(root: &Path, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> io::Result<()> {
     println!("project root: {}", root.display());
-    let (router, config) = build_web_router(root);
+    let (router, config) = build_web_router(root, false, ProtectedPaths::default())?;
 
     println!(
         "serving static content — startPage: {}, port: {}{}",
@@ -208,13 +216,13 @@ async fn run_web(root: &Path, shutdown: impl std::future::Future<Output = ()> + 
     // No `api/` subfolder in a web-only project — `certPath`/`keyPath`
     // resolve relative to the project root itself, right alongside
     // `webserve.json`.
-    serve(root, router, IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.port, &config.tls, root, shutdown).await
+    serve(root, router, IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.port, &config.tls, root, true, shutdown).await
 }
 
 async fn run_both(root: &Path, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> io::Result<()> {
     println!("project root: {}", root.display());
-    let (api_router, server_config) = build_api_router(root).await?;
-    let (web_router, web_config) = build_web_router(root);
+    let (api_router, server_config, protected) = build_api_router_with_protected(root, true).await?;
+    let (web_router, web_config) = build_web_router(root, true, protected)?;
 
     let api_root_display = crate::server::normalize_api_root(&server_config.api_root).unwrap_or_else(|| "unprefixed".to_string());
     println!(
@@ -252,7 +260,9 @@ async fn run_both(root: &Path, shutdown: impl std::future::Future<Output = ()> +
     let router = api_router.merge(web_router);
 
     // `config/server.json`'s `tls` is authoritative here too — same
-    // single-listener reasoning as the port-authority note above.
+    // single-listener reasoning as the port-authority note above. Likewise
+    // `caseSensitiveMethods`: same authority rule as `port`/`tls`, so it also
+    // decides method matching for the static routes.
     let api_dir = crate::project::api_base(root);
     serve(
         root,
@@ -261,6 +271,7 @@ async fn run_both(root: &Path, shutdown: impl std::future::Future<Output = ()> +
         server_config.port,
         &server_config.tls,
         &api_dir,
+        crate::server::ServeShape::of(&server_config),
         shutdown,
     )
     .await
@@ -270,15 +281,28 @@ async fn run_both(root: &Path, shutdown: impl std::future::Future<Output = ()> +
 /// middleware-wrapped API router — the piece `run_api` and `run_both` both
 /// need, extracted so serving both roles from one process doesn't mean
 /// duplicating SQL connection handling or router composition.
-async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
+#[cfg(test)]
+async fn build_api_router(root: &Path, web_role: bool) -> io::Result<(Router, ServerConfig)> {
+    let (router, server_config, _) = build_api_router_with_protected(root, web_role).await?;
+    Ok((router, server_config))
+}
+
+/// `build_api_router`'s real body, also returning the local files this
+/// side owns (TLS material, SQLite databases) so a static router serving
+/// the same project root can refuse to expose them.
+async fn build_api_router_with_protected(root: &Path, web_role: bool) -> io::Result<(Router, ServerConfig, ProtectedPaths)> {
     let api_dir = crate::project::api_base(root);
     let config = Config::load_or_exit(&api_dir);
     println!(
-        "loaded config — debugMode={}, {} connection(s), {} error code(s)",
+        "loaded config — debugMode={}, {} connection(s), {} error code(s), strictOpenApi={}, caseSensitiveMethods={}, endpointSymlinks={}",
         config.server.debug_mode,
         config.connections.len(),
-        config.errors.len()
+        config.errors.len(),
+        config.server.strict_open_api(),
+        config.server.case_sensitive_methods(),
+        config.server.endpoint_symlinks().as_str()
     );
+    announce_method_case(&config.server);
 
     // A log line, not a blocker — the server starts normally either way.
     // Exists so an accumulating pile of unclassified errors (see
@@ -295,6 +319,16 @@ async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
         );
     }
 
+    // Before any connection is opened: a strict refusal must not have
+    // touched real infrastructure, let alone bound a port or written a pidfile.
+    let endpoint_tree = startup_endpoint_tree(root, &config.server)?;
+    let extras = RootExtras {
+        web: web_role,
+        control_plane: false,
+    };
+    check_route_table(&config.server, &endpoint_tree, extras, "")?;
+    let openapi_document = load_openapi_for_startup_with(root, &config.server, &endpoint_tree, extras)?;
+
     let drivers = match crate::sql::connect_all(&config.connections).await {
         Ok(drivers) => drivers,
         Err(err) => {
@@ -304,7 +338,368 @@ async fn build_api_router(root: &Path) -> io::Result<(Router, ServerConfig)> {
     };
     println!("connected {} SQL data source(s)", drivers.len());
 
-    assemble_api_router(root, config, Arc::new(drivers), None).await
+    let mut protected = ProtectedPaths::default();
+    protected.add_tls(&config.server.tls, &api_dir);
+    protected.add_sqlite(&config.connections, root);
+
+    let (router, server_config) = assemble_api_router(root, config, Arc::new(drivers), None, openapi_document, endpoint_tree).await?;
+    Ok((router, server_config, protected))
+}
+
+#[cfg(test)]
+fn tree_of(root: &Path) -> EndpointTree {
+    scan_endpoint_tree(root, &ServerConfig::default())
+}
+
+pub(crate) fn link_context(root: &Path, server: &ServerConfig) -> LinkContext {
+    LinkContext::new(root, server.endpoint_symlinks())
+}
+
+/// One scan of `api/datasources/endpoints/` under the configured link policy;
+/// every walker in a command shares the result. Says so when the policy lets
+/// endpoint files be read from outside the project.
+pub(crate) fn scan_endpoint_tree(root: &Path, server: &ServerConfig) -> EndpointTree {
+    if server.endpoint_symlinks() == crate::config::EndpointSymlinks::Follow {
+        tracing::warn!("endpointSymlinks is \"follow\" — endpoint files may be read from outside the project (writes are still confined to it)");
+    }
+    EndpointTree::scan(&link_context(root, server), &crate::project::api_base(root).join("datasources/endpoints"))
+}
+
+/// Logs every link the scan refused to follow; under `strictOpenApi` each one
+/// is an error and startup is refused.
+pub(crate) fn report_tree_findings(tree: &EndpointTree, strict: bool) -> io::Result<()> {
+    let mut strict_findings = 0usize;
+    for (finding, message) in tree.findings().iter().zip(tree.link_messages()) {
+        if strict && finding.strict {
+            strict_findings += 1;
+            eprintln!("error: {message}");
+            tracing::error!("{message}");
+        } else {
+            tracing::warn!("{message}");
+        }
+    }
+    if strict_findings > 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{strict_findings} link(s) under datasources/endpoints were not followed and \"strictOpenApi\" is true — refusing to start"),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn startup_endpoint_tree(root: &Path, server: &ServerConfig) -> io::Result<Arc<EndpointTree>> {
+    let tree = scan_endpoint_tree(root, server);
+    report_tree_findings(&tree, server.strict_open_api())?;
+    Ok(Arc::new(tree))
+}
+
+const METHOD_CASE_MISSING_NOTICE: &str = "HTTP method names are matched case-insensitively (default; caseSensitiveMethods is not set in config/server.json) — a proxy/WAF rule blocking an exact method like DELETE can be bypassed with 'delete'; set caseSensitiveMethods: true for RFC 9110 exact matching";
+const METHOD_CASE_EXPLICIT_FALSE_NOTICE: &str =
+    "HTTP method names are matched case-insensitively (caseSensitiveMethods: false in config/server.json); set caseSensitiveMethods: true for RFC 9110 exact matching";
+
+/// What to tell the operator about method-name matching, and at what level:
+/// a warning when the key was never set, info when it was explicitly false,
+/// nothing under exact matching. Not a spec issue, so never fatal under strict.
+pub(crate) fn method_case_notice(server: &ServerConfig) -> Option<(tracing::Level, String)> {
+    if server.case_sensitive_methods() {
+        None
+    } else if server.case_sensitive_methods_explicit() {
+        Some((tracing::Level::INFO, METHOD_CASE_EXPLICIT_FALSE_NOTICE.to_string()))
+    } else {
+        Some((tracing::Level::WARN, METHOD_CASE_MISSING_NOTICE.to_string()))
+    }
+}
+
+pub(crate) fn announce_method_case(server: &ServerConfig) {
+    if let Some((level, message)) = method_case_notice(server) {
+        if level == tracing::Level::WARN {
+            tracing::warn!("{message}");
+        } else {
+            tracing::info!("{message}");
+        }
+        println!("{message}");
+    }
+}
+
+/// What the startup security check found beyond a refusal, returned so a
+/// caller (or a test) can see exactly what was warned about.
+#[derive(Debug, Default)]
+pub(crate) struct StartupSecurityReport {
+    /// Built-in routes (`/healthz`, `/readyz`) answering a secured operation whose
+    /// security is only the document-wide default: logged, not refused.
+    pub builtin_warnings: Vec<String>,
+    /// Why `openapi.yaml` couldn't be loaded (strict off), so endpoint
+    /// security was not checked at all.
+    pub not_loaded: Option<String>,
+    /// `Severity::Error` load issues (strict off) — operations the loader
+    /// dropped, whose routes therefore weren't checked.
+    pub dropped_issues: usize,
+    pub unmatched: Vec<PathBuf>,
+}
+
+/// Builds the route table the server is about to register (endpoint files, the API
+/// built-ins and any root-level extras) without building a router, logs warnings, and
+/// refuses on anything axum would panic on or misroute. Runs before any connection,
+/// bind or pidfile.
+pub(crate) fn check_route_table(server: &ServerConfig, tree: &EndpointTree, extras: RootExtras, refusal_hint: &str) -> io::Result<RoutePlan> {
+    check_route_table_logging(server, tree, extras, refusal_hint, true)
+}
+
+fn check_route_table_logging(server: &ServerConfig, tree: &EndpointTree, extras: RootExtras, refusal_hint: &str, log_warnings: bool) -> io::Result<RoutePlan> {
+    let mode = MethodCase::from_case_sensitive(server.case_sensitive_methods());
+    let plan = RoutePlan::build(tree, mode, &RouteContext::for_server(server).with_extras(extras));
+    let strict = server.strict_open_api();
+    if log_warnings {
+        for warning in plan.warnings(strict) {
+            tracing::warn!("{}", warning.message());
+        }
+    }
+    let refusals = plan.refusals(strict);
+    if refusals.is_empty() {
+        return Ok(plan);
+    }
+    for problem in &refusals {
+        eprintln!("error: {}", problem.message());
+        tracing::error!("{}", problem.message());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{} route problem(s) under datasources/endpoints or config/server.json — refusing to start; run frogs validate{refusal_hint}",
+            refusals.len()
+        ),
+    ))
+}
+
+fn refuse_class(items: Vec<String>, summary: impl FnOnce(usize) -> String) -> io::Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    for message in &items {
+        eprintln!("error: {message}");
+        tracing::error!("{message}");
+    }
+    Err(io::Error::new(io::ErrorKind::InvalidData, summary(items.len())))
+}
+
+pub(crate) const REGISTERED_SERVICE_SECURITY_HINT: &str = " — a service registered with this frogs version stays stopped when it hits this (a service registered with an older version restarts every 5 s under --restart-policy on-failure; re-register it, or use --restart-policy never)";
+
+/// Loads `openapi.yaml` and checks every endpoint file's `security` against
+/// it (always, for an API project — the refusal is not tied to
+/// `strictOpenApi`). The loaded document is handed back only when something
+/// else needs it — request validation, the docs UI, or `strictOpenApi`
+/// itself — and every issue it found is logged. A load failure degrades to
+/// `None` with a warning, except under strict where it (and any
+/// strict-class issue) refuses to start.
+pub(crate) fn load_openapi_for_startup_with(
+    root: &Path,
+    server: &ServerConfig,
+    tree: &EndpointTree,
+    extras: RootExtras,
+) -> io::Result<Option<Arc<crate::openapi::OpenApiDocument>>> {
+    load_openapi_for_startup_reported(root, server, "", tree, extras).map(|(doc, _)| doc)
+}
+
+/// Default extras (no web role, no control plane): production code must name its own via `load_openapi_for_startup_with`.
+#[cfg(test)]
+pub(crate) fn load_openapi_for_startup(root: &Path, server: &ServerConfig, tree: &EndpointTree) -> io::Result<Option<Arc<crate::openapi::OpenApiDocument>>> {
+    load_openapi_for_startup_with(root, server, tree, RootExtras::default())
+}
+
+pub(crate) fn load_openapi_for_startup_reported(
+    root: &Path,
+    server: &ServerConfig,
+    refusal_hint: &str,
+    tree: &EndpointTree,
+    extras: RootExtras,
+) -> io::Result<(Option<Arc<crate::openapi::OpenApiDocument>>, StartupSecurityReport)> {
+    let strict = server.strict_open_api();
+    let spec_needed = strict || server.features.request_validation || server.docs_ui.mode != crate::config::DocsUiMode::Off;
+    let mut report = StartupSecurityReport::default();
+    match crate::openapi::load(&root.join(crate::project::MANIFEST_FILE), server.openapi_load_options()) {
+        Ok(doc) => {
+            if spec_needed {
+                let mut strict_findings = 0usize;
+                for issue in &doc.issues {
+                    let is_strict = strict && issue.kind.is_strict_error();
+                    if is_strict {
+                        strict_findings += 1;
+                        eprintln!("error: {}", issue.message);
+                        tracing::error!("{}", issue.message);
+                    } else {
+                        tracing::warn!("{}", issue.message);
+                    }
+                }
+                if strict_findings > 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{strict_findings} {} issue(s) found and \"strictOpenApi\" is true — refusing to start",
+                            crate::project::MANIFEST_FILE
+                        ),
+                    ));
+                }
+                if strict {
+                    let stream_files = crate::endpoint::reserved_stream_key_files(tree, doc.method_case);
+                    if !stream_files.is_empty() {
+                        for file in &stream_files {
+                            let message = format!(
+                                "{}: \"stream\" is reserved for streaming responses, which this frogs version does not implement",
+                                file.display()
+                            );
+                            eprintln!("error: {message}");
+                            tracing::error!("{message}");
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "{} endpoint file(s) use the reserved \"stream\" key and \"strictOpenApi\" is true — refusing to start",
+                                stream_files.len()
+                            ),
+                        ));
+                    }
+                    // The same read-only on-disk scan `generate` and `validate` make: letter-case
+                    // conflicts between spec paths and folders, two paths claiming one folder,
+                    // and stub names that are not a canonical method token.
+                    let plan = crate::commands::generate::plan_endpoint_files(&crate::project::api_base(root), &doc, tree, &link_context(root, server));
+                    let findings: Vec<String> = plan
+                        .errors
+                        .iter()
+                        .filter(|e| e.strict)
+                        .map(|e| e.message.clone())
+                        .chain(plan.invalid_tokens.iter().cloned())
+                        .collect();
+                    refuse_class(findings, |n| {
+                        format!(
+                            "{n} endpoint folder/file problem(s) found and \"strictOpenApi\" is true — refusing to start; fix them, then run frogs validate{refusal_hint}"
+                        )
+                    })?;
+                }
+            }
+
+            if !strict {
+                report.dropped_issues = doc.issues.iter().filter(|i| i.severity == crate::openapi::Severity::Error).count();
+                if report.dropped_issues > 0 {
+                    tracing::warn!(
+                        "{} openapi.yaml issue(s) dropped or skipped part of the spec; the skipped and dropped operations are still checked for routing shadows, but endpoint security for them is only compared to the spec leniently",
+                        report.dropped_issues
+                    );
+                }
+            }
+            let mode = MethodCase::from_case_sensitive(server.case_sensitive_methods());
+            let plan = RoutePlan::build(tree, mode, &RouteContext::for_server(server).with_extras(extras));
+            let check = crate::endpoint::security_check_with_routes(tree, &doc, &plan);
+            for message in &check.builtin_warnings {
+                tracing::warn!("{message}");
+            }
+            report.builtin_warnings = check.builtin_warnings.clone();
+            for file in &check.unmatched {
+                tracing::warn!("{}", crate::endpoint::unmatched_security_message(file));
+            }
+            report.unmatched = check.unmatched.clone();
+
+            refuse_class(check.ambiguous.iter().map(|f| f.message()).collect(), |n| {
+                format!(
+                    "{n} endpoint file(s) belong to a method openapi.yaml declares ambiguously (keys differing only in case) — refusing to start; fix openapi.yaml, then run frogs validate{refusal_hint}"
+                )
+            })?;
+            refuse_class(check.mismatches.iter().map(|m| m.message()).collect(), |n| {
+                format!(
+                    "{n} endpoint file(s) don't apply the security openapi.yaml declares — refusing to start; set each file's \"security\" to one of the acceptable schemes shown (or change openapi.yaml), then run frogs validate{refusal_hint}"
+                )
+            })?;
+            refuse_class(check.stale_variants.iter().map(|v| v.message()).collect(), |n| {
+                format!(
+                    "{n} endpoint file(s) stand in for a secured openapi.yaml operation under another method spelling without its security — refusing to start; then run frogs validate{refusal_hint}"
+                )
+            })?;
+            refuse_class(check.template_instances.iter().map(|v| v.message()).collect(), |n| {
+                format!(
+                    "{n} endpoint file(s) are instances of a secured openapi.yaml path template without its security — refusing to start; then run frogs validate{refusal_hint}"
+                )
+            })?;
+            let shadow_messages: Vec<String> = check
+                .shadowed
+                .iter()
+                .map(|v| v.message())
+                .chain(check.unverifiable.iter().map(|v| v.message()))
+                .chain(check.builtin_refusals.iter().map(|v| v.message()))
+                .collect();
+            refuse_class(shadow_messages, |n| {
+                format!(
+                    "{n} secured openapi.yaml operation(s) would be answered by a route that does not enforce their security — refusing to start; then run frogs validate{refusal_hint}"
+                )
+            })?;
+            if strict && !check.unmatched.is_empty() {
+                for file in &check.unmatched {
+                    let message = crate::endpoint::unmatched_security_message(file);
+                    eprintln!("error: {message}");
+                    tracing::error!("{message}");
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{} endpoint file(s) match no openapi.yaml operation and \"strictOpenApi\" is true — refusing to start{refusal_hint}",
+                        check.unmatched.len()
+                    ),
+                ));
+            }
+            if server.features.request_validation {
+                refuse_class(crate::endpoint::unresolved_parameter_routes(tree, &doc), |n| {
+                    format!(
+                        "{n} route(s) have an openapi.yaml parameter $ref frogs could not resolve, so request validation for them would be incomplete — refusing to start; fix the $ref, then run frogs validate{refusal_hint}"
+                    )
+                })?;
+            }
+            Ok((spec_needed.then(|| Arc::new(doc)), report))
+        }
+        Err(e) if strict => {
+            eprintln!("error: failed to load {}: {e}", crate::project::MANIFEST_FILE);
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to load {}: {e} (\"strictOpenApi\" is true)", crate::project::MANIFEST_FILE),
+            ))
+        }
+        Err(e) => {
+            if spec_needed {
+                tracing::warn!(
+                    "failed to load {}: {e} — request validation is disabled and docs UI's operation list is empty for this run",
+                    crate::project::MANIFEST_FILE
+                );
+            }
+            tracing::warn!("could not load openapi.yaml ({e}) — endpoint security was not checked against it for this run");
+            report.not_loaded = Some(e.to_string());
+            Ok((None, report))
+        }
+    }
+}
+
+/// The same check `frogs run` does at startup, for `frogs register` and a
+/// registered `frogs run` — a service whose project would be refused on
+/// start must not get installed or (re)started. That includes a static site
+/// whose pages or protected paths `frogs validate` counts as problems.
+pub(crate) fn precheck_security_for_service(root: &Path) -> io::Result<()> {
+    let has_api = root.join(crate::project::MANIFEST_FILE).is_file();
+    let has_web = root.join("webserve.json").is_file();
+    let mut protected = ProtectedPaths::default();
+    if has_api {
+        let api_dir = crate::project::api_base(root);
+        let config = Config::load(&api_dir).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let tree = startup_endpoint_tree(root, &config.server)?;
+        let extras = RootExtras {
+            web: has_web,
+            control_plane: false,
+        };
+        check_route_table(&config.server, &tree, extras, REGISTERED_SERVICE_SECURITY_HINT)?;
+        load_openapi_for_startup_reported(root, &config.server, REGISTERED_SERVICE_SECURITY_HINT, &tree, extras)?;
+        protected.add_tls(&config.server.tls, &api_dir);
+        protected.add_sqlite(&config.connections, root);
+    }
+    if has_web {
+        let config = crate::webserve::load(&root.join("webserve.json")).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        check_web_pages(root, &config, has_api, &mut protected)?;
+    }
+    Ok(())
 }
 
 /// Composes the fully-nested, middleware-wrapped API router from an
@@ -318,9 +713,20 @@ pub(crate) async fn assemble_api_router(
     config: Config,
     drivers: Arc<HashMap<String, Box<dyn SqlDriver>>>,
     mock_provider: Option<Arc<dyn MockProvider>>,
+    openapi_document: Option<Arc<crate::openapi::OpenApiDocument>>,
+    endpoint_tree: Arc<EndpointTree>,
 ) -> io::Result<(Router, ServerConfig)> {
     let api_dir = crate::project::api_base(root);
     let debug_mode = config.server.debug_mode;
+    let method_case = MethodCase::from_case_sensitive(config.server.case_sensitive_methods());
+    if let Some(doc) = &openapi_document
+        && doc.method_case != method_case
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "openapi.yaml was loaded under a different caseSensitiveMethods setting than the router is being built with — refusing to start",
+        ));
+    }
     // The client-certificate codes ship as runtime defaults (rather than
     // only in a freshly generated `config/errors/core.json`, which is
     // write-once) so a project generated before mTLS existed classifies
@@ -335,7 +741,16 @@ pub(crate) async fn assemble_api_router(
             },
         );
     }
+    errors.insert_if_absent(
+        "endpoint.unavailable",
+        crate::errors::ErrorDefinition {
+            http_status: 503,
+            expose_detail: false,
+        },
+    );
     let errors = std::sync::Arc::new(errors);
+    // Deliberately a subset of the caller's own `check_route_table` (no web/control-plane extras): a second line of defence for callers that skip it, never the place web or control-plane routing is decided.
+    check_route_table_logging(&config.server, &endpoint_tree, RootExtras::default(), "", false)?;
     let client_identity_available = mock_provider.is_some() || config.server.tls.client_identity_enabled();
     if config
         .server
@@ -353,32 +768,9 @@ pub(crate) async fn assemble_api_router(
     let services = std::sync::Arc::new(config.services);
     let discovered_errors = std::sync::Arc::new(std::sync::Mutex::new(config.discovered_errors));
 
-    // Loaded whenever either `features.requestValidation` or `docsUi.mode`
-    // needs it — both are read-only consumers of the same parsed document,
-    // so one load serves both rather than each maintaining its own copy.
-    // `Arc`-wrapped so `docs_ui_router` can hold its own cheap clone
-    // alongside `build_router`'s borrow. A load failure degrades to "no
-    // route gets validation, docs UI's operation list is empty" with a
-    // warning, the same graceful-degradation posture `build_router` itself
-    // uses for a route whose operation can't be matched, rather than
-    // refusing to start the server over either concern.
-    let openapi_document: Option<std::sync::Arc<crate::openapi::OpenApiDocument>> =
-        if config.server.features.request_validation || config.server.docs_ui.mode != crate::config::DocsUiMode::Off {
-            match crate::openapi::load(&root.join(crate::project::MANIFEST_FILE)) {
-                Ok(doc) => Some(std::sync::Arc::new(doc)),
-                Err(e) => {
-                    tracing::warn!(
-                        "failed to load {}: {e} — request validation is disabled and docs UI's operation list is empty for this run",
-                        crate::project::MANIFEST_FILE
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
     let endpoint_router = crate::endpoint::build_router(
         &api_dir,
+        &endpoint_tree,
         drivers.clone(),
         &config.connections,
         errors,
@@ -386,10 +778,13 @@ pub(crate) async fn assemble_api_router(
         services,
         discovered_errors,
         debug_mode,
-        openapi_document.as_deref(),
+        // The spec is loaded for strict checks and the docs UI as well, but only
+        // `features.requestValidation` may make the routes validate requests with it.
+        openapi_document.as_deref().filter(|_| config.server.features.request_validation),
         mock_provider,
         config.server.effective_source_call_timeout_ms(),
         client_identity_available,
+        method_case,
     );
     let mut router = crate::server::router().merge(endpoint_router);
 
@@ -405,7 +800,7 @@ pub(crate) async fn assemble_api_router(
         router = router.merge(crate::server::metrics_router(metrics.clone()));
     }
     if config.server.docs_ui.mode != crate::config::DocsUiMode::Off {
-        let endpoint_summaries = crate::endpoint::endpoint_summaries(&api_dir.join("datasources/endpoints"));
+        let endpoint_summaries = crate::endpoint::endpoint_summaries(&endpoint_tree, method_case);
         router = router.merge(crate::server::docs_ui_router(
             config.server.docs_ui.mode,
             &config.server.docs_ui.path,
@@ -450,23 +845,42 @@ pub(crate) async fn assemble_api_router(
         router
     };
 
-    Ok((router, config.server))
+    let mut server_config = config.server;
+    server_config.canonical_literals = std::sync::Arc::new(crate::endpoint::canonical_literal_set(&crate::endpoint::route_inventory(&endpoint_tree, method_case)));
+    Ok((router, server_config))
 }
 
 /// Loads `webserve.json` and builds the static-content router — the piece
 /// `run_web` and `run_both` both need. Exits the process on a malformed
 /// config, same posture as `build_api_router` does for a broken
 /// `config/server.json`.
-fn build_web_router(root: &Path) -> (Router, WebServeConfig) {
+fn build_web_router(root: &Path, has_api: bool, mut protected: ProtectedPaths) -> io::Result<(Router, WebServeConfig)> {
     let config = match crate::webserve::load(&root.join("webserve.json")) {
         Ok(config) => config,
         Err(err) => {
             eprintln!("error: {err}");
-            std::process::exit(1);
+            crate::exit_codes::exit_config_refused();
         }
     };
-    let router = crate::webserve::router(root.to_path_buf(), config.clone());
-    (router, config)
+    for message in check_web_pages(root, &config, has_api, &mut protected)? {
+        eprintln!("warning: {message}");
+        tracing::warn!("{message}");
+    }
+    let router = crate::webserve::router(root.to_path_buf(), config.clone(), protected);
+    Ok((router, config))
+}
+
+/// The same page and protected-path checks `frogs validate` counts as problems. Refusing to start on them is
+/// safe for a registered service now: a configuration refusal exits without being restarted. Returns the warnings.
+fn check_web_pages(root: &Path, config: &WebServeConfig, has_api: bool, protected: &mut ProtectedPaths) -> io::Result<Vec<String>> {
+    protected.add_dir("logging.directory", &crate::server::logging::resolve_log_directory(root, has_api).0);
+    let (problems, warnings) = crate::webserve::page_problems(root, config, protected);
+    refuse_class(problems, |n| {
+        format!(
+            "{n} static-content problem(s) found (a page that would never be served, or a protected path that could not be resolved) — refusing to start; fix them, then run frogs validate"
+        )
+    })?;
+    Ok(warnings)
 }
 
 /// Binds `port`, writes the PID file, serves `router` until `shutdown`
@@ -500,6 +914,7 @@ fn build_web_router(root: &Path) -> (Router, WebServeConfig) {
 /// terminating the process externally. `bind` is the interface to listen
 /// on — every `frogs run` caller passes the unspecified address (all
 /// interfaces); `frogs test` defaults to loopback.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve(
     root: &Path,
     router: Router,
@@ -507,18 +922,27 @@ pub(crate) async fn serve(
     port: u16,
     tls: &TlsConfig,
     tls_base: &Path,
+    case_sensitive_methods: impl Into<crate::server::ServeShape>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> io::Result<()> {
+    let shape = case_sensitive_methods.into();
     // Structure first (a `clientAuth` block over plain HTTP is an error, not
     // an ignored setting), before anything is bound or written.
     tls.validate_structure().map_err(|m| io::Error::new(io::ErrorKind::InvalidInput, m))?;
     match tls.mode {
-        TlsMode::Off => serve_http(root, router, bind, port, shutdown).await,
-        TlsMode::Manual => serve_https(root, router, bind, port, tls, tls_base, shutdown).await,
+        TlsMode::Off => serve_http(root, router, bind, port, shape, shutdown).await,
+        TlsMode::Manual => serve_https(root, router, bind, port, tls, tls_base, shape, shutdown).await,
     }
 }
 
-async fn serve_http(root: &Path, router: Router, bind: IpAddr, port: u16, shutdown: impl std::future::Future<Output = ()> + Send + 'static) -> io::Result<()> {
+async fn serve_http(
+    root: &Path,
+    router: Router,
+    bind: IpAddr,
+    port: u16,
+    shape: crate::server::ServeShape,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> io::Result<()> {
     let addr = SocketAddr::new(bind, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
@@ -538,7 +962,7 @@ async fn serve_http(root: &Path, router: Router, bind: IpAddr, port: u16, shutdo
     // is `localhost` — harmless overhead for every other route, which
     // simply never looks at `ConnectInfo`.
     let result = tokio::select! {
-        result = axum::serve(listener, router.into_make_service_with_connect_info::<std::net::SocketAddr>()) => result,
+        result = axum::serve(listener, crate::server::served_service(router, shape)) => result,
         _ = shutdown => {
             println!("shutting down");
             Ok(())
@@ -554,6 +978,7 @@ async fn serve_http(root: &Path, router: Router, bind: IpAddr, port: u16, shutdo
 /// base each caller passes and why. The whole `ServerConfig` (every file
 /// read, every parse) is built before the port is bound or the pidfile is
 /// written, so any misconfiguration fails the process cleanly first.
+#[allow(clippy::too_many_arguments)]
 async fn serve_https(
     root: &Path,
     router: Router,
@@ -561,6 +986,7 @@ async fn serve_https(
     port: u16,
     tls: &TlsConfig,
     tls_base: &Path,
+    shape: crate::server::ServeShape,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> io::Result<()> {
     let addr = SocketAddr::new(bind, port);
@@ -610,7 +1036,7 @@ async fn serve_https(
     // Same `with_connect_info` reasoning as `serve_http` — axum-server's
     // TLS acceptor supports the identical `MakeService` shape.
     let result = tokio::select! {
-        result = server.serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>()) => result,
+        result = server.serve(crate::server::served_service(router, shape)) => result,
         _ = shutdown => {
             println!("shutting down");
             Ok(())
@@ -716,7 +1142,7 @@ mod tests {
         };
         let router = Router::new();
 
-        let err = serve(&root, router, IpAddr::V4(Ipv4Addr::UNSPECIFIED), free_port(), &tls, &root, ctrl_c_shutdown())
+        let err = serve(&root, router, IpAddr::V4(Ipv4Addr::UNSPECIFIED), free_port(), &tls, &root, false, ctrl_c_shutdown())
             .await
             .expect_err("tls.mode: manual with no tls.manual block must fail, not silently serve plain HTTP");
         assert!(err.to_string().contains("tls.manual"));
@@ -743,7 +1169,7 @@ mod tests {
         };
         let router = Router::new();
 
-        let err = serve(&root, router, IpAddr::V4(Ipv4Addr::UNSPECIFIED), free_port(), &tls, &root, ctrl_c_shutdown())
+        let err = serve(&root, router, IpAddr::V4(Ipv4Addr::UNSPECIFIED), free_port(), &tls, &root, false, ctrl_c_shutdown())
             .await
             .expect_err("a nonexistent cert file must fail to load, not panic or hang");
         assert!(err.to_string().contains("does-not-exist-cert.pem"));
@@ -795,6 +1221,7 @@ mod tests {
                 port,
                 &tls,
                 &spawned_api_dir,
+                false,
                 ctrl_c_shutdown(),
             )
             .await;
@@ -850,6 +1277,7 @@ mod tests {
                 port,
                 &tls,
                 &spawned_api_dir,
+                false,
                 ctrl_c_shutdown(),
             )
             .await;
@@ -912,6 +1340,107 @@ mod tests {
             .expect("a real HTTPS request against run_web's own tls config should succeed");
         assert_eq!(response.status(), 200);
         assert_eq!(response.text().await.unwrap(), "hello from static content");
+
+        // The key, the certificate and frogs' own runtime files are never
+        // served, over the same real TLS listener, in any case spelling.
+        std::fs::create_dir_all(root.join(".frogs")).unwrap();
+        std::fs::write(root.join(".frogs/run.json"), "SECRET-RUN").unwrap();
+        std::fs::create_dir_all(root.join("runtime-logs")).unwrap();
+        std::fs::write(root.join("runtime-logs/frogs.log.2026-10-26"), "SECRET-LOG").unwrap();
+        for target in ["/key.pem", "/KEY.PEM", "/cert.pem", "/.frogs/run.json", "/runtime-logs/frogs.log.2026-10-26"] {
+            let denied = client.get(format!("https://localhost:{port}{target}")).send().await.unwrap();
+            assert_eq!(denied.status(), 404, "{target}");
+            let body = denied.text().await.unwrap();
+            assert!(
+                !body.contains("PRIVATE KEY") && !body.contains("CERTIFICATE") && !body.contains("SECRET-"),
+                "{target} leaked: {body}"
+            );
+        }
+    }
+
+    /// Both roles in one process, wired exactly as `run_both` does (API side
+    /// collects the protected paths, the web side consumes them): the log
+    /// directory re-enters the root through `../../<rootname>/logs`, a TLS key
+    /// sits outside `api/`, a CRL and the SQLite `-wal` sidecar only appear
+    /// after the router is built, and the SQLite URI spells the root in
+    /// another case on Windows.
+    #[tokio::test]
+    async fn both_roles_never_serve_logs_tls_material_sqlite_files_or_api_config_even_for_files_created_after_startup() {
+        let root = scratch_api_project(false);
+        let root = std::fs::canonicalize(&root).unwrap();
+        let rootname = root.file_name().unwrap().to_string_lossy().to_string();
+        std::fs::write(root.join("index.html"), "<html>public</html>").unwrap();
+        std::fs::write(root.join("webserve.json"), r#"{ "startPage": "index.html" }"#).unwrap();
+        std::fs::create_dir_all(root.join("tls")).unwrap();
+        std::fs::write(root.join("tls/key.pem"), "SECRET-KEY").unwrap();
+
+        let plain_root = root.to_string_lossy().trim_start_matches(r"\\?\").replace('\\', "/");
+        let uri_root = if cfg!(windows) { plain_root.to_uppercase() } else { plain_root.clone() };
+        let database = if cfg!(windows) {
+            format!("file:///{uri_root}/data.db?mode=rwc")
+        } else {
+            format!("file://{uri_root}/data.db?mode=rwc")
+        };
+        std::fs::write(
+            root.join("api/config/server.json"),
+            format!(
+                r#"{{
+                    "features": {{ "requestCorrelation": false, "requestValidation": false }},
+                    "logging": {{ "directory": "../../{rootname}/logs" }},
+                    "tls": {{
+                        "mode": "off",
+                        "manual": {{ "certPath": "../tls/cert.pem", "keyPath": "../tls/key.pem" }},
+                        "clientAuth": {{ "mode": "required", "caPath": "../tls/ca.pem", "crlPaths": ["../tls/revoked.crl"] }}
+                    }}
+                }}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("api/config/connections.json"),
+            format!(r#"{{ "main": {{ "driver": "sqlite", "database": "{database}" }} }}"#),
+        )
+        .unwrap();
+        std::fs::write(root.join("api/config/secret.txt"), "SECRET-API").unwrap();
+
+        let (api_router, _server_config, protected) = build_api_router_with_protected(&root, true).await.expect("scratch API project should build");
+        let (web_router, _) = build_web_router(&root, true, protected).expect("scratch web project should build");
+        let router = api_router.merge(web_router);
+        let addr = crate::server::spawn_served(router, false).await;
+
+        // Appear only after the router was built.
+        std::fs::create_dir_all(root.join("logs")).unwrap();
+        std::fs::write(root.join("logs/x"), "SECRET-LOG").unwrap();
+        std::fs::write(root.join("tls/revoked.crl"), "SECRET-CRL").unwrap();
+        std::fs::write(root.join("tls/cert.pem"), "SECRET-CERT").unwrap();
+        std::fs::write(root.join("tls/ca.pem"), "SECRET-CA").unwrap();
+        std::fs::write(root.join("data.db-wal"), "SECRET-WAL").unwrap();
+
+        let client = reqwest::Client::new();
+        for target in [
+            "/api/config/connections.json",
+            "/api/config/secret.txt",
+            "/logs/x",
+            "/LOGS/x",
+            "/tls/key.pem",
+            "/tls/cert.pem",
+            "/tls/ca.pem",
+            "/tls/revoked.crl",
+            "/TLS/REVOKED.CRL",
+            "/data.db",
+            "/data.db-wal",
+            "/openapi.yaml",
+            "/webserve.json",
+        ] {
+            let response = client.get(format!("http://{addr}{target}")).send().await.unwrap();
+            assert_eq!(response.status(), 404, "{target}");
+            let body = response.bytes().await.unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert!(!text.contains("SECRET-") && !text.starts_with("SQLite format 3"), "{target} leaked: {text:?}");
+        }
+        let ok = client.get(format!("http://{addr}/index.html")).send().await.unwrap();
+        assert_eq!(ok.status(), 200);
+        assert_eq!(ok.text().await.unwrap(), "<html>public</html>");
     }
 
     /// A minimal but complete API-role scratch project — every file
@@ -945,7 +1474,9 @@ mod tests {
     #[tokio::test]
     async fn request_correlation_true_adds_the_x_request_id_header() {
         let root = scratch_api_project(true);
-        let (router, _) = build_api_router(&root).await.expect("a minimal but complete scratch project should build cleanly");
+        let (router, _) = build_api_router(&root, false)
+            .await
+            .expect("a minimal but complete scratch project should build cleanly");
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -960,7 +1491,9 @@ mod tests {
     #[tokio::test]
     async fn request_correlation_false_omits_the_x_request_id_header() {
         let root = scratch_api_project(false);
-        let (router, _) = build_api_router(&root).await.expect("a minimal but complete scratch project should build cleanly");
+        let (router, _) = build_api_router(&root, false)
+            .await
+            .expect("a minimal but complete scratch project should build cleanly");
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1065,7 +1598,9 @@ mod tests {
     #[tokio::test]
     async fn cors_end_to_end_echoes_an_allowed_origin_and_omits_others() {
         let root = scratch_api_project_with_cors(r#"["https://allowed.example"]"#);
-        let (router, _) = build_api_router(&root).await.expect("a minimal but complete scratch project should build cleanly");
+        let (router, _) = build_api_router(&root, false)
+            .await
+            .expect("a minimal but complete scratch project should build cleanly");
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1115,7 +1650,9 @@ mod tests {
     #[tokio::test]
     async fn docs_ui_off_never_registers_the_route() {
         let root = scratch_api_project_with_docs_ui("off");
-        let (router, _) = build_api_router(&root).await.expect("a minimal but complete scratch project should build cleanly");
+        let (router, _) = build_api_router(&root, false)
+            .await
+            .expect("a minimal but complete scratch project should build cleanly");
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1135,7 +1672,9 @@ mod tests {
     #[tokio::test]
     async fn docs_ui_localhost_mode_is_reachable_through_the_real_serve_http_connect_info_wiring() {
         let root = scratch_api_project_with_docs_ui("localhost");
-        let (router, _) = build_api_router(&root).await.expect("a minimal but complete scratch project should build cleanly");
+        let (router, _) = build_api_router(&root, false)
+            .await
+            .expect("a minimal but complete scratch project should build cleanly");
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1175,7 +1714,9 @@ mod tests {
         std::fs::write(api_dir.join("config/connections.json"), "{}").unwrap();
         std::fs::write(api_dir.join("security/schemes.json"), "{}").unwrap();
 
-        let (router, _) = build_api_router(&root).await.expect("a minimal but complete scratch project should build cleanly");
+        let (router, _) = build_api_router(&root, false)
+            .await
+            .expect("a minimal but complete scratch project should build cleanly");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1215,7 +1756,9 @@ mod tests {
         )
         .unwrap();
 
-        let (router, _) = build_api_router(&root).await.expect("a minimal but complete scratch project should build cleanly");
+        let (router, _) = build_api_router(&root, false)
+            .await
+            .expect("a minimal but complete scratch project should build cleanly");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1281,7 +1824,9 @@ mod tests {
         )
         .unwrap();
 
-        let (router, _) = build_api_router(&root).await.expect("a minimal but complete scratch project should build cleanly");
+        let (router, _) = build_api_router(&root, false)
+            .await
+            .expect("a minimal but complete scratch project should build cleanly");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1335,3 +1880,888 @@ mod tests {
 
 #[cfg(test)]
 mod mtls_tests;
+
+#[cfg(test)]
+mod strict_open_api_startup_tests {
+    use super::*;
+
+    fn temp_project() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-run-m1-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Same shape as the other scratch projects in this file, but with a
+    /// caller-supplied spec and `server.json`.
+    fn scratch(server_json: &str, spec: Option<&str>) -> std::path::PathBuf {
+        let root = temp_project();
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(api_dir.join("config/errors")).unwrap();
+        std::fs::create_dir_all(api_dir.join("security")).unwrap();
+        std::fs::create_dir_all(api_dir.join("datasources/endpoints")).unwrap();
+        if let Some(spec) = spec {
+            std::fs::write(root.join("openapi.yaml"), spec).unwrap();
+        }
+        std::fs::write(api_dir.join("config/server.json"), server_json).unwrap();
+        std::fs::write(api_dir.join("config/errors/core.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("config/connections.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("security/schemes.json"), "{}").unwrap();
+        root
+    }
+
+    fn server(json: &str) -> ServerConfig {
+        serde_json::from_str(json).unwrap()
+    }
+
+    const CLEAN: &str =
+        "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths:\n  /ping:\n    get:\n      operationId: ping\n      responses:\n        '200': { description: ok }\n";
+    const UNSAFE: &str =
+        "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths:\n  /x/..:\n    get:\n      operationId: bad\n      responses:\n        '200': { description: ok }\n";
+    const OFF: &str = r#"{ "features": { "requestValidation": false } }"#;
+    const STRICT_OFF_FEATURES: &str = r#"{ "strictOpenApi": true, "features": { "requestValidation": false } }"#;
+
+    #[test]
+    fn strict_loads_the_spec_even_when_request_validation_and_docs_ui_are_off() {
+        let root = scratch(STRICT_OFF_FEATURES, Some(CLEAN));
+        let doc = load_openapi_for_startup(&root, &server(STRICT_OFF_FEATURES), &tree_of(&root)).unwrap();
+        assert_eq!(doc.expect("strict must load the document").operations.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn non_strict_with_nothing_needing_the_spec_does_not_load_it() {
+        let root = scratch(OFF, Some(UNSAFE));
+        assert!(load_openapi_for_startup(&root, &server(OFF), &tree_of(&root)).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn non_strict_with_issues_still_starts_and_hands_back_the_document() {
+        let root = scratch(r#"{ "features": { "requestValidation": true } }"#, Some(UNSAFE));
+        let doc = load_openapi_for_startup(&root, &server(r#"{ "features": { "requestValidation": true } }"#), &tree_of(&root))
+            .unwrap()
+            .expect("loaded");
+        assert!(doc.operations.is_empty());
+        assert!(!doc.issues.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn non_strict_with_a_missing_spec_degrades_to_none() {
+        let json = r#"{ "features": { "requestValidation": true } }"#;
+        let root = scratch(json, None);
+        assert!(load_openapi_for_startup(&root, &server(json), &tree_of(&root)).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strict_with_a_missing_spec_is_a_refusal() {
+        let root = scratch(STRICT_OFF_FEATURES, None);
+        let err = load_openapi_for_startup(&root, &server(STRICT_OFF_FEATURES), &tree_of(&root)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strict_with_an_unsafe_path_is_a_refusal_naming_the_issue_count() {
+        let root = scratch(STRICT_OFF_FEATURES, Some(UNSAFE));
+        let err = load_openapi_for_startup(&root, &server(STRICT_OFF_FEATURES), &tree_of(&root)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("1 openapi.yaml issue(s)"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strict_treats_a_missing_version_as_a_refusal_but_not_served_operations_as_fine() {
+        let no_version = "info: { title: t, version: '1' }\npaths: {}\n";
+        let root = scratch(STRICT_OFF_FEATURES, Some(no_version));
+        assert!(load_openapi_for_startup(&root, &server(STRICT_OFF_FEATURES), &tree_of(&root)).is_err());
+
+        let not_served = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /s:\n    additionalOperations:\n      PURGE:\n        operationId: q\n        responses: { '200': { description: ok } }\n";
+        std::fs::write(root.join("openapi.yaml"), not_served).unwrap();
+        assert!(load_openapi_for_startup(&root, &server(STRICT_OFF_FEATURES), &tree_of(&root)).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_strict_refusal_happens_before_any_port_or_pidfile_is_touched() {
+        let root = scratch(STRICT_OFF_FEATURES, Some(UNSAFE));
+        let err = build_api_router(&root, false).await.expect_err("strict + unsafe path must refuse");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(!root.join(".frogs/run.json").exists());
+        assert!(pidfile::read(&root).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_strict_refusal_happens_before_connections_are_opened() {
+        let root = scratch(STRICT_OFF_FEATURES, Some(UNSAFE));
+        std::fs::write(
+            root.join("api/config/connections.json"),
+            r#"{ "main": { "driver": "nosuchdriver", "url": "nowhere" } }"#,
+        )
+        .unwrap();
+        let err = build_api_router(&root, false).await.expect_err("must refuse");
+        assert!(err.to_string().contains("openapi.yaml"), "the spec refusal must win over the connection error: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_strict_project_with_a_clean_spec_builds_normally() {
+        let root = scratch(STRICT_OFF_FEATURES, Some(CLEAN));
+        assert!(build_api_router(&root, false).await.is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `/Cars` and `/cars` are ambiguous (generate sets both aside), but
+    /// `run` routes from disk and request validation must still apply, by
+    /// exact bytes, via `find_operation`'s fallback.
+    fn ambiguous_project(server_json: &str) -> std::path::PathBuf {
+        let spec = "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths:\n  /Cars:\n    get:\n      operationId: upper\n      parameters:\n        - { name: q, in: query, required: true, schema: { type: string } }\n      responses:\n        '200': { description: ok }\n  /cars:\n    get:\n      operationId: lower\n      parameters:\n        - { name: q, in: query, required: true, schema: { type: string } }\n      responses:\n        '200': { description: ok }\n";
+        let root = scratch(server_json, Some(spec));
+        let dir = root.join("api/datasources/endpoints/cars");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("endpoint.get.json"), r#"{ "operationId": "lower", "sources": {}, "response": {} }"#).unwrap();
+        std::fs::write(
+            root.join("api/config/errors/core.json"),
+            r#"{ "validation.missing_parameter": { "httpStatus": 400, "exposeDetail": true } }"#,
+        )
+        .unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn ambiguous_paths_still_get_request_validation_when_not_strict() {
+        let root = ambiguous_project(r#"{ "features": { "requestValidation": true } }"#);
+        let (router, _) = build_api_router(&root, false).await.expect("non-strict must start");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let missing = reqwest::get(format!("http://{addr}/cars")).await.unwrap();
+        assert_eq!(missing.status(), 400, "a missing required query parameter must be rejected, not fail open");
+        let ok = reqwest::get(format!("http://{addr}/cars?q=1")).await.unwrap();
+        assert_eq!(ok.status(), 200);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn docs_ui_does_not_switch_request_validation_on_when_the_feature_is_off() {
+        let root = ambiguous_project(r#"{ "features": { "requestValidation": false }, "docsUi": { "mode": "public" } }"#);
+        let (router, _) = build_api_router(&root, false).await.expect("non-strict must start");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let missing = reqwest::get(format!("http://{addr}/cars")).await.unwrap();
+        assert_eq!(
+            missing.status(),
+            200,
+            "requestValidation is off: the missing query parameter is not rejected just because docsUi loaded the spec"
+        );
+        let docs = reqwest::get(format!("http://{addr}/docs")).await.unwrap();
+        assert_eq!(docs.status(), 200, "the docs UI still gets the spec");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_paths_are_a_refusal_when_strict() {
+        let root = ambiguous_project(r#"{ "strictOpenApi": true }"#);
+        assert!(build_api_router(&root, false).await.is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m2_strict_startup_tests {
+    use super::*;
+
+    fn scratch(server_json: &str, spec: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-run-m2-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(api_dir.join("config")).unwrap();
+        std::fs::create_dir_all(api_dir.join("datasources/endpoints/things")).unwrap();
+        std::fs::write(root.join("openapi.yaml"), spec).unwrap();
+        std::fs::write(api_dir.join("config/server.json"), server_json).unwrap();
+        root
+    }
+
+    fn write_endpoint(root: &std::path::Path, json: &str) {
+        std::fs::write(root.join("api/datasources/endpoints/things/endpoint.get.json"), json).unwrap();
+    }
+
+    fn server(json: &str) -> ServerConfig {
+        serde_json::from_str(json).unwrap()
+    }
+
+    const STRICT: &str = r#"{ "strictOpenApi": true }"#;
+    const LAX: &str = r#"{ "strictOpenApi": false, "features": { "requestValidation": true } }"#;
+    const CLEAN: &str = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /things:\n    get:\n      operationId: getThings\n      responses:\n        '200': { description: ok }\n";
+    const STREAM_FILE: &str = r#"{ "operationId": "getThings", "stream": null, "sources": {}, "response": {} }"#;
+    const NESTED_STREAM_ONLY: &str = r#"{ "operationId": "getThings", "sources": {}, "response": { "stream": "sources.a.b" } }"#;
+
+    #[test]
+    fn strict_with_a_top_level_stream_key_refuses_to_start_naming_the_reserved_key() {
+        let root = scratch(STRICT, CLEAN);
+        write_endpoint(&root, STREAM_FILE);
+        let err = load_openapi_for_startup(&root, &server(STRICT), &tree_of(&root)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let message = err.to_string();
+        assert!(message.contains("1 endpoint file(s) use the reserved \"stream\" key"), "{message}");
+        assert!(message.contains("refusing to start"), "{message}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn non_strict_with_a_stream_key_still_starts() {
+        let root = scratch(LAX, CLEAN);
+        write_endpoint(&root, STREAM_FILE);
+        assert!(load_openapi_for_startup(&root, &server(LAX), &tree_of(&root)).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strict_with_only_a_nested_stream_key_is_fine() {
+        let root = scratch(STRICT, CLEAN);
+        write_endpoint(&root, NESTED_STREAM_ONLY);
+        assert!(load_openapi_for_startup(&root, &server(STRICT), &tree_of(&root)).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strict_with_only_w2_w3_w4_findings_starts_normally() {
+        let spec = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /things:\n    get:\n      operationId: getThings\n      security: [ { old: [] } ]\n      responses:\n        '200':\n          description: ok\n          content:\n            text/event-stream: {}\n  /u:\n    post:\n      operationId: u\n      requestBody:\n        content:\n          multipart/form-data: { schema: { type: object } }\n      responses:\n        '200': { description: ok }\ncomponents:\n  securitySchemes:\n    old: { type: apiKey, in: header, name: k, deprecated: true }\n";
+        let root = scratch(STRICT, spec);
+        let doc = load_openapi_for_startup(&root, &server(STRICT), &tree_of(&root)).unwrap().expect("loaded");
+        assert!(doc.issues.len() >= 3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strict_with_an_unresolved_default_mapping_refuses_to_start_with_the_unchanged_message() {
+        let spec = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths: {}\ncomponents:\n  schemas:\n    V: { oneOf: [ { type: string } ], discriminator: { propertyName: k, defaultMapping: Nope } }\n";
+        let root = scratch(STRICT, spec);
+        let err = load_openapi_for_startup(&root, &server(STRICT), &tree_of(&root)).unwrap_err();
+        assert_eq!(err.to_string(), "1 openapi.yaml issue(s) found and \"strictOpenApi\" is true — refusing to start");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strict_with_a_broken_media_type_ref_refuses_to_start() {
+        let spec = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /a:\n    get:\n      operationId: a\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { $ref: '#/components/mediaTypes/Missing' }\n";
+        let root = scratch(STRICT, spec);
+        assert!(load_openapi_for_startup(&root, &server(STRICT), &tree_of(&root)).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m2_7_startup_security_tests {
+    use super::*;
+
+    fn scratch(server_json: &str, spec: Option<&str>, endpoint: Option<&str>) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-run-m27-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(api_dir.join("config/errors")).unwrap();
+        std::fs::create_dir_all(api_dir.join("security")).unwrap();
+        std::fs::create_dir_all(api_dir.join("datasources/endpoints/things")).unwrap();
+        if let Some(spec) = spec {
+            std::fs::write(root.join("openapi.yaml"), spec).unwrap();
+        }
+        if let Some(endpoint) = endpoint {
+            std::fs::write(api_dir.join("datasources/endpoints/things/endpoint.get.json"), endpoint).unwrap();
+        }
+        std::fs::write(api_dir.join("config/server.json"), server_json).unwrap();
+        std::fs::write(api_dir.join("config/errors/core.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("config/connections.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("security/schemes.json"), "{}").unwrap();
+        root
+    }
+
+    fn server(json: &str) -> ServerConfig {
+        serde_json::from_str(json).unwrap()
+    }
+
+    const DEFAULT: &str = "{}";
+    const FEATURES_OFF: &str = r#"{ "features": { "requestValidation": false } }"#;
+    const STRICT: &str = r#"{ "strictOpenApi": true }"#;
+
+    const SECURED_SPEC: &str = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  securitySchemes:\n    apiKeyAuth: { type: apiKey, in: header, name: k }\npaths:\n  /things:\n    get:\n      operationId: getThings\n      security: [ { apiKeyAuth: [] } ]\n      responses:\n        '200': { description: ok }\n";
+    const OPEN_SPEC: &str = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /things:\n    get:\n      operationId: getThings\n      responses:\n        '200': { description: ok }\n";
+    const UNPROTECTED: &str = r#"{ "operationId": "getThings", "sources": {}, "response": {} }"#;
+    const PROTECTED: &str = r#"{ "operationId": "getThings", "security": "apiKeyAuth", "sources": {}, "response": {} }"#;
+
+    #[test]
+    fn strict_refuses_a_non_canonical_stub_name_but_a_default_run_only_ignores_it() {
+        let root = scratch(STRICT, Some(OPEN_SPEC), Some(UNPROTECTED));
+        // A separate folder: on a case-insensitive filesystem `endpoint.GET.json` next to `endpoint.get.json` is the same file.
+        std::fs::create_dir_all(root.join("api/datasources/endpoints/other")).unwrap();
+        std::fs::write(root.join("api/datasources/endpoints/other/endpoint.GET.json"), UNPROTECTED).unwrap();
+        let err = load_openapi_for_startup(&root, &server(STRICT), &tree_of(&root)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("endpoint folder/file problem(s) found and \"strictOpenApi\" is true"),
+            "{err}"
+        );
+        assert!(load_openapi_for_startup(&root, &server(DEFAULT), &tree_of(&root)).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strict_refuses_an_endpoint_folder_that_differs_from_the_spec_path_only_by_letter_case() {
+        let root = scratch(STRICT, Some(OPEN_SPEC), None);
+        let endpoints = root.join("api/datasources/endpoints");
+        std::fs::remove_dir(endpoints.join("things")).unwrap();
+        std::fs::create_dir_all(endpoints.join("Things")).unwrap();
+        std::fs::write(endpoints.join("Things/endpoint.get.json"), UNPROTECTED).unwrap();
+        let err = load_openapi_for_startup(&root, &server(STRICT), &tree_of(&root)).unwrap_err();
+        assert!(
+            err.to_string().contains("endpoint folder/file problem(s) found and \"strictOpenApi\" is true"),
+            "{err}"
+        );
+        assert!(load_openapi_for_startup(&root, &server(DEFAULT), &tree_of(&root)).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strict_with_a_clean_endpoint_tree_is_not_refused_by_the_on_disk_scan() {
+        let root = scratch(STRICT, Some(OPEN_SPEC), Some(UNPROTECTED));
+        assert!(load_openapi_for_startup(&root, &server(STRICT), &tree_of(&root)).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_mismatch_is_refused_even_with_strict_off_and_every_spec_consuming_feature_off() {
+        let root = scratch(FEATURES_OFF, Some(SECURED_SPEC), Some(UNPROTECTED));
+        let err = load_openapi_for_startup(&root, &server(FEATURES_OFF), &tree_of(&root)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let message = err.to_string();
+        assert!(
+            message.starts_with("1 endpoint file(s) don't apply the security openapi.yaml declares — refusing to start;"),
+            "{message}"
+        );
+        assert!(message.ends_with("then run frogs validate"), "no registered-service hint on a plain run: {message}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_mismatch_is_refused_under_strict_too() {
+        let root = scratch(STRICT, Some(SECURED_SPEC), Some(UNPROTECTED));
+        let err = load_openapi_for_startup(&root, &server(STRICT), &tree_of(&root)).unwrap_err();
+        assert!(err.to_string().contains("don't apply the security"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_registered_service_refusal_carries_the_restart_policy_hint() {
+        let root = scratch(FEATURES_OFF, Some(SECURED_SPEC), Some(UNPROTECTED));
+        let err = precheck_security_for_service(&root).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("don't apply the security"), "{message}");
+        assert!(message.contains("--restart-policy never"), "{message}");
+        assert!(message.contains("restarts every 5 s under --restart-policy on-failure"), "{message}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_clean_project_with_the_spec_features_off_loads_nothing_into_memory() {
+        let root = scratch(FEATURES_OFF, Some(SECURED_SPEC), Some(PROTECTED));
+        let (doc, report) = load_openapi_for_startup_reported(&root, &server(FEATURES_OFF), "", &tree_of(&root), RootExtras::default()).unwrap();
+        assert!(doc.is_none(), "the document must not leak into request validation / docs when those are off");
+        assert!(report.unmatched.is_empty() && report.not_loaded.is_none() && report.dropped_issues == 0);
+        assert!(load_openapi_for_startup(&root, &server(FEATURES_OFF), &tree_of(&root)).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_clean_project_with_default_config_hands_back_the_document() {
+        let root = scratch(DEFAULT, Some(SECURED_SPEC), Some(PROTECTED));
+        assert!(load_openapi_for_startup(&root, &server(DEFAULT), &tree_of(&root)).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_with_no_matching_operation_is_reported_unmatched_and_startup_proceeds() {
+        let root = scratch(DEFAULT, Some(OPEN_SPEC), Some(UNPROTECTED));
+        std::fs::create_dir_all(root.join("api/datasources/endpoints/ghost")).unwrap();
+        std::fs::write(root.join("api/datasources/endpoints/ghost/endpoint.get.json"), UNPROTECTED).unwrap();
+        let (doc, report) = load_openapi_for_startup_reported(&root, &server(DEFAULT), "", &tree_of(&root), RootExtras::default()).unwrap();
+        assert!(doc.is_some());
+        assert_eq!(report.unmatched.len(), 1);
+        assert!(report.unmatched[0].to_string_lossy().contains("ghost"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unsafe_path_spec_with_strict_off_reports_the_dropped_operations_summary() {
+        let spec = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /x/..:\n    get:\n      operationId: bad\n      responses:\n        '200': { description: ok }\n";
+        let root = scratch(FEATURES_OFF, Some(spec), Some(UNPROTECTED));
+        let (_, report) = load_openapi_for_startup_reported(&root, &server(FEATURES_OFF), "", &tree_of(&root), RootExtras::default()).unwrap();
+        assert!(report.dropped_issues >= 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_or_unparseable_spec_with_strict_off_starts_with_a_not_checked_report() {
+        let missing = scratch(FEATURES_OFF, None, Some(UNPROTECTED));
+        let (doc, report) = load_openapi_for_startup_reported(&missing, &server(FEATURES_OFF), "", &tree_of(&missing), RootExtras::default()).unwrap();
+        assert!(doc.is_none());
+        assert!(report.not_loaded.is_some());
+
+        let broken = scratch(FEATURES_OFF, Some("openapi: [unterminated"), Some(UNPROTECTED));
+        let (doc, report) = load_openapi_for_startup_reported(&broken, &server(FEATURES_OFF), "", &tree_of(&broken), RootExtras::default()).unwrap();
+        assert!(doc.is_none());
+        assert!(report.not_loaded.is_some());
+        let _ = std::fs::remove_dir_all(&missing);
+        let _ = std::fs::remove_dir_all(&broken);
+    }
+
+    #[test]
+    fn a_missing_spec_under_strict_is_still_refused() {
+        let root = scratch(STRICT, None, Some(UNPROTECTED));
+        assert!(load_openapi_for_startup(&root, &server(STRICT), &tree_of(&root)).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_service_precheck_only_warns_on_load_failure_and_unmatched_files() {
+        let missing = scratch(FEATURES_OFF, None, Some(UNPROTECTED));
+        assert!(precheck_security_for_service(&missing).is_ok());
+        let unmatched = scratch(FEATURES_OFF, Some(OPEN_SPEC), None);
+        std::fs::create_dir_all(unmatched.join("api/datasources/endpoints/ghost")).unwrap();
+        std::fs::write(unmatched.join("api/datasources/endpoints/ghost/endpoint.get.json"), UNPROTECTED).unwrap();
+        assert!(precheck_security_for_service(&unmatched).is_ok());
+        let ok = scratch(FEATURES_OFF, Some(SECURED_SPEC), Some(PROTECTED));
+        assert!(precheck_security_for_service(&ok).is_ok());
+        let _ = std::fs::remove_dir_all(&missing);
+        let _ = std::fs::remove_dir_all(&unmatched);
+        let _ = std::fs::remove_dir_all(&ok);
+    }
+
+    #[test]
+    fn a_web_only_project_without_a_spec_passes_the_service_precheck() {
+        let root = std::env::temp_dir().join(format!(
+            "frogs-run-m27-web-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("index.html"), "<html></html>").unwrap();
+        assert!(precheck_security_for_service(&root).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_mismatch_check_reads_the_api_subfolder_not_the_project_root() {
+        // A same-shaped tree at the project root (not under api/) must be ignored.
+        let root = scratch(FEATURES_OFF, Some(SECURED_SPEC), Some(PROTECTED));
+        std::fs::create_dir_all(root.join("datasources/endpoints/things")).unwrap();
+        std::fs::write(root.join("datasources/endpoints/things/endpoint.get.json"), UNPROTECTED).unwrap();
+        assert!(load_openapi_for_startup(&root, &server(FEATURES_OFF), &tree_of(&root)).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod m3_method_case_tests {
+    use super::*;
+
+    fn temp_project() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-run-m3-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn server(json: &str) -> ServerConfig {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn a_missing_key_warns_with_the_bypass_wording_and_matching_is_case_insensitive() {
+        let config = server("{}");
+        assert!(!config.case_sensitive_methods());
+        assert!(!config.case_sensitive_methods_explicit());
+        let (level, message) = method_case_notice(&config).expect("a notice");
+        assert_eq!(level, tracing::Level::WARN);
+        assert!(message.contains("caseSensitiveMethods is not set") && message.contains("bypass"), "{message}");
+    }
+
+    #[test]
+    fn an_explicit_false_is_an_info_notice_with_the_documented_text() {
+        let config = server(r#"{ "caseSensitiveMethods": false }"#);
+        assert!(config.case_sensitive_methods_explicit());
+        let (level, message) = method_case_notice(&config).expect("a notice");
+        assert_eq!(level, tracing::Level::INFO);
+        assert_eq!(
+            message,
+            "HTTP method names are matched case-insensitively (caseSensitiveMethods: false in config/server.json); set caseSensitiveMethods: true for RFC 9110 exact matching"
+        );
+    }
+
+    #[test]
+    fn an_explicit_true_has_no_notice_and_reaches_the_load_options() {
+        let config = server(r#"{ "caseSensitiveMethods": true }"#);
+        assert!(method_case_notice(&config).is_none());
+        assert!(config.openapi_load_options().case_sensitive_methods);
+        assert!(!server("{}").openapi_load_options().case_sensitive_methods);
+    }
+
+    #[test]
+    fn the_default_server_config_writes_the_key_as_false_and_an_absent_key_is_not_serialized() {
+        let written = serde_json::to_value(ServerConfig::default()).unwrap();
+        assert_eq!(written["caseSensitiveMethods"], false);
+        let unset = serde_json::to_value(server("{}")).unwrap();
+        assert!(unset.get("caseSensitiveMethods").is_none(), "{unset}");
+    }
+
+    const QUERY_ON_31: &str =
+        "openapi: 3.1.0\ninfo: { title: t, version: '1' }\npaths:\n  /q:\n    query:\n      operationId: q\n      responses:\n        '200': { description: ok }\n";
+
+    fn scratch(server_json: &str, spec: &str) -> std::path::PathBuf {
+        let root = temp_project();
+        let api_dir = root.join("api");
+        std::fs::create_dir_all(api_dir.join("config/errors")).unwrap();
+        std::fs::create_dir_all(api_dir.join("security")).unwrap();
+        std::fs::create_dir_all(api_dir.join("datasources/endpoints")).unwrap();
+        std::fs::write(root.join("openapi.yaml"), spec).unwrap();
+        std::fs::write(api_dir.join("config/server.json"), server_json).unwrap();
+        std::fs::write(api_dir.join("config/errors/core.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("config/connections.json"), "{}").unwrap();
+        std::fs::write(api_dir.join("security/schemes.json"), "{}").unwrap();
+        root
+    }
+
+    #[test]
+    fn strict_refuses_to_start_a_3_1_spec_that_uses_query_but_non_strict_starts() {
+        let strict = r#"{ "strictOpenApi": true, "features": { "requestValidation": false } }"#;
+        let root = scratch(strict, QUERY_ON_31);
+        let err = load_openapi_for_startup(&root, &server(strict), &tree_of(&root)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            load_openapi_for_startup(&root, &server(r#"{ "features": { "requestValidation": true } }"#), &tree_of(&root))
+                .unwrap()
+                .is_some()
+        );
+
+        std::fs::write(root.join("openapi.yaml"), QUERY_ON_31.replace("3.1.0", "3.2.0")).unwrap();
+        assert!(load_openapi_for_startup(&root, &server(strict), &tree_of(&root)).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    async fn both_roles_get_status(case_sensitive_json: &str) -> u16 {
+        let port = free_port();
+        let root = scratch(
+            &format!(r#"{{ "features": {{ "requestCorrelation": false, "requestValidation": false }}, "port": {port}{case_sensitive_json} }}"#),
+            "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths: {}\n",
+        );
+        std::fs::write(root.join("index.html"), "<html>hello</html>").unwrap();
+        std::fs::write(root.join("webserve.json"), r#"{ "startPage": "index.html" }"#).unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let run_root = root.clone();
+        let task = tokio::spawn(async move {
+            run_direct_with_shutdown(&run_root, async {
+                let _ = rx.await;
+            })
+            .await
+        });
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let mut up = false;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(up, "the both-roles server never started listening");
+        let (line, _, _, _) = crate::server::raw_request(addr, b"get /index.html HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await;
+        let _ = tx.send(());
+        let _ = task.await;
+        let _ = std::fs::remove_dir_all(&root);
+        line.split(' ').nth(1).unwrap().parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_both_roles_project_serves_a_lowercase_get_static_asset_when_matching_is_case_insensitive() {
+        assert_eq!(both_roles_get_status(r#", "caseSensitiveMethods": false"#).await, 200);
+    }
+
+    #[tokio::test]
+    async fn a_both_roles_project_applies_case_sensitive_methods_to_its_static_routes_too() {
+        assert_eq!(both_roles_get_status(r#", "caseSensitiveMethods": true"#).await, 405);
+    }
+}
+
+#[cfg(test)]
+mod m4_run_tests {
+    use super::*;
+
+    fn temp_project() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-run-m4-test-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn server(json: &str) -> ServerConfig {
+        serde_json::from_str(json).unwrap()
+    }
+
+    const DUPLICATE_KEYS: &str = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /x:\n    additionalOperations:\n      purge:\n        operationId: a\n        responses: { '200': { description: ok } }\n      PURGE:\n        operationId: b\n        responses: { '200': { description: ok } }\n";
+    const SINGLE_PURGE: &str = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /x:\n    additionalOperations:\n      PURGE:\n        operationId: a\n        responses: { '200': { description: ok } }\n";
+    const STUB: &str = r#"{ "operationId": "a", "sources": {}, "response": {} }"#;
+
+    fn project(spec: &str, server_json: &str, files: &[&str]) -> std::path::PathBuf {
+        let root = temp_project();
+        let api = root.join("api");
+        for dir in ["config/errors", "security", "datasources/endpoints/x"] {
+            std::fs::create_dir_all(api.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("openapi.yaml"), spec).unwrap();
+        std::fs::write(api.join("config/server.json"), server_json).unwrap();
+        std::fs::write(api.join("config/errors/core.json"), "{}").unwrap();
+        std::fs::write(api.join("config/connections.json"), "{}").unwrap();
+        std::fs::write(api.join("security/schemes.json"), "{}").unwrap();
+        for file in files {
+            std::fs::write(api.join("datasources/endpoints/x").join(file), STUB).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn an_endpoint_file_for_a_method_declared_by_case_only_duplicate_keys_refuses_startup_with_strict_off() {
+        let root = project(DUPLICATE_KEYS, "{}", &["endpoint.PURGE.json"]);
+        let err = load_openapi_for_startup(&root, &server("{}"), &tree_of(&root)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("declares ambiguously"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_same_ambiguous_file_refuses_startup_with_strict_on_too() {
+        let root = project(DUPLICATE_KEYS, r#"{ "strictOpenApi": true }"#, &["endpoint.PURGE.json"]);
+        let err = load_openapi_for_startup(&root, &server(r#"{ "strictOpenApi": true }"#), &tree_of(&root)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn case_only_duplicate_keys_with_no_endpoint_file_do_not_stop_startup_when_strict_is_off() {
+        let root = project(DUPLICATE_KEYS, "{}", &[]);
+        assert!(load_openapi_for_startup(&root, &server("{}"), &tree_of(&root)).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_registered_service_precheck_refuses_an_ambiguous_method_file_too() {
+        let root = project(DUPLICATE_KEYS, "{}", &["endpoint.PURGE.json"]);
+        let err = precheck_security_for_service(&root).unwrap_err();
+        assert!(err.to_string().contains("declares ambiguously"), "{err}");
+        let ok = project(SINGLE_PURGE, "{}", &["endpoint.PURGE.json"]);
+        assert!(precheck_security_for_service(&ok).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&ok);
+    }
+
+    #[test]
+    fn strict_startup_refuses_every_m4_issue_kind_and_a_clean_spec_starts() {
+        let strict = r#"{ "strictOpenApi": true }"#;
+        let bad_key = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /x:\n    additionalOperations:\n      OPTIONS:\n        operationId: a\n        responses: { '200': { description: ok } }\n";
+        let root = project(bad_key, strict, &[]);
+        assert!(load_openapi_for_startup(&root, &server(strict), &tree_of(&root)).is_err(), "S3 under strict");
+        assert!(
+            load_openapi_for_startup(&root, &server("{}"), &tree_of(&root)).is_ok(),
+            "S3 without strict only warns"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        let fixed_variant = "openapi: 3.2.0\ninfo: { title: t, version: '1' }\npaths:\n  /x:\n    additionalOperations:\n      get:\n        operationId: a\n        responses: { '200': { description: ok } }\n";
+        let root = project(fixed_variant, strict, &[]);
+        assert!(load_openapi_for_startup(&root, &server(strict), &tree_of(&root)).is_err(), "S4 under strict");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // W1 (case-distinct method, exact mode) never refuses, even under strict.
+        let exact_strict = r#"{ "strictOpenApi": true, "caseSensitiveMethods": true }"#;
+        let root = project(&fixed_variant.replace("get:", "purge:"), exact_strict, &[]);
+        assert!(
+            load_openapi_for_startup(&root, &server(exact_strict), &tree_of(&root)).is_ok(),
+            "W1 is not a strict error"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        let root = project(SINGLE_PURGE, strict, &["endpoint.PURGE.json"]);
+        assert!(load_openapi_for_startup(&root, &server(strict), &tree_of(&root)).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn assemble_api_router_refuses_a_document_loaded_under_the_other_case_setting() {
+        for (server_json, load_case_sensitive) in [(r#"{ "caseSensitiveMethods": true }"#, false), (r#"{ "caseSensitiveMethods": false }"#, true)] {
+            let root = project(SINGLE_PURGE, server_json, &[]);
+            let api = root.join("api");
+            let config = Config::load(&api).unwrap();
+            let doc = crate::openapi::load(
+                &root.join("openapi.yaml"),
+                crate::openapi::LoadOptions {
+                    case_sensitive_methods: load_case_sensitive,
+                },
+            )
+            .unwrap();
+            let err = assemble_api_router(&root, config, Arc::new(HashMap::new()), None, Some(Arc::new(doc)), Arc::new(tree_of(&root)))
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("different caseSensitiveMethods"), "{err}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[tokio::test]
+    async fn assemble_api_router_accepts_a_document_loaded_under_the_same_setting_and_serves_the_extension_route() {
+        for (server_json, case_sensitive, token, request) in [
+            (
+                r#"{ "caseSensitiveMethods": false, "features": { "requestValidation": false } }"#,
+                false,
+                "PURGE",
+                "purge",
+            ),
+            (
+                r#"{ "caseSensitiveMethods": true, "features": { "requestValidation": false } }"#,
+                true,
+                "PURGE",
+                "PURGE",
+            ),
+        ] {
+            let root = project(SINGLE_PURGE, server_json, &[]);
+            std::fs::write(root.join("api/datasources/endpoints/x").join(format!("endpoint.{token}.json")), STUB).unwrap();
+            let config = Config::load(&root.join("api")).unwrap();
+            let doc = crate::openapi::load(
+                &root.join("openapi.yaml"),
+                crate::openapi::LoadOptions {
+                    case_sensitive_methods: case_sensitive,
+                },
+            )
+            .unwrap();
+            let (router, server_config) = assemble_api_router(&root, config, Arc::new(HashMap::new()), None, Some(Arc::new(doc)), Arc::new(tree_of(&root)))
+                .await
+                .expect("matching settings assemble");
+            let addr = crate::server::spawn_served(router, server_config.case_sensitive_methods()).await;
+            let resp = reqwest::Client::new()
+                .request(reqwest::Method::from_bytes(request.as_bytes()).unwrap(), format!("http://{addr}/x"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{server_json} {request}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+}
+
+#[cfg(test)]
+mod web_startup_refusal_tests {
+    use super::*;
+
+    fn web_project(webserve_json: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "frogs-run-web-refusal-{}-{}-{n}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("api/config")).unwrap();
+        std::fs::write(root.join("index.html"), "home").unwrap();
+        std::fs::write(root.join("api/config/connections.json"), "{}").unwrap();
+        std::fs::write(root.join("webserve.json"), webserve_json).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_start_page_that_would_never_be_served_refuses_the_web_router_instead_of_only_warning() {
+        let root = web_project(r#"{ "startPage": "api/config/connections.json" }"#);
+        let err = build_web_router(&root, false, ProtectedPaths::default()).expect_err("a denied startPage must refuse to start");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("1 static-content problem(s) found"), "{err}");
+        assert!(
+            crate::exit_codes::is_config_refusal(&err),
+            "so a registered service stays stopped instead of restart-looping"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_servable_site_still_builds_and_a_bad_not_found_page_refuses_too() {
+        let ok = web_project(r#"{ "startPage": "index.html" }"#);
+        assert!(build_web_router(&ok, false, ProtectedPaths::default()).is_ok());
+        let bad = web_project(r#"{ "startPage": "index.html", "notFoundPage": ".frogs/run.json" }"#);
+        assert!(build_web_router(&bad, false, ProtectedPaths::default()).is_err());
+        let _ = std::fs::remove_dir_all(&ok);
+        let _ = std::fs::remove_dir_all(&bad);
+    }
+
+    #[test]
+    fn the_service_precheck_covers_a_web_only_project_and_refuses_the_same_problems() {
+        let root = web_project(r#"{ "startPage": "api/config/connections.json" }"#);
+        std::fs::remove_dir_all(root.join("api")).unwrap();
+        std::fs::create_dir_all(root.join("api/config")).unwrap();
+        std::fs::write(root.join("api/config/connections.json"), "{}").unwrap();
+        let err = precheck_security_for_service(&root).unwrap_err();
+        assert!(err.to_string().contains("static-content problem(s)"), "{err}");
+        std::fs::write(root.join("webserve.json"), r#"{ "startPage": "index.html" }"#).unwrap();
+        assert!(precheck_security_for_service(&root).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_allowed_well_known_start_page_is_servable() {
+        let root = web_project(r#"{ "startPage": ".well-known/index.html", "allowDotPaths": [".well-known"] }"#);
+        std::fs::create_dir_all(root.join(".well-known")).unwrap();
+        std::fs::write(root.join(".well-known/index.html"), "wk").unwrap();
+        assert!(build_web_router(&root, false, ProtectedPaths::default()).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod symlink_tests;
+
+#[cfg(test)]
+mod route_tests;
+
+#[cfg(test)]
+mod ref_tests;

@@ -423,6 +423,50 @@ pub struct ServerConfig {
     /// URL-level separation from its static content if this is set.
     #[serde(default)]
     pub api_root: String,
+    /// When true, `generate`/`validate`/`run`/`test` refuse to proceed on any
+    /// openapi.yaml problem that would otherwise only be a warning or a
+    /// silently skipped path (unsafe/colliding paths, unrecognized version,
+    /// file-name case conflicts). Read at startup only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_open_api: Option<bool>,
+    /// When true, HTTP request method names are matched exactly as RFC 9110
+    /// says (`DELETE`, never `delete`). Unset or false matches them
+    /// case-insensitively. Read at startup only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_sensitive_methods: Option<bool>,
+    /// How links (symlinks, Windows junctions) under `datasources/endpoints/`
+    /// are treated when *reading* endpoint files. Unset means `contained`.
+    /// Never relaxes what `generate`/`test record` will write through. Read at
+    /// startup only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_symlinks: Option<EndpointSymlinks>,
+    /// Runtime only, never read from or written to `server.json`: the NFC spellings of the
+    /// non-ASCII literal route segments `assemble_api_router` registered, which `ServeShape`
+    /// hands to the request-path canonicaliser.
+    #[serde(skip)]
+    pub(crate) canonical_literals: std::sync::Arc<std::collections::BTreeSet<String>>,
+}
+
+/// `config/server.json`'s `endpointSymlinks`: `contained` follows a link only
+/// when its target stays inside the project, `refuse` follows none, `follow`
+/// also reads targets outside the project (writes stay confined regardless).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointSymlinks {
+    #[default]
+    Contained,
+    Refuse,
+    Follow,
+}
+
+impl EndpointSymlinks {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EndpointSymlinks::Contained => "contained",
+            EndpointSymlinks::Refuse => "refuse",
+            EndpointSymlinks::Follow => "follow",
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -440,11 +484,45 @@ impl Default for ServerConfig {
             source_call_timeout_ms: default_source_call_timeout_ms(),
             port: 8080,
             api_root: String::new(),
+            strict_open_api: Some(false),
+            case_sensitive_methods: Some(false),
+            endpoint_symlinks: Some(EndpointSymlinks::Contained),
+            canonical_literals: Default::default(),
         }
     }
 }
 
 impl ServerConfig {
+    pub fn strict_open_api(&self) -> bool {
+        self.strict_open_api.unwrap_or(false)
+    }
+
+    #[allow(dead_code)] // Public accessor for later milestones; exercised by tests.
+    pub fn strict_open_api_explicit(&self) -> bool {
+        self.strict_open_api == Some(true)
+    }
+
+    pub fn case_sensitive_methods(&self) -> bool {
+        self.case_sensitive_methods.unwrap_or(false)
+    }
+
+    pub fn endpoint_symlinks(&self) -> EndpointSymlinks {
+        self.endpoint_symlinks.unwrap_or_default()
+    }
+
+    /// Whether the key is present at all (either value) — unlike
+    /// `strict_open_api_explicit`, which only reports `true`, because the
+    /// method-case notice differs between "never decided" and "chose false".
+    pub fn case_sensitive_methods_explicit(&self) -> bool {
+        self.case_sensitive_methods.is_some()
+    }
+
+    pub fn openapi_load_options(&self) -> crate::openapi::LoadOptions {
+        crate::openapi::LoadOptions {
+            case_sensitive_methods: self.case_sensitive_methods(),
+        }
+    }
+
     /// The one producer of a real source-call bound: `source_call_timeout_ms`
     /// clamped to `MAX_SOURCE_CALL_TIMEOUT_MS`, warning once if the file
     /// asked for more. Call this at startup/router-assembly time only (once
@@ -687,4 +765,95 @@ mod tests {
 }
 
 #[cfg(test)]
+mod strict_open_api_tests {
+    use super::*;
+
+    #[test]
+    fn the_default_config_serialises_with_a_visible_strict_open_api_false() {
+        let json = serde_json::to_string(&ServerConfig::default()).unwrap();
+        assert!(json.contains("\"strictOpenApi\":false"), "{json}");
+    }
+
+    #[test]
+    fn a_file_without_the_key_is_none_and_not_strict_and_not_explicit() {
+        let config: ServerConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.strict_open_api, None);
+        assert!(!config.strict_open_api());
+        assert!(!config.strict_open_api_explicit());
+        let reserialised = serde_json::to_string(&config).unwrap();
+        assert!(!reserialised.contains("strictOpenApi"), "an unset key stays unset: {reserialised}");
+    }
+
+    #[test]
+    fn true_round_trips_and_is_both_strict_and_explicit() {
+        let config: ServerConfig = serde_json::from_str(r#"{ "strictOpenApi": true }"#).unwrap();
+        assert!(config.strict_open_api());
+        assert!(config.strict_open_api_explicit());
+        let again: ServerConfig = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(again.strict_open_api, Some(true));
+    }
+
+    #[test]
+    fn an_explicit_false_is_not_strict() {
+        let config: ServerConfig = serde_json::from_str(r#"{ "strictOpenApi": false }"#).unwrap();
+        assert_eq!(config.strict_open_api, Some(false));
+        assert!(!config.strict_open_api());
+        assert!(!config.strict_open_api_explicit());
+    }
+}
+
+#[cfg(test)]
 mod mtls_tests;
+
+#[cfg(test)]
+mod endpoint_symlinks_tests {
+    use super::*;
+
+    fn parse(json: &str) -> Result<ServerConfig, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    #[test]
+    fn a_missing_key_means_contained_and_stays_unset_so_the_file_is_never_rewritten() {
+        let config = parse("{}").unwrap();
+        assert_eq!(config.endpoint_symlinks, None);
+        assert_eq!(config.endpoint_symlinks(), EndpointSymlinks::Contained);
+        assert!(
+            !serde_json::to_string(&config).unwrap().contains("endpointSymlinks"),
+            "an unset key must not be serialised"
+        );
+    }
+
+    #[test]
+    fn the_default_config_writes_contained_explicitly() {
+        let json = serde_json::to_string(&ServerConfig::default()).unwrap();
+        assert!(json.contains(r#""endpointSymlinks":"contained""#), "{json}");
+    }
+
+    #[test]
+    fn each_mode_parses_lowercase_and_round_trips() {
+        for (text, mode) in [
+            ("contained", EndpointSymlinks::Contained),
+            ("refuse", EndpointSymlinks::Refuse),
+            ("follow", EndpointSymlinks::Follow),
+        ] {
+            let config = parse(&format!(r#"{{ "endpointSymlinks": "{text}" }}"#)).unwrap();
+            assert_eq!(config.endpoint_symlinks(), mode);
+            assert_eq!(mode.as_str(), text);
+            let again = parse(&serde_json::to_string(&config).unwrap()).unwrap();
+            assert_eq!(again.endpoint_symlinks(), mode);
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_wrongly_cased_value_fails_to_parse_instead_of_defaulting() {
+        for bad in [r#""Follow""#, r#""FOLLOW""#, r#""allow""#, r#""""#, "true", "1", "null_"] {
+            assert!(parse(&format!(r#"{{ "endpointSymlinks": {bad} }}"#)).is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn an_explicit_null_is_the_same_as_an_absent_key() {
+        assert_eq!(parse(r#"{ "endpointSymlinks": null }"#).unwrap().endpoint_symlinks(), EndpointSymlinks::Contained);
+    }
+}

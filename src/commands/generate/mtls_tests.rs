@@ -11,7 +11,7 @@ fn load_spec(yaml: &str) -> crate::openapi::OpenApiDocument {
     let dir = temp_dir("generate-spec");
     let path = dir.join("openapi.yaml");
     std::fs::write(&path, yaml).unwrap();
-    crate::openapi::load(&path).unwrap()
+    crate::openapi::load(&path, crate::openapi::LoadOptions::default()).unwrap()
 }
 
 fn security_defining(name: &str) -> SecurityConfig {
@@ -128,7 +128,7 @@ fn the_default_core_errors_define_both_client_cert_codes_as_exposed_401s() {
 #[test]
 fn a_freshly_scaffolded_core_json_contains_both_client_cert_codes_and_loads() {
     let root = temp_dir("generate-scaffold");
-    scaffold_config(&root.join("api")).unwrap();
+    scaffold_config(&ProjectBoundary::new(&root), &root.join("api")).unwrap();
     let registry = crate::errors::ErrorRegistry::load(&root.join("api/config/errors")).unwrap();
     assert_eq!(registry.get("auth.client_cert_missing").map(|d| d.http_status), Some(401));
     assert_eq!(registry.get("auth.client_cert_expired").map(|d| d.http_status), Some(401));

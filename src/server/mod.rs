@@ -8,12 +8,16 @@ pub(crate) mod test_pki;
 pub mod tls;
 
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
 use axum::extract::{Request, State};
-use axum::http::{HeaderName, HeaderValue, StatusCode, header};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{Router, routing::MethodRouter, routing::get};
@@ -30,12 +34,196 @@ const CORRELATION_HEADER: &str = "x-request-id";
 #[derive(Clone)]
 pub struct RequestId(pub String);
 
+/// The method as it arrived on the wire, kept only when `NormalizeMethod`
+/// rewrote it. Diagnostic only — nothing branches on it.
+#[derive(Clone)]
+pub(crate) struct OriginalMethod(pub String);
+
+/// Longest method name `NormalizeMethod` will rewrite; anything longer is
+/// passed through untouched (and never logged).
+const MAX_NORMALIZED_METHOD_LEN: usize = 64;
+
+/// Matches request method names case-insensitively (unless `case_sensitive`)
+/// by rewriting the method to its uppercase form before the Router sees it.
+///
+/// Method normalization must wrap the fully assembled Router as a tower Service, never `Router::layer`. axum 0.7 applies Router layers per method slot, inside method dispatch (`method_routing.rs:974-986`). The 'outermost' comments on `apply_cors`/`apply_metrics`/`apply_rate_limit` describe their order relative to each other, not relative to method dispatch.
+///
+/// Generic over the body type because `axum::serve` hands the service a
+/// `Request<Body>` while axum-server hands it a `Request<Incoming>`.
+#[derive(Clone)]
+pub(crate) struct NormalizeMethod<S> {
+    inner: S,
+    case_sensitive: bool,
+}
+
+impl<S, B> tower_service::Service<Request<B>> for NormalizeMethod<S>
+where
+    S: tower_service::Service<Request<B>, Response = Response, Error = Infallible>,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = futures_util::future::Either<std::future::Ready<Result<Response, Infallible>>, S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<B>) -> Self::Future {
+        use futures_util::future::Either;
+
+        let name = req.method().as_str();
+        if name == "CONNECT" {
+            // Never reaches the Router, so this response skips CORS, request
+            // correlation and metrics. A 501 is never a 2xx, so hyper can never
+            // open a tunnel, and `Connection: close` drops the connection.
+            let mut response = Response::new(axum::body::Body::empty());
+            *response.status_mut() = StatusCode::NOT_IMPLEMENTED;
+            response.headers_mut().insert(header::CONNECTION, HeaderValue::from_static("close"));
+            return Either::Left(std::future::ready(Ok(response)));
+        }
+        if self.case_sensitive || !name.bytes().any(|b| b.is_ascii_lowercase()) {
+            return Either::Right(self.inner.call(req));
+        }
+        if name.eq_ignore_ascii_case("head") || name.eq_ignore_ascii_case("connect") {
+            // Deliberately NOT normalized. hyper decides whether a response has a body (HEAD responses have none) from the method it parsed off the wire. If a lowercase `head` were rewritten to HEAD here, axum would run its HEAD handling while hyper still sends a body, so the response would be malformed. Lowercase `connect` is not a tunnel for hyper either. Passing them through untouched makes the router answer 405 with a correct `Allow` header. See docs/frogs-openapi-3.2-support.md, "Why lowercase head is rejected".
+            return Either::Right(self.inner.call(req));
+        }
+        if name.len() > MAX_NORMALIZED_METHOD_LEN {
+            return Either::Right(self.inner.call(req));
+        }
+        let original = name.to_string();
+        let upper = name.to_ascii_uppercase();
+        if let Ok(method) = Method::from_bytes(upper.as_bytes()) {
+            tracing::debug!(original_method = %original, method = %upper, "request method normalized");
+            *req.method_mut() = method;
+            req.extensions_mut().insert(OriginalMethod(original));
+        }
+        Either::Right(self.inner.call(req))
+    }
+}
+
+/// Rewrites the request path to its canonical percent-encoding
+/// (`openapi::path_encoding::canonicalize_path`) before the Router sees it.
+///
+/// RFC 3986 section 6.2.2.2 says `/caf%C3%A9` and `/caf%c3%a9` (and `/%41` and `/A`) name the same resource, but axum 0.7 matches a literal route segment
+/// against the raw wire bytes while handing a `:param` segment its percent-decoded text, so an equivalent spelling of a literal route could fall through to a sibling `{param}` route
+/// or the static-content catch-all. Canonicalizing first gives every resource exactly one spelling, which is what the registered paths (`route_syntax::axum_registration_path`) and
+/// the startup route-shadow analysis assume. Like `NormalizeMethod` it must wrap the assembled Router as a tower Service, never `Router::layer`: a Router layer runs after routing.
+/// A URI that cannot be rebuilt is answered 400, never passed through un-canonicalized.
+#[derive(Clone)]
+pub(crate) struct CanonicalPath<S> {
+    inner: S,
+    /// NFC spellings of the non-ASCII literal segments the router registers; see `canonicalize_path_with`.
+    literals: Arc<std::collections::BTreeSet<String>>,
+}
+
+impl<S, B> tower_service::Service<Request<B>> for CanonicalPath<S>
+where
+    S: tower_service::Service<Request<B>, Response = Response, Error = Infallible>,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = futures_util::future::Either<std::future::Ready<Result<Response, Infallible>>, S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<B>) -> Self::Future {
+        use futures_util::future::Either;
+
+        let rewritten = match crate::openapi::path_encoding::canonicalize_path_with(req.uri().path(), &self.literals) {
+            std::borrow::Cow::Borrowed(_) => None,
+            std::borrow::Cow::Owned(path) => Some(rebuild_uri(req.uri(), &path)),
+        };
+        match rewritten {
+            None => {}
+            Some(Some(uri)) => *req.uri_mut() = uri,
+            Some(None) => {
+                let mut response = Response::new(axum::body::Body::empty());
+                *response.status_mut() = StatusCode::BAD_REQUEST;
+                return Either::Left(std::future::ready(Ok(response)));
+            }
+        }
+        Either::Right(self.inner.call(req))
+    }
+}
+
+fn rebuild_uri(uri: &axum::http::Uri, path: &str) -> Option<axum::http::Uri> {
+    let path_and_query = match uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    };
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(path_and_query.parse().ok()?);
+    axum::http::Uri::from_parts(parts).ok()
+}
+
+/// How a listener shapes requests before the Router sees them: whether method
+/// names are matched case-sensitively, and which non-ASCII literal route
+/// segments (NFC) a differently-normalised request spelling is rewritten to.
+/// A bare `bool` converts to a shape with no literals.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ServeShape {
+    pub case_sensitive_methods: bool,
+    pub literals: Arc<std::collections::BTreeSet<String>>,
+}
+
+impl ServeShape {
+    /// The shape for a listener serving the API described by `config`.
+    pub(crate) fn of(config: &crate::config::ServerConfig) -> Self {
+        ServeShape {
+            case_sensitive_methods: config.case_sensitive_methods(),
+            literals: config.canonical_literals.clone(),
+        }
+    }
+}
+
+impl From<bool> for ServeShape {
+    fn from(case_sensitive_methods: bool) -> Self {
+        ServeShape {
+            case_sensitive_methods,
+            literals: Arc::default(),
+        }
+    }
+}
+
+/// The one way every listener wraps a Router. See `NormalizeMethod` for why
+/// this cannot be a `Router::layer`. Outermost to innermost the request
+/// passes `IdentityService` (TLS only), `ConnectInfo`, `NormalizeMethod`,
+/// `CanonicalPath`, the Router.
+pub(crate) fn served_service(router: Router, shape: impl Into<ServeShape>) -> IntoMakeServiceWithConnectInfo<NormalizeMethod<CanonicalPath<Router>>, SocketAddr> {
+    let shape = shape.into();
+    // Request type named only to pick the trait impl; NormalizeMethod is generic
+    // over the body, so the result still serves Request<Body> and Request<Incoming>.
+    <NormalizeMethod<CanonicalPath<Router>> as axum::ServiceExt<axum::extract::Request>>::into_make_service_with_connect_info::<SocketAddr>(NormalizeMethod {
+        inner: CanonicalPath {
+            inner: router,
+            literals: shape.literals,
+        },
+        case_sensitive: shape.case_sensitive_methods,
+    })
+}
+
 /// The base router: just `/healthz` for now. Real endpoint routing (from
 /// `openapi.yaml`) is added separately by `endpoint::build_router` and
 /// merged in by the caller — the correlation-ID middleware is deliberately
 /// *not* applied here; see `apply_middleware`.
 pub fn router() -> Router {
-    Router::new().route("/healthz", get(healthz))
+    Router::new().route(HEALTHZ_PATH, get(healthz))
+}
+
+pub(crate) const HEALTHZ_PATH: &str = "/healthz";
+pub(crate) const READYZ_PATH: &str = "/readyz";
+pub(crate) const METRICS_PATH: &str = "/metrics";
+
+/// The three docs-UI routes for a (normalised) `docsUi.path`: page, `operations.json`, `endpoints.json`.
+pub(crate) fn docs_ui_route_paths(normalized_path: &str) -> [String; 3] {
+    [
+        format!("/{normalized_path}"),
+        format!("/{normalized_path}/operations.json"),
+        format!("/{normalized_path}/endpoints.json"),
+    ]
 }
 
 /// Mounts `router` (already carrying `/healthz` plus every endpoint route —
@@ -61,7 +249,7 @@ pub fn mount_under(router: Router, api_root: &str) -> Router {
 /// than baked into `router()` unconditionally — so turning the feature off
 /// means the route isn't registered at all, not just hidden.
 pub fn readyz_router(drivers: Arc<HashMap<String, Box<dyn SqlDriver>>>) -> Router {
-    Router::new().route("/readyz", get(readyz)).with_state(drivers)
+    Router::new().route(READYZ_PATH, get(readyz)).with_state(drivers)
 }
 
 async fn readyz(State(drivers): State<Arc<HashMap<String, Box<dyn SqlDriver>>>>) -> Response {
@@ -80,7 +268,7 @@ async fn readyz(State(drivers): State<Arc<HashMap<String, Box<dyn SqlDriver>>>>)
 /// be the *same* `Arc` passed to `apply_metrics`, so what this endpoint
 /// reports is actually what the middleware recorded, not an empty copy.
 pub fn metrics_router(metrics: Arc<Metrics>) -> Router {
-    Router::new().route("/metrics", get(metrics_handler)).with_state(metrics)
+    Router::new().route(METRICS_PATH, get(metrics_handler)).with_state(metrics)
 }
 
 async fn metrics_handler(State(metrics): State<Arc<Metrics>>) -> Response {
@@ -136,10 +324,11 @@ pub fn docs_ui_router(
         security,
         endpoint_summaries: Arc::new(endpoint_summaries),
     };
+    let [page_path, operations_path, endpoints_path] = docs_ui_route_paths(&path);
     let router = Router::new()
-        .route(&format!("/{path}"), get(docs_ui_page))
-        .route(&format!("/{path}/operations.json"), get(docs_ui_operations_handler))
-        .route(&format!("/{path}/endpoints.json"), get(docs_ui_endpoints_handler))
+        .route(&page_path, get(docs_ui_page))
+        .route(&operations_path, get(docs_ui_operations_handler))
+        .route(&endpoints_path, get(docs_ui_endpoints_handler))
         .with_state(state);
     match mode {
         crate::config::DocsUiMode::Localhost => router.layer(middleware::from_fn(docs_ui_localhost_gate)),
@@ -183,7 +372,12 @@ async fn docs_ui_operations_handler(State(state): State<DocsUiState>) -> Respons
     let operations: Vec<serde_json::Value> = state
         .openapi_document
         .as_ref()
-        .map(|doc| doc.operations.iter().map(|op| docs_ui_operation_json(op, &state.security)).collect())
+        .map(|doc| {
+            doc.operations
+                .iter()
+                .map(|op| docs_ui_operation_json(op, &state.security, &doc.deprecated_security_schemes))
+                .collect()
+        })
         .unwrap_or_default();
     let component_schemas = state
         .openapi_document
@@ -214,7 +408,11 @@ async fn docs_ui_operations_handler(State(state): State<DocsUiState>) -> Respons
 /// when the verifier needs the connection's client certificate (an `mtls`
 /// verifier, or any `cert.*` parameter) — presented by the browser/OS during
 /// the TLS handshake, so the console has no field for it.
-fn docs_ui_operation_json(op: &crate::openapi::Operation, security: &crate::security::SecurityConfig) -> serde_json::Value {
+fn docs_ui_operation_json(
+    op: &crate::openapi::Operation,
+    security: &crate::security::SecurityConfig,
+    deprecated: &std::collections::HashSet<String>,
+) -> serde_json::Value {
     let parameters: Vec<serde_json::Value> = op
         .parameters
         .iter()
@@ -230,18 +428,26 @@ fn docs_ui_operation_json(op: &crate::openapi::Operation, security: &crate::secu
             .and_then(|v| v.def.parameters().iter().find(|p| p.from.starts_with("header.")))
             .map(|p| p.from.trim_start_matches("header.").to_string());
         let client_cert = security.verifiers.get(scheme_name).is_some_and(|v| v.requires_client_cert());
-        serde_json::json!({ "scheme": scheme_name, "header": header, "clientCert": client_cert })
+        let mut info = serde_json::json!({ "scheme": scheme_name, "header": header, "clientCert": client_cert });
+        if deprecated.contains(scheme_name) {
+            info["deprecated"] = serde_json::Value::Bool(true);
+        }
+        info
     });
 
-    serde_json::json!({
-        "method": op.method.to_uppercase(),
+    let mut out = serde_json::json!({
+        "method": op.http_method,
         "path": op.path,
         "operationId": op.operation_id,
         "parameters": parameters,
         "requestBody": request_body,
         "successStatusCodes": op.response_status_codes,
         "security": security_info,
-    })
+    });
+    if matches!(op.response_mode, crate::openapi::ResponseMode::Stream(_)) {
+        out["streaming"] = serde_json::Value::Bool(true);
+    }
+    out
 }
 
 /// Restricts `/docs` to the real TCP peer being loopback, for
@@ -410,6 +616,8 @@ async fn metrics_middleware(State(metrics): State<Arc<Metrics>>, req: Request, n
 /// 429/401/500 response generated by one of those inner layers still
 /// carries `Access-Control-Allow-Origin`: without it, a browser hides that
 /// response's real status from calling JS behind a generic network error.
+///
+/// "Outermost" here is relative to the other layers only; see `NormalizeMethod` for where method dispatch sits.
 pub fn apply_cors(router: Router, allowed_origins: &[String]) -> Router {
     use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
@@ -590,9 +798,13 @@ async fn correlation_id_middleware(mut req: Request, next: Next) -> Response {
 
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    let original_method = req.extensions().get::<OriginalMethod>().cloned();
     let span = tracing::info_span!("request", request_id = %id, %method, %path);
 
     let mut response = async move {
+        if let Some(original) = original_method {
+            tracing::debug!(original_method = %original.0, "request method was normalized");
+        }
         let response = next.run(req).await;
         // `debug`, not `info` — see `docs/frogs-persistent-logging.md`'s
         // severity-contract note: this fires once per HTTP request, so an
@@ -609,6 +821,60 @@ async fn correlation_id_middleware(mut req: Request, next: Next) -> Response {
         response.headers_mut().insert(HeaderName::from_static(CORRELATION_HEADER), value);
     }
     response
+}
+
+/// Binds an ephemeral port and serves `router` through the real
+/// `served_service` wrapper, never a bare `axum::serve(listener, router)`.
+#[cfg(test)]
+pub(crate) async fn spawn_served(router: Router, shape: impl Into<ServeShape>) -> SocketAddr {
+    let shape = shape.into();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, served_service(router, shape)).await.unwrap();
+    });
+    addr
+}
+
+/// Sends `bytes` verbatim over a fresh TCP connection and returns the status
+/// line, the headers (names lowercased), the raw body bytes after the header
+/// block, and whether the server closed the connection.
+#[cfg(test)]
+pub(crate) async fn raw_request(addr: SocketAddr, bytes: &[u8]) -> (String, Vec<(String, String)>, Vec<u8>, bool) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(bytes).await.unwrap();
+    let mut received = Vec::new();
+    let mut closed = false;
+    loop {
+        let mut chunk = [0u8; 4096];
+        match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => {
+                closed = true;
+                break;
+            }
+            Ok(Ok(n)) => received.extend_from_slice(&chunk[..n]),
+            Ok(Err(_)) => {
+                closed = true;
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    let split = received.windows(4).position(|w| w == b"\r\n\r\n");
+    let (head, body) = match split {
+        Some(i) => (&received[..i], received[i + 4..].to_vec()),
+        None => (&received[..], Vec::new()),
+    };
+    let head = String::from_utf8_lossy(head).into_owned();
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().unwrap_or_default().to_string();
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    (status_line, headers, body, closed)
 }
 
 #[cfg(test)]
@@ -1161,6 +1427,7 @@ mod tests {
             operations: vec![crate::openapi::Operation {
                 path: "/cars/{id}".to_string(),
                 method: "get".to_string(),
+                http_method: "GET".to_string(),
                 operation_id: "getCar".to_string(),
                 response_schema: None,
                 parameters: vec![crate::openapi::ParameterInfo {
@@ -1172,9 +1439,11 @@ mod tests {
                 request_body: None,
                 response_status_codes: vec![200],
                 security: Some("apiKeyAuth".to_string()),
+                ..Default::default()
             }],
             component_schemas: serde_json::Map::new(),
             security_scheme_types: HashMap::new(),
+            ..Default::default()
         }
     }
 
@@ -1251,5 +1520,373 @@ mod tests {
         let addr = spawn(docs_ui_router(crate::config::DocsUiMode::Localhost, "docs", doc, security, vec![])).await;
         let response = reqwest::get(format!("http://{addr}/docs/endpoints.json")).await.unwrap();
         assert_eq!(response.status(), 403, "endpoints.json must be behind the same gate as the console page itself");
+    }
+}
+
+#[cfg(test)]
+mod m2_docs_ui_tests {
+    use super::*;
+    use crate::openapi::{Operation, ResponseMode, StreamSpec};
+    use std::collections::HashSet;
+
+    fn op(security: Option<&str>, mode: ResponseMode) -> Operation {
+        Operation {
+            path: "/a".to_string(),
+            method: "get".to_string(),
+            http_method: "GET".to_string(),
+            operation_id: "a".to_string(),
+            response_status_codes: vec![200],
+            security: security.map(str::to_string),
+            response_mode: mode,
+            ..Default::default()
+        }
+    }
+
+    fn stream() -> ResponseMode {
+        ResponseMode::Stream(StreamSpec {
+            status: Some(200),
+            media_type: "text/event-stream".to_string(),
+            item_schema: None,
+            item_encoding: None,
+        })
+    }
+
+    #[test]
+    fn security_deprecated_is_present_only_for_a_deprecated_scheme() {
+        let security = crate::security::SecurityConfig::default();
+        let deprecated = HashSet::from(["old".to_string()]);
+
+        let old = docs_ui_operation_json(&op(Some("old"), ResponseMode::Single), &security, &deprecated);
+        assert_eq!(old["security"]["scheme"], "old");
+        assert_eq!(old["security"]["deprecated"], true);
+
+        let fresh = docs_ui_operation_json(&op(Some("fresh"), ResponseMode::Single), &security, &deprecated);
+        assert!(fresh["security"].get("deprecated").is_none(), "{fresh}");
+
+        let none = docs_ui_operation_json(&op(None, ResponseMode::Single), &security, &deprecated);
+        assert!(none["security"].is_null());
+    }
+
+    #[test]
+    fn streaming_true_is_present_only_for_a_stream_operation() {
+        let security = crate::security::SecurityConfig::default();
+        let streaming = docs_ui_operation_json(&op(None, stream()), &security, &HashSet::new());
+        assert_eq!(streaming["streaming"], true);
+        let single = docs_ui_operation_json(&op(None, ResponseMode::Single), &security, &HashSet::new());
+        assert!(single.get("streaming").is_none(), "{single}");
+    }
+
+    #[test]
+    fn the_request_body_schema_in_the_payload_is_the_dereferenced_media_type_schema() {
+        let dir = std::env::temp_dir().join(format!(
+            "frogs-server-m2-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("openapi.yaml");
+        std::fs::write(
+            &path,
+            "openapi: 3.2.0\ninfo: { title: t, version: '1' }\ncomponents:\n  mediaTypes:\n    B: { schema: { type: object, required: [vin] } }\npaths:\n  /cars:\n    post:\n      operationId: c\n      requestBody:\n        required: true\n        content:\n          application/json: { $ref: '#/components/mediaTypes/B' }\n      responses:\n        '200': { description: ok }\n",
+        )
+        .unwrap();
+        let doc = crate::openapi::load(&path, crate::openapi::LoadOptions::default()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let json = docs_ui_operation_json(&doc.operations[0], &crate::security::SecurityConfig::default(), &doc.deprecated_security_schemes);
+        assert_eq!(json["requestBody"]["schema"]["type"], "object");
+        assert_eq!(json["requestBody"]["required"], true);
+    }
+
+    #[test]
+    fn the_docs_page_pills_are_fixed_text_set_via_text_content_never_interpolated() {
+        assert!(DOCS_UI_HTML.contains(r#"deprecatedPill.textContent = "deprecated";"#));
+        assert!(DOCS_UI_HTML.contains(r#"streamingPill.textContent = "streaming (served as single JSON)";"#));
+        // The pills are only ever driven by strict-boolean flags, not by spec text.
+        assert!(DOCS_UI_HTML.contains("op.streaming === true"));
+        assert!(DOCS_UI_HTML.contains("op.security.deprecated === true"));
+    }
+}
+
+#[cfg(test)]
+mod m3_method_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::routing::any;
+
+    /// `/g` is a GET-only route, `/any` echoes the method the handler actually saw
+    /// plus whether the normalizer recorded an original spelling.
+    fn app() -> Router {
+        Router::new().route("/g", get(|| async { "hi" })).route(
+            "/any",
+            any(|req: Request| async move {
+                let original = req.extensions().get::<OriginalMethod>().map(|o| o.0.clone()).unwrap_or_else(|| "-".to_string());
+                format!("{}|{}", req.method(), original)
+            }),
+        )
+    }
+
+    async fn send(addr: SocketAddr, method: &str, path: &str) -> (String, Vec<(String, String)>, Vec<u8>, bool) {
+        raw_request(addr, format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes()).await
+    }
+
+    fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+
+    fn status(line: &str) -> u16 {
+        line.split(' ').nth(1).unwrap().parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn lowercase_get_and_query_are_normalized_when_matching_is_case_insensitive() {
+        let addr = spawn_served(app(), false).await;
+        let (line, _, body, _) = send(addr, "get", "/g").await;
+        assert_eq!(status(&line), 200, "{line}");
+        assert_eq!(body, b"hi");
+        let (line, _, body, _) = send(addr, "query", "/any").await;
+        assert_eq!(status(&line), 200, "{line}");
+        assert_eq!(String::from_utf8(body).unwrap(), "QUERY|query");
+        let (_, _, body, _) = send(addr, "QUERY", "/any").await;
+        assert_eq!(String::from_utf8(body).unwrap(), "QUERY|-", "an already-canonical method records no original");
+    }
+
+    #[tokio::test]
+    async fn lowercase_get_is_405_when_case_sensitive_methods_is_on_and_the_method_reaches_the_router_untouched() {
+        let addr = spawn_served(app(), true).await;
+        let (line, _, _, _) = send(addr, "get", "/g").await;
+        assert_eq!(status(&line), 405, "{line}");
+        let (_, _, body, _) = send(addr, "query", "/any").await;
+        assert_eq!(String::from_utf8(body).unwrap(), "query|-");
+        assert_eq!(status(&send(addr, "GET", "/g").await.0), 200);
+    }
+
+    #[tokio::test]
+    async fn lowercase_head_is_never_rewritten_it_gets_405_with_an_allow_header_in_both_modes() {
+        for case_sensitive in [false, true] {
+            let addr = spawn_served(app(), case_sensitive).await;
+            let (line, headers, body, _) = send(addr, "head", "/g").await;
+            assert_eq!(status(&line), 405, "{case_sensitive}: {line}");
+            let allow = header(&headers, "allow").unwrap_or_default();
+            assert!(allow.contains("GET") && allow.contains("HEAD"), "{allow}");
+            assert!(body.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn uppercase_head_is_a_normal_200_without_a_body() {
+        for case_sensitive in [false, true] {
+            let addr = spawn_served(app(), case_sensitive).await;
+            let (line, _, body, _) = send(addr, "HEAD", "/g").await;
+            assert_eq!(status(&line), 200, "{line}");
+            assert!(body.is_empty(), "{body:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn lowercase_connect_is_passed_through_untouched_and_is_not_a_501() {
+        for case_sensitive in [false, true] {
+            let addr = spawn_served(app(), case_sensitive).await;
+            let (line, headers, _, _) = send(addr, "connect", "/g").await;
+            let code = status(&line);
+            assert_ne!(code, 501, "{line}");
+            if code == 405 {
+                assert!(header(&headers, "allow").is_some_and(|a| a.contains("GET")), "{headers:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_connect_is_501_with_no_allow_header_and_the_connection_is_closed_in_both_modes() {
+        for case_sensitive in [false, true] {
+            let addr = spawn_served(app(), case_sensitive).await;
+            // No `Connection: close` from the client: the server must be the one closing.
+            let (line, headers, body, closed) = raw_request(addr, b"CONNECT /g HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+            assert_eq!(status(&line), 501, "{line}");
+            assert!(header(&headers, "allow").is_none(), "{headers:?}");
+            assert_eq!(header(&headers, "connection"), Some("close"));
+            assert!(body.is_empty());
+            assert!(closed, "the server must drop the connection after a CONNECT 501");
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_case_methods_on_an_unknown_path_are_404_including_head() {
+        let addr = spawn_served(app(), false).await;
+        for method in ["Get", "Head", "get", "query"] {
+            let (line, _, _, _) = send(addr, method, "/unknown").await;
+            assert_eq!(status(&line), 404, "{method}: {line}");
+        }
+    }
+
+    // ---- fake inner service -------------------------------------------------
+
+    type Seen = (String, Option<String>, bool);
+
+    #[derive(Clone, Default)]
+    struct Probe {
+        seen: Arc<Mutex<Vec<Seen>>>,
+    }
+
+    #[derive(Clone)]
+    struct Marker;
+
+    impl tower_service::Service<Request<Body>> for Probe {
+        type Response = Response;
+        type Error = Infallible;
+        type Future = std::future::Ready<Result<Response, Infallible>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request<Body>) -> Self::Future {
+            let original = req.extensions().get::<OriginalMethod>().map(|o| o.0.clone());
+            self.seen
+                .lock()
+                .unwrap()
+                .push((req.method().as_str().to_string(), original, req.extensions().get::<Marker>().is_some()));
+            std::future::ready(Ok(Response::new(Body::empty())))
+        }
+    }
+
+    async fn call_through(case_sensitive: bool, method: &str) -> (String, Option<String>, bool) {
+        use tower_service::Service;
+        let probe = Probe::default();
+        let mut service = NormalizeMethod {
+            inner: CanonicalPath {
+                inner: probe.clone(),
+                literals: Default::default(),
+            },
+            case_sensitive,
+        };
+        let mut req = Request::builder()
+            .method(Method::from_bytes(method.as_bytes()).unwrap())
+            .uri("/x")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(Marker);
+        service.call(req).await.unwrap();
+        let seen = probe.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        seen.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn original_method_is_recorded_only_when_the_method_was_actually_rewritten() {
+        assert_eq!(call_through(false, "get").await, ("GET".to_string(), Some("get".to_string()), true));
+        assert_eq!(call_through(false, "GET").await, ("GET".to_string(), None, true));
+        assert_eq!(call_through(false, "Query").await, ("QUERY".to_string(), Some("Query".to_string()), true));
+        assert_eq!(call_through(true, "get").await, ("get".to_string(), None, true));
+    }
+
+    #[tokio::test]
+    async fn other_request_extensions_survive_normalization() {
+        assert!(call_through(false, "post").await.2, "extension inserted before the normalizer must still be there");
+    }
+
+    #[tokio::test]
+    async fn a_method_longer_than_64_bytes_is_passed_through_unchanged() {
+        let long = "a".repeat(65);
+        let (seen, original, _) = call_through(false, &long).await;
+        assert_eq!(seen, long);
+        assert_eq!(original, None);
+        let boundary = "a".repeat(64);
+        let (seen, original, _) = call_through(false, &boundary).await;
+        assert_eq!(seen, boundary.to_ascii_uppercase());
+        assert_eq!(original, Some(boundary));
+    }
+
+    #[tokio::test]
+    async fn head_and_connect_spellings_other_than_exact_uppercase_pass_through_and_exact_connect_never_reaches_the_inner_service() {
+        assert_eq!(call_through(false, "head").await, ("head".to_string(), None, true));
+        assert_eq!(call_through(false, "Head").await, ("Head".to_string(), None, true));
+        assert_eq!(call_through(false, "connect").await, ("connect".to_string(), None, true));
+
+        use tower_service::Service;
+        let probe = Probe::default();
+        let mut service = NormalizeMethod {
+            inner: CanonicalPath {
+                inner: probe.clone(),
+                literals: Default::default(),
+            },
+            case_sensitive: false,
+        };
+        let req = Request::builder().method(Method::CONNECT).uri("/x").body(Body::empty()).unwrap();
+        let response = service.call(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(probe.seen.lock().unwrap().is_empty());
+    }
+
+    // ---- CORS preflight / rate-limit through the real wrapper --------------
+
+    #[tokio::test]
+    async fn a_cors_preflight_asking_for_query_on_an_extension_path_succeeds() {
+        let router = apply_cors(Router::new().route("/any", any(|| async { "x" })), &["https://app.example".to_string()]);
+        let addr = spawn_served(router, false).await;
+        let response = reqwest::Client::new()
+            .request(Method::OPTIONS, format!("http://{addr}/any"))
+            .header("origin", "https://app.example")
+            .header("access-control-request-method", "QUERY")
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "{}", response.status());
+        assert!(response.headers().get("access-control-allow-origin").is_some());
+    }
+
+    #[tokio::test]
+    async fn cors_headers_are_present_on_a_normalized_lowercase_get_when_case_insensitive() {
+        let router = apply_cors(Router::new().route("/g", get(|| async { "hi" })), &["https://app.example".to_string()]);
+        let addr = spawn_served(router, false).await;
+        let (line, headers, _, _) = raw_request(
+            addr,
+            b"get /g HTTP/1.1\r\nHost: localhost\r\nOrigin: https://app.example\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_eq!(status(&line), 200, "{line}");
+        assert!(header(&headers, "access-control-allow-origin").is_some(), "{headers:?}");
+    }
+
+    #[tokio::test]
+    async fn get_and_normalized_lowercase_get_share_one_per_route_rate_limit_bucket() {
+        let limiter = Arc::new(RateLimiter::new(1, 1));
+        let route = apply_rate_limit_to_route(get(|| async { "hi" }), limiter);
+        let addr = spawn_served(Router::new().route("/g", route), false).await;
+        assert_eq!(status(&send(addr, "GET", "/g").await.0), 200);
+        assert_eq!(status(&send(addr, "get", "/g").await.0), 429, "the lowercase spelling must not get a fresh bucket");
+    }
+
+    // ---- docs UI static assertions -------------------------------------------
+
+    #[test]
+    fn docs_ui_cleans_the_method_class_and_defines_the_query_badge_after_the_default_rule() {
+        assert!(DOCS_UI_HTML.matches(r#"op.method.toLowerCase().replace(/[^a-z0-9-]/g, "")"#).count() >= 2);
+        assert!(DOCS_UI_HTML.contains("--query:"));
+        let default_rule = DOCS_UI_HTML.find(".method-badge {").expect("default badge rule");
+        let query_rule = DOCS_UI_HTML.find(".method-query {").expect("query rule");
+        assert!(default_rule < query_rule);
+        assert!(DOCS_UI_HTML.contains("background: var(--muted)"));
+        assert!(DOCS_UI_HTML.contains("escapeHtml(op.method)"));
+    }
+
+    #[test]
+    fn docs_ui_try_it_guard_disables_unsendable_methods_and_explains_why() {
+        assert!(DOCS_UI_HTML.contains(r#"["CONNECT", "TRACE", "TRACK"].indexOf(u) >= 0"#));
+        assert!(DOCS_UI_HTML.contains(r#"["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"].indexOf(u) >= 0 && m !== u"#));
+        assert!(DOCS_UI_HTML.contains("tryButton.disabled = true"));
+        assert!(DOCS_UI_HTML.contains("this method can't be sent exactly from a browser"));
+    }
+
+    #[test]
+    fn the_docs_ui_operation_json_carries_the_wire_method_for_query() {
+        let op = crate::openapi::Operation {
+            path: "/things".to_string(),
+            method: "query".to_string(),
+            http_method: "QUERY".to_string(),
+            operation_id: "q".to_string(),
+            ..Default::default()
+        };
+        let json = docs_ui_operation_json(&op, &crate::security::SecurityConfig::default(), &std::collections::HashSet::new());
+        assert_eq!(json["method"], "QUERY");
     }
 }

@@ -3,8 +3,8 @@ mod server;
 
 pub use connections::ConnectionConfig;
 pub use server::{
-    ClientAuthConfig, ClientAuthMode, CrlPolicy, DocsUiMode, LogLevel, LoggingConfig, MAX_SOURCE_CALL_TIMEOUT_MS, ManualTlsConfig, RateLimitConfig, ServerConfig,
-    TlsConfig, TlsMode,
+    ClientAuthConfig, ClientAuthMode, CrlPolicy, DocsUiMode, EndpointSymlinks, LogLevel, LoggingConfig, MAX_SOURCE_CALL_TIMEOUT_MS, ManualTlsConfig, RateLimitConfig,
+    ServerConfig, TlsConfig, TlsMode,
 };
 
 use std::collections::HashMap;
@@ -131,7 +131,7 @@ impl Config {
     pub fn load_or_exit(project_root: &Path) -> Self {
         Self::load(project_root).unwrap_or_else(|err| {
             eprintln!("error: failed to load config for project at {}:\n{err}", project_root.display());
-            std::process::exit(1);
+            crate::exit_codes::exit_config_refused();
         })
     }
 }

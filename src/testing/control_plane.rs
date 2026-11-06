@@ -15,8 +15,10 @@ use super::session::MockSession;
 /// no CORS headers plus `axum::Json`'s content-type requirement is what
 /// keeps a browser page on another origin from flipping the scenario).
 /// `frogs run` never constructs this router at all.
+pub const SCENARIO_PATH: &str = "/_frogs/scenario";
+
 pub fn router(session: Arc<MockSession>) -> Router {
-    Router::new().route("/_frogs/scenario", get(read).post(set).delete(clear)).with_state(session)
+    Router::new().route(SCENARIO_PATH, get(read).post(set).delete(clear)).with_state(session)
 }
 
 #[derive(Deserialize)]

@@ -26,6 +26,9 @@ struct Harness {
     api_dir: std::path::PathBuf,
     pki: Pki,
     port: u16,
+    case_sensitive: bool,
+    /// Overrides `case_sensitive` when a test serves with the shape a real `frogs run` would (registered literals included).
+    shape: Option<crate::server::ServeShape>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<io::Result<()>>>,
 }
@@ -43,6 +46,8 @@ impl Harness {
             api_dir,
             pki,
             port: free_port(),
+            case_sensitive: false,
+            shape: None,
             stop: None,
             task: None,
         }
@@ -64,8 +69,9 @@ impl Harness {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         self.stop = Some(tx);
         let (root, api_dir, port) = (self.root.clone(), self.api_dir.clone(), self.port);
+        let shape = self.shape.clone().unwrap_or_else(|| self.case_sensitive.into());
         self.task = Some(tokio::spawn(async move {
-            serve(&root, router, IpAddr::V4(Ipv4Addr::LOCALHOST), port, &tls, &api_dir, async {
+            serve(&root, router, IpAddr::V4(Ipv4Addr::LOCALHOST), port, &tls, &api_dir, shape, async {
                 let _ = rx.await;
             })
             .await
@@ -134,6 +140,7 @@ impl Harness {
             self.port,
             tls,
             &self.api_dir,
+            false,
             std::future::pending::<()>(),
         )
         .await;
@@ -628,7 +635,12 @@ fn write_api_project(h: &Harness, client_auth: &str, verifier_json: &str, extra_
 }
 
 async fn start_api(h: &mut Harness) {
-    let (router, server_config) = build_api_router(&h.root).await.expect("scratch project should build");
+    let (router, server_config) = build_api_router(&h.root, false).await.expect("scratch project should build");
+    // Method case stays whatever the test set on the harness; only the registered literals come from the config.
+    h.shape = Some(crate::server::ServeShape {
+        case_sensitive_methods: h.case_sensitive,
+        ..crate::server::ServeShape::of(&server_config)
+    });
     h.start(router, server_config.tls).await;
 }
 
@@ -728,7 +740,7 @@ async fn a_cert_route_is_refused_at_startup_when_client_auth_is_off() {
     let client = h.client(None);
     assert_eq!(
         h.get(&client, "/protected").await.unwrap().0,
-        404,
+        503,
         "no way to ever obtain a certificate: the route must not exist"
     );
     assert_eq!(h.get(&client, "/open").await.unwrap().0, 200);
@@ -786,7 +798,7 @@ async fn required_mode_with_probes_enabled_warns_at_startup_and_optional_does_no
             MTLS_ORDERS,
             serde_json::json!({ "features": { "requestCorrelation": false, "requestValidation": false, "readyzCheck": true, "metrics": false } }),
         );
-        let _ = build_api_router(&h.root).await.unwrap();
+        let _ = build_api_router(&h.root, false).await.unwrap();
         let warned = logs.text().contains("load-balancer probes");
         assert_eq!(warned, expect_warning, "{mode}: {}", logs.text());
     }
@@ -923,4 +935,186 @@ async fn spoofed_headers_over_plain_http_never_create_an_identity_in_the_echo_ro
         .await
         .unwrap();
     assert_eq!(response.json::<serde_json::Value>().await.unwrap(), serde_json::json!({ "anonymous": true }));
+}
+
+// ---------------------------------------------------------------------
+// QUERY over mTLS through the real serve() wrapper
+// ---------------------------------------------------------------------
+
+async fn start_query_api(h: &mut Harness, client_auth: &str) {
+    write_api_project(h, client_auth, MTLS_ORDERS, serde_json::json!({}));
+    std::fs::write(
+        h.api_dir.join("datasources/endpoints/protected/endpoint.query.json"),
+        r#"{ "operationId": "queryProtected", "security": "certAuth", "sources": {}, "response": {} }"#,
+    )
+    .unwrap();
+    start_api(h).await;
+}
+
+async fn send_method(h: &Harness, spec: Option<&LeafSpec>, method: &str, path: &str) -> Result<(u16, String), reqwest::Error> {
+    let pem = spec.map(|s| h.leaf(s).identity_pem());
+    let client = h.client(pem.as_deref());
+    let response = client
+        .request(reqwest::Method::from_bytes(method.as_bytes()).unwrap(), format!("https://localhost:{}{path}", h.port))
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    Ok((status, response.text().await?))
+}
+
+#[tokio::test]
+async fn a_query_request_over_required_mtls_accepts_the_allowed_san_and_rejects_another() {
+    let mut h = Harness::new();
+    start_query_api(&mut h, REQUIRED).await;
+    assert_eq!(send_method(&h, Some(&LeafSpec::valid()), "QUERY", "/protected").await.unwrap().0, 200);
+
+    let other = LeafSpec {
+        dns: vec!["a.svc.example".into(), "b.svc.example".into()],
+        ..LeafSpec::valid()
+    };
+    let (status, body) = send_method(&h, Some(&other), "QUERY", "/protected").await.unwrap();
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(json(&body)["name"], "auth.invalid_credentials");
+}
+
+#[tokio::test]
+async fn a_query_request_with_no_certificate_under_optional_mtls_is_client_cert_missing() {
+    let mut h = Harness::new();
+    start_query_api(&mut h, OPTIONAL).await;
+    let (status, body) = send_method(&h, None, "QUERY", "/protected").await.unwrap();
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(json(&body)["name"], "auth.client_cert_missing");
+}
+
+#[tokio::test]
+async fn a_lowercase_query_is_accepted_over_mtls_when_matching_is_case_insensitive_and_refused_when_exact() {
+    let mut h = Harness::new();
+    start_query_api(&mut h, REQUIRED).await;
+    assert_eq!(
+        send_method(&h, Some(&LeafSpec::valid()), "query", "/protected").await.unwrap().0,
+        200,
+        "the identity extension must survive the normalizer"
+    );
+    drop(h);
+
+    let mut exact = Harness::new();
+    exact.case_sensitive = true;
+    start_query_api(&mut exact, REQUIRED).await;
+    assert_eq!(send_method(&exact, Some(&LeafSpec::valid()), "query", "/protected").await.unwrap().0, 405);
+    assert_eq!(send_method(&exact, Some(&LeafSpec::valid()), "QUERY", "/protected").await.unwrap().0, 200);
+}
+
+// ---------------------------------------------------------------------
+// Request-path canonicalisation through the real TLS listener
+// ---------------------------------------------------------------------
+
+/// A secured `café/menu` folder next to an open `{p}/menu` sibling: if any
+/// spelling of the literal slipped past canonicalisation it would be answered
+/// by the open parameter route (200) instead of demanding a certificate (401).
+fn write_cafe_project(h: &Harness) {
+    write_api_project(h, OPTIONAL, MTLS_ORDERS, serde_json::json!({}));
+    std::fs::write(
+        h.root.join("openapi.yaml"),
+        "openapi: 3.1.0\ninfo: { title: t, version: '1' }\n\
+         paths:\n  /protected:\n    get:\n      operationId: getProtected\n      security: [{ certAuth: [] }]\n      responses: { '200': { description: ok } }\n  \
+         /open:\n    get:\n      operationId: getOpen\n      responses: { '200': { description: ok } }\n  \
+         /caf\u{e9}/menu:\n    get:\n      operationId: getCafe\n      security: [{ certAuth: [] }]\n      responses: { '200': { description: ok } }\n  \
+         /{p}/menu:\n    get:\n      operationId: getAny\n      responses: { '200': { description: ok } }\n\
+         components:\n  securitySchemes:\n    certAuth: { type: mutualTLS }\n",
+    )
+    .unwrap();
+    let endpoints = h.api_dir.join("datasources/endpoints");
+    for (folder, body) in [
+        (
+            "caf\u{e9}/menu",
+            r#"{ "operationId": "getCafe", "security": "certAuth", "sources": {}, "response": {} }"#,
+        ),
+        ("{p}/menu", r#"{ "operationId": "getAny", "sources": {}, "response": {} }"#),
+    ] {
+        std::fs::create_dir_all(endpoints.join(folder)).unwrap();
+        std::fs::write(endpoints.join(folder).join("endpoint.get.json"), body).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn every_spelling_of_a_secured_literal_folder_demands_a_certificate_over_tls() {
+    let mut h = Harness::new();
+    write_cafe_project(&h);
+    start_api(&mut h).await;
+    for path in [
+        "/caf%C3%A9/menu",
+        "/caf%c3%a9/menu",
+        "/caf%C3%a9/menu",
+        "/%63af%C3%A9/menu",
+        "/cafe%CC%81/menu",
+        "/cafe%cc%81/menu",
+    ] {
+        let (status, body) = h.get_as(None, path).await.unwrap();
+        assert_eq!(status, 401, "{path} must not be answered by the open {{p}} route: {body}");
+        assert_eq!(json(&body)["name"], "auth.client_cert_missing", "{path}");
+    }
+    let (status, _) = h.get_as(None, "/cafe/menu").await.unwrap();
+    assert_eq!(status, 200, "an unrelated value still reaches the open parameter route");
+    let (status, _) = h.get_as(Some(&LeafSpec::valid()), "/cafe%CC%81/menu").await.unwrap();
+    assert_eq!(status, 200, "with a valid certificate the decomposed spelling reaches the literal folder");
+}
+
+// ---------------------------------------------------------------------
+// web-only projects (`webserve.json` owns the listener)
+// ---------------------------------------------------------------------
+
+/// A web-only project has no `config/server.json`: `run_web` hands
+/// `webserve.json`'s own `tls` (clientAuth included) to the same `serve` the
+/// API role uses, with paths resolving against the project root — which is
+/// also the served directory, so the key and CA bundle must stay undisclosed.
+#[tokio::test]
+async fn a_web_only_project_enforces_client_auth_from_webserve_json_and_never_serves_its_tls_files() {
+    let mut h = Harness::new();
+    // Web-only layout: TLS material beside webserve.json, no `api/` folder.
+    write_basic_tls_files(&h.root, &h.pki);
+    std::fs::write(h.root.join("index.html"), "hello from static content").unwrap();
+    std::fs::write(
+        h.root.join("webserve.json"),
+        format!(
+            r#"{{ "startPage": "index.html", "port": {}, "tls": {{ "mode": "manual", "manual": {{ "certPath": "cert.pem", "keyPath": "key.pem" }}, "clientAuth": {REQUIRED} }} }}"#,
+            h.port
+        ),
+    )
+    .unwrap();
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    h.stop = Some(tx);
+    let root = h.root.clone();
+    h.task = Some(tokio::spawn(async move {
+        run_web(&root, async {
+            let _ = rx.await;
+        })
+        .await
+    }));
+    for _ in 0..100 {
+        if h.task.as_ref().unwrap().is_finished() {
+            panic!("run_web ended before listening: {:?}", h.task.take().unwrap().await);
+        }
+        if TcpStream::connect(("127.0.0.1", h.port)).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(h.get_as(None, "/").await.is_err(), "no certificate must fail the handshake on a web-only listener");
+    let valid = h.leaf(&LeafSpec::valid());
+    let wrong_ca = build_leaf(&h.pki.wrong_ca, &LeafSpec::valid());
+    assert!(
+        h.get(&h.client(Some(&wrong_ca.identity_pem())), "/").await.is_err(),
+        "a certificate from an unrelated CA must be rejected"
+    );
+
+    let client = h.client(Some(&valid.identity_pem()));
+    let (status, body) = h.get(&client, "/").await.unwrap();
+    assert_eq!((status, body.as_str()), (200, "hello from static content"));
+    for protected in ["/key.pem", "/client-ca.pem", "/cert.pem", "/webserve.json"] {
+        let (status, body) = h.get(&client, protected).await.unwrap();
+        assert_eq!(status, 404, "{protected} must not be served");
+        assert!(!body.contains("PRIVATE KEY") && !body.contains("BEGIN CERTIFICATE"), "{protected} leaked: {body}");
+    }
 }

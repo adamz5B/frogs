@@ -16,6 +16,11 @@ serde_json = { version = "1", features = ["preserve_order"] }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 axum = "0.7"
+unicode-normalization = "0.1"
+# Already compiled in via axum 0.7.9; a direct dependency so the route-table
+# probe (`endpoint::route_plan`) has exactly the router's matching semantics.
+# Pinned: axum 0.8 changes the parameter syntax, so re-check on any axum upgrade.
+matchit = "=0.7.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
@@ -146,6 +151,9 @@ tower-service = "0.3"
 # 0.8.x's newer `windows-sys` bump, to keep this dependency's own transitive
 # footprint as small as reasonably possible.
 windows-service = "0.7.0"
+# Already in the tree through windows-service (same 0.52 line, so no new package): `webserve::deny` asks the
+# OS for a file's identity (volume serial + file index) to catch hard links to protected files.
+windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
 
 [dev-dependencies]
 # Generates a self-signed cert + key entirely in-memory at test time — no
@@ -172,6 +180,18 @@ mssql = ["dep:tiberius", "dep:deadpool", "dep:tokio-util"]
 # Opt-in, not in `default` — pulls in `oracle-rs`/`deadpool-oracle` instead of
 # an sqlx adapter (see those dependencies' own comment above for why).
 oracle = ["dep:oracle-rs", "dep:deadpool-oracle"]
+# Test-only, never part of a shipped build. Gates the integration tests that
+# drive the real `frogs` binary end to end (spawning `frogs run`, raw TCP on
+# 127.0.0.1, `frogs stop` -> taskkill/kill). That spawn/socket/kill chain trips
+# behaviour-based antivirus heuristics on developer machines, so a plain
+# `cargo test` doesn't build them at all. CI runs them as their own step:
+# `cargo test --locked --features e2e-tests --test m4_end_to_end`.
+e2e-tests = []
+
+[[test]]
+name = "m4_end_to_end"
+path = "tests/m4_end_to_end.rs"
+required-features = ["e2e-tests"]
 
 [profile.release]
 opt-level = "z"     # optimize for size over speed

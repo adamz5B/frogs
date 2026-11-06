@@ -2,6 +2,7 @@ mod commands;
 mod config;
 mod endpoint;
 mod errors;
+mod exit_codes;
 mod http;
 mod openapi;
 mod project;
@@ -50,6 +51,12 @@ enum Command {
         /// for a project registered via `frogs register`)
         #[arg(long)]
         restart: bool,
+        /// Internal-only, baked into a service definition together with
+        /// `--service-managed`: the exit code for a configuration refusal
+        /// (default 78). launchd has no per-code restart rule, so its
+        /// definition passes 0 to make a refusal a clean exit.
+        #[arg(long = "config-refusal-exit", hide = true, requires = "service_managed")]
+        config_refusal_exit: Option<u8>,
     },
     /// Stop the running server for the current project
     Stop,
@@ -101,6 +108,12 @@ enum Command {
         /// regardless of this setting
         #[arg(long, value_enum, default_value = "on-failure")]
         restart_policy: RestartPolicy,
+        /// Delay in milliseconds between a failure exit and the OS restarting
+        /// the service (1..=3600000). Off by default: omitted keeps the fixed
+        /// 5 s delay. Only valid with `--restart-policy on-failure`; useful
+        /// for slowing the restart loop a configuration refusal causes
+        #[arg(long, value_name = "MS", value_parser = clap::value_parser!(u32).range(1..=3_600_000))]
+        restart_delay_ms: Option<u32>,
     },
     /// Remove this project's OS-managed service registration
     Unregister {
@@ -257,10 +270,19 @@ fn main() {
         .build()
         .expect("failed to build the tokio runtime");
 
+    if let Command::Run {
+        service_managed: true,
+        config_refusal_exit,
+        ..
+    } = &cli.command
+    {
+        exit_codes::set_config_refusal_exit(config_refusal_exit.map_or(exit_codes::CONFIG_REFUSED, i32::from));
+    }
+
     let result = runtime.block_on(async {
         match cli.command {
             Command::Generate { role } => commands::generate::run(&cwd, role),
-            Command::Run { service_managed, restart } => commands::run::run(&cwd, service_managed, restart).await,
+            Command::Run { service_managed, restart, .. } => commands::run::run(&cwd, service_managed, restart).await,
             Command::Stop => commands::stop::run(&cwd),
             Command::Register {
                 name,
@@ -270,6 +292,7 @@ fn main() {
                 description,
                 start_type,
                 restart_policy,
+                restart_delay_ms,
             } => commands::register::run(
                 &cwd,
                 name.as_deref(),
@@ -278,6 +301,7 @@ fn main() {
                 description.as_deref(),
                 start_type,
                 restart_policy,
+                restart_delay_ms,
             ),
             Command::Unregister { user, system } => commands::unregister::run(&cwd, resolve_scope(user, system)),
             Command::Test {
@@ -314,7 +338,11 @@ fn main() {
     if let Err(err) = result {
         eprintln!("error: {err}");
         tracing::error!("error: {err}");
-        std::process::exit(1);
+        std::process::exit(if exit_codes::is_config_refusal(&err) {
+            exit_codes::config_refusal_exit()
+        } else {
+            1
+        });
     }
 }
 
@@ -355,7 +383,8 @@ mod tests {
             parse(&["run"]),
             Command::Run {
                 service_managed: false,
-                restart: false
+                restart: false,
+                ..
             }
         ));
     }
@@ -371,7 +400,8 @@ mod tests {
             parse(&["run", "--restart"]),
             Command::Run {
                 service_managed: false,
-                restart: true
+                restart: true,
+                ..
             }
         ));
     }
@@ -385,9 +415,23 @@ mod tests {
             parse(&["run", "--service-managed"]),
             Command::Run {
                 service_managed: true,
-                restart: false
+                restart: false,
+                ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_the_hidden_config_refusal_exit_only_together_with_service_managed() {
+        match parse(&["run", "--service-managed", "--config-refusal-exit", "0"]) {
+            Command::Run { config_refusal_exit, .. } => assert_eq!(config_refusal_exit, Some(0)),
+            _ => panic!("expected Command::Run"),
+        }
+        match parse(&["run", "--service-managed"]) {
+            Command::Run { config_refusal_exit, .. } => assert_eq!(config_refusal_exit, None),
+            _ => panic!("expected Command::Run"),
+        }
+        assert!(Cli::try_parse_from(["frogs", "run", "--config-refusal-exit", "0"]).is_err());
     }
 
     #[test]
@@ -401,7 +445,9 @@ mod tests {
                 description,
                 start_type,
                 restart_policy,
+                restart_delay_ms,
             } => {
+                assert_eq!(restart_delay_ms, None, "the restart delay timer must be off by default");
                 assert_eq!(name, None);
                 assert!(!user);
                 assert!(!system);
@@ -420,6 +466,19 @@ mod tests {
             Command::Register { restart_policy, .. } => assert_eq!(restart_policy, RestartPolicy::Never),
             _ => panic!("expected Command::Register"),
         }
+    }
+
+    #[test]
+    fn parses_register_with_restart_delay_ms() {
+        match parse(&["register", "--restart-delay-ms", "30000"]) {
+            Command::Register { restart_delay_ms, .. } => assert_eq!(restart_delay_ms, Some(30000)),
+            _ => panic!("expected Command::Register"),
+        }
+    }
+
+    #[test]
+    fn rejects_register_with_zero_restart_delay_ms() {
+        assert!(Cli::try_parse_from(["frogs", "register", "--restart-delay-ms", "0"]).is_err());
     }
 
     #[test]
