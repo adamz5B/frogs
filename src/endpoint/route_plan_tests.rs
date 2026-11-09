@@ -931,7 +931,8 @@ async fn the_plans_routed_set_equals_what_the_real_router_answers_and_placeholde
     }
 }
 
-#[cfg(unix)]
+// Linux only: APFS (macOS) rejects non-UTF-8 file names with EILSEQ, so the fixture can't be created there.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_non_utf8_folder_is_absent_from_the_inventory_and_the_router_alike() {
     use std::os::unix::ffi::OsStrExt;
