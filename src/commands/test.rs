@@ -7,6 +7,7 @@ use std::sync::Arc;
 use axum::Router;
 use serde_json::Value;
 
+use crate::commands::report::{CommandError, ErrorKind, Lines, ReportLine};
 use crate::config::{Config, ServerConfig};
 use crate::endpoint::mock::{NO_MATCHING_CASE, RouteKey, SOURCE_NOT_MOCKED, UNKNOWN_SCENARIO};
 use crate::endpoint::{EndpointFile, MockOutcome, SourceDef, nested_many_parent};
@@ -138,21 +139,73 @@ async fn shutdown_signal() {
 /// session installed as every route's `MockProvider` plus the
 /// `/_frogs/scenario` control plane merged at the absolute root.
 pub(crate) async fn build_mock_router(root: &Path, opts: &TestServerOptions) -> io::Result<(Router, Arc<MockSession>, ServerConfig)> {
+    let mut notes = Lines::live();
+    match prepare_mock_router(root, opts, PrepareMode::Serve, &mut notes).await {
+        Ok(prepared) => Ok((prepared.router, prepared.session, prepared.server_config)),
+        Err(error) if matches!(error.kind, ErrorKind::Refusal | ErrorKind::Io) => Err(error.into_io()),
+        Err(error) => {
+            eprintln!("error: {}", error.message);
+            std::process::exit(error.exit_code);
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrepareMode {
+    /// The server `frogs test` serves: the report streams to stdout and the control plane is mounted.
+    Serve,
+    /// An in-process batch run: no stdout, no control plane, discovered codes kept in memory only.
+    Batch,
+}
+
+pub(crate) struct Prepared {
+    pub router: Router,
+    pub session: Arc<MockSession>,
+    pub server_config: ServerConfig,
+    /// The in-memory sink of a `Batch` run (`None` when `Serve` wrote to the scratch file).
+    pub discovered: Option<Arc<std::sync::Mutex<crate::errors::DiscoveredErrors>>>,
+}
+
+/// `build_mock_router` as data: never prints and never exits; what it would have printed is appended to `notes`
+/// (warnings and errors on the stderr lines, everything else on the stdout ones), in order, even when it fails.
+pub(crate) async fn prepare_mock_router(root: &Path, opts: &TestServerOptions, mode: PrepareMode, notes: &mut Lines) -> Result<Prepared, CommandError> {
     let api_root = crate::project::api_base(root);
-    let mut config = Config::load_or_exit(&api_root);
+    let mut config = Config::load(&api_root).map_err(|err| CommandError::config_load(&api_root, err))?;
     let strict = config.server.strict_open_api();
-    println!(
-        "strictOpenApi={strict}, caseSensitiveMethods={}, endpointSymlinks={}",
-        config.server.case_sensitive_methods(),
-        config.server.endpoint_symlinks().as_str()
+    notes.plain(
+        "test",
+        format!(
+            "strictOpenApi={strict}, caseSensitiveMethods={}, endpointSymlinks={}",
+            config.server.case_sensitive_methods(),
+            config.server.endpoint_symlinks().as_str()
+        ),
     );
-    crate::commands::run::announce_method_case(&config.server);
+    if let Some(message) = crate::commands::run::log_method_case_notice(&config.server) {
+        notes.plain("test", message);
+    }
     // Link findings are reported (and refused under strict) with the test-file findings just below.
     let endpoint_tree = Arc::new(crate::commands::run::scan_endpoint_tree(root, &config.server));
-    let extras = crate::endpoint::route_plan::RootExtras { web: false, control_plane: true };
+    let extras = crate::endpoint::route_plan::RootExtras {
+        web: false,
+        control_plane: mode == PrepareMode::Serve,
+    };
     crate::commands::run::check_route_table(&config.server, &endpoint_tree, extras, "")?;
-    let openapi_document = crate::commands::run::load_openapi_for_startup_with(root, &config.server, &endpoint_tree, extras)?;
-    let mode = MethodCase::from_case_sensitive(config.server.case_sensitive_methods());
+    let openapi_document = crate::commands::run::load_openapi_for_startup_with_security(root, &config.server, &endpoint_tree, extras, &config.security)?;
+    // `frogs test` always has a certificate identity to offer (a case's own `clientCert`), so cert-dependent tools are servable.
+    let mcp_tools = crate::mcp::check(
+        &crate::mcp::StartupInputs {
+            server: &config.server,
+            security: &config.security,
+            connections: &config.connections,
+            tree: &endpoint_tree,
+            doc: openapi_document.as_deref(),
+            client_identity_available: true,
+            web_role: false,
+            web_allow_dot_paths: &[],
+        },
+        "",
+    )?;
+    let method_mode = MethodCase::from_case_sensitive(config.server.case_sensitive_methods());
 
     // Harness-owned codes classify like any other — a project that
     // deliberately defines one of them in `config/errors/` keeps its own.
@@ -166,20 +219,21 @@ pub(crate) async fn build_mock_router(root: &Path, opts: &TestServerOptions) -> 
         );
     }
 
-    let (discovered, findings) = discover_test_files(&endpoint_tree, mode);
+    let (discovered, findings) = discover_test_files(&endpoint_tree, method_mode);
     let strict_findings = findings.iter().filter(|f| f.strict_error).count();
     for finding in &findings {
         if strict && finding.strict_error {
-            eprintln!("error: {}", finding.message);
+            notes.top_error("test", finding.message.as_str());
         } else {
-            eprintln!("warning: {}", finding.message);
+            notes.top_warning("test", finding.message.as_str());
         }
     }
     if strict && strict_findings > 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{strict_findings} problem(s) found in the test files and \"strictOpenApi\" is true — refusing to start"),
-        ));
+        )
+        .into());
     }
 
     let mut files = Vec::new();
@@ -192,8 +246,7 @@ pub(crate) async fn build_mock_router(root: &Path, opts: &TestServerOptions) -> 
         let file = match loaded {
             Ok(file) => file,
             Err(e) => {
-                eprintln!("error: {}: {e}", test_file_path.display());
-                std::process::exit(1);
+                return Err(CommandError::fatal(format!("{}: {e}", test_file_path.display())));
             }
         };
         let endpoint = endpoint_file_path.and_then(
@@ -201,7 +254,7 @@ pub(crate) async fn build_mock_router(root: &Path, opts: &TestServerOptions) -> 
                 Ok(endpoint) => Some(endpoint),
                 Err(message) => {
                     if endpoint_file_path.is_file() {
-                        eprintln!("warning: {message}");
+                        notes.top_warning("test", message);
                     }
                     None
                 }
@@ -216,7 +269,7 @@ pub(crate) async fn build_mock_router(root: &Path, opts: &TestServerOptions) -> 
     }
 
     let mut routable = HashMap::new();
-    for (url_path, method, file_path) in crate::endpoint::discover_endpoint_files(&endpoint_tree, mode) {
+    for (url_path, method, file_path) in crate::endpoint::discover_endpoint_files(&endpoint_tree, method_mode) {
         if let Ok(endpoint) = read_endpoint_file(&file_path, endpoint_tree.is_via_link(&file_path)) {
             routable.insert(
                 RouteKey {
@@ -237,47 +290,424 @@ pub(crate) async fn build_mock_router(root: &Path, opts: &TestServerOptions) -> 
         );
     }
     for warning in crate::testing::validate::validate_corpus(&files, &routable) {
-        eprintln!("warning: {warning}");
+        notes.top_warning("test", warning);
     }
-    println!(
-        "loaded {} test file(s) with {} case(s) — {} route(s) discovered",
-        files.len(),
-        files.iter().map(|f| f.file.cases.len()).sum::<usize>(),
-        routable.len()
+    notes.plain(
+        "test",
+        format!(
+            "loaded {} test file(s) with {} case(s) — {} route(s) discovered",
+            files.len(),
+            files.iter().map(|f| f.file.cases.len()).sum::<usize>(),
+            routable.len()
+        ),
     );
 
-    let session = match MockSession::new(
+    let session = MockSession::new(
         files,
         opts.scenario.clone(),
         ReportConfig {
             format: opts.report,
             file: opts.report_file.clone(),
         },
-    ) {
-        Ok(session) => session,
-        Err(message) => {
-            eprintln!("error: {message}");
-            std::process::exit(1);
-        }
-    };
+    )
+    .map_err(CommandError::fatal)?;
+    if mode == PrepareMode::Batch {
+        session.set_quiet();
+    }
     if !session.known_scenarios().is_empty() {
-        println!("scenarios: {}", session.known_scenarios().join(", "));
+        notes.plain("test", format!("scenarios: {}", session.known_scenarios().join(", ")));
     }
     if let Some(flag) = session.scenario_flag() {
-        println!("active scenario (--scenario): {flag}");
+        notes.plain("test", format!("active scenario (--scenario): {flag}"));
     }
 
+    let gate_note = install_gate_mock_checked(&api_root, &config, &session, notes).map_err(CommandError::fatal)?;
     let provider: Arc<dyn crate::endpoint::mock::MockProvider> = session.clone();
+    let (sink, discovered_handle) = match mode {
+        PrepareMode::Serve => (crate::commands::run::DiscoveredSink::File, None),
+        PrepareMode::Batch => {
+            let handle = Arc::new(std::sync::Mutex::new(std::mem::take(&mut config.discovered_errors)));
+            (crate::commands::run::DiscoveredSink::MemoryOnly(handle.clone()), Some(handle))
+        }
+    };
     let (router, server_config) =
-        crate::commands::run::assemble_api_router(root, config, Arc::new(HashMap::new()), Some(provider), openapi_document, endpoint_tree).await?;
+        crate::commands::run::assemble_api_router_with(root, config, Arc::new(HashMap::new()), Some(provider), openapi_document, endpoint_tree, sink).await?;
     // Merged last, at the absolute root: outside `apiRoot`, outside every
     // optional middleware layer (correlation, metrics, rate limiting, CORS)
     // — merging never retroactively shares layers, which is exactly what
     // keeps this route un-CORS'd.
-    let router = router.merge(crate::testing::control_plane::router(session.clone()));
-    println!("scenario control plane: GET/POST/DELETE /_frogs/scenario");
+    let router = if mode == PrepareMode::Serve {
+        router.merge(crate::testing::control_plane::router(session.clone()))
+    } else {
+        router
+    };
+    if server_config.features.mcp {
+        notes.plain(
+            "test",
+            format!(
+                "MCP: POST {}{} ({mcp_tools} tool(s))",
+                crate::server::normalize_api_root(&server_config.api_root).unwrap_or_default(),
+                crate::mcp::MCP_PATH
+            ),
+        );
+    }
+    if let Some(note) = gate_note {
+        notes.plain("test", note);
+    }
+    notes.plain("test", "scenario control plane: GET/POST/DELETE /_frogs/scenario");
 
-    Ok((router, session, server_config))
+    Ok(Prepared {
+        router,
+        session,
+        server_config,
+        discovered: discovered_handle,
+    })
+}
+
+/// Reads `api/datasources/mcp-gate.test.json` (`{"verifier": <mock value>}`) for an MCP `accessScheme`
+/// that has a datasource to mock, and hands it to the session. Only this `frogs test` path ever
+/// opens the file. A link, a differently-cased twin, a non-regular file or a malformed body is exit 1.
+#[cfg(test)]
+fn install_gate_mock(api_dir: &Path, config: &Config, session: &MockSession) -> Option<String> {
+    let mut notes = Lines::default();
+    let result = install_gate_mock_checked(api_dir, config, session, &mut notes);
+    for line in &notes.0 {
+        eprintln!("{}", line.render());
+    }
+    result.unwrap_or_else(|message| {
+        eprintln!("error: {message}");
+        std::process::exit(1);
+    })
+}
+
+fn install_gate_mock_checked(api_dir: &Path, config: &Config, session: &MockSession, notes: &mut Lines) -> Result<Option<String>, String> {
+    let Some(scheme) = config
+        .server
+        .mcp_settings()
+        .access_scheme
+        .as_ref()
+        .and_then(|value| value.as_str().map(str::to_string))
+    else {
+        return Ok(None);
+    };
+    if !config.server.features.mcp {
+        return Ok(None);
+    }
+    let Some(verifier) = config.security.verifiers.get(&scheme) else {
+        return Ok(None);
+    };
+    let datasources = api_dir.join("datasources");
+    let state = match crate::openapi::dir_index::DirIndex::read(api_dir) {
+        Ok(index) => index.lookup("datasources"),
+        Err(e) => return Err(format!("cannot read {}: {e}", api_dir.display())),
+    };
+    let file = match state {
+        crate::openapi::dir_index::Lookup::Exact(crate::openapi::dir_index::EntryKind::Dir) => match check_file(&datasources, "mcp-gate.test.json") {
+            Ok(FileState::Present(path)) | Ok(FileState::PresentViaLink(path)) => Some(path),
+            Ok(FileState::Absent) => None,
+            Err(e) => return Err(format!("mcp-gate.test.json: {e}")),
+        },
+        crate::openapi::dir_index::Lookup::Absent => None,
+        _ => {
+            return Err(format!(
+                "{} is not a plain directory (a link or another kind of entry) — refusing to read mcp-gate.test.json from it",
+                datasources.display()
+            ));
+        }
+    };
+    if verifier.mtls.is_some() {
+        if file.is_some() {
+            notes.top_warning(
+                "test",
+                format!("mcp-gate.test.json is ignored: accessScheme '{scheme}' is an mtls verifier, which runs for real against the connection certificate"),
+            );
+        }
+        return Ok(Some(format!("MCP: accessScheme '{scheme}' gate mock: none (mtls gate runs for real)")));
+    }
+    let Some(path) = file else {
+        return Ok(Some(format!("MCP: accessScheme '{scheme}' gate mock: none (gate fails closed)")));
+    };
+    let parsed = std::fs::read_to_string(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).map_err(|e| format!("invalid JSON: {e}")))
+        .and_then(|value| match value {
+            serde_json::Value::Object(mut map) if map.len() == 1 && map.contains_key("verifier") => {
+                serde_json::from_value::<crate::endpoint::MockOutcome>(map.remove("verifier").unwrap_or_default()).map_err(|e| e.to_string())
+            }
+            _ => Err("must be a JSON object with exactly one key, \"verifier\"".to_string()),
+        });
+    match parsed {
+        Ok(outcome) => session.set_gate_mock(outcome),
+        Err(message) => return Err(format!("{}: {message}", path.display())),
+    }
+    Ok(Some(format!("MCP: accessScheme '{scheme}' gate mock: {}", path.display())))
+}
+
+/// What an in-process batch run is asked to drive. Every filter is exact equality; `None` selects everything.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct BatchOptions {
+    pub path: Option<String>,
+    pub method: Option<String>,
+    pub scenario: Option<String>,
+}
+
+pub(crate) struct BatchOutcome {
+    pub summary: crate::testing::report::Summary,
+    pub entries: Vec<Value>,
+    pub undrivable: Vec<Value>,
+    pub selected_other: Vec<Value>,
+    pub timeouts: usize,
+    /// Answered before the mock provider was reached (a rate limiter, a validation layer): reported as served, status and all.
+    pub answered_early: usize,
+    pub discovered_codes: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+impl BatchOutcome {
+    pub(crate) fn problems(&self) -> usize {
+        self.summary.failed + self.summary.unmatched + self.summary.not_mocked + self.undrivable.len() + self.selected_other.len() + self.timeouts
+    }
+}
+
+const BATCH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const BATCH_BODY_LIMIT: usize = 1024 * 1024;
+
+/// Runs every selected `*.test.json` case exactly once through the same mock router `frogs test` serves, in process:
+/// no port, no pidfile, nothing written under the project. Cases run one at a time in a fixed order (route path, then
+/// method, then file order) so a `save` feeds the later cases that read it.
+pub(crate) async fn run_batch(root: &Path, opts: &BatchOptions) -> Result<BatchOutcome, CommandError> {
+    let mut notes = Lines::default();
+    let prepared = prepare_mock_router(
+        root,
+        &TestServerOptions {
+            port: None,
+            bind: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            scenario: None,
+            report: ReportFormat::Text,
+            report_file: None,
+        },
+        PrepareMode::Batch,
+        &mut notes,
+    )
+    .await?;
+    let Prepared {
+        router,
+        session,
+        server_config,
+        discovered,
+    } = prepared;
+    if let Some(scenario) = &opts.scenario
+        && !session.known_scenarios().contains(scenario)
+    {
+        return Err(CommandError::fatal(format!(
+            "unknown scenario '{}' — {}",
+            crate::openapi::untrusted(scenario),
+            if session.known_scenarios().is_empty() {
+                "no case in this project declares a scenario".to_string()
+            } else {
+                format!("known scenarios: {}", session.known_scenarios().join(", "))
+            }
+        )));
+    }
+
+    let case_sensitive = server_config.case_sensitive_methods();
+    let prefix = crate::server::normalize_api_root(&server_config.api_root).unwrap_or_default();
+    let service = crate::server::driven_service(router, crate::server::ServeShape::of(&server_config));
+    let discovered_before: HashMap<String, u64> = discovered
+        .as_ref()
+        .map(|handle| {
+            handle
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entries()
+                .into_iter()
+                .map(|(code, entry)| (code.clone(), entry.occurrences))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut outcome = BatchOutcome {
+        summary: Default::default(),
+        entries: Vec::new(),
+        undrivable: Vec::new(),
+        selected_other: Vec::new(),
+        timeouts: 0,
+        answered_early: 0,
+        discovered_codes: Vec::new(),
+        notes: Vec::new(),
+    };
+
+    for loaded in session.files_sorted() {
+        let route = &loaded.route;
+        if let Some(path) = &opts.path
+            && *path != route.path
+        {
+            continue;
+        }
+        if let Some(method) = &opts.method {
+            let wire = crate::openapi::method_token::display_token(&route.method);
+            let same = if case_sensitive { *method == wire } else { method.eq_ignore_ascii_case(&wire) };
+            if !same {
+                continue;
+            }
+        }
+        for (index, case) in loaded.file.cases.iter().enumerate() {
+            if let Some(scenario) = &opts.scenario
+                && case.scenario.as_deref() != Some(scenario.as_str())
+            {
+                continue;
+            }
+            let file_display = crate::testing::session::test_file_display(route);
+            let undrivable = |reason: String| {
+                serde_json::json!({
+                    "method": crate::openapi::method_token::display_token(&route.method),
+                    "path": route.path,
+                    "case": case.name,
+                    "file": file_display,
+                    "reason": reason,
+                })
+            };
+            let request = match build_batch_request(&session, route, case, &prefix, case_sensitive) {
+                Ok(request) => request,
+                Err(reason) => {
+                    outcome.undrivable.push(undrivable(reason));
+                    continue;
+                }
+            };
+            let before = session.report_len();
+            let mut svc = service.clone();
+            let call = async {
+                futures_util::future::poll_fn(|cx| tower_service::Service::<axum::http::Request<axum::body::Body>>::poll_ready(&mut svc, cx))
+                    .await
+                    .ok();
+                tower_service::Service::call(&mut svc, request).await
+            };
+            let response = match tokio::time::timeout(BATCH_REQUEST_TIMEOUT, call).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(never)) => match never {},
+                Err(_) => {
+                    outcome.timeouts += 1;
+                    outcome.entries.push(serde_json::json!({
+                        "method": crate::openapi::method_token::display_token(&route.method),
+                        "path": route.path,
+                        "case": case.name,
+                        "file": file_display,
+                        "verdict": "timeout",
+                        "timeoutSeconds": BATCH_REQUEST_TIMEOUT.as_secs(),
+                    }));
+                    continue;
+                }
+            };
+            let status = response.status().as_u16();
+            if session.report_len() > before
+                && let Some((entry, served_index)) = session.last_entry()
+            {
+                if entry.case_name.is_some() && served_index != Some(index) {
+                    outcome.selected_other.push(serde_json::json!({
+                        "method": crate::openapi::method_token::display_token(&route.method),
+                        "path": route.path,
+                        "case": case.name,
+                        "file": file_display,
+                        "selectedOther": { "name": entry.case_name, "file": entry.case_file },
+                    }));
+                }
+                outcome.entries.push(crate::testing::report::entry_json(&entry));
+            } else {
+                let bytes = axum::body::to_bytes(response.into_body(), BATCH_BODY_LIMIT).await.unwrap_or_default();
+                let body = serde_json::from_slice::<Value>(&bytes).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+                outcome.answered_early += 1;
+                outcome.entries.push(serde_json::json!({
+                    "method": crate::openapi::method_token::display_token(&route.method),
+                    "path": route.path,
+                    "case": case.name,
+                    "file": file_display,
+                    "status": status,
+                    "body": crate::testing::report::cap_body(&body),
+                    "verdict": "served",
+                    "note": "answered before the mock provider was reached",
+                }));
+            }
+        }
+    }
+
+    outcome.summary = session.summary();
+    if let Some(handle) = &discovered {
+        let guard = handle.lock().unwrap_or_else(|p| p.into_inner());
+        outcome.discovered_codes = guard
+            .entries()
+            .into_iter()
+            .filter(|(code, entry)| discovered_before.get(*code).is_none_or(|before| entry.occurrences > *before))
+            .map(|(code, _)| code.clone())
+            .collect();
+    }
+    outcome.notes = notes.0.iter().map(ReportLine::render).collect();
+    Ok(outcome)
+}
+
+/// A case's `request` block as a real HTTP request, `{{memory.*}}` substituted. `Err` is why it can't be built.
+fn build_batch_request(
+    session: &MockSession,
+    route: &RouteKey,
+    case: &crate::testing::TestCase,
+    api_prefix: &str,
+    case_sensitive: bool,
+) -> Result<axum::http::Request<axum::body::Body>, String> {
+    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+
+    let path_values = session.substitute_map(&case.request.path);
+    let mut used = std::collections::HashSet::new();
+    let mut path = String::new();
+    for segment in route.path.split('/').filter(|s| !s.is_empty()) {
+        path.push('/');
+        match segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+            Some(name) => {
+                let Some(value) = path_values.get(name) else {
+                    return Err(format!("the case gives no value for path parameter '{name}'"));
+                };
+                used.insert(name);
+                path.push_str(&utf8_percent_encode(value, NON_ALPHANUMERIC).to_string());
+            }
+            None => path.push_str(&crate::openapi::path_encoding::encode_literal_segment(segment)),
+        }
+    }
+    if path.is_empty() {
+        path.push('/');
+    }
+    if let Some(extra) = path_values.keys().find(|key| !used.contains(key.as_str())) {
+        return Err(format!("the case's request.path names '{extra}', which is not a parameter of {}", route.path));
+    }
+
+    let mut uri = format!("{api_prefix}{path}");
+    let query = session.substitute_map(&case.request.query);
+    let mut pairs: Vec<(&String, &String)> = query.iter().collect();
+    pairs.sort();
+    for (index, (key, value)) in pairs.into_iter().enumerate() {
+        uri.push(if index == 0 { '?' } else { '&' });
+        uri.push_str(&utf8_percent_encode(key, NON_ALPHANUMERIC).to_string());
+        uri.push('=');
+        uri.push_str(&utf8_percent_encode(value, NON_ALPHANUMERIC).to_string());
+    }
+
+    let wire = crate::openapi::method_token::display_token(&route.method);
+    let wire_text = if case_sensitive { wire.clone() } else { wire.to_ascii_uppercase() };
+    let method = axum::http::Method::from_bytes(wire_text.as_bytes()).map_err(|_| format!("'{}' is not a usable HTTP method", crate::openapi::untrusted(&wire)))?;
+    let mut builder = axum::http::Request::builder().method(method).uri(uri);
+    for (name, value) in session.substitute_map(&case.request.headers) {
+        let name = axum::http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| format!("'{}' is not a valid header name", crate::openapi::untrusted(&name)))?;
+        let value = axum::http::HeaderValue::from_str(&value).map_err(|_| format!("the value of header '{name}' is not a valid header value"))?;
+        builder = builder.header(name, value);
+    }
+    if let Some(scenario) = &case.scenario {
+        builder = builder.header(crate::testing::session::SCENARIO_HEADER, scenario.as_str());
+    }
+    let body = match &case.request.body {
+        Some(body) => {
+            builder = builder.header("content-type", "application/json");
+            axum::body::Body::from(serde_json::to_vec(&session.substitute(body)).map_err(|e| e.to_string())?)
+        }
+        None => axum::body::Body::empty(),
+    };
+    builder.body(body).map_err(|e| format!("the request could not be built: {e}"))
 }
 
 /// `frogs test record <path> <method>` — runs one real request against
@@ -316,7 +746,13 @@ pub async fn record(cwd: &Path, path: &str, method: &str) -> io::Result<()> {
         std::process::exit(1);
     }
     let endpoint_tree = crate::commands::run::startup_endpoint_tree(&root, &config.server)?;
-    crate::commands::run::load_openapi_for_startup_with(&root, &config.server, &endpoint_tree, crate::endpoint::route_plan::RootExtras::default())?;
+    crate::commands::run::load_openapi_for_startup_with_security(
+        &root,
+        &config.server,
+        &endpoint_tree,
+        crate::endpoint::route_plan::RootExtras::default(),
+        &config.security,
+    )?;
 
     let sql_root = api_root.join("datasources/sql");
     let http_root = api_root.join("datasources/http");
@@ -2399,3 +2835,6 @@ mod symlink_tests;
 
 #[cfg(test)]
 mod route_tests;
+
+#[cfg(test)]
+mod mcp_tests;

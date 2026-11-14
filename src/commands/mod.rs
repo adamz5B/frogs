@@ -3,6 +3,7 @@ pub mod errors;
 pub mod generate;
 pub mod help;
 pub mod register;
+pub(crate) mod report;
 pub mod run;
 pub mod stop;
 pub mod test;

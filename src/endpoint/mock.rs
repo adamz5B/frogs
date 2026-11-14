@@ -137,6 +137,9 @@ pub struct Served<'a> {
 pub trait MockProvider: Send + Sync {
     fn select(&self, route: &RouteKey, request: &InboundRequest<'_>) -> MockSelection;
     fn observe(&self, route: &RouteKey, selection: &MockSelection, served: &Served<'_>);
+    /// The `verifier` mock for the MCP `accessScheme` gate (from `api/datasources/mcp-gate.test.json`),
+    /// `None` when that file is absent. Only a provider can reach it, so `frogs run` never does.
+    fn gate_verifier_mock(&self) -> Option<MockOutcome>;
 }
 
 /// The no-real-infrastructure guarantee: every `endpoint.sources` key

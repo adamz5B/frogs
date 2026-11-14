@@ -52,7 +52,7 @@ fn analyse(spec_yaml: &str, files: &[(&str, &str, Option<&str>)], ctx: &RouteCon
     let doc = crate::openapi::load(&root.join("openapi.yaml"), crate::openapi::LoadOptions { case_sensitive_methods: false }).unwrap();
     let tree = tree_for_tests(&root.join("datasources/endpoints"));
     let plan = RoutePlan::build(&tree, doc.method_case, ctx);
-    let check = security_check_with_routes(&tree, &doc, &plan);
+    let check = security_check_with_routes(&tree, &doc, &plan, &crate::security::SecurityConfig::default());
     (Analysis { check, doc }, Proj { root })
 }
 

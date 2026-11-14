@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::HeaderMap;
@@ -45,10 +46,17 @@ impl VerifyErrorCause {
     }
 }
 
+/// What a passed verification granted: `None` when the verifier has no `scopesFrom`, or the
+/// result carried no usable scope claim (which fails any required scope).
+#[derive(Debug, Clone, Default)]
+pub struct Granted {
+    pub scopes: Option<Arc<[String]>>,
+}
+
 /// Runs one scheme's verifier against the caller's request headers (and, for
 /// a certificate-dependent verifier, the connection's client-certificate
-/// identity) and checks its result with `validIf`. `Ok(())` means the
-/// request is authorized to proceed.
+/// identity) and checks its result with `validIf`. `Ok` means the
+/// request is authorized to proceed; the scopes it carries are checked by the caller on every request.
 ///
 /// `scheme_name` plus the exact bound credential value(s) form the cache
 /// key (see `cache_key`), so a hit for one caller's key never leaks into
@@ -75,10 +83,10 @@ pub async fn verify(
     client_cert: Option<&ClientCertIdentity>,
     cache: &VerifierCache,
     call_timeout_ms: NonZeroU64,
-) -> Result<(), VerifyErrorCause> {
+) -> Result<Granted, VerifyErrorCause> {
     if let Some(condition) = &verifier.mtls {
         return match client_cert {
-            Some(identity) if condition.matches(identity) => Ok(()),
+            Some(identity) if condition.matches(identity) => Ok(Granted::default()),
             _ => Err(VerifyErrorCause::Invalid),
         };
     }
@@ -90,9 +98,9 @@ pub async fn verify(
     let key = ttl.map(|_| cache_key(scheme_name, fingerprint, &bound));
 
     if let Some(key) = &key
-        && let Some(valid) = cache.get(key)
+        && let Some((valid, scopes)) = cache.get(key)
     {
-        return if valid { Ok(()) } else { Err(VerifyErrorCause::Invalid) };
+        return if valid { Ok(Granted { scopes }) } else { Err(VerifyErrorCause::Invalid) };
     }
 
     let call_timeout = Duration::from_millis(call_timeout_ms.get());
@@ -103,15 +111,20 @@ pub async fn verify(
     };
 
     let valid = verifier.valid_if.evaluate(&resolved);
+    let scopes = if valid {
+        verifier.scopes_path.as_ref().and_then(|path| path.extract(&resolved))
+    } else {
+        None
+    };
     // Only a real answer (valid or not) is worth caching — a datasource
     // failure returns early via `?` above and never reaches here, so a
     // transient DB/HTTP outage is always retried on the next request
     // rather than freezing every caller out (or in) until the TTL passes.
     if let (Some(key), Some(ttl)) = (key, ttl) {
-        cache.set(key, valid, Duration::from_secs(ttl));
+        cache.set(key, valid, scopes.clone(), Duration::from_secs(ttl));
     }
 
-    if valid { Ok(()) } else { Err(VerifyErrorCause::Invalid) }
+    if valid { Ok(Granted { scopes }) } else { Err(VerifyErrorCause::Invalid) }
 }
 
 /// A fixed-width, injective cache key: `v2:` + the lowercase hex SHA-256 of a
@@ -370,6 +383,7 @@ mod tests {
             valid_if: ValidIf::parse(def.valid_if()).unwrap(),
             def,
             mtls: None,
+            scopes_path: None,
         }
     }
 
@@ -594,6 +608,7 @@ mod tests {
             valid_if: ValidIf::parse(def.valid_if()).unwrap(),
             def,
             mtls: None,
+            scopes_path: None,
         };
 
         let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
@@ -674,6 +689,7 @@ mod tests {
             valid_if: ValidIf::parse(def.valid_if()).unwrap(),
             def,
             mtls: None,
+            scopes_path: None,
         };
 
         let headers = headers_with("X-Api-Key", "good-key");
@@ -739,6 +755,7 @@ mod tests {
             valid_if: ValidIf::parse(def.valid_if()).unwrap(),
             def,
             mtls: None,
+            scopes_path: None,
         };
         let client = reqwest::Client::new();
         let cache = VerifierCache::new();
@@ -843,6 +860,7 @@ mod tests {
             valid_if: ValidIf::parse(def.valid_if()).unwrap(),
             def,
             mtls: None,
+            scopes_path: None,
         };
 
         let drivers: HashMap<String, Box<dyn SqlDriver>> = HashMap::new();
@@ -961,6 +979,7 @@ mod tests {
             valid_if: ValidIf::parse(def.valid_if()).unwrap(),
             def,
             mtls: None,
+            scopes_path: None,
         };
 
         let headers = headers_with("X-Api-Key", "good-key");
@@ -1051,6 +1070,7 @@ mod tests {
             valid_if: ValidIf::parse(def.valid_if()).unwrap(),
             def,
             mtls: None,
+            scopes_path: None,
         };
 
         let headers = headers_with("X-Api-Key", "good-key");

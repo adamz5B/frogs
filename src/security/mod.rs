@@ -9,7 +9,7 @@ pub use cache::VerifierCache;
 pub use client_cert::MtlsCondition;
 pub(crate) use client_cert::{CertField, ClientCertIdentity};
 pub use schemes::SchemeConfig;
-pub use valid_if::{ValidIf, ValidIfParseError};
+pub use valid_if::{ScopesPath, ValidIf, ValidIfParseError};
 pub use verifier::VerifierDef;
 pub use verify::verify;
 
@@ -78,6 +78,8 @@ pub struct LoadedVerifier {
     /// the client-certificate fields rather than evaluated as a generic
     /// `ValidIf` over a datasource result.
     pub mtls: Option<MtlsCondition>,
+    /// `Some` only when the verifier file declares `scopesFrom`: scopes are enforceable.
+    pub scopes_path: Option<ScopesPath>,
 }
 
 impl LoadedVerifier {
@@ -179,7 +181,19 @@ impl SecurityConfig {
                     Some(_) => {}
                 }
             }
-            verifiers.insert(scheme_name.clone(), LoadedVerifier { def, valid_if, mtls });
+            let scopes_path = match def.scopes_from() {
+                Some(expr) => Some(ScopesPath::parse(expr).map_err(invalid_cert_config)?),
+                None => None,
+            };
+            verifiers.insert(
+                scheme_name.clone(),
+                LoadedVerifier {
+                    def,
+                    valid_if,
+                    mtls,
+                    scopes_path,
+                },
+            );
         }
 
         Ok(SecurityConfig { schemes, verifiers })
@@ -316,3 +330,6 @@ mod tests {
 
 #[cfg(test)]
 mod mtls_load_tests;
+
+#[cfg(test)]
+mod scope_tests;

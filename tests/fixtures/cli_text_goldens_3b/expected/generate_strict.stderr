@@ -1,0 +1,3 @@
+error: path '/cars:batchGet' skipped: segment 'cars:batchGet' contains ':' or '*', which the route table treats as parameter/wildcard syntax
+error: 1 openapi.yaml issue(s) found and "strictOpenApi" is true — nothing was generated; fix them (or set it to false) and re-run
+error: generate finished with 1 problem(s) — see the messages above

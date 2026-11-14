@@ -1,0 +1,59 @@
+{
+  "operationId": "listCarsByMaker",
+  "sources": {
+    "cars": {
+      "type": "sql",
+      "connection": "vehicles_db",
+      "script": "list_cars_by_maker.sql",
+      "cardinality": "many",
+      "onError": 500,
+      "parameters": [
+        {
+          "name": "maker",
+          "from": "query.maker"
+        }
+      ]
+    },
+    "pricing": {
+      "type": "http",
+      "request": "pricing_lookup.json",
+      "cardinality": "many",
+      "allowNestedMany": true,
+      "maxConcurrency": 3,
+      "maxRows": 50,
+      "rowTimeoutMs": 5000,
+      "onError": 502,
+      "optional": true,
+      "parameters": [
+        {
+          "name": "vin",
+          "from": "sources.cars[].vin"
+        }
+      ]
+    }
+  },
+  "response": {
+    "type": "array",
+    "source": "sources.cars",
+    "items": {
+      "vin": "vin",
+      "maker": "maker",
+      "model": "model",
+      "year": {
+        "from": "year",
+        "format": "integer"
+      },
+      "price": {
+        "from": "pricing.amount",
+        "format": "decimal",
+        "precision": 2
+      },
+      "currency": "pricing.currency",
+      "listedAt": {
+        "from": "listed_at",
+        "format": "date-time",
+        "sourceFormat": "unix-seconds"
+      }
+    }
+  }
+}

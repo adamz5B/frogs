@@ -7,6 +7,7 @@ use crate::openapi::endpoint_tree::tree_for_tests;
 
 mod axum_contract;
 mod encoding;
+mod mcp_metadata;
 mod refs;
 mod security;
 

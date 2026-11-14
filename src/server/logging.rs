@@ -21,6 +21,16 @@ pub fn install_bootstrap_subscriber() {
         .try_init();
 }
 
+/// The same subscriber writing to stderr instead of stdout, for a process whose stdout carries data
+/// (`frogs mcp`'s JSON-RPC stream, `frogs validate --json`'s one document). No ANSI colours: stderr is a log, not a terminal UI.
+pub fn install_stderr_subscriber() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
+}
+
 /// Held only for its `Drop` side effect — `tracing_appender`'s non-blocking
 /// writer flushes its buffered file writes when its `WorkerGuard` drops, so
 /// the caller must keep this alive for as long as file logging should keep

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::commands::report::{CommandError, ErrorKind, Lines, ReportLine};
 use crate::config::EndpointSymlinks;
 use crate::config::{Config, ServerConfig};
 use crate::openapi::dir_index::{
@@ -46,13 +47,62 @@ pub enum Role {
     Web,
 }
 
+/// What a `generate` run did, as data (FR21), plus every line the command line would have printed.
+#[derive(Debug, Default)]
+pub(crate) struct GenerateReport {
+    /// Stub files created, project-relative.
+    pub created: Vec<String>,
+    /// `(stub, backup)`, project-relative.
+    pub migrated: Vec<(String, String)>,
+    pub reference_refreshed: Vec<String>,
+    /// `(from, to)`, project-relative.
+    pub orphaned: Vec<(String, String)>,
+    /// Stub files brought back from orphaned status, project-relative.
+    pub restored: Vec<String>,
+    pub unchanged: usize,
+    pub strict_aborted: bool,
+    /// Every problem the run counted (what `GenerateOutcome::errors` holds), plus a role-level failure.
+    pub errors: Vec<String>,
+    /// The run stopped with a failure: the command line exits 1.
+    pub failed: bool,
+    pub lines: Vec<ReportLine>,
+}
+
 pub fn run(cwd: &Path, role: Option<Role>) -> io::Result<()> {
     let root = require_project_root(cwd);
-    println!("project root: {}", root.display());
+    let mut out = Lines::live();
+    match generate_run(&root, role, &mut out) {
+        Ok(report) if report.failed => std::process::exit(1),
+        Ok(_) => Ok(()),
+        Err(error) => exit_or_io(error),
+    }
+}
+
+/// `generate` for a caller that wants data: nothing is printed and the process never exits.
+pub(crate) fn generate_report(root: &Path, role: Option<Role>) -> Result<GenerateReport, CommandError> {
+    let mut out = Lines::default();
+    let mut report = generate_run(root, role, &mut out)?;
+    report.lines = out.0;
+    Ok(report)
+}
+
+/// How the command line used to react to an error: a refusal or I/O failure goes back to `main`, anything else is
+/// printed and exits with its own code.
+fn exit_or_io<T>(error: CommandError) -> io::Result<T> {
+    if matches!(error.kind, ErrorKind::Refusal | ErrorKind::Io) {
+        return Err(error.into_io());
+    }
+    eprintln!("error: {}", error.message);
+    std::process::exit(error.exit_code);
+}
+
+fn generate_run(root: &Path, role: Option<Role>, out: &mut Lines) -> Result<GenerateReport, CommandError> {
+    out.plain("generate", format!("project root: {}", root.display()));
 
     let has_openapi = root.join(MANIFEST_FILE).is_file();
-    let web_files = find_files_with_extensions(&root, WEB_ASSET_EXTENSIONS);
+    let web_files = find_files_with_extensions(root, WEB_ASSET_EXTENSIONS);
     let has_web = !web_files.is_empty();
+    let mut report = GenerateReport::default();
 
     match (has_openapi, has_web) {
         (false, false) => {
@@ -60,45 +110,84 @@ pub fn run(cwd: &Path, role: Option<Role>) -> io::Result<()> {
             // guarantees at least one marker exists at `root` — but a clear
             // failure beats silently doing nothing if that invariant ever
             // breaks.
-            eprintln!("error: no {MANIFEST_FILE} or web asset files found at {} — nothing to generate", root.display());
-            std::process::exit(1);
+            return Err(CommandError::fatal(format!(
+                "no {MANIFEST_FILE} or web asset files found at {} — nothing to generate",
+                root.display()
+            )));
         }
         (true, true) => match role {
-            Some(Role::Api) => generate_api(&root),
-            Some(Role::Web) => generate_web(&root, &web_files),
+            Some(Role::Api) => generate_api_step(root, out, &mut report)?,
+            Some(Role::Web) => generate_web_with(root, &web_files, out)?,
             // Both markers present and no override: generate both sides of
             // the project rather than forcing the user to pick, now that a
             // project can genuinely serve both at once (see `run_both` in
             // `commands::run`, Point 5).
             None => {
-                generate_api(&root)?;
-                generate_web(&root, &web_files)
+                generate_api_step(root, out, &mut report)?;
+                if !report.failed {
+                    generate_web_with(root, &web_files, out)?;
+                }
             }
         },
         (true, false) => {
             if role == Some(Role::Web) {
-                eprintln!("error: --role web was given, but no web asset files were found at {}", root.display());
-                std::process::exit(1);
+                return Err(CommandError::fatal(format!(
+                    "--role web was given, but no web asset files were found at {}",
+                    root.display()
+                )));
             }
-            generate_api(&root)
+            generate_api_step(root, out, &mut report)?;
         }
         (false, true) => {
             if role == Some(Role::Api) {
-                eprintln!("error: --role api was given, but no {MANIFEST_FILE} was found at {}", root.display());
-                std::process::exit(1);
+                return Err(CommandError::fatal(format!(
+                    "--role api was given, but no {MANIFEST_FILE} was found at {}",
+                    root.display()
+                )));
             }
-            generate_web(&root, &web_files)
+            generate_web_with(root, &web_files, out)?;
         }
     }
+    Ok(report)
 }
 
-fn generate_api(root: &Path) -> io::Result<()> {
-    let outcome = generate_api_inner(root)?;
+fn generate_api_step(root: &Path, out: &mut Lines, report: &mut GenerateReport) -> Result<(), CommandError> {
+    let (outcome, events, unchanged) = generate_api_core(root, out)?;
+    let relative = |path: &Path| {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    report.created = events.created.iter().map(|p| relative(p)).collect();
+    report.migrated = events.migrated.iter().map(|(stub, backup)| (relative(stub), relative(backup))).collect();
+    report.reference_refreshed = events.refreshed.iter().map(|p| relative(p)).collect();
+    report.orphaned = events.orphaned.iter().map(|(from, to)| (relative(from), relative(to))).collect();
+    report.restored = events.restored.iter().map(|p| relative(p)).collect();
+    report.unchanged = unchanged;
+    report.strict_aborted = outcome.strict_aborted;
     if outcome.strict_aborted || !outcome.errors.is_empty() {
-        eprintln!("error: generate finished with {} problem(s) — see the messages above", outcome.errors.len().max(1));
-        std::process::exit(1);
+        out.top_error(
+            "generate",
+            format!("generate finished with {} problem(s) — see the messages above", outcome.errors.len().max(1)),
+        );
+        report.failed = true;
     }
+    report.errors = outcome.errors;
     Ok(())
+}
+
+#[cfg(test)]
+fn generate_api(root: &Path) -> io::Result<()> {
+    let mut out = Lines::live();
+    let mut report = GenerateReport::default();
+    match generate_api_step(root, &mut out, &mut report) {
+        Ok(()) if report.failed => std::process::exit(1),
+        Ok(()) => Ok(()),
+        Err(error) => exit_or_io(error),
+    }
 }
 
 /// What `generate_api_inner` found wrong. Every entry was already printed
@@ -110,39 +199,62 @@ pub(crate) struct GenerateOutcome {
     pub strict_aborted: bool,
 }
 
-pub(crate) fn print_issues(issues: &[LoadIssue]) {
+/// The files a run touched, absolute; `generate_api_step` turns them project-relative.
+#[derive(Debug, Default)]
+pub(crate) struct GenerateEvents {
+    created: Vec<PathBuf>,
+    migrated: Vec<(PathBuf, PathBuf)>,
+    refreshed: Vec<PathBuf>,
+    orphaned: Vec<(PathBuf, PathBuf)>,
+    restored: Vec<PathBuf>,
+}
+
+fn print_issues(out: &mut Lines, issues: &[LoadIssue]) {
     for issue in issues {
         match issue.severity {
-            Severity::Warning => eprintln!("warning: {}", issue.message),
-            Severity::Error => eprintln!("error: {}", issue.message),
+            Severity::Warning => out.top_warning("openapi", issue.message.as_str()),
+            Severity::Error => out.top_error("openapi", issue.message.as_str()),
         }
     }
 }
 
+#[cfg(test)]
 pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
+    let mut out = Lines::live();
+    match generate_api_core(root, &mut out) {
+        Ok((outcome, _, _)) => Ok(outcome),
+        Err(error) => exit_or_io(error),
+    }
+}
+
+fn generate_api_core(root: &Path, out: &mut Lines) -> Result<(GenerateOutcome, GenerateEvents, usize), CommandError> {
     let api_root = crate::project::api_base(root);
     let mut outcome = GenerateOutcome::default();
+    let mut events = GenerateEvents::default();
 
     // Nothing is created, not even the scaffold, until every place generate
     // will write resolves inside the project — whatever `server.json` says.
     let boundary = ProjectBoundary::new(root);
     if let Err(e) = write_gate(&boundary, &api_root) {
-        eprintln!("error: {e}");
-        eprintln!("error: nothing was generated — fix the link or folder above and re-run");
+        out.top_error("generate", e.to_string());
+        out.top_error("generate", "nothing was generated — fix the link or folder above and re-run");
         outcome.errors.push(e.to_string());
-        return Ok(outcome);
+        return Ok((outcome, events, 0));
     }
-    scaffold_config(&boundary, &api_root)?;
+    scaffold_config_with(&boundary, &api_root, out)?;
 
-    let config = Config::load_or_exit(&api_root);
-    println!(
-        "loaded config — debugMode={}, {} connection(s), {} error code(s), strictOpenApi={}, caseSensitiveMethods={}, endpointSymlinks={}",
-        config.server.debug_mode,
-        config.connections.len(),
-        config.errors.len(),
-        config.server.strict_open_api(),
-        config.server.case_sensitive_methods(),
-        config.server.endpoint_symlinks().as_str()
+    let config = Config::load(&api_root).map_err(|err| CommandError::config_load(&api_root, err))?;
+    out.plain(
+        "generate",
+        format!(
+            "loaded config — debugMode={}, {} connection(s), {} error code(s), strictOpenApi={}, caseSensitiveMethods={}, endpointSymlinks={}",
+            config.server.debug_mode,
+            config.connections.len(),
+            config.errors.len(),
+            config.server.strict_open_api(),
+            config.server.case_sensitive_methods(),
+            config.server.endpoint_symlinks().as_str()
+        ),
     );
     let ctx = LinkContext {
         boundary,
@@ -152,30 +264,27 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
 
     let doc = match crate::openapi::load(&root.join(MANIFEST_FILE), config.server.openapi_load_options()) {
         Ok(doc) => doc,
-        Err(err) => {
-            eprintln!("error: {err}");
-            std::process::exit(1);
-        }
+        Err(err) => return Err(CommandError::fatal(err.to_string())),
     };
 
-    println!("found {} operation(s) in {}:", doc.operations.len(), MANIFEST_FILE);
+    out.plain("generate", format!("found {} operation(s) in {}:", doc.operations.len(), MANIFEST_FILE));
     for op in &doc.operations {
-        println!("  {} {} -> {}", op.http_method, op.path, op.operation_id);
+        out.plain("generate", format!("  {} {} -> {}", op.http_method, op.path, op.operation_id));
     }
-    print_issues(&doc.issues);
+    print_issues(out, &doc.issues);
 
     let tree = EndpointTree::scan(&ctx, &endpoints_root);
     let plan = plan_endpoint_files(&api_root, &doc, &tree, &ctx);
     for error in &plan.errors {
-        eprintln!("error: {}", error.message);
+        out.top_error("generate", error.message.as_str());
     }
 
     let links = link_report(&tree);
     for message in &links.errors {
-        eprintln!("error: {message}");
+        out.top_error("generate", message.as_str());
     }
     for message in plan.invalid_tokens.iter().chain(&plan.wrong_mode).chain(&links.warnings) {
-        eprintln!("warning: {message}");
+        out.top_warning("generate", message.as_str());
     }
 
     let strict_findings = doc.issues.iter().filter(|i| i.kind.is_strict_error()).count()
@@ -186,14 +295,15 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
         + links.warnings.len();
     if strict_findings > 0 {
         if config.server.strict_open_api() {
-            eprintln!(
-                "error: {strict_findings} openapi.yaml issue(s) found and \"strictOpenApi\" is true — nothing was generated; fix them (or set it to false) and re-run"
+            out.top_error(
+                "generate",
+                format!("{strict_findings} openapi.yaml issue(s) found and \"strictOpenApi\" is true — nothing was generated; fix them (or set it to false) and re-run"),
             );
             outcome.strict_aborted = true;
             outcome.errors.push(format!("{strict_findings} strict openapi issue(s)"));
-            return Ok(outcome);
+            return Ok((outcome, events, 0));
         }
-        println!("note: {strict_findings} issue(s) would be errors with \"strictOpenApi\": true");
+        out.plain("generate", format!("note: {strict_findings} issue(s) would be errors with \"strictOpenApi\": true"));
     }
     outcome
         .errors
@@ -206,33 +316,45 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
     if !components.is_empty() {
         let mut names: Vec<&String> = components.keys().collect();
         names.sort();
-        println!(
-            "resolved {} component(s) into datasources/components/: {}",
-            names.len(),
-            names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ")
+        out.plain(
+            "generate",
+            format!(
+                "resolved {} component(s) into datasources/components/: {}",
+                names.len(),
+                names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ")
+            ),
         );
     }
     if !changed_components.is_empty() {
         let mut names: Vec<&String> = changed_components.iter().collect();
         names.sort();
-        println!(
-            "component(s) changed since the last generate run: {}",
-            names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ")
+        out.plain(
+            "generate",
+            format!(
+                "component(s) changed since the last generate run: {}",
+                names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ")
+            ),
         );
     }
 
-    archive_orphans(&ctx.boundary, &plan.archive, &mut file_errors);
+    archive_orphans(&ctx.boundary, &plan.archive, &mut file_errors, out);
     let restored = restore_orphaned_endpoints(&ctx, &api_root, &doc, &plan.skip, &mut file_errors)?;
     for (path, method) in &restored {
-        println!(
-            "  restoring {} {} (was orphaned) — will run through the normal migration flow below",
-            crate::openapi::method_token::display_token(method),
-            untrusted(path)
+        out.plain(
+            "generate",
+            format!(
+                "  restoring {} {} (was orphaned) — will run through the normal migration flow below",
+                crate::openapi::method_token::display_token(method),
+                untrusted(path)
+            ),
         );
+        if let Ok(DirState::Exists(dir)) = endpoint_dir(&ctx, &endpoints_root, path) {
+            events.restored.push(dir.join(format!("endpoint.{method}.json")));
+        }
     }
 
     let restored_set: HashSet<(String, String)> = restored.into_iter().collect();
-    let summary = write_endpoint_files(
+    let summary = write_endpoint_files_with(
         &ctx,
         &api_root,
         &doc,
@@ -242,16 +364,24 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
         config.server.auto_migrate_endpoints,
         &plan.skip,
         &mut file_errors,
+        out,
+        &mut events,
     )?;
-    println!(
-        "endpoints: {} unchanged (skipped), {} newly generated, {} migrated, {} drifted but left alone \
-         (autoMigrateEndpoints off)",
-        summary.skipped, summary.created, summary.migrated, summary.drift_warned
+    out.plain(
+        "generate",
+        format!(
+            "endpoints: {} unchanged (skipped), {} newly generated, {} migrated, {} drifted but left alone \
+             (autoMigrateEndpoints off)",
+            summary.skipped, summary.created, summary.migrated, summary.drift_warned
+        ),
     );
     if summary.references_refreshed > 0 {
-        println!(
-            "  {} reference file(s) refreshed (request parameters changed; stubs untouched)",
-            summary.references_refreshed
+        out.plain(
+            "generate",
+            format!(
+                "  {} reference file(s) refreshed (request parameters changed; stubs untouched)",
+                summary.references_refreshed
+            ),
         );
     }
 
@@ -259,32 +389,43 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
     let tree = EndpointTree::scan(&ctx, &endpoints_root);
     let orphaned = mark_orphaned_endpoints(&ctx, &tree, &doc, &plan.rejected_paths, &plan.protected_files, &mut file_errors)?;
     for (path, method) in &orphaned {
-        println!(
-            "  {} {} no longer in {MANIFEST_FILE} — prefixed with _ (never deleted; restores automatically \
-             if it comes back)",
-            crate::openapi::method_token::display_token(method),
-            untrusted(path)
+        out.plain(
+            "generate",
+            format!(
+                "  {} {} no longer in {MANIFEST_FILE} — prefixed with _ (never deleted; restores automatically \
+                 if it comes back)",
+                crate::openapi::method_token::display_token(method),
+                untrusted(path)
+            ),
         );
+        if let Ok(DirState::Exists(dir)) = endpoint_dir(&ctx, &endpoints_root, path) {
+            events
+                .orphaned
+                .push((dir.join(format!("endpoint.{method}.json")), dir.join(format!("_endpoint.{method}.json"))));
+        }
     }
 
     for hint in mutual_tls_hints(&doc, &config.security) {
-        println!("{hint}");
+        out.plain("security", hint);
     }
 
     for error in &file_errors {
-        eprintln!("error: {error}");
+        out.top_error("generate", error.as_str());
     }
     outcome.errors.extend(file_errors);
 
     let validation_errors = validate_success_statuses(&tree, &doc);
     for error in &validation_errors {
-        eprintln!("error: {error}");
+        out.top_error("generate", error.as_str());
     }
     if !validation_errors.is_empty() {
-        eprintln!(
-            "error: {} endpoint file(s) have an invalid successStatus — files were still written above, \
-             but this needs fixing by hand",
-            validation_errors.len()
+        out.top_error(
+            "generate",
+            format!(
+                "{} endpoint file(s) have an invalid successStatus — files were still written above, \
+                 but this needs fixing by hand",
+                validation_errors.len()
+            ),
         );
         outcome.errors.extend(validation_errors);
     }
@@ -298,10 +439,10 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
     });
     let route_plan = RoutePlan::build(&tree, method_case, &route_ctx);
     for problem in route_plan.warnings(strict) {
-        eprintln!("warning: {}", problem.message());
+        out.top_warning("routes", problem.message());
     }
     for problem in route_plan.refusals(strict) {
-        eprintln!("error: {}", problem.message());
+        out.top_error("routes", problem.message());
         outcome.errors.push(problem.message().to_string());
     }
     let with_control_plane = RoutePlan::build(
@@ -315,12 +456,12 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
     for problem in with_control_plane.refusals(strict) {
         if !route_plan.problems.contains(problem) {
             let message = format!("{} (frogs test would refuse to start)", problem.message());
-            eprintln!("error: {message}");
+            out.top_error("routes", message.as_str());
             outcome.errors.push(message);
         }
     }
 
-    let security = crate::endpoint::security_check_with_routes(&tree, &doc, &route_plan);
+    let security = crate::endpoint::security_check_with_routes(&tree, &doc, &route_plan, &config.security);
     let mut security_errors: Vec<String> = Vec::new();
     security_errors.extend(security.mismatches.iter().map(|m| m.message()));
     security_errors.extend(security.ambiguous.iter().map(|m| m.message()));
@@ -329,8 +470,9 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
     security_errors.extend(security.shadowed.iter().map(|m| m.message()));
     security_errors.extend(security.unverifiable.iter().map(|m| m.message()));
     security_errors.extend(security.builtin_refusals.iter().map(|m| m.message()));
+    security_errors.extend(security.scope_mismatches.iter().cloned());
     let known_builtin_refusals: std::collections::HashSet<String> = security.builtin_refusals.iter().map(|m| m.message()).collect();
-    for message in crate::endpoint::security_check_with_routes(&tree, &doc, &with_control_plane)
+    for message in crate::endpoint::security_check_with_routes(&tree, &doc, &with_control_plane, &config.security)
         .builtin_refusals
         .iter()
         .map(|m| m.message())
@@ -339,26 +481,26 @@ pub(crate) fn generate_api_inner(root: &Path) -> io::Result<GenerateOutcome> {
         security_errors.push(format!("{message} (frogs test would refuse to start)"));
     }
     for message in security_errors {
-        eprintln!("error: {message}");
+        out.top_error("security", message.as_str());
         outcome.errors.push(message);
     }
-    for message in &security.builtin_warnings {
-        eprintln!("warning: {message}");
+    for message in security.builtin_warnings.iter().chain(&security.scope_warnings) {
+        out.top_warning("security", message.as_str());
     }
     for file in &security.unmatched {
         let message = crate::endpoint::unmatched_security_message(file);
         if strict {
-            eprintln!("error: {message} (\"strictOpenApi\" is true)");
+            out.top_error("security", format!("{message} (\"strictOpenApi\" is true)"));
             outcome.errors.push(message);
         } else {
-            eprintln!("warning: {message}");
+            out.top_warning("security", message);
         }
     }
     if !security.mismatches.is_empty() || !security.unmatched.is_empty() {
-        println!("note: generate never changes an existing endpoint file's \"security\" — edit it by hand");
+        out.plain("security", "note: generate never changes an existing endpoint file's \"security\" — edit it by hand");
     }
 
-    Ok(outcome)
+    Ok((outcome, events, summary.skipped))
 }
 
 /// For each `mutualTLS` security scheme an operation uses that
@@ -407,27 +549,36 @@ fn mutual_tls_hints(doc: &crate::openapi::OpenApiDocument, security: &crate::sec
 /// endpoint stub) has no natural place for a `_todo`-style marker without
 /// changing the on-disk shape every existing project's `connections.json`
 /// already uses.
+#[cfg(test)]
 fn scaffold_config(boundary: &ProjectBoundary, api_root: &Path) -> io::Result<()> {
+    scaffold_config_with(boundary, api_root, &mut Lines::default())
+}
+
+fn scaffold_config_with(boundary: &ProjectBoundary, api_root: &Path, out: &mut Lines) -> io::Result<()> {
     write_if_absent(
         boundary,
+        out,
         &api_root.join("config/server.json"),
         &serde_json::to_string_pretty(&ServerConfig::default()).expect("always serializes"),
         "config/server.json",
     )?;
     write_if_absent(
         boundary,
+        out,
         &api_root.join("config/errors/core.json"),
         &serde_json::to_string_pretty(&default_core_errors()).expect("always serializes"),
         "config/errors/core.json",
     )?;
     write_if_absent(
         boundary,
+        out,
         &api_root.join("config/connections.json"),
         "{}",
         "config/connections.json (empty — add your SQL connections here)",
     )?;
     write_if_absent(
         boundary,
+        out,
         &api_root.join("security/schemes.json"),
         "{}",
         "security/schemes.json (empty — add security schemes + verifiers here, or leave empty if this API needs none)",
@@ -453,7 +604,7 @@ pub(crate) fn write_gate(boundary: &ProjectBoundary, api_root: &Path) -> Result<
     Ok(())
 }
 
-fn write_if_absent(boundary: &ProjectBoundary, path: &Path, contents: &str, message: &str) -> io::Result<()> {
+fn write_if_absent(boundary: &ProjectBoundary, out: &mut Lines, path: &Path, contents: &str, message: &str) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => return Err(EndpointFsError::Symlink { at: path.to_path_buf() }.into()),
         Ok(meta) if meta.is_file() => return Ok(()),
@@ -466,7 +617,7 @@ fn write_if_absent(boundary: &ProjectBoundary, path: &Path, contents: &str, mess
     }
     let name = path.file_name().and_then(|n| n.to_str()).expect("scaffold paths always end in a file name");
     create_new_checked(boundary, path.parent().expect("a file always has a parent"), name, contents.as_bytes())?;
-    println!("wrote {message}");
+    out.plain("generate", format!("wrote {message}"));
     Ok(())
 }
 
@@ -499,10 +650,15 @@ fn default_core_errors() -> Value {
 /// present, else the first `.html` file found (alphabetically, for
 /// determinism); `not_found_page` defaults to `404.html` if that exists,
 /// else is left unset (a generic 404 is used at request time — Point 2).
+#[cfg(test)]
 fn generate_web(root: &Path, web_files: &[PathBuf]) -> io::Result<()> {
+    generate_web_with(root, web_files, &mut Lines::default()).map_err(CommandError::into_io)
+}
+
+fn generate_web_with(root: &Path, web_files: &[PathBuf], out: &mut Lines) -> Result<(), CommandError> {
     let webserve_path = root.join("webserve.json");
     if webserve_path.is_file() {
-        println!("webserve.json already exists at {} — left unchanged", webserve_path.display());
+        out.plain("web", format!("webserve.json already exists at {} — left unchanged", webserve_path.display()));
         return Ok(());
     }
 
@@ -511,10 +667,13 @@ fn generate_web(root: &Path, web_files: &[PathBuf]) -> io::Result<()> {
         .filter_map(|path| path.file_name().and_then(|n| n.to_str()).map(str::to_string))
         .filter(|name| match crate::webserve::lexically_denied(root, name) {
             Some(reason) => {
-                println!(
-                    "note: {} is never served by frogs run ({}) — not considered for startPage/notFoundPage",
-                    name,
-                    reason.as_str()
+                out.plain(
+                    "web",
+                    format!(
+                        "note: {} is never served by frogs run ({}) — not considered for startPage/notFoundPage",
+                        name,
+                        reason.as_str()
+                    ),
                 );
                 false
             }
@@ -534,11 +693,10 @@ fn generate_web(root: &Path, web_files: &[PathBuf]) -> io::Result<()> {
         // all) can reach here when `--role web` was given explicitly
         // alongside an openapi.yaml. A static site needs a page to start
         // from, so this is a real, reportable error, not a silent default.
-        eprintln!(
-            "error: no .html file found at {} — a static-content project needs at least one to use as a start page",
+        return Err(CommandError::fatal(format!(
+            "no .html file found at {} — a static-content project needs at least one to use as a start page",
             root.display()
-        );
-        std::process::exit(1);
+        )));
     };
 
     let not_found_page = names.iter().find(|name| name.as_str() == "404.html").cloned();
@@ -550,15 +708,20 @@ fn generate_web(root: &Path, web_files: &[PathBuf]) -> io::Result<()> {
         not_found_page,
         tls: Default::default(),
     };
-    crate::webserve::save_to(&webserve_path, &config)?;
+    // Created through the project-boundary primitives: a dangling `webserve.json` link is refused, never written through.
+    let json = serde_json::to_string_pretty(&config).expect("WebServeConfig always serializes");
+    create_new_file(&ProjectBoundary::new(root), root, "webserve.json", json.as_bytes()).map_err(|e| CommandError::from(io::Error::from(e)))?;
 
-    println!(
-        "found {} web asset file(s): {} — wrote webserve.json (startPage: {}, port: {}{})",
-        names.len(),
-        names.join(", "),
-        config.start_page,
-        config.port,
-        config.not_found_page.as_ref().map(|p| format!(", notFoundPage: {p}")).unwrap_or_default()
+    out.plain(
+        "web",
+        format!(
+            "found {} web asset file(s): {} — wrote webserve.json (startPage: {}, port: {}{})",
+            names.len(),
+            names.join(", "),
+            config.start_page,
+            config.port,
+            config.not_found_page.as_ref().map(|p| format!(", notFoundPage: {p}")).unwrap_or_default()
+        ),
     );
     Ok(())
 }
@@ -1308,6 +1471,10 @@ fn build_reference_file(op: &Operation, hash: &str, response_descriptor: &Value,
         "response": response_descriptor,
         "availableParameterSources": op.available_parameter_sources(),
     });
+    let scopes = op.security_scopes();
+    if !scopes.is_empty() {
+        reference["securityScopes"] = serde_json::json!(scopes);
+    }
     if let ResponseMode::Stream(spec) = &op.response_mode {
         reference["responseMode"] = stream_reference(spec, components);
     }
@@ -1350,6 +1517,10 @@ fn build_stub_file(op: &Operation, reference_file_name: &str, response_descripto
     });
     if let Some(scheme) = &op.security {
         stub["security"] = Value::String(scheme.clone());
+        let scopes = op.security_scopes();
+        if !scopes.is_empty() {
+            stub["securityScopes"] = serde_json::json!(scopes);
+        }
     }
     stub
 }
@@ -1378,6 +1549,7 @@ struct GenerateSummary {
 /// that changed, or it was just restored from orphaned status — everything
 /// else is left completely alone. An operation whose folder or files can't
 /// be used safely is reported in `errors` and skipped; the rest still run.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn write_endpoint_files(
     ctx: &LinkContext,
@@ -1389,6 +1561,35 @@ fn write_endpoint_files(
     auto_migrate_endpoints: bool,
     skip: &HashSet<(String, String)>,
     errors: &mut Vec<String>,
+) -> io::Result<GenerateSummary> {
+    write_endpoint_files_with(
+        ctx,
+        root,
+        doc,
+        components,
+        changed_components,
+        just_restored,
+        auto_migrate_endpoints,
+        skip,
+        errors,
+        &mut Lines::default(),
+        &mut GenerateEvents::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_endpoint_files_with(
+    ctx: &LinkContext,
+    root: &Path,
+    doc: &OpenApiDocument,
+    components: &HashMap<String, Value>,
+    changed_components: &HashSet<String>,
+    just_restored: &HashSet<(String, String)>,
+    auto_migrate_endpoints: bool,
+    skip: &HashSet<(String, String)>,
+    errors: &mut Vec<String>,
+    out: &mut Lines,
+    events: &mut GenerateEvents,
 ) -> io::Result<GenerateSummary> {
     let mut summary = GenerateSummary::default();
     let endpoints_root = root.join("datasources/endpoints");
@@ -1406,6 +1607,8 @@ fn write_endpoint_files(
             just_restored,
             auto_migrate_endpoints,
             &mut summary,
+            out,
+            events,
         ) {
             Ok(()) => {}
             Err(EndpointFsError::Io(e)) => return Err(e),
@@ -1426,6 +1629,8 @@ fn write_one_endpoint(
     just_restored: &HashSet<(String, String)>,
     auto_migrate_endpoints: bool,
     summary: &mut GenerateSummary,
+    out: &mut Lines,
+    events: &mut GenerateEvents,
 ) -> Result<(), EndpointFsError> {
     let state = endpoint_dir(ctx, endpoints_root, &op.path)?;
     let reference_file_name = format!("endpoint.{}.reference.json", op.method);
@@ -1465,12 +1670,18 @@ fn write_one_endpoint(
             match create_endpoint_dir_for(ctx, endpoints_root, &op.path)
                 .and_then(|dir| write_existing_file(&ctx.boundary, &dir, &reference_file_name, reference_bytes.as_bytes()))
             {
-                Ok(()) => summary.references_refreshed += 1,
+                Ok(()) => {
+                    summary.references_refreshed += 1;
+                    events.refreshed.push(state.path().join(&reference_file_name));
+                }
                 Err(e) => {
-                    eprintln!(
-                        "warning: {} {}: {reference_file_name} is out of date but could not be refreshed ({e})",
-                        op.http_method,
-                        untrusted(&op.path)
+                    out.top_warning(
+                        "generate",
+                        format!(
+                            "{} {}: {reference_file_name} is out of date but could not be refreshed ({e})",
+                            op.http_method,
+                            untrusted(&op.path)
+                        ),
                     );
                     summary.skipped += 1;
                 }
@@ -1501,24 +1712,32 @@ fn write_one_endpoint(
                 serde_json::to_string_pretty(&stub).expect("always serializes").as_bytes(),
             )?;
             summary.created += 1;
+            events.created.push(dir.join(&stub_file_name));
         }
         FileState::PresentViaLink(stub_path) => {
-            eprintln!(
-                "warning: {} has drifted from its updated schema but is a link; not migrated, review by hand against {reference_file_name}",
-                stub_path.display()
+            out.top_warning(
+                "generate",
+                format!(
+                    "{} has drifted from its updated schema but is a link; not migrated, review by hand against {reference_file_name}",
+                    stub_path.display()
+                ),
             );
             summary.drift_warned += 1;
         }
         FileState::Present(stub_path) if auto_migrate_endpoints => {
-            backup_stub(&ctx.boundary, &dir, &op.method, &stub_path)?;
+            let backup = backup_stub(&ctx.boundary, &dir, &op.method, &stub_path)?;
             migrate_stub(&ctx.boundary, &dir, &stub_file_name, &stub_path, &response_descriptor)?;
             summary.migrated += 1;
+            events.migrated.push((stub_path, backup));
         }
         FileState::Present(stub_path) => {
-            eprintln!(
-                "warning: {} has drifted from its updated schema but autoMigrateEndpoints is off — \
-                 review it manually against {reference_file_name}",
-                stub_path.display()
+            out.top_warning(
+                "generate",
+                format!(
+                    "{} has drifted from its updated schema but autoMigrateEndpoints is off — \
+                     review it manually against {reference_file_name}",
+                    stub_path.display()
+                ),
             );
             summary.drift_warned += 1;
         }
@@ -1568,7 +1787,7 @@ fn wrong_mode_orphans(dir: &Path, op: &Operation, mode: MethodCase, out: &mut Ve
 /// Moves each planned orphan into its folder's `_backups/` as
 /// `orphan.<name>.<timestamp>.json` (never deleted, never overwritten) and says where it went.
 /// `dir` entries that vanished since the plan was made are skipped.
-fn archive_orphans(boundary: &ProjectBoundary, items: &[ArchiveItem], errors: &mut Vec<String>) {
+fn archive_orphans(boundary: &ProjectBoundary, items: &[ArchiveItem], errors: &mut Vec<String>, out: &mut Lines) {
     let mut seen: HashSet<(PathBuf, String)> = HashSet::new();
     for item in items {
         if !seen.insert((item.dir.clone(), item.name.clone())) {
@@ -1589,11 +1808,14 @@ fn archive_orphans(boundary: &ProjectBoundary, items: &[ArchiveItem], errors: &m
             Err(EndpointFsError::AlreadyExists { at: backups_dir })
         })();
         match outcome {
-            Ok(dest) => println!(
-                "  moved orphaned {} to {} ({}) — nothing deleted",
-                untrusted(&item.name),
-                untrusted(&format!("{}/_backups/{dest}", item.dir.display())),
-                item.reason
+            Ok(dest) => out.plain(
+                "generate",
+                format!(
+                    "  moved orphaned {} to {} ({}) — nothing deleted",
+                    untrusted(&item.name),
+                    untrusted(&format!("{}/_backups/{dest}", item.dir.display())),
+                    item.reason
+                ),
             ),
             Err(e) => errors.push(format!("{}: could not archive orphaned {}: {e}", item.dir.display(), untrusted(&item.name))),
         }
@@ -1606,7 +1828,9 @@ fn archive_orphans(boundary: &ProjectBoundary, items: &[ArchiveItem], errors: &m
 /// file went stale.
 fn reference_parameter_details_match(stored: Option<&Value>, op: &Operation) -> bool {
     let Some(stored) = stored else { return true };
-    stored.get("request") == Some(&op.request_sources()) && stored.get("availableParameterSources") == Some(&serde_json::json!(op.available_parameter_sources()))
+    stored.get("request") == Some(&op.request_sources())
+        && stored.get("availableParameterSources") == Some(&serde_json::json!(op.available_parameter_sources()))
+        && stored.get("securityScopes").cloned().unwrap_or_else(|| serde_json::json!([])) == serde_json::json!(op.security_scopes())
 }
 
 /// The path folder's `_backups/`, created when absent; refuses a link, a non-folder or a differently-cased twin.
@@ -1632,11 +1856,12 @@ fn ensure_backups_dir(boundary: &ProjectBoundary, dir: &Path) -> Result<PathBuf,
 /// alongside its other methods — never a shared directory) before
 /// migration touches anything, so a bad automatic migration is always
 /// trivially reversible by hand.
-fn backup_stub(boundary: &ProjectBoundary, dir: &Path, method: &str, stub_path: &Path) -> Result<(), EndpointFsError> {
+fn backup_stub(boundary: &ProjectBoundary, dir: &Path, method: &str, stub_path: &Path) -> Result<PathBuf, EndpointFsError> {
     let backups_dir = ensure_backups_dir(boundary, dir)?;
     let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%SZ");
     let backup_name = format!("endpoint.{method}.{timestamp}.json");
-    copy_into_checked(boundary, stub_path, &backups_dir, &backup_name)
+    copy_into_checked(boundary, stub_path, &backups_dir, &backup_name)?;
+    Ok(backups_dir.join(backup_name))
 }
 
 /// Structurally merges the existing stub's `response` tree onto the fresh
@@ -2599,6 +2824,12 @@ mod route_tests;
 
 #[cfg(test)]
 mod ref_tests;
+
+#[cfg(test)]
+mod mcp_tests;
+
+#[cfg(test)]
+mod report_tests;
 
 #[cfg(test)]
 mod hardening_tests {

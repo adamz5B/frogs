@@ -1,0 +1,11 @@
+project root: <ROOT>
+wrote config/server.json
+wrote config/errors/core.json
+wrote config/connections.json (empty — add your SQL connections here)
+wrote security/schemes.json (empty — add security schemes + verifiers here, or leave empty if this API needs none)
+loaded config — debugMode=false, 0 connection(s), 14 error code(s), strictOpenApi=false, caseSensitiveMethods=false, endpointSymlinks=contained
+found 2 operation(s) in openapi.yaml:
+  GET /cars -> listCars
+  GET /cars/{vin} -> getCar
+endpoints: 0 unchanged (skipped), 2 newly generated, 0 migrated, 0 drifted but left alone (autoMigrateEndpoints off)
+found 1 web asset file(s): index.html — wrote webserve.json (startPage: index.html, port: 8080)

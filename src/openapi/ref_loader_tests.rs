@@ -78,7 +78,9 @@ fn a_parameter_ref_contributes_name_location_required_and_type_like_an_inline_pa
             name: "limit".into(),
             location: "query".into(),
             required: true,
-            schema_type: Some("integer".into())
+            schema_type: Some("integer".into()),
+            schema: Some(serde_json::json!({ "type": "integer" })),
+            ..Default::default()
         }]
     );
     assert!(op(&doc, "/x", "get").unresolved_parameter_refs.is_empty());

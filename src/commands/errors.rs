@@ -2,9 +2,22 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
+use crate::commands::report::{CommandError, Lines, ReportLine};
 use crate::config::Config;
 use crate::errors::ErrorDefinition;
+use crate::openapi::dir_index::{FileState, check_file, create_dirs_checked, create_new_file, write_existing_file};
+use crate::openapi::endpoint_tree::ProjectBoundary;
 use crate::project::{api_base, require_project_root};
+
+/// What a freeze did, as data, plus the lines the command line prints.
+#[derive(Debug, Default)]
+pub(crate) struct FreezeReport {
+    /// The dated file written and the codes it now holds from this run, project-relative.
+    pub written: Option<(String, Vec<String>)>,
+    pub skipped: Vec<String>,
+    pub purged: bool,
+    pub lines: Vec<ReportLine>,
+}
 
 /// Batches every entry in `config/errors.discovered.json` into a new,
 /// dated file under `config/errors/`, then purges the scratch file — see
@@ -13,12 +26,33 @@ use crate::project::{api_base, require_project_root};
 /// nudges toward it via the startup warning (see `commands::run`).
 pub fn freeze(cwd: &Path) -> io::Result<()> {
     let root = require_project_root(cwd);
-    let api_dir = api_base(&root);
-    let config = Config::load_or_exit(&api_dir);
+    let mut out = Lines::live();
+    match freeze_run(&root, &mut out) {
+        Ok(_) => Ok(()),
+        Err(error) if matches!(error.kind, crate::commands::report::ErrorKind::Refusal | crate::commands::report::ErrorKind::Io) => Err(error.into_io()),
+        Err(error) => {
+            eprintln!("error: {}", error.message);
+            std::process::exit(error.exit_code);
+        }
+    }
+}
+
+/// `freeze` for a caller that wants data: nothing is printed and the process never exits.
+pub(crate) fn freeze_report(root: &Path) -> Result<FreezeReport, CommandError> {
+    let mut out = Lines::default();
+    let mut report = freeze_run(root, &mut out)?;
+    report.lines = out.0;
+    Ok(report)
+}
+
+fn freeze_run(root: &Path, out: &mut Lines) -> Result<FreezeReport, CommandError> {
+    let api_dir = api_base(root);
+    let config = Config::load(&api_dir).map_err(|err| CommandError::config_load(&api_dir, err))?;
+    let mut report = FreezeReport::default();
 
     if config.discovered_errors.is_empty() {
-        println!("config/errors.discovered.json is empty — nothing to freeze");
-        return Ok(());
+        out.plain("errors", "config/errors.discovered.json is empty — nothing to freeze");
+        return Ok(report);
     }
 
     let mut to_write: HashMap<String, ErrorDefinition> = HashMap::new();
@@ -45,37 +79,75 @@ pub fn freeze(cwd: &Path) -> io::Result<()> {
     frozen.sort();
     skipped.sort();
 
+    // Every write below goes through the project-boundary primitives: a link planted at `config/errors`, the dated
+    // file or the scratch file can't redirect it, and nothing is written at all until the existing dated file parsed.
+    let boundary = ProjectBoundary::new(root);
     let errors_dir = api_dir.join("config/errors");
     if !to_write.is_empty() {
-        std::fs::create_dir_all(&errors_dir)?;
-        let output_path = errors_dir.join(format!("discovered-{}.json", chrono::Utc::now().format("%Y-%m-%d")));
+        create_dirs_checked(&boundary, &errors_dir).map_err(io::Error::from)?;
+        let file_name = format!("discovered-{}.json", chrono::Utc::now().format("%Y-%m-%d"));
+        let output_path = errors_dir.join(&file_name);
 
         // Running `freeze` twice in one day lands on the same filename —
         // merge into it rather than clobbering an earlier batch from
         // earlier today. Safe to just extend: any code already in this
         // file is also in the registry `config.errors` was loaded from, so
-        // it would already have been routed into `skipped` above.
-        let mut existing: HashMap<String, ErrorDefinition> = match std::fs::read_to_string(&output_path) {
-            Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => HashMap::new(),
-            Err(err) => return Err(err),
+        // it would already have been routed into `skipped` above. An existing file that does not parse is
+        // refused, never replaced: it may hold definitions that would be lost.
+        let state = check_file(&errors_dir, &file_name).map_err(io::Error::from)?;
+        let mut existing: HashMap<String, ErrorDefinition> = match &state {
+            FileState::Present(path) | FileState::PresentViaLink(path) => {
+                let contents = std::fs::read_to_string(path)?;
+                serde_json::from_str(&contents).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{} exists but is not a valid error-definitions file — refusing to overwrite it; fix or remove it and run freeze again",
+                            output_path.display()
+                        ),
+                    )
+                })?
+            }
+            FileState::Absent => HashMap::new(),
         };
         existing.extend(to_write);
 
         let json = serde_json::to_string_pretty(&existing).expect("error definitions always serialize");
-        std::fs::write(&output_path, json)?;
-        println!("wrote {} entries to {}", frozen.len(), output_path.display());
+        match state {
+            FileState::Absent => create_new_file(&boundary, &errors_dir, &file_name, json.as_bytes()),
+            _ => write_existing_file(&boundary, &errors_dir, &file_name, json.as_bytes()),
+        }
+        .map_err(io::Error::from)?;
+        out.plain("errors", format!("wrote {} entries to {}", frozen.len(), output_path.display()));
+        let relative = output_path
+            .strip_prefix(root)
+            .unwrap_or(&output_path)
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        report.written = Some((relative, frozen));
     }
 
     if !skipped.is_empty() {
-        println!("skipped {} entries already classified in config/errors/: {}", skipped.len(), skipped.join(", "));
+        out.plain(
+            "errors",
+            format!("skipped {} entries already classified in config/errors/: {}", skipped.len(), skipped.join(", ")),
+        );
     }
+    report.skipped = skipped;
 
-    let discovered_path = api_dir.join("config/errors.discovered.json");
-    crate::errors::DiscoveredErrors::default().save(&discovered_path)?;
-    println!("purged config/errors.discovered.json");
+    let config_dir = api_dir.join("config");
+    let purged = "{}";
+    match check_file(&config_dir, "errors.discovered.json").map_err(io::Error::from)? {
+        FileState::Absent => create_new_file(&boundary, &config_dir, "errors.discovered.json", purged.as_bytes()),
+        _ => write_existing_file(&boundary, &config_dir, "errors.discovered.json", purged.as_bytes()),
+    }
+    .map_err(io::Error::from)?;
+    out.plain("errors", "purged config/errors.discovered.json");
+    report.purged = true;
 
-    Ok(())
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -251,3 +323,6 @@ mod tests {
         assert!(written.contains_key("datasource.http.unknown:Timeout"));
     }
 }
+
+#[cfg(test)]
+mod report_tests;

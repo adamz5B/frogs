@@ -5,11 +5,16 @@ pub mod endpoint_tree;
 mod endpoint_tree_tests;
 #[cfg(test)]
 pub(crate) mod fs_os_tests;
+pub(crate) mod json_schema;
+#[cfg(test)]
+mod json_schema_tests;
 pub(crate) mod local_ref;
 #[cfg(test)]
 mod local_ref_tests;
 pub mod method_token;
 pub mod path_encoding;
+#[cfg(test)]
+mod path_level_parameter_tests;
 pub mod path_rules;
 #[cfg(test)]
 mod ref_loader_tests;
@@ -40,7 +45,7 @@ pub struct LoadOptions {
 /// `cookie` is parsed (so it isn't silently dropped) but not surfaced in
 /// the reference file yet — the doc's own reference-file examples only
 /// ever show `query`/`path`/`header`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ParameterInfo {
     pub name: String,
     pub location: String,
@@ -56,6 +61,13 @@ pub struct ParameterInfo {
     /// this project doesn't otherwise model) get presence-checked only,
     /// never type-checked.
     pub schema_type: Option<String>,
+    /// The raw parameter schema (a single-`content` parameter's entry schema after
+    /// media-type ref resolution). `$ref`s inside it are not resolved here; MCP
+    /// tool building inlines them (`json_schema`).
+    pub schema: Option<Value>,
+    pub description: Option<String>,
+    /// Declared through `content` rather than `schema`.
+    pub from_content: bool,
 }
 
 /// A `requestBody`'s `application/json` schema, if the operation declares
@@ -115,6 +127,9 @@ pub struct Operation {
     /// against what the spec actually allows rather than the collapsed first
     /// name. Empty outer list: no security required.
     pub security_alternatives: Vec<Vec<String>>,
+    /// Parallel to `security_alternatives` (same requirement and key order): each key's scope list
+    /// from the spec, `None` when it is not an array of valid scope tokens.
+    pub security_requirement_scopes: Vec<Vec<RequirementScopes>>,
     /// The effective `security:` came only from the document-wide default, not from this operation.
     pub security_inherited: bool,
     /// Streaming is detected but not served: the endpoint is still one JSON
@@ -128,6 +143,8 @@ pub struct Operation {
     /// Raw `$ref` text of every parameter `$ref` that could not be resolved. Those parameters
     /// are absent from `parameters`, so request validation for this operation is incomplete.
     pub unresolved_parameter_refs: Vec<String>,
+    pub summary: Option<String>,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -227,6 +244,18 @@ impl Operation {
         ))
     }
 
+    /// The scopes the spec requires of the scheme `security` names: the first requirement whose
+    /// first key is that scheme, empty when it lists none or the list is unreadable.
+    pub fn security_scopes(&self) -> Vec<String> {
+        let Some(scheme) = &self.security else { return Vec::new() };
+        self.security_alternatives
+            .iter()
+            .zip(&self.security_requirement_scopes)
+            .find(|(alternative, _)| alternative.first() == Some(scheme))
+            .and_then(|(_, keys)| keys.first().cloned().flatten())
+            .unwrap_or_default()
+    }
+
     fn parameter_names(&self, location: &str) -> Vec<String> {
         self.parameters.iter().filter(|p| p.location == location).map(|p| p.name.clone()).collect()
     }
@@ -254,7 +283,11 @@ impl Operation {
     }
 }
 
-type ResolvedSecurity = (Option<String>, Vec<String>, Vec<Vec<String>>);
+/// One requirement key's scope list; `None` when the spec's value could never be matched by a
+/// stub's `securityScopes` (not an array of strings, or an element that is not a scope token).
+pub type RequirementScopes = Option<Vec<String>>;
+
+type ResolvedSecurity = (Option<String>, Vec<String>, Vec<Vec<String>>, Vec<Vec<RequirementScopes>>);
 
 struct OpCtx<'a> {
     refs: RefIndex<'a>,
@@ -267,15 +300,22 @@ struct OpCtx<'a> {
 /// leniently: `(alternatives, unparseable, inherited)`. A `security` value
 /// that isn't a list of objects is `unparseable` (callers fail closed: secured,
 /// with no acceptable scheme). Never produces load issues.
-fn lenient_security(entry: Option<&Value>, ctx: &OpCtx) -> (Vec<Vec<String>>, bool, bool) {
+type LenientSecurity = (Vec<Vec<String>>, Vec<Vec<RequirementScopes>>, bool, bool);
+
+fn lenient_security(entry: Option<&Value>, ctx: &OpCtx) -> LenientSecurity {
     match entry.and_then(Value::as_object).and_then(|obj| obj.get("security")) {
         Some(value) => {
             let well_formed = value.as_array().is_some_and(|list| list.iter().all(Value::is_object));
             let mut scratch = Vec::new();
-            let (_, _, alternatives) = resolve_security(value, ctx.scheme_names, "", &mut scratch);
-            (alternatives, !well_formed, false)
+            let (_, _, alternatives, scopes) = resolve_security(value, ctx.scheme_names, "", &mut scratch);
+            (alternatives, scopes, !well_formed, false)
         }
-        None => (ctx.document_security.map(|d| d.2.clone()).unwrap_or_default(), ctx.document_security_malformed, true),
+        None => (
+            ctx.document_security.map(|d| d.2.clone()).unwrap_or_default(),
+            ctx.document_security.map(|d| d.3.clone()).unwrap_or_default(),
+            ctx.document_security_malformed,
+            true,
+        ),
     }
 }
 
@@ -287,12 +327,13 @@ fn key_wire(key: &str, mode: MethodCase) -> String {
 }
 
 fn dropped_entry(path: &str, key: &str, entry: &Value, ctx: &OpCtx, mode: MethodCase) -> DroppedOperation {
-    let (security_alternatives, security_unparseable, security_inherited) = lenient_security(Some(entry), ctx);
+    let (security_alternatives, security_requirement_scopes, security_unparseable, security_inherited) = lenient_security(Some(entry), ctx);
     DroppedOperation {
         path: path.to_string(),
         key: key.to_string(),
         wire: key_wire(key, mode),
         security_alternatives,
+        security_requirement_scopes,
         security_unparseable,
         security_inherited,
     }
@@ -303,13 +344,14 @@ fn dropped_entry(path: &str, key: &str, entry: &Value, ctx: &OpCtx, mode: Method
 fn read_skipped_path(raw: &str, item: &Map<String, Value>, reason: &str, ctx: &OpCtx, mode: MethodCase) -> Vec<SkippedOperation> {
     let mut out = Vec::new();
     let mut push = |wire: String, entry: &Value| {
-        let (security_alternatives, security_unparseable, security_inherited) = lenient_security(Some(entry), ctx);
+        let (security_alternatives, security_requirement_scopes, security_unparseable, security_inherited) = lenient_security(Some(entry), ctx);
         out.push(SkippedOperation {
             raw_path: raw.to_string(),
             reason: reason.to_string(),
             method_wire: wire,
             operation_id: entry.get("operationId").and_then(Value::as_str).unwrap_or_default().to_string(),
             security_alternatives,
+            security_requirement_scopes,
             security_unparseable,
             security_inherited,
             any_method: false,
@@ -337,6 +379,7 @@ fn unresolved_path_item_skip(raw_path: &str, reason: String) -> SkippedOperation
         method_wire: String::new(),
         operation_id: String::new(),
         security_alternatives: Vec::new(),
+        security_requirement_scopes: Vec::new(),
         security_unparseable: true,
         security_inherited: false,
         any_method: true,
@@ -378,13 +421,13 @@ fn note_ref_siblings(entry: &Value, what: &str, label: &str, issues: &mut Vec<Lo
     ));
 }
 
-/// Extracts `name`/`in`/`required`/`schema.type` from an operation's
-/// `parameters` array (each element may be a `$ref` into `components.parameters`). A parameter
-/// with no `schema` but exactly one `content` entry takes its type from that entry's schema.
-/// The second value lists the raw `$ref`s that could not be resolved: those parameters are
-/// unknown, which request validation must not treat as absent-and-fine.
-fn extract_parameters(operation: &Map<String, Value>, ctx: &OpCtx, label: &str, issues: &mut Vec<LoadIssue>) -> (Vec<ParameterInfo>, Vec<String>) {
-    let Some(parameters) = operation.get("parameters").and_then(Value::as_array) else {
+/// Extracts `name`/`in`/`required`/`schema` from a `parameters` array (each element may be a
+/// `$ref` into `components.parameters`). A parameter with no `schema` but exactly one `content`
+/// entry takes its schema from that entry. The second value lists the raw `$ref`s that could not
+/// be resolved: those parameters are unknown, which request validation must not treat as
+/// absent-and-fine.
+fn extract_parameters(parameters: Option<&Vec<Value>>, ctx: &OpCtx, label: &str, issues: &mut Vec<LoadIssue>) -> (Vec<ParameterInfo>, Vec<String>) {
+    let Some(parameters) = parameters else {
         return (Vec::new(), Vec::new());
     };
     let mut out = Vec::new();
@@ -420,15 +463,17 @@ fn extract_parameters(operation: &Map<String, Value>, ctx: &OpCtx, label: &str, 
             continue;
         };
         let required = param.get("required").and_then(Value::as_bool).unwrap_or(false);
-        let schema_type = match param.get("schema") {
-            Some(schema) => schema.get("type").and_then(Value::as_str).map(str::to_string),
+        let mut from_content = false;
+        let schema: Option<Value> = match param.get("schema") {
+            Some(schema) => Some(schema.clone()),
             None => match param.get("content").and_then(Value::as_object) {
                 Some(content) if content.len() == 1 => {
+                    from_content = true;
                     let (media, entry) = content.iter().next().expect("len checked");
                     match resolve_ref(entry, RefKind::MediaType, &ctx.refs) {
                         Ok(Some(obj)) => {
                             note_ref_siblings(entry, "media type", label, issues);
-                            obj.get("schema").and_then(|s| s.get("type")).and_then(Value::as_str).map(str::to_string)
+                            obj.get("schema").cloned()
                         }
                         Ok(None) => None,
                         Err(e) => {
@@ -441,17 +486,47 @@ fn extract_parameters(operation: &Map<String, Value>, ctx: &OpCtx, label: &str, 
                         }
                     }
                 }
-                _ => None,
+                Some(_) => {
+                    from_content = true;
+                    None
+                }
+                None => None,
             },
         };
+        let schema_type = schema.as_ref().and_then(|s| s.get("type")).and_then(Value::as_str).map(str::to_string);
         out.push(ParameterInfo {
             name: name.to_string(),
             location: location.to_string(),
             required,
             schema_type,
+            schema,
+            description: param.get("description").and_then(Value::as_str).map(str::to_string),
+            from_content,
         });
     }
     (out, unresolved)
+}
+
+/// Path-level parameters merged into one operation's own: an operation-level parameter replaces
+/// a path-level one with the same `(name, in)` (header names compare case-insensitively).
+fn merge_path_parameters(path_level: &[ParameterInfo], operation_level: Vec<ParameterInfo>) -> Vec<ParameterInfo> {
+    let same = |a: &ParameterInfo, b: &ParameterInfo| {
+        a.location == b.location
+            && if a.location == "header" {
+                a.name.eq_ignore_ascii_case(&b.name)
+            } else {
+                a.name == b.name
+            }
+    };
+    let mut merged: Vec<ParameterInfo> = path_level.iter().filter(|p| !operation_level.iter().any(|o| same(p, o))).cloned().collect();
+    merged.extend(operation_level);
+    merged
+}
+
+/// A path item's own `parameters`, extracted once per path and merged into each of its operations.
+struct PathLevelParameters {
+    parameters: Vec<ParameterInfo>,
+    unresolved: Vec<String>,
 }
 
 fn is_streaming_entry(media_key: &str, entry: &Map<String, Value>) -> bool {
@@ -685,13 +760,16 @@ fn resolve_security(value: &Value, scheme_names: &Map<String, Value>, context: &
     let mut first = None;
     let mut all: Vec<String> = Vec::new();
     let mut alternatives: Vec<Vec<String>> = Vec::new();
+    let mut requirement_scopes: Vec<Vec<RequirementScopes>> = Vec::new();
     let Some(requirements) = value.as_array() else {
-        return (None, all, alternatives);
+        return (None, all, alternatives, requirement_scopes);
     };
     for requirement in requirements {
         let Some(obj) = requirement.as_object() else { continue };
         let mut alternative: Vec<String> = Vec::new();
-        for key in obj.keys() {
+        let mut key_scopes: Vec<RequirementScopes> = Vec::new();
+        for (key, scope_value) in obj {
+            key_scopes.push(parse_requirement_scopes(scope_value));
             let resolved = resolve_scheme_key(key, scheme_names).unwrap_or_else(|| {
                 issues.push(LoadIssue::new(
                     IssueKind::SecurityRequirementUnresolved,
@@ -723,8 +801,17 @@ fn resolve_security(value: &Value, scheme_names: &Map<String, Value>, context: &
             ));
         }
         alternatives.push(alternative);
+        requirement_scopes.push(key_scopes);
     }
-    (first, all, alternatives)
+    (first, all, alternatives, requirement_scopes)
+}
+
+fn parse_requirement_scopes(value: &Value) -> RequirementScopes {
+    value
+        .as_array()?
+        .iter()
+        .map(|item| item.as_str().filter(|text| crate::mcp::is_scope_token(text)).map(str::to_string))
+        .collect()
 }
 
 const MAX_DEFAULT_MAPPING_SCAN_DEPTH: usize = 32;
@@ -927,6 +1014,9 @@ pub struct OpenApiDocument {
     /// routable-looking (no operations) so collision analysis sees them, and generate never
     /// treats their endpoint files as orphans.
     pub unresolved_path_items: BTreeSet<String>,
+    pub info_title: Option<String>,
+    /// `info.version` stringified (a YAML number is accepted).
+    pub info_version: Option<String>,
 }
 
 /// An `additionalOperations` entry on an accepted path that the loader dropped (S3, S4,
@@ -937,6 +1027,7 @@ pub struct DroppedOperation {
     pub key: String,
     pub wire: String,
     pub security_alternatives: Vec<Vec<String>>,
+    pub security_requirement_scopes: Vec<Vec<RequirementScopes>>,
     /// The `security` value was not a list of requirement objects: treated as secured with no acceptable scheme.
     pub security_unparseable: bool,
     pub security_inherited: bool,
@@ -950,6 +1041,7 @@ pub struct SkippedOperation {
     pub method_wire: String,
     pub operation_id: String,
     pub security_alternatives: Vec<Vec<String>>,
+    pub security_requirement_scopes: Vec<Vec<RequirementScopes>>,
     pub security_unparseable: bool,
     pub security_inherited: bool,
     /// Stands for every method of the path (an unresolvable path item): `method_wire` is empty and
@@ -1103,6 +1195,7 @@ fn build_operation(
     token: &MethodToken,
     operation_obj: &Map<String, Value>,
     ctx: &OpCtx,
+    path_level: &PathLevelParameters,
     spec_version: &SpecVersion,
     issues: &mut Vec<LoadIssue>,
 ) -> Operation {
@@ -1130,11 +1223,13 @@ fn build_operation(
             ));
         }
     }
-    let (parameters, unresolved_parameter_refs) = extract_parameters(operation_obj, ctx, &label, issues);
+    let (own_parameters, mut unresolved_parameter_refs) = extract_parameters(operation_obj.get("parameters").and_then(Value::as_array), ctx, &label, issues);
+    let parameters = merge_path_parameters(&path_level.parameters, own_parameters);
+    unresolved_parameter_refs.extend(path_level.unresolved.iter().cloned());
     let (request_body, request_body_unresolved, request_stream) = extract_request_body(operation_obj, ctx, &label, issues);
     let (response_schema, response_mode) = extract_response(operation_obj, ctx, &label, issues);
     let security_inherited = operation_obj.get("security").is_none() && ctx.document_security.is_some();
-    let (security, declared_security_schemes, security_alternatives) = match operation_obj.get("security") {
+    let (security, declared_security_schemes, security_alternatives, security_requirement_scopes) = match operation_obj.get("security") {
         Some(value) => resolve_security(value, ctx.scheme_names, &label, issues),
         None => ctx.document_security.cloned().unwrap_or_default(),
     };
@@ -1150,11 +1245,14 @@ fn build_operation(
         security,
         declared_security_schemes,
         security_alternatives,
+        security_requirement_scopes,
         security_inherited,
         response_mode,
         request_stream,
         request_body_unresolved,
         unresolved_parameter_refs,
+        summary: operation_obj.get("summary").and_then(Value::as_str).map(str::to_string),
+        description: operation_obj.get("description").and_then(Value::as_str).map(str::to_string),
     }
 }
 
@@ -1175,6 +1273,11 @@ fn parse_operations(
     issues: &mut Vec<LoadIssue>,
 ) -> Result<ParsedPath, OpenApiError> {
     let mut parsed = ParsedPath::default();
+    let (path_parameters, path_unresolved) = extract_parameters(item.get("parameters").and_then(Value::as_array), ctx, &format!("path '{}'", untrusted(path)), issues);
+    let path_level = PathLevelParameters {
+        parameters: path_parameters,
+        unresolved: path_unresolved,
+    };
     for method in FIXED_FIELDS {
         let Some(operation_obj) = item.get(method).and_then(Value::as_object) else {
             continue;
@@ -1185,9 +1288,15 @@ fn parse_operations(
                 method: method.to_string(),
             });
         }
-        parsed
-            .operations
-            .push(build_operation(path, &MethodToken::Fixed(method), operation_obj, ctx, spec_version, issues));
+        parsed.operations.push(build_operation(
+            path,
+            &MethodToken::Fixed(method),
+            operation_obj,
+            ctx,
+            &path_level,
+            spec_version,
+            issues,
+        ));
     }
 
     let additional = match item.get("additionalOperations") {
@@ -1324,7 +1433,7 @@ fn parse_operations(
             }
             None => {}
         }
-        parsed.operations.push(build_operation(path, &method, obj, ctx, spec_version, issues));
+        parsed.operations.push(build_operation(path, &method, obj, ctx, &path_level, spec_version, issues));
     }
     Ok(parsed)
 }
@@ -1577,6 +1686,12 @@ pub(crate) fn load_with_policy(path: &Path, policy: PortabilityPolicy, options: 
         dropped_operations,
         skipped_operations,
         unresolved_path_items,
+        info_title: doc.get("info").and_then(|info| info.get("title")).and_then(Value::as_str).map(str::to_string),
+        info_version: doc.get("info").and_then(|info| info.get("version")).and_then(|version| match version {
+            Value::String(text) => Some(text.clone()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        }),
     };
 
     let mut mapping_issues = Vec::new();
@@ -1627,7 +1742,7 @@ mod tests {
             document_security: None,
             document_security_malformed: false,
         };
-        super::extract_parameters(operation, &ctx, "test", &mut Vec::new()).0
+        super::extract_parameters(operation.get("parameters").and_then(Value::as_array), &ctx, "test", &mut Vec::new()).0
     }
 
     fn extract_request_body(operation: &Map<String, Value>) -> Option<RequestBodySchema> {
@@ -1732,12 +1847,16 @@ mod tests {
                             location: "query".to_string(),
                             required: true,
                             schema_type: Some("string".to_string()),
+                            schema: Some(serde_json::json!({ "type": "string" })),
+                            ..Default::default()
                         },
                         ParameterInfo {
                             name: "model".to_string(),
                             location: "query".to_string(),
                             required: true,
                             schema_type: Some("string".to_string()),
+                            schema: Some(serde_json::json!({ "type": "string" })),
+                            ..Default::default()
                         },
                     ],
                     request_body: None,
@@ -1768,12 +1887,15 @@ mod tests {
                         location: "path".to_string(),
                         required: true,
                         schema_type: Some("string".to_string()),
+                        schema: Some(serde_json::json!({ "type": "string" })),
+                        ..Default::default()
                     }],
                     request_body: None,
                     response_status_codes: vec![200, 404],
                     security: Some("apiKeyAuth".to_string()),
                     declared_security_schemes: vec!["apiKeyAuth".to_string()],
                     security_alternatives: vec![vec!["apiKeyAuth".to_string()]],
+                    security_requirement_scopes: vec![vec![Some(Vec::new())]],
                     ..Default::default()
                 },
             ]
@@ -1794,18 +1916,24 @@ mod tests {
                     location: "path".to_string(),
                     required: true,
                     schema_type: Some("string".to_string()),
+                    schema: Some(serde_json::json!({ "type": "string" })),
+                    ..Default::default()
                 },
                 ParameterInfo {
                     name: "limit".to_string(),
                     location: "query".to_string(),
                     required: false,
                     schema_type: Some("integer".to_string()),
+                    schema: Some(serde_json::json!({ "type": "integer" })),
+                    ..Default::default()
                 },
                 ParameterInfo {
                     name: "Authorization".to_string(),
                     location: "header".to_string(),
                     required: true,
                     schema_type: Some("string".to_string()),
+                    schema: Some(serde_json::json!({ "type": "string" })),
+                    ..Default::default()
                 },
             ],
             request_body: None,
@@ -1842,18 +1970,23 @@ mod tests {
                     location: "path".to_string(),
                     required: true,
                     schema_type: Some("integer".to_string()),
+                    schema: Some(serde_json::json!({ "type": "integer" })),
+                    ..Default::default()
                 },
                 ParameterInfo {
                     name: "limit".to_string(),
                     location: "query".to_string(),
                     required: false,
                     schema_type: Some("integer".to_string()),
+                    schema: Some(serde_json::json!({ "type": "integer" })),
+                    ..Default::default()
                 },
                 ParameterInfo {
                     name: "note".to_string(),
                     location: "query".to_string(),
                     required: false,
                     schema_type: None,
+                    ..Default::default()
                 },
             ]
         );

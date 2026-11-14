@@ -37,6 +37,10 @@ pub enum VerifierDef {
         /// per the design doc, but is meaningless without Point 4's cache.
         #[serde(rename = "cacheTtlSeconds", default)]
         cache_ttl_seconds: Option<u64>,
+        /// Where the credential's granted scopes live in the resolved result,
+        /// e.g. `"response.scope"` — enforced against an endpoint's `securityScopes`.
+        #[serde(rename = "scopesFrom", default)]
+        scopes_from: Option<String>,
     },
     Http {
         request: String,
@@ -46,6 +50,10 @@ pub enum VerifierDef {
         valid_if: String,
         #[serde(rename = "cacheTtlSeconds", default)]
         cache_ttl_seconds: Option<u64>,
+        /// Where the credential's granted scopes live in the resolved result,
+        /// e.g. `"response.scope"` — enforced against an endpoint's `securityScopes`.
+        #[serde(rename = "scopesFrom", default)]
+        scopes_from: Option<String>,
     },
     /// A datasource-free check of the connection's already-validated client
     /// certificate: `validIf` is `cert.<field> = <value>` (see
@@ -67,6 +75,8 @@ pub enum VerifierDef {
         parameters: Option<Box<serde_json::Value>>,
         #[serde(rename = "cacheTtlSeconds", default)]
         cache_ttl_seconds: Option<Box<serde_json::Value>>,
+        #[serde(rename = "scopesFrom", default)]
+        scopes_from: Option<Box<serde_json::Value>>,
     },
 }
 
@@ -80,6 +90,13 @@ impl VerifierDef {
     pub fn cache_ttl_seconds(&self) -> Option<u64> {
         match self {
             VerifierDef::Sql { cache_ttl_seconds, .. } | VerifierDef::Http { cache_ttl_seconds, .. } => *cache_ttl_seconds,
+            VerifierDef::Mtls { .. } => None,
+        }
+    }
+
+    pub fn scopes_from(&self) -> Option<&str> {
+        match self {
+            VerifierDef::Sql { scopes_from, .. } | VerifierDef::Http { scopes_from, .. } => scopes_from.as_deref(),
             VerifierDef::Mtls { .. } => None,
         }
     }
@@ -100,6 +117,7 @@ impl VerifierDef {
             request,
             parameters,
             cache_ttl_seconds,
+            scopes_from,
             ..
         } = self
         else {
@@ -111,6 +129,7 @@ impl VerifierDef {
             ("request", request.is_some()),
             ("parameters", parameters.is_some()),
             ("cacheTtlSeconds", cache_ttl_seconds.is_some()),
+            ("scopesFrom", scopes_from.is_some()),
         ]
         .into_iter()
         .filter_map(|(name, set)| set.then_some(name))

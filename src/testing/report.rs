@@ -243,7 +243,7 @@ pub fn render_json(report: &Report, ended_at: DateTime<Utc>) -> String {
     serde_json::to_string_pretty(&document).expect("a report document always serializes")
 }
 
-fn entry_json(entry: &Entry) -> Value {
+pub fn entry_json(entry: &Entry) -> Value {
     let mismatches: Vec<Value> = match &entry.verdict {
         Verdict::Fail(mismatches) => mismatches
             .iter()

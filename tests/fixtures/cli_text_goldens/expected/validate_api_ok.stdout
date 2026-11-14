@@ -1,0 +1,8 @@
+API project at <ROOT>/api
+  config: OK (0 connection(s), 1 error code(s), 0 security scheme(s), strictOpenApi=false, endpointSymlinks=contained)
+  method case: case-insensitive (caseSensitiveMethods: false)
+  routes: 3 registered, 0 problem(s)
+  openapi.yaml: OK (0 operation(s))
+  SQL connections: none configured
+  endpoint files: 0 discovered, 0 problem(s)
+frogs validate: OK, no problems found

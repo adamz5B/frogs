@@ -205,6 +205,19 @@ pub(crate) fn served_service(router: Router, shape: impl Into<ServeShape>) -> In
     })
 }
 
+/// The same wrapping `served_service` applies, as a plain request-to-response service for driving a Router in
+/// process (no listener, no `ConnectInfo`).
+pub(crate) fn driven_service(router: Router, shape: impl Into<ServeShape>) -> NormalizeMethod<CanonicalPath<Router>> {
+    let shape = shape.into();
+    NormalizeMethod {
+        inner: CanonicalPath {
+            inner: router,
+            literals: shape.literals,
+        },
+        case_sensitive: shape.case_sensitive_methods,
+    }
+}
+
 /// The base router: just `/healthz` for now. Real endpoint routing (from
 /// `openapi.yaml`) is added separately by `endpoint::build_router` and
 /// merged in by the caller — the correlation-ID middleware is deliberately
@@ -669,8 +682,8 @@ struct RateLimiterState {
 /// `Retry-After` only has whole-second granularity) rounded up from however
 /// long until the bucket would actually have a full token again, never 0
 /// (a caller retrying in the same instant would just be rejected again).
-struct RateLimitExceeded {
-    retry_after_secs: u64,
+pub(crate) struct RateLimitExceeded {
+    pub(crate) retry_after_secs: u64,
 }
 
 impl RateLimiter {
@@ -685,7 +698,7 @@ impl RateLimiter {
         }
     }
 
-    fn try_acquire(&self) -> Result<(), RateLimitExceeded> {
+    pub(crate) fn try_acquire(&self) -> Result<(), RateLimitExceeded> {
         // `into_inner` deliberately keeps whatever `tokens`/`last_refill` were
         // in the bucket at poison time — resetting to full capacity here would
         // hand every caller a fresh burst allowance, i.e. a fail-open rate
@@ -736,16 +749,20 @@ where
     method_router.layer(middleware::from_fn_with_state(limiter, rate_limit_middleware))
 }
 
+/// The body a rate-limited call gets, over HTTP and (as a tool error) over MCP.
+pub(crate) fn rate_limited_body() -> serde_json::Value {
+    serde_json::json!({
+        "code": 429,
+        "name": "rate_limit_exceeded",
+        "detail": "rate limit exceeded, try again later"
+    })
+}
+
 async fn rate_limit_middleware(State(limiter): State<Arc<RateLimiter>>, req: Request, next: Next) -> Response {
     match limiter.try_acquire() {
         Ok(()) => next.run(req).await,
         Err(exceeded) => {
-            let body = serde_json::json!({
-                "code": 429,
-                "name": "rate_limit_exceeded",
-                "detail": "rate limit exceeded, try again later"
-            });
-            let mut response = (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
+            let mut response = (StatusCode::TOO_MANY_REQUESTS, axum::Json(rate_limited_body())).into_response();
             if let Ok(value) = HeaderValue::from_str(&exceeded.retry_after_secs.to_string()) {
                 response.headers_mut().insert(HeaderName::from_static("retry-after"), value);
             }
@@ -1435,6 +1452,7 @@ mod tests {
                     location: "path".to_string(),
                     required: true,
                     schema_type: Some("string".to_string()),
+                    ..Default::default()
                 }],
                 request_body: None,
                 response_status_codes: vec![200],

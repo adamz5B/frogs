@@ -1,0 +1,23 @@
+openapi: 3.0.3
+info: { title: t, version: '1' }
+paths:
+  /cars:batchGet:
+    get:
+      operationId: listCars
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  maker: { type: string }
+                  year: { type: integer }
+  /cars/{vin}:
+    get:
+      operationId: getCar
+      parameters:
+        - { name: vin, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: ok, content: { application/json: { schema: { type: object, properties: { vin: { type: string } } } } } }

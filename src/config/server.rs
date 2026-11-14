@@ -78,6 +78,35 @@ pub struct CorsConfig {
     pub allowed_origins: Vec<String>,
 }
 
+pub const DEFAULT_MCP_LIST_TTL_MS: u64 = 300_000;
+pub const MAX_MCP_LIST_TTL_MS: u64 = 86_400_000;
+
+pub const DEFAULT_VERIFIER_CACHE_MAX_ENTRIES: u64 = 10_000;
+pub const MIN_VERIFIER_CACHE_MAX_ENTRIES: u64 = 100;
+/// The bound is per entry, not per byte: a valid entry can carry up to 4 KiB of scopes, so
+/// the ceiling is a worst case of several GiB; the default is about 41 MiB.
+pub const MAX_VERIFIER_CACHE_MAX_ENTRIES: u64 = 1_000_000;
+
+/// `config/server.json`'s `mcp` block — only consulted when `features.mcp` is on.
+/// `accessScheme` and `protectedResource` are kept as lenient values and interpreted by
+/// `mcp::settings`, so an MCP-off `server.json` never fails to load over them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_ttl_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_scheme: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_resource: Option<serde_json::Value>,
+}
+
 /// TLS mode for `frogs run`'s listener — `off` (default, unchanged plain
 /// HTTP) or `manual` (a user-supplied cert+key PEM pair). `acme` (automatic
 /// Let's Encrypt provisioning, per `docs/frogs-https-development.md`) is a
@@ -348,6 +377,8 @@ pub struct Features {
     pub request_validation: bool,
     #[serde(default)]
     pub cors: bool,
+    #[serde(default)]
+    pub mcp: bool,
 }
 
 impl Default for Features {
@@ -360,6 +391,7 @@ impl Default for Features {
             service_registry: false,
             request_validation: true,
             cors: false,
+            mcp: false,
         }
     }
 }
@@ -390,6 +422,9 @@ pub struct ServerConfig {
     /// `CorsConfig`'s own doc comment.
     #[serde(default)]
     pub cors: CorsConfig,
+    /// Only actually consulted when `features.mcp` is on — see `McpConfig`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpConfig>,
     /// `off` by default — see `DocsUiMode`'s own doc comment.
     #[serde(default)]
     pub docs_ui: DocsUiConfig,
@@ -411,6 +446,10 @@ pub struct ServerConfig {
     /// `MAX_SOURCE_CALL_TIMEOUT_MS` ceiling.
     #[serde(default = "default_source_call_timeout_ms")]
     pub source_call_timeout_ms: NonZeroU64,
+    /// Upper bound on entries in the one shared verifier cache. Never read
+    /// directly: go through `effective_verifier_cache_max_entries`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_cache_max_entries: Option<u64>,
     /// Not part of the original design doc (which never pins down a port) —
     /// a sensible default so `frogs run` has somewhere to bind.
     #[serde(default = "default_port")]
@@ -478,10 +517,12 @@ impl Default for ServerConfig {
             discovered_errors_warn_threshold: 20,
             rate_limit: RateLimitConfig::default(),
             cors: CorsConfig::default(),
+            mcp: None,
             docs_ui: DocsUiConfig::default(),
             tls: TlsConfig::default(),
             logging: LoggingConfig::default(),
             source_call_timeout_ms: default_source_call_timeout_ms(),
+            verifier_cache_max_entries: None,
             port: 8080,
             api_root: String::new(),
             strict_open_api: Some(false),
@@ -517,6 +558,11 @@ impl ServerConfig {
         self.case_sensitive_methods.is_some()
     }
 
+    /// The `mcp` block, or its all-defaults value when the file has none.
+    pub fn mcp_settings(&self) -> McpConfig {
+        self.mcp.clone().unwrap_or_default()
+    }
+
     pub fn openapi_load_options(&self) -> crate::openapi::LoadOptions {
         crate::openapi::LoadOptions {
             case_sensitive_methods: self.case_sensitive_methods(),
@@ -539,6 +585,21 @@ impl ServerConfig {
             return NonZeroU64::new(MAX_SOURCE_CALL_TIMEOUT_MS).expect("MAX_SOURCE_CALL_TIMEOUT_MS is non-zero");
         }
         self.source_call_timeout_ms
+    }
+
+    /// `verifierCacheMaxEntries` clamped to the supported range, warning once when it had to
+    /// be. Router-assembly time only, like `effective_source_call_timeout_ms`.
+    pub fn effective_verifier_cache_max_entries(&self) -> u64 {
+        let Some(requested) = self.verifier_cache_max_entries else {
+            return DEFAULT_VERIFIER_CACHE_MAX_ENTRIES;
+        };
+        let clamped = requested.clamp(MIN_VERIFIER_CACHE_MAX_ENTRIES, MAX_VERIFIER_CACHE_MAX_ENTRIES);
+        if clamped != requested {
+            tracing::warn!(
+                "server.json: verifierCacheMaxEntries {requested} is outside {MIN_VERIFIER_CACHE_MAX_ENTRIES}..={MAX_VERIFIER_CACHE_MAX_ENTRIES} — using {clamped}"
+            );
+        }
+        clamped
     }
 }
 

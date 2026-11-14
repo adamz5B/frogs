@@ -1,0 +1,5 @@
+warning: /cars/by-maker/endpoint.get.test.json case #2 "maxRows exceeded — nested fan-out rejected, pricing (optional) degrades every row to null instead of failing the request": identical request block to case #1 "happy path — one pricing call fanned out per row, merged into each car" under the same scenario — it is shadowed and can never be selected
+warning: /cars/{vin}/endpoint.get.test.json case #2 "pricing service down — optional source, should degrade gracefully": identical request block to case #1 "happy path" under the same scenario — it is shadowed and can never be selected
+warning: /cars/{vin}/endpoint.get.test.json case #4 "no api key — verifier mocked as inactive": identical request block to case #1 "happy path" under the same scenario — it is shadowed and can never be selected
+warning: GET /cars: has sources but no .test.json file — every request will fail with test.source_not_mocked
+warning: POST /cars: has sources but no .test.json file — every request will fail with test.source_not_mocked

@@ -122,6 +122,11 @@ pub async fn execute(
     array_params: &HashSet<String>,
     caller_headers: &HeaderMap,
 ) -> Result<Value, HttpError> {
+    if substitutes_a_dot_segment(&request.url, params) {
+        return Err(HttpError::Request(
+            "a URL parameter value is a dot segment ('.' or '..'), which would rewrite the request path".to_string(),
+        ));
+    }
     let url = substitute_string(&request.url, params);
     let method = reqwest::Method::from_bytes(request.method.as_bytes()).map_err(|e| HttpError::InvalidMethod(format!("{}: {e}", request.method)))?;
 
@@ -251,6 +256,20 @@ fn substitute_string(template: &str, params: &HashMap<String, SqlValue>) -> Stri
             utf8_percent_encode(v, URL_COMPONENT).to_string()
         }
     })
+}
+
+/// Whether a substituted value is exactly `.` or `..` (or any run of dots). Even percent-encoded, the URL
+/// parser treats that as a dot segment and resolves it, climbing out of the template's path prefix, so
+/// such a request is refused rather than sent.
+fn substitutes_a_dot_segment(template: &str, params: &HashMap<String, SqlValue>) -> bool {
+    let found = std::cell::Cell::new(false);
+    substitute_template(template, params, |name, v| {
+        if !name.starts_with(SERVICE_REGISTRY_PREFIX) && !v.is_empty() && v.bytes().all(|b| b == b'.') {
+            found.set(true);
+        }
+        String::new()
+    });
+    found.get()
 }
 
 /// Substitutes `{{param}}` verbatim — no percent-encoding — for JSON body
@@ -671,5 +690,37 @@ mod tests {
             .expect("request should succeed");
 
         assert_eq!(result, serde_json::json!([{ "maker": "Honda" }, { "maker": "Ford" }]));
+    }
+}
+
+#[cfg(test)]
+mod dot_segment_tests {
+    use super::*;
+
+    fn params(value: &str) -> HashMap<String, SqlValue> {
+        HashMap::from([
+            ("id".to_string(), SqlValue::Text(value.to_string())),
+            ("services.base".to_string(), SqlValue::Text("..".to_string())),
+        ])
+    }
+
+    #[test]
+    fn a_value_of_only_dots_is_a_dot_segment() {
+        for value in [".", "..", "..."] {
+            assert!(substitutes_a_dot_segment("http://h/items/{{id}}/x", &params(value)), "{value}");
+        }
+    }
+
+    #[test]
+    fn values_that_merely_contain_dots_or_are_empty_are_not_refused() {
+        for value in ["a.b", "..a", "a..", "v1.2", "", "a/../b"] {
+            assert!(!substitutes_a_dot_segment("http://h/items/{{id}}/x", &params(value)), "{value}");
+        }
+    }
+
+    #[test]
+    fn service_registry_placeholders_are_exempt_and_unused_params_do_not_count() {
+        assert!(!substitutes_a_dot_segment("{{services.base}}/x", &params("ok")));
+        assert!(!substitutes_a_dot_segment("http://h/static", &params("..")));
     }
 }

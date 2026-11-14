@@ -3,7 +3,8 @@ mod server;
 
 pub use connections::ConnectionConfig;
 pub use server::{
-    ClientAuthConfig, ClientAuthMode, CrlPolicy, DocsUiMode, EndpointSymlinks, LogLevel, LoggingConfig, MAX_SOURCE_CALL_TIMEOUT_MS, ManualTlsConfig, RateLimitConfig,
+    ClientAuthConfig, ClientAuthMode, CrlPolicy, DEFAULT_MCP_LIST_TTL_MS, DEFAULT_VERIFIER_CACHE_MAX_ENTRIES, DocsUiMode, EndpointSymlinks, LogLevel, LoggingConfig,
+    MAX_MCP_LIST_TTL_MS, MAX_SOURCE_CALL_TIMEOUT_MS, MAX_VERIFIER_CACHE_MAX_ENTRIES, MIN_VERIFIER_CACHE_MAX_ENTRIES, ManualTlsConfig, McpConfig, RateLimitConfig,
     ServerConfig, TlsConfig, TlsMode,
 };
 
@@ -321,3 +322,9 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod mcp_config_tests;
+
+#[cfg(test)]
+mod verifier_cache_config_tests;

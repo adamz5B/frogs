@@ -74,7 +74,7 @@ fn analyse_with(project: &Proj, case_sensitive: bool, ctx: &RouteContext) -> Ana
     .unwrap();
     let tree = tree_for_tests(&project.root.join("datasources/endpoints"));
     let plan = RoutePlan::build(&tree, doc.method_case, ctx);
-    let check = security_check_with_routes(&tree, &doc, &plan);
+    let check = security_check_with_routes(&tree, &doc, &plan, &crate::security::SecurityConfig::default());
     Analysis { check, doc, plan }
 }
 
@@ -451,7 +451,7 @@ fn a_secured_operation_on_a_windows_portability_skipped_path_is_shadowed_by_the_
     assert!(doc.skipped_paths.contains("/a?"), "{:?}", doc.skipped_paths);
     let tree = tree_for_tests(&project.root.join("datasources/endpoints"));
     let plan = RoutePlan::build(&tree, doc.method_case, &endpoints_only());
-    let check = security_check_with_routes(&tree, &doc, &plan);
+    let check = security_check_with_routes(&tree, &doc, &plan, &crate::security::SecurityConfig::default());
     assert_eq!(check.shadowed.len(), 1, "{:?}", check.shadowed.iter().map(|s| s.message()).collect::<Vec<_>>());
     assert!(matches!(check.shadowed[0].origin, ShadowOrigin::Skipped(_)));
 }

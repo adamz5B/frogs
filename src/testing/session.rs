@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use axum::http::HeaderMap;
@@ -42,6 +43,8 @@ struct SessionState {
     override_scenario: Option<String>,
     memory: Memory,
     report: Report,
+    /// Index (within the matched route's cases) of the case the newest `observe` served from.
+    last_case_index: Option<usize>,
 }
 
 /// A dedicated OS thread that rewrites the report file after every
@@ -63,6 +66,9 @@ pub struct MockSession {
     report_config: ReportConfig,
     state: Mutex<SessionState>,
     writer: Mutex<Option<ReportWriter>>,
+    gate_mock: std::sync::OnceLock<MockOutcome>,
+    /// No per-request line on stdout (an in-process batch run owns its stdout).
+    quiet: AtomicBool,
 }
 
 impl MockSession {
@@ -110,9 +116,47 @@ impl MockSession {
                 override_scenario: None,
                 memory: Memory::new(),
                 report,
+                last_case_index: None,
             }),
             writer: Mutex::new(writer),
+            gate_mock: std::sync::OnceLock::new(),
+            quiet: AtomicBool::new(false),
         }))
+    }
+
+    /// Installs the MCP gate's verifier mock once, at startup, before the server binds.
+    pub fn set_gate_mock(&self, mock: MockOutcome) {
+        let _ = self.gate_mock.set(mock);
+    }
+
+    pub fn set_quiet(&self) {
+        self.quiet.store(true, Ordering::Relaxed);
+    }
+
+    /// Every loaded test file, ordered by route path then method.
+    pub fn files_sorted(&self) -> Vec<&LoadedTestFile> {
+        let mut files: Vec<&LoadedTestFile> = self.files.values().collect();
+        files.sort_by(|a, b| (&a.route.path, &a.route.method).cmp(&(&b.route.path, &b.route.method)));
+        files
+    }
+
+    pub fn report_len(&self) -> usize {
+        self.state.lock().unwrap().report.entries.len()
+    }
+
+    /// The newest report entry and the index of the case it was served from, if any.
+    pub fn last_entry(&self) -> Option<(Entry, Option<usize>)> {
+        let state = self.state.lock().unwrap();
+        state.report.entries.last().map(|entry| (entry.clone(), state.last_case_index))
+    }
+
+    /// `{{memory.*}}` substitution against what earlier cases saved.
+    pub fn substitute(&self, value: &serde_json::Value) -> serde_json::Value {
+        self.state.lock().unwrap().memory.substitute(value)
+    }
+
+    pub fn substitute_map(&self, map: &HashMap<String, String>) -> HashMap<String, String> {
+        self.state.lock().unwrap().memory.substitute_string_map(map)
     }
 
     pub fn known_scenarios(&self) -> &[String] {
@@ -202,6 +246,10 @@ pub(crate) fn test_file_display(route: &RouteKey) -> String {
 }
 
 impl MockProvider for MockSession {
+    fn gate_verifier_mock(&self) -> Option<MockOutcome> {
+        self.gate_mock.get().cloned()
+    }
+
     fn select(&self, route: &RouteKey, request: &InboundRequest<'_>) -> MockSelection {
         let scenario = match self.current_scenario(request.headers) {
             Ok(choice) => choice,
@@ -332,7 +380,11 @@ impl MockProvider for MockSession {
                 }
             }
 
-            let line = matches!(self.report_config.format, ReportFormat::Text).then(|| report::render_text_line(&entry));
+            state.last_case_index = match selection {
+                MockSelection::Case { case: Some(case_ref), .. } => Some(case_ref.index),
+                _ => None,
+            };
+            let line = (matches!(self.report_config.format, ReportFormat::Text) && !self.quiet.load(Ordering::Relaxed)).then(|| report::render_text_line(&entry));
             state.report.entries.push(entry);
             let content = self.report_config.file.as_ref().map(|_| render_content(&state.report, self.report_config.format));
             (line, content)

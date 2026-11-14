@@ -1,0 +1,9 @@
+API project at <ROOT>/api
+  config: OK (1 connection(s), 1 error code(s), 0 security scheme(s), strictOpenApi=false, endpointSymlinks=contained)
+  method case: case-insensitive (caseSensitiveMethods: false)
+  routes: 4 registered, 0 problem(s)
+  openapi.yaml: OK (0 operation(s))
+  warning: <ROOT>/api/datasources/endpoints/things/endpoint.get.json: no matching operation in openapi.yaml — endpoint security was not checked for this route
+  connection 'db': FAILED — connection failed: connection 'db' uses driver 'nosuchdriver', which isn't compiled into this binary (rebuild with `--features nosuchdriver` or use a build that includes it)
+  endpoint files: 1 discovered, 1 problem(s)
+    - <ROOT>/api/datasources/endpoints/things/endpoint.get.json: security scheme 'noSuchScheme' has no matching entry in security/schemes.json

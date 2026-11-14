@@ -1,0 +1,1 @@
+{ "operationId": "getThings", "security": "noSuchScheme", "sources": {}, "response": {} }

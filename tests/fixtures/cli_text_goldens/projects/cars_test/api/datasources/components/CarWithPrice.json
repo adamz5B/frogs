@@ -1,0 +1,10 @@
+{
+  "_hash": "407631f313d2451f",
+  "maker": "string",
+  "model": "string",
+  "year": "integer",
+  "vin": "string",
+  "price": "number",
+  "currency": "string",
+  "listedAt": "string (date-time)"
+}

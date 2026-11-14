@@ -78,6 +78,7 @@ pub fn load(path: &Path) -> Result<WebServeConfig, WebServeLoadError> {
 /// `frogs generate --role web`'s writer — called only when `webserve.json`
 /// doesn't already exist (see `commands::generate`), so this never
 /// overwrites a hand-edited config.
+#[cfg(test)]
 pub fn save_to(path: &Path, config: &WebServeConfig) -> std::io::Result<()> {
     let json = serde_json::to_string_pretty(config).expect("WebServeConfig always serializes");
     std::fs::write(path, json)

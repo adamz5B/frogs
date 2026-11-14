@@ -182,6 +182,16 @@ async fn run_api(root: &Path, shutdown: impl std::future::Future<Output = ()> + 
     .await
 }
 
+/// `webserve.json`'s `allowDotPaths`; empty when there is no web role or the file doesn't load (that failure is reported by the web side).
+pub(crate) fn web_allow_dot_paths(root: &Path, web_role: bool) -> Vec<String> {
+    if !web_role {
+        return Vec::new();
+    }
+    crate::webserve::load(&root.join("webserve.json"))
+        .map(|config| config.allow_dot_paths)
+        .unwrap_or_default()
+}
+
 /// `/healthz` (always) plus `/readyz`/`/metrics` (only when their feature
 /// is on), each already prefixed with `apiRoot` — the same list `run_api`
 /// and `run_both` both print at startup, so a project running both roles
@@ -197,6 +207,13 @@ fn operational_routes_display(server_config: &ServerConfig) -> Vec<String> {
     }
     if server_config.docs_ui.mode != crate::config::DocsUiMode::Off {
         routes.push(format!("{api_root_display}/{}", crate::server::normalize_docs_ui_path(&server_config.docs_ui.path)));
+    }
+    if server_config.features.mcp {
+        routes.push(format!("{api_root_display}{}", crate::mcp::MCP_PATH));
+        let (auth, _) = crate::mcp::parse_auth_settings(&server_config.mcp_settings(), &crate::mcp::final_path(server_config));
+        if let Some(protected) = auth.protected {
+            routes.push(protected.metadata_path);
+        }
     }
     routes
 }
@@ -327,7 +344,20 @@ async fn build_api_router_with_protected(root: &Path, web_role: bool) -> io::Res
         control_plane: false,
     };
     check_route_table(&config.server, &endpoint_tree, extras, "")?;
-    let openapi_document = load_openapi_for_startup_with(root, &config.server, &endpoint_tree, extras)?;
+    let openapi_document = load_openapi_for_startup_with_security(root, &config.server, &endpoint_tree, extras, &config.security)?;
+    crate::mcp::check(
+        &crate::mcp::StartupInputs {
+            server: &config.server,
+            security: &config.security,
+            connections: &config.connections,
+            tree: &endpoint_tree,
+            doc: openapi_document.as_deref(),
+            client_identity_available: config.server.tls.client_identity_enabled(),
+            web_role,
+            web_allow_dot_paths: &web_allow_dot_paths(root, web_role),
+        },
+        "",
+    )?;
 
     let drivers = match crate::sql::connect_all(&config.connections).await {
         Ok(drivers) => drivers,
@@ -410,13 +440,19 @@ pub(crate) fn method_case_notice(server: &ServerConfig) -> Option<(tracing::Leve
     }
 }
 
+/// Logs the method-case notice and returns its text, for a caller that reports it some other way than stdout.
+pub(crate) fn log_method_case_notice(server: &ServerConfig) -> Option<String> {
+    let (level, message) = method_case_notice(server)?;
+    if level == tracing::Level::WARN {
+        tracing::warn!("{message}");
+    } else {
+        tracing::info!("{message}");
+    }
+    Some(message)
+}
+
 pub(crate) fn announce_method_case(server: &ServerConfig) {
-    if let Some((level, message)) = method_case_notice(server) {
-        if level == tracing::Level::WARN {
-            tracing::warn!("{message}");
-        } else {
-            tracing::info!("{message}");
-        }
+    if let Some(message) = log_method_case_notice(server) {
         println!("{message}");
     }
 }
@@ -491,13 +527,25 @@ pub(crate) const REGISTERED_SERVICE_SECURITY_HINT: &str = " — a service regist
 /// itself — and every issue it found is logged. A load failure degrades to
 /// `None` with a warning, except under strict where it (and any
 /// strict-class issue) refuses to start.
+pub(crate) fn load_openapi_for_startup_with_security(
+    root: &Path,
+    server: &ServerConfig,
+    tree: &EndpointTree,
+    extras: RootExtras,
+    security: &crate::security::SecurityConfig,
+) -> io::Result<Option<Arc<crate::openapi::OpenApiDocument>>> {
+    load_openapi_for_startup_reported_with(root, server, "", tree, extras, security).map(|(doc, _)| doc)
+}
+
+/// Where nothing is enforceable (no verifiers), so only scope warnings can come out of the spec check.
+#[cfg(test)]
 pub(crate) fn load_openapi_for_startup_with(
     root: &Path,
     server: &ServerConfig,
     tree: &EndpointTree,
     extras: RootExtras,
 ) -> io::Result<Option<Arc<crate::openapi::OpenApiDocument>>> {
-    load_openapi_for_startup_reported(root, server, "", tree, extras).map(|(doc, _)| doc)
+    load_openapi_for_startup_with_security(root, server, tree, extras, &crate::security::SecurityConfig::default())
 }
 
 /// Default extras (no web role, no control plane): production code must name its own via `load_openapi_for_startup_with`.
@@ -506,6 +554,7 @@ pub(crate) fn load_openapi_for_startup(root: &Path, server: &ServerConfig, tree:
     load_openapi_for_startup_with(root, server, tree, RootExtras::default())
 }
 
+#[cfg(test)]
 pub(crate) fn load_openapi_for_startup_reported(
     root: &Path,
     server: &ServerConfig,
@@ -513,8 +562,19 @@ pub(crate) fn load_openapi_for_startup_reported(
     tree: &EndpointTree,
     extras: RootExtras,
 ) -> io::Result<(Option<Arc<crate::openapi::OpenApiDocument>>, StartupSecurityReport)> {
+    load_openapi_for_startup_reported_with(root, server, refusal_hint, tree, extras, &crate::security::SecurityConfig::default())
+}
+
+pub(crate) fn load_openapi_for_startup_reported_with(
+    root: &Path,
+    server: &ServerConfig,
+    refusal_hint: &str,
+    tree: &EndpointTree,
+    extras: RootExtras,
+    security: &crate::security::SecurityConfig,
+) -> io::Result<(Option<Arc<crate::openapi::OpenApiDocument>>, StartupSecurityReport)> {
     let strict = server.strict_open_api();
-    let spec_needed = strict || server.features.request_validation || server.docs_ui.mode != crate::config::DocsUiMode::Off;
+    let spec_needed = strict || server.features.request_validation || server.docs_ui.mode != crate::config::DocsUiMode::Off || server.features.mcp;
     let mut report = StartupSecurityReport::default();
     match crate::openapi::load(&root.join(crate::project::MANIFEST_FILE), server.openapi_load_options()) {
         Ok(doc) => {
@@ -588,11 +648,14 @@ pub(crate) fn load_openapi_for_startup_reported(
             }
             let mode = MethodCase::from_case_sensitive(server.case_sensitive_methods());
             let plan = RoutePlan::build(tree, mode, &RouteContext::for_server(server).with_extras(extras));
-            let check = crate::endpoint::security_check_with_routes(tree, &doc, &plan);
+            let check = crate::endpoint::security_check_with_routes(tree, &doc, &plan, security);
             for message in &check.builtin_warnings {
                 tracing::warn!("{message}");
             }
             report.builtin_warnings = check.builtin_warnings.clone();
+            for message in &check.scope_warnings {
+                tracing::warn!("{message}");
+            }
             for file in &check.unmatched {
                 tracing::warn!("{}", crate::endpoint::unmatched_security_message(file));
             }
@@ -606,6 +669,11 @@ pub(crate) fn load_openapi_for_startup_reported(
             refuse_class(check.mismatches.iter().map(|m| m.message()).collect(), |n| {
                 format!(
                     "{n} endpoint file(s) don't apply the security openapi.yaml declares — refusing to start; set each file's \"security\" to one of the acceptable schemes shown (or change openapi.yaml), then run frogs validate{refusal_hint}"
+                )
+            })?;
+            refuse_class(check.scope_mismatches.clone(), |n| {
+                format!(
+                    "{n} endpoint file(s) don't cover the scopes openapi.yaml requires for their scheme — refusing to start; add the scopes to each file's \"securityScopes\" (or change openapi.yaml), then run frogs validate{refusal_hint}"
                 )
             })?;
             refuse_class(check.stale_variants.iter().map(|v| v.message()).collect(), |n| {
@@ -691,7 +759,20 @@ pub(crate) fn precheck_security_for_service(root: &Path) -> io::Result<()> {
             control_plane: false,
         };
         check_route_table(&config.server, &tree, extras, REGISTERED_SERVICE_SECURITY_HINT)?;
-        load_openapi_for_startup_reported(root, &config.server, REGISTERED_SERVICE_SECURITY_HINT, &tree, extras)?;
+        let (document, _) = load_openapi_for_startup_reported_with(root, &config.server, REGISTERED_SERVICE_SECURITY_HINT, &tree, extras, &config.security)?;
+        crate::mcp::check(
+            &crate::mcp::StartupInputs {
+                server: &config.server,
+                security: &config.security,
+                connections: &config.connections,
+                tree: &tree,
+                doc: document.as_deref(),
+                client_identity_available: config.server.tls.client_identity_enabled(),
+                web_role: has_web,
+                web_allow_dot_paths: &web_allow_dot_paths(root, has_web),
+            },
+            REGISTERED_SERVICE_SECURITY_HINT,
+        )?;
         protected.add_tls(&config.server.tls, &api_dir);
         protected.add_sqlite(&config.connections, root);
     }
@@ -716,6 +797,25 @@ pub(crate) async fn assemble_api_router(
     openapi_document: Option<Arc<crate::openapi::OpenApiDocument>>,
     endpoint_tree: Arc<EndpointTree>,
 ) -> io::Result<(Router, ServerConfig)> {
+    assemble_api_router_with(root, config, drivers, mock_provider, openapi_document, endpoint_tree, DiscoveredSink::File).await
+}
+
+/// Where unclassified error codes are recorded: the scratch file next to the config (`run`/`test`), or only in a
+/// caller-owned handle (an in-process batch run, which must not touch the project).
+pub(crate) enum DiscoveredSink {
+    File,
+    MemoryOnly(Arc<std::sync::Mutex<crate::errors::DiscoveredErrors>>),
+}
+
+pub(crate) async fn assemble_api_router_with(
+    root: &Path,
+    config: Config,
+    drivers: Arc<HashMap<String, Box<dyn SqlDriver>>>,
+    mock_provider: Option<Arc<dyn MockProvider>>,
+    openapi_document: Option<Arc<crate::openapi::OpenApiDocument>>,
+    endpoint_tree: Arc<EndpointTree>,
+    sink: DiscoveredSink,
+) -> io::Result<(Router, ServerConfig)> {
     let api_dir = crate::project::api_base(root);
     let debug_mode = config.server.debug_mode;
     let method_case = MethodCase::from_case_sensitive(config.server.case_sensitive_methods());
@@ -732,6 +832,7 @@ pub(crate) async fn assemble_api_router(
     // write-once) so a project generated before mTLS existed classifies
     // them correctly too; a project that defines either keeps its own.
     let mut errors = config.errors;
+    let mock_provider_gate_mock: Option<Option<crate::endpoint::MockOutcome>> = mock_provider.as_ref().map(|provider| provider.gate_verifier_mock());
     for code in ["auth.client_cert_missing", "auth.client_cert_expired"] {
         errors.insert_if_absent(
             code,
@@ -741,6 +842,13 @@ pub(crate) async fn assemble_api_router(
             },
         );
     }
+    errors.insert_if_absent(
+        "auth.insufficient_scope",
+        crate::errors::ErrorDefinition {
+            http_status: 403,
+            expose_detail: true,
+        },
+    );
     errors.insert_if_absent(
         "endpoint.unavailable",
         crate::errors::ErrorDefinition {
@@ -766,9 +874,27 @@ pub(crate) async fn assemble_api_router(
     }
     let security = std::sync::Arc::new(config.security);
     let services = std::sync::Arc::new(config.services);
-    let discovered_errors = std::sync::Arc::new(std::sync::Mutex::new(config.discovered_errors));
+    let (discovered_errors, discovery_memory_only) = match sink {
+        DiscoveredSink::File => (std::sync::Arc::new(std::sync::Mutex::new(config.discovered_errors)), false),
+        DiscoveredSink::MemoryOnly(handle) => (handle, true),
+    };
 
-    let endpoint_router = crate::endpoint::build_router(
+    // Shared by the HTTP routes and the MCP mount: one scheme cache, one global bucket, one metrics sink.
+    let verifier_cache = std::sync::Arc::new(crate::security::VerifierCache::with_capacity(
+        config.server.effective_verifier_cache_max_entries() as usize
+    ));
+    let source_call_timeout = config.server.effective_source_call_timeout_ms();
+    let gate_drivers = drivers.clone();
+    let gate_security = security.clone();
+    let gate_cache = verifier_cache.clone();
+    let metrics = config.server.features.metrics.then(|| std::sync::Arc::new(crate::server::Metrics::new()));
+    let global_limiter = config.server.features.rate_limiting.then(|| {
+        std::sync::Arc::new(crate::server::RateLimiter::new(
+            config.server.rate_limit.requests_per_second,
+            config.server.rate_limit.burst,
+        ))
+    });
+    let built = crate::endpoint::build_routes(
         &api_dir,
         &endpoint_tree,
         drivers.clone(),
@@ -782,10 +908,17 @@ pub(crate) async fn assemble_api_router(
         // `features.requestValidation` may make the routes validate requests with it.
         openapi_document.as_deref().filter(|_| config.server.features.request_validation),
         mock_provider,
-        config.server.effective_source_call_timeout_ms(),
+        source_call_timeout,
         client_identity_available,
         method_case,
+        verifier_cache,
+        discovery_memory_only,
     );
+    let crate::endpoint::BuiltRoutes {
+        router: endpoint_router,
+        accepted,
+        http_client,
+    } = built;
     let mut router = crate::server::router().merge(endpoint_router);
 
     // Each is a separate, independently-stated router merged in only when
@@ -795,7 +928,6 @@ pub(crate) async fn assemble_api_router(
     if config.server.features.readyz_check {
         router = router.merge(crate::server::readyz_router(drivers));
     }
-    let metrics = config.server.features.metrics.then(|| std::sync::Arc::new(crate::server::Metrics::new()));
     if let Some(metrics) = &metrics {
         router = router.merge(crate::server::metrics_router(metrics.clone()));
     }
@@ -814,24 +946,74 @@ pub(crate) async fn assemble_api_router(
     // Applied last, after every route is registered (nesting under
     // apiRoot included) — see `server::apply_middleware`'s doc comment for
     // why this ordering matters; `apply_metrics`/`apply_rate_limit` have the
-    // same requirement, for the same reason.
-    let router = if config.server.features.request_correlation {
-        crate::server::apply_middleware(router)
-    } else {
-        router
+    // same requirement, for the same reason. The MCP router gets the very
+    // same layers with the very same `Arc`s (so one request budget, one
+    // metrics sink), and is merged in after CORS below, never under it.
+    let features = &config.server.features;
+    let shared_layers = |router: Router| -> Router {
+        let router = if features.request_correlation {
+            crate::server::apply_middleware(router)
+        } else {
+            router
+        };
+        let router = match &metrics {
+            Some(metrics) => crate::server::apply_metrics(router, metrics.clone()),
+            None => router,
+        };
+        match &global_limiter {
+            Some(limiter) => crate::server::apply_rate_limit(router, limiter.clone()),
+            None => router,
+        }
     };
-    let router = match metrics {
-        Some(metrics) => crate::server::apply_metrics(router, metrics),
-        None => router,
-    };
-    let router = if config.server.features.rate_limiting {
-        let limiter = std::sync::Arc::new(crate::server::RateLimiter::new(
-            config.server.rate_limit.requests_per_second,
-            config.server.rate_limit.burst,
-        ));
-        crate::server::apply_rate_limit(router, limiter)
+    let router = shared_layers(router);
+    let gate_mock = mock_provider_gate_mock;
+    let mcp_router = if features.mcp {
+        let settings = config.server.mcp_settings();
+        let final_path = crate::mcp::final_path(&config.server);
+        let (auth, auth_errors) = crate::mcp::parse_auth_settings(&settings, &final_path);
+        if !auth_errors.is_empty() {
+            for message in &auth_errors {
+                eprintln!("error: {message}");
+                tracing::error!("{message}");
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} MCP problem(s) found — refusing to start; run frogs validate", auth_errors.len()),
+            ));
+        }
+        let planned = crate::mcp::plan_for_router(&accepted, openapi_document.as_deref(), &settings, &auth);
+        let Some(plan) = planned.plan else {
+            for message in &planned.errors {
+                eprintln!("error: {message}");
+                tracing::error!("{message}");
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} MCP problem(s) found — refusing to start; run frogs validate", planned.errors.len()),
+            ));
+        };
+        // Only a mock provider can supply a gate mock: `frogs run` always passes `None`.
+        let gate = crate::mcp::GateParts {
+            ctx: crate::endpoint::OwnedAuthContext {
+                security: gate_security,
+                drivers: gate_drivers,
+                sql_root: api_dir.join("datasources/sql"),
+                http_root: api_dir.join("datasources/http"),
+                http_client,
+                verifier_cache: gate_cache,
+                timeout: source_call_timeout,
+            },
+            mock: gate_mock,
+        };
+        let mcp_router = crate::mcp::build_router(plan, &accepted, openapi_document.as_deref(), &settings, &auth, gate, &final_path)?;
+        let metadata_router = crate::mcp::metadata_router(&auth)?;
+        let mcp_router = shared_layers(mcp_router);
+        Some(match metadata_router {
+            Some(metadata) => mcp_router.merge(shared_layers(metadata)),
+            None => mcp_router,
+        })
     } else {
-        router
+        None
     };
     // Outermost of all the optional middleware layers — see
     // `server::apply_cors`'s doc comment for why it has to wrap the others,
@@ -843,6 +1025,10 @@ pub(crate) async fn assemble_api_router(
         crate::server::apply_cors(router, &config.server.cors.allowed_origins)
     } else {
         router
+    };
+    let router = match mcp_router {
+        Some(mcp_router) => router.merge(mcp_router),
+        None => router,
     };
 
     let mut server_config = config.server;
@@ -2765,3 +2951,6 @@ mod route_tests;
 
 #[cfg(test)]
 mod ref_tests;
+
+#[cfg(test)]
+mod mcp_tests;

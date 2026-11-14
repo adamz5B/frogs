@@ -1,0 +1,27 @@
+{
+  "operationId": "createCar",
+  "successStatus": 201,
+  "sources": {
+    "car": {
+      "type": "sql",
+      "connection": "vehicles_db",
+      "script": "create_car.sql",
+      "cardinality": "one",
+      "onError": 500,
+      "parameters": [
+        { "name": "maker", "from": "body.maker" },
+        { "name": "model", "from": "body.model" },
+        { "name": "year", "from": "body.year" }
+      ]
+    }
+  },
+  "response": {
+    "maker": "sources.car.maker",
+    "model": "sources.car.model",
+    "year": {
+      "from": "sources.car.year",
+      "format": "integer"
+    },
+    "vin": "sources.car.vin"
+  }
+}

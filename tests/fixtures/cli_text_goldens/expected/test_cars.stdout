@@ -1,0 +1,13 @@
+strictOpenApi=false, caseSensitiveMethods=false, endpointSymlinks=contained
+WARN frogs::commands::run: HTTP method names are matched case-insensitively (default; caseSensitiveMethods is not set in config/server.json) — a proxy/WAF rule blocking an exact method like DELETE can be bypassed with 'delete'; set caseSensitiveMethods: true for RFC 9110 exact matching
+HTTP method names are matched case-insensitively (default; caseSensitiveMethods is not set in config/server.json) — a proxy/WAF rule blocking an exact method like DELETE can be bypassed with 'delete'; set caseSensitiveMethods: true for RFC 9110 exact matching
+INFO frogs::commands::test: GET /cars/by-maker <- <ROOT>/api/datasources/endpoints/cars/by-maker/endpoint.get.test.json (2 case(s))
+INFO frogs::commands::test: GET /cars/{vin} <- <ROOT>/api/datasources/endpoints/cars/{vin}/endpoint.get.test.json (4 case(s))
+loaded 2 test file(s) with 6 case(s) — 4 route(s) discovered
+INFO frogs::endpoint: GET /cars/by-maker -> <ROOT>/api/datasources/endpoints/cars/by-maker/endpoint.get.json (operationId: listCarsByMaker)
+INFO frogs::endpoint: GET /cars -> <ROOT>/api/datasources/endpoints/cars/endpoint.get.json (operationId: getCarInfo)
+INFO frogs::endpoint: POST /cars -> <ROOT>/api/datasources/endpoints/cars/endpoint.post.json (operationId: createCar)
+INFO frogs::endpoint: GET /cars/:vin -> <ROOT>/api/datasources/endpoints/cars/{vin}/endpoint.get.json (operationId: getCarByVin)
+scenario control plane: GET/POST/DELETE /_frogs/scenario
+INFO frogs::commands::test: frogs test starting port=<PORT> tls_mode=Off scenario=None
+listening on http://127.0.0.1:<PORT> (Ctrl+C to stop, or `frogs stop` from another terminal)

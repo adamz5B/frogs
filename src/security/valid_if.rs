@@ -60,11 +60,7 @@ impl ValidIf {
         let left = parts.next().unwrap_or("").trim();
         let right = parts.next().ok_or_else(|| ValidIfParseError::MissingEquals(expr.to_string()))?.trim();
 
-        let mut segments: Vec<String> = left.split('.').map(str::trim).map(str::to_string).collect();
-        if segments.len() < 2 || segments.iter().any(String::is_empty) {
-            return Err(ValidIfParseError::InvalidPath(expr.to_string()));
-        }
-        segments.remove(0); // drop the source label — see the struct doc comment
+        let segments = parse_result_path(left).ok_or_else(|| ValidIfParseError::InvalidPath(expr.to_string()))?;
 
         if right.is_empty() {
             return Err(ValidIfParseError::MissingValue(expr.to_string()));
@@ -83,14 +79,60 @@ impl ValidIf {
     /// same posture as an unclassified error code defaulting to
     /// `exposeDetail: false` rather than assuming the best.
     pub fn evaluate(&self, resolved: &Value) -> bool {
-        let mut current = resolved;
-        for segment in &self.path {
-            match current.get(segment) {
-                Some(next) => current = next,
-                None => return false,
-            }
+        lookup_path(resolved, &self.path) == Some(&self.expected)
+    }
+}
+
+/// `<label>.<field>[.<field>...]` with the label dropped; `None` for fewer than two segments or an empty one.
+fn parse_result_path(text: &str) -> Option<Vec<String>> {
+    let mut segments: Vec<String> = text.split('.').map(str::trim).map(str::to_string).collect();
+    if segments.len() < 2 || segments.iter().any(String::is_empty) {
+        return None;
+    }
+    segments.remove(0); // drop the source label — see the struct doc comment
+    Some(segments)
+}
+
+fn lookup_path<'a>(resolved: &'a Value, path: &[String]) -> Option<&'a Value> {
+    let mut current = resolved;
+    for segment in path {
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
+const MAX_GRANTED_SCOPES: usize = 64;
+const MAX_GRANTED_SCOPES_BYTES: usize = 4 * 1024;
+
+/// A verifier's `scopesFrom`: where in its resolved result the credential's granted scopes live.
+/// Same left-hand-side grammar as `validIf`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopesPath {
+    path: Vec<String>,
+}
+
+impl ScopesPath {
+    pub fn parse(expr: &str) -> Result<Self, String> {
+        match parse_result_path(expr) {
+            Some(path) => Ok(ScopesPath { path }),
+            None => Err(format!("scopesFrom '{expr}' is invalid — expected '<source>.<field>'")),
         }
-        current == &self.expected
+    }
+
+    /// A string is split on U+0020 only; an array is accepted only when every element is a
+    /// string, taken verbatim. Anything else, or more than 64 scopes or 4 KiB, is "no scopes":
+    /// fail closed, never truncate.
+    pub fn extract(&self, resolved: &Value) -> Option<std::sync::Arc<[String]>> {
+        let scopes: Vec<String> = match lookup_path(resolved, &self.path)? {
+            Value::String(text) => text.split(' ').filter(|piece| !piece.is_empty()).map(str::to_string).collect(),
+            Value::Array(items) => items.iter().map(|item| item.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()?,
+            _ => return None,
+        };
+        if scopes.len() > MAX_GRANTED_SCOPES || scopes.iter().map(String::len).sum::<usize>() > MAX_GRANTED_SCOPES_BYTES {
+            tracing::debug!("a verifier result carried more scopes than the cap allows; treating it as granting none");
+            return None;
+        }
+        Some(scopes.into())
     }
 }
 

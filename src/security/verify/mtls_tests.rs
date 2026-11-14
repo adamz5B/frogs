@@ -17,6 +17,7 @@ fn loaded(json: &str) -> LoadedVerifier {
         valid_if: ValidIf::parse(def.valid_if()).unwrap(),
         def,
         mtls,
+        scopes_path: None,
     }
 }
 
@@ -114,6 +115,7 @@ async fn run_verify(
         call_timeout,
     )
     .await
+    .map(|_| ())
 }
 
 // ---------------------------------------------------------------------

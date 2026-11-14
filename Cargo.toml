@@ -12,7 +12,7 @@ categories = ["web-programming::http-server", "command-line-utilities"]
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 axum = "0.7"
@@ -64,6 +64,9 @@ serde_yaml = "0.9"
 # into a URL, instead of hand-rolling encoding logic for something this
 # easy to get subtly wrong.
 percent-encoding = "2"
+# MCP `Mcp-Name`/`Mcp-Method` headers carry a `=?base64?...?=` form for non-ASCII tool names (`mcp::protocol`).
+# Already in the tree via other dependencies at 0.22.
+base64 = "0.22"
 # `default-features = false` + only the `cors` feature: `cors` itself pulls
 # in zero extra crates (see its Cargo.toml — `cors = []`), and "0.6" matches
 # the version `reqwest` already resolves this to transitively, so this stays

@@ -1,0 +1,7 @@
+project root: <ROOT>
+loaded config — debugMode=false, 0 connection(s), 14 error code(s), strictOpenApi=false, caseSensitiveMethods=false, endpointSymlinks=contained
+found 1 operation(s) in openapi.yaml:
+  GET /cars -> listCars
+endpoints: 0 unchanged (skipped), 0 newly generated, 1 migrated, 0 drifted but left alone (autoMigrateEndpoints off)
+  GET /cars/{vin} no longer in openapi.yaml — prefixed with _ (never deleted; restores automatically if it comes back)
+webserve.json already exists at <ROOT>/webserve.json — left unchanged

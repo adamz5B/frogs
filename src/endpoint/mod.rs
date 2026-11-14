@@ -51,8 +51,8 @@ pub(crate) use schema::{EndpointFile, SourceDef};
 
 /// Everything one route's handler needs, baked in at startup so the handler
 /// function itself can stay generic and shared across every route.
-struct RouteState {
-    endpoint: EndpointFile,
+pub(crate) struct RouteState {
+    pub(crate) endpoint: EndpointFile,
     /// This route in OpenAPI-style `{name}` form — what a `MockProvider`
     /// keys its `.test.json` files by, and what the report names.
     route: RouteKey,
@@ -126,6 +126,180 @@ pub(crate) fn parse_endpoint_json(contents: &str, via_link: bool) -> Result<Endp
     serde_json::from_str(contents).map_err(|e| if via_link { parse_error_summary(&e) } else { format!("invalid JSON: {e}") })
 }
 
+/// One endpoint file's fate when the route table is built: serve it, keep its slot with a 503, or
+/// leave it out of the table altogether.
+pub(crate) enum RouteDecision {
+    Accepted {
+        entry: InventoryEntry,
+        endpoint: EndpointFile,
+        contents: String,
+    },
+    Unavailable {
+        entry: InventoryEntry,
+        reason: String,
+        /// Present when the file parsed but could not be served; `None` when it could not even be parsed.
+        endpoint: Option<EndpointFile>,
+    },
+    Skipped {
+        message: String,
+        error: bool,
+    },
+}
+
+/// The shared servability checks (`build_routes` fail-closed, `frogs validate` report): an unknown
+/// scheme, a certificate-dependent scheme no listener could satisfy, and the nested-many and
+/// call-timeout problems.
+pub(crate) fn servability_problems(
+    endpoint: &EndpointFile,
+    security: &SecurityConfig,
+    connections: &HashMap<String, ConnectionConfig>,
+    client_identity_available: bool,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    // A declared scheme that `security/schemes.json` doesn't actually define is a config mistake — fail closed by refusing to
+    // serve the route at all rather than accidentally leaving it open.
+    if let Some(scheme) = &endpoint.security {
+        match security.verifiers.get(scheme) {
+            None => problems.push(format!("security scheme '{scheme}' has no matching entry in security/schemes.json")),
+            Some(verifier) if verifier.requires_client_cert() && !client_identity_available => problems.push(format!(
+                "security scheme '{scheme}' needs a client certificate, but this server's TLS listener doesn't request one \
+                 (set tls.mode to \"manual\" and enable tls.clientAuth in config/server.json)"
+            )),
+            Some(_) => {}
+        }
+    }
+    problems.extend(scope_problems(endpoint, security));
+    problems.extend(validate_nested_many(endpoint, connections));
+    problems.extend(validate_source_call_timeout(endpoint));
+    problems
+}
+
+/// `securityScopes` that frogs could not enforce (or that are malformed): the route is unservable
+/// rather than silently unprotected by the scopes the operator wrote down.
+fn scope_problems(endpoint: &EndpointFile, security: &SecurityConfig) -> Vec<String> {
+    let mut problems = Vec::new();
+    if endpoint.security_scopes.is_empty() {
+        return problems;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for scope in &endpoint.security_scopes {
+        if !crate::mcp::is_scope_token(scope) {
+            problems.push(format!(
+                "securityScopes entry '{}' is not a valid scope token (1-128 printable ASCII characters, no space, double quote or backslash)",
+                crate::openapi::untrusted(scope)
+            ));
+        } else if !seen.insert(scope.as_str()) {
+            problems.push(format!("securityScopes lists '{}' more than once", crate::openapi::untrusted(scope)));
+        }
+    }
+    let Some(scheme) = &endpoint.security else {
+        problems.push("securityScopes is set but the endpoint declares no \"security\" scheme, so the scopes could not be enforced".to_string());
+        return problems;
+    };
+    if let Some(verifier) = security.verifiers.get(scheme) {
+        if verifier.mtls.is_some() {
+            problems.push(format!(
+                "securityScopes is set but scheme '{}' is an mtls verifier, which has no scopes to check",
+                crate::openapi::untrusted(scheme)
+            ));
+        } else if verifier.scopes_path.is_none() {
+            problems.push(format!(
+                "securityScopes is set but the verifier for scheme '{}' declares no \"scopesFrom\", so frogs could not enforce it — add scopesFrom to the verifier file",
+                crate::openapi::untrusted(scheme)
+            ));
+        }
+    }
+    problems
+}
+
+/// Why a file could not be served: the parsed file (when it parsed) and the reason.
+type Unjudged = (Option<Box<EndpointFile>>, String);
+
+/// Reads and judges every inventory entry the way `build_routes` registers it, without building
+/// anything and without logging: the startup MCP check and the router consume the same decisions,
+/// so a tool can never exist for a route that is not served.
+pub(crate) fn accept_routes(
+    tree: &EndpointTree,
+    mode: MethodCase,
+    security: &SecurityConfig,
+    connections: &HashMap<String, ConnectionConfig>,
+    client_identity_available: bool,
+) -> Vec<RouteDecision> {
+    let inventory = route_inventory(tree, mode);
+    let plan = RoutePlan::from_inventory(&inventory, &RouteContext::endpoints_only());
+    let mut decisions = Vec::new();
+    for entry in inventory.entries {
+        let file_path = &entry.file;
+        match &entry.status {
+            EntryStatus::NotRouted(reason) => {
+                let message = format!("skipping {}: {reason}", crate::openapi::untrusted(&file_path.display().to_string()));
+                decisions.push(RouteDecision::Skipped { message, error: false });
+                continue;
+            }
+            EntryStatus::Duplicate => {
+                let message = format!(
+                    "skipping {}: {} {} is already registered by another endpoint file",
+                    crate::openapi::untrusted(&file_path.display().to_string()),
+                    entry.wire,
+                    crate::openapi::untrusted(&entry.url_path)
+                );
+                decisions.push(RouteDecision::Skipped { message, error: false });
+                continue;
+            }
+            EntryStatus::Routed => {}
+        }
+        if plan.is_excluded(&entry.url_path) {
+            let message = format!(
+                "not serving {}: {} {} is part of a route-table problem (see the error above)",
+                crate::openapi::untrusted(&file_path.display().to_string()),
+                entry.wire,
+                crate::openapi::untrusted(&entry.url_path)
+            );
+            decisions.push(RouteDecision::Skipped { message, error: true });
+            continue;
+        }
+        if entry.kind.is_none() {
+            continue;
+        }
+        let via_link = tree.is_via_link(file_path);
+        let judged: Result<(EndpointFile, String), Unjudged> = (|| {
+            let contents = std::fs::read_to_string(file_path).map_err(|e| (None, e.to_string()))?;
+            let endpoint: EndpointFile = parse_endpoint_json(&contents, via_link).map_err(|e| (None, e))?;
+            let problems = servability_problems(&endpoint, security, connections, client_identity_available);
+            if !problems.is_empty() {
+                return Err((Some(Box::new(endpoint)), problems.join("; ")));
+            }
+            Ok((endpoint, contents))
+        })();
+        decisions.push(match judged {
+            Ok((endpoint, contents)) => RouteDecision::Accepted { entry, endpoint, contents },
+            Err((endpoint, reason)) => RouteDecision::Unavailable {
+                entry,
+                reason,
+                endpoint: endpoint.map(|boxed| *boxed),
+            },
+        });
+    }
+    decisions
+}
+
+/// A route `build_routes` registered for real: what the MCP mount needs to call the very same
+/// handler state and per-endpoint limiter the HTTP route uses.
+pub(crate) struct AcceptedRoute {
+    pub url_path: String,
+    pub token: String,
+    pub file: PathBuf,
+    pub state: Arc<RouteState>,
+    pub rate_limiter: Option<Arc<crate::server::RateLimiter>>,
+}
+
+pub(crate) struct BuiltRoutes {
+    pub router: Router,
+    pub accepted: Vec<AcceptedRoute>,
+    /// The one client every route shares, handed to the MCP gate so its verifier uses it too.
+    pub http_client: reqwest::Client,
+}
+
 /// Registers one axum route per distinct path for the `endpoint.<method>.json`
 /// files (one of `method_token::ROUTABLE_FIXED`) in `endpoint_tree`, the scan
 /// of `datasources/endpoints/` the caller already made and reported on (QUERY
@@ -138,7 +312,7 @@ pub(crate) fn parse_endpoint_json(contents: &str, via_link: bool) -> Result<Endp
 /// `errors`, loaded once and read-only for the process's whole lifetime —
 /// it's written to at request time.
 #[allow(clippy::too_many_arguments)]
-pub fn build_router(
+pub(crate) fn build_routes(
     project_root: &Path,
     endpoint_tree: &EndpointTree,
     drivers: Arc<HashMap<String, Box<dyn SqlDriver>>>,
@@ -168,14 +342,21 @@ pub fn build_router(
     // Must agree with how `openapi_document` (if any) was loaded; the caller
     // (`commands::run::assemble_api_router`) refuses a mismatch.
     method_case: MethodCase,
-) -> Router {
+    // Shared by every route (and by the MCP mount): two endpoints protected by the same scheme reuse one cached result.
+    verifier_cache: Arc<VerifierCache>,
+    // An in-process run records discovered codes in `discovered_errors` only and never writes `config/errors.discovered.json`.
+    discovery_memory_only: bool,
+) -> BuiltRoutes {
     let sql_root = project_root.join("datasources/sql");
     let http_root = project_root.join("datasources/http");
-    let discovered_errors_path = project_root.join("config/errors.discovered.json");
+    let discovered_errors_path = if discovery_memory_only {
+        PathBuf::new()
+    } else {
+        project_root.join("config/errors.discovered.json")
+    };
     // One shared client for every route — reuses connection pooling across
     // requests instead of paying a fresh-connection cost per call.
     let http_client = reqwest::Client::new();
-    let verifier_cache = Arc::new(VerifierCache::new());
     let component_schemas = Arc::new(openapi_document.map(|doc| doc.component_schemas.clone()).unwrap_or_default());
 
     for finding in method_file_findings(endpoint_tree, method_case) {
@@ -189,66 +370,24 @@ pub fn build_router(
     }
     let unavailable = Arc::new(UnavailableState { errors: errors.clone() });
 
+    let mut accepted: Vec<AcceptedRoute> = Vec::new();
     let mut by_path: BTreeMap<String, PathRoutes> = BTreeMap::new();
-    for entry in &inventory.entries {
+    for decision in accept_routes(endpoint_tree, method_case, &security, connections, client_identity_available) {
+        let (entry, built) = match decision {
+            RouteDecision::Skipped { message, error, .. } => {
+                if error {
+                    tracing::error!("{message}");
+                } else {
+                    tracing::warn!("{message}");
+                }
+                continue;
+            }
+            RouteDecision::Unavailable { entry, reason, .. } => (entry, Err(reason)),
+            RouteDecision::Accepted { entry, endpoint, contents } => (entry, Ok((endpoint, contents))),
+        };
         let (url_path, method, file_path, wire) = (&entry.url_path, &entry.token, &entry.file, entry.wire.as_str());
-        match &entry.status {
-            EntryStatus::NotRouted(reason) => {
-                tracing::warn!("skipping {}: {reason}", crate::openapi::untrusted(&file_path.display().to_string()));
-                continue;
-            }
-            EntryStatus::Duplicate => {
-                tracing::warn!(
-                    "skipping {}: {wire} {} is already registered by another endpoint file",
-                    crate::openapi::untrusted(&file_path.display().to_string()),
-                    crate::openapi::untrusted(url_path)
-                );
-                continue;
-            }
-            EntryStatus::Routed => {}
-        }
-        if plan.is_excluded(url_path) {
-            tracing::error!(
-                "not serving {}: {wire} {} is part of a route-table problem (see the error above)",
-                crate::openapi::untrusted(&file_path.display().to_string()),
-                crate::openapi::untrusted(url_path)
-            );
-            continue;
-        }
         let Some(kind) = entry.kind.clone() else { continue };
-        let via_link = endpoint_tree.is_via_link(file_path);
-        let built: Result<MethodRouter<()>, String> = (|| {
-            let contents = std::fs::read_to_string(file_path).map_err(|e| e.to_string())?;
-            let endpoint: EndpointFile = parse_endpoint_json(&contents, via_link)?;
-
-            // A declared scheme that `security/schemes.json` doesn't actually
-            // define is a config mistake — fail closed by refusing to serve
-            // the route at all rather than accidentally leaving it open, the
-            // same "skip with a loud warning" posture used for a malformed
-            // endpoint file above.
-            if let Some(scheme) = &endpoint.security
-                && !security.verifiers.contains_key(scheme)
-            {
-                return Err(format!("security scheme '{scheme}' has no matching entry in security/schemes.json"));
-            }
-
-            if let Some(scheme) = &endpoint.security
-                && let Some(verifier) = security.verifiers.get(scheme)
-                && verifier.requires_client_cert()
-                && !client_identity_available
-            {
-                return Err(format!(
-                    "security scheme '{scheme}' needs a client certificate, but this server's TLS listener doesn't request one \
-                 (set tls.mode to \"manual\" and enable tls.clientAuth in config/server.json)"
-                ));
-            }
-
-            let mut source_problems = validate_nested_many(&endpoint, connections);
-            source_problems.extend(validate_source_call_timeout(&endpoint));
-            if !source_problems.is_empty() {
-                return Err(source_problems.join("; "));
-            }
-
+        let built: Result<MethodRouter<()>, String> = built.map(|(endpoint, contents)| {
             tracing::info!("{wire} {url_path} -> {} (operationId: {})", file_path.display(), endpoint.operation_id);
 
             if has_reserved_stream_key(&contents) {
@@ -311,27 +450,36 @@ pub fn build_router(
                 mock_provider: mock_provider.clone(),
                 response_mode,
             });
-            // Read back out before `state` moves into `.with_state` below —
-            // this endpoint's own `rateLimit`, if it declared one, gets its own
+            // This endpoint's own `rateLimit`, if it declared one, gets its own
             // dedicated bucket layered onto just this route (in addition to,
             // not instead of, the global bucket `apply_rate_limit` applies to
             // the whole router in `commands::run`).
-            let rate_limit_override = state.endpoint.rate_limit.clone();
+            let limiter = state
+                .endpoint
+                .rate_limit
+                .as_ref()
+                .map(|rate_limit| Arc::new(crate::server::RateLimiter::new(rate_limit.requests_per_second, rate_limit.burst)));
 
             let mut method_router: MethodRouter<()> = match &kind {
-                RouteKind::Standard(Method::GET) => get(handle_request).with_state(state),
-                RouteKind::Standard(Method::POST) => post(handle_request).with_state(state),
-                RouteKind::Standard(Method::PUT) => put(handle_request).with_state(state),
-                RouteKind::Standard(Method::PATCH) => patch(handle_request).with_state(state),
-                RouteKind::Standard(Method::DELETE) => delete(handle_request).with_state(state),
-                _ => any(handle_request).with_state(state),
+                RouteKind::Standard(Method::GET) => get(handle_request).with_state(state.clone()),
+                RouteKind::Standard(Method::POST) => post(handle_request).with_state(state.clone()),
+                RouteKind::Standard(Method::PUT) => put(handle_request).with_state(state.clone()),
+                RouteKind::Standard(Method::PATCH) => patch(handle_request).with_state(state.clone()),
+                RouteKind::Standard(Method::DELETE) => delete(handle_request).with_state(state.clone()),
+                _ => any(handle_request).with_state(state.clone()),
             };
-            if let Some(rate_limit) = rate_limit_override {
-                let limiter = Arc::new(crate::server::RateLimiter::new(rate_limit.requests_per_second, rate_limit.burst));
-                method_router = crate::server::apply_rate_limit_to_route(method_router, limiter);
+            if let Some(limiter) = &limiter {
+                method_router = crate::server::apply_rate_limit_to_route(method_router, limiter.clone());
             }
-            Ok(method_router)
-        })();
+            accepted.push(AcceptedRoute {
+                url_path: url_path.clone(),
+                token: method.clone(),
+                file: file_path.clone(),
+                state,
+                rate_limiter: limiter,
+            });
+            method_router
+        });
 
         // A file that can't be served keeps its slot with a 503, so its requests can't fall through to a sibling `{param}` route.
         let method_router = match built {
@@ -382,7 +530,47 @@ pub fn build_router(
         }
         router = router.route(&crate::openapi::route_syntax::axum_registration_path(&url_path), combined);
     }
-    router
+    BuiltRoutes { router, accepted, http_client }
+}
+
+/// The router alone, with its own verifier cache — what the endpoint tests (which predate the MCP mount) build.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub fn build_router(
+    project_root: &Path,
+    endpoint_tree: &EndpointTree,
+    drivers: Arc<HashMap<String, Box<dyn SqlDriver>>>,
+    connections: &HashMap<String, ConnectionConfig>,
+    errors: Arc<ErrorRegistry>,
+    security: Arc<SecurityConfig>,
+    services: Arc<HashMap<String, String>>,
+    discovered_errors: Arc<Mutex<DiscoveredErrors>>,
+    debug_mode: bool,
+    openapi_document: Option<&crate::openapi::OpenApiDocument>,
+    mock_provider: Option<Arc<dyn MockProvider>>,
+    source_call_timeout_ms: NonZeroU64,
+    client_identity_available: bool,
+    method_case: MethodCase,
+) -> Router {
+    build_routes(
+        project_root,
+        endpoint_tree,
+        drivers,
+        connections,
+        errors,
+        security,
+        services,
+        discovered_errors,
+        debug_mode,
+        openapi_document,
+        mock_provider,
+        source_call_timeout_ms,
+        client_identity_available,
+        method_case,
+        Arc::new(VerifierCache::new()),
+        false,
+    )
+    .router
 }
 
 /// Every endpoint file the tree holds, decided once the way `build_router`
@@ -518,14 +706,9 @@ async fn dispatch_extension(table: Arc<HashMap<Method, MethodRouter<()>>>, allow
     response
 }
 
-/// Parses every discovered endpoint file and reports problems without
-/// building any routes — `frogs validate`'s read-only counterpart to
-/// `build_router`'s own per-file loop. Deliberately not sharing code with
-/// `build_router` itself: that function also constructs a route/
-/// `RouteState` per file, which a dry run has no use for, and the actual
-/// check logic (parse JSON, confirm a declared security scheme resolves)
-/// is small enough that duplicating it here stays cheaper than
-/// restructuring `build_router` to serve both callers.
+/// Parses every discovered endpoint file and reports problems without building any routes —
+/// `frogs validate`'s read-only counterpart to `build_routes`, judging each file with the same
+/// `servability_problems` so the two can't disagree about what is served.
 pub(crate) fn validate_endpoint_files(
     endpoint_tree: &EndpointTree,
     security: &SecurityConfig,
@@ -553,28 +736,7 @@ pub(crate) fn validate_endpoint_files(
                 continue;
             }
         };
-        if let Some(scheme) = &endpoint.security
-            && !security.verifiers.contains_key(scheme)
-        {
-            problems.push(format!(
-                "{}: security scheme '{scheme}' has no matching entry in security/schemes.json",
-                file_path.display()
-            ));
-        }
-        if let Some(scheme) = &endpoint.security
-            && let Some(verifier) = security.verifiers.get(scheme)
-            && verifier.requires_client_cert()
-            && !client_identity_available
-        {
-            problems.push(format!(
-                "{}: security scheme '{scheme}' needs a client certificate, but tls.clientAuth is off or absent — this route would be refused at startup",
-                file_path.display()
-            ));
-        }
-        for problem in validate_nested_many(&endpoint, connections) {
-            problems.push(format!("{}: {problem}", file_path.display()));
-        }
-        for problem in validate_source_call_timeout(&endpoint) {
+        for problem in servability_problems(&endpoint, security, connections, client_identity_available) {
             problems.push(format!("{}: {problem}", file_path.display()));
         }
     }
@@ -821,39 +983,55 @@ async fn respond_single(
     body: &Value,
     transaction_id: &str,
 ) -> Response {
-    let (http_status, response_body) = match &state.mock_provider {
-        None => {
-            resolve_request(
-                &state.endpoint,
-                &state.security,
-                &state.services,
-                &state.drivers,
-                &state.sql_root,
-                &state.http_root,
-                &state.http_client,
-                &state.errors,
-                &state.discovered_errors,
-                &state.discovered_errors_path,
-                state.debug_mode,
-                &state.verifier_cache,
-                headers,
-                client_cert,
-                path_params,
-                query_params,
-                body,
-                transaction_id,
-                &HashMap::new(),
-                state.operation.as_ref(),
-                &state.component_schemas,
-                state.source_call_timeout_ms,
-            )
-            .await
-        }
-        Some(provider) => handle_mocked(state, provider.as_ref(), headers, client_cert, path_params, query_params, body, transaction_id).await,
-    };
+    let (http_status, response_body) = state.execute(headers, client_cert, path_params, query_params, body, transaction_id).await;
 
     let status = StatusCode::from_u16(http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (status, Json(response_body)).into_response()
+}
+
+impl RouteState {
+    /// One request through this route's real (or, under `frogs test`, mocked) resolution —
+    /// shared by the HTTP handler and the MCP `tools/call` path so neither can drift.
+    pub(crate) async fn execute(
+        &self,
+        headers: &HeaderMap,
+        client_cert: Option<&ClientCertIdentity>,
+        path_params: &HashMap<String, String>,
+        query_params: &HashMap<String, String>,
+        body: &Value,
+        transaction_id: &str,
+    ) -> (u16, Value) {
+        match &self.mock_provider {
+            None => {
+                resolve_request(
+                    &self.endpoint,
+                    &self.security,
+                    &self.services,
+                    &self.drivers,
+                    &self.sql_root,
+                    &self.http_root,
+                    &self.http_client,
+                    &self.errors,
+                    &self.discovered_errors,
+                    &self.discovered_errors_path,
+                    self.debug_mode,
+                    &self.verifier_cache,
+                    headers,
+                    client_cert,
+                    path_params,
+                    query_params,
+                    body,
+                    transaction_id,
+                    &HashMap::new(),
+                    self.operation.as_ref(),
+                    &self.component_schemas,
+                    self.source_call_timeout_ms,
+                )
+                .await
+            }
+            Some(provider) => handle_mocked(self, provider.as_ref(), headers, client_cert, path_params, query_params, body, transaction_id).await,
+        }
+    }
 }
 
 /// The `frogs test` request path: ask the provider which case (and mocks)
@@ -980,6 +1158,172 @@ fn not_mocked_detail(unmocked: &[mock::Unmocked], case: Option<&mock::CaseRef>) 
     )
 }
 
+/// Why `authorize` refused. `kind` is derived from `code` for real and mocked outcomes alike
+/// and is read only by the MCP `accessScheme` gate; HTTP routes classify by `code`/`message`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthFailureKind {
+    Credentials,
+    CertMissing,
+    CertExpired,
+    InsufficientScope,
+    Unavailable,
+}
+
+impl AuthFailureKind {
+    fn of_code(code: &str) -> Self {
+        match code {
+            "auth.invalid_credentials" => AuthFailureKind::Credentials,
+            "auth.client_cert_missing" => AuthFailureKind::CertMissing,
+            "auth.client_cert_expired" => AuthFailureKind::CertExpired,
+            "auth.insufficient_scope" => AuthFailureKind::InsufficientScope,
+            _ => AuthFailureKind::Unavailable,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AuthFailure {
+    pub kind: AuthFailureKind,
+    pub code: String,
+    pub message: String,
+}
+
+impl AuthFailure {
+    fn new(code: &str, message: String) -> Self {
+        AuthFailure {
+            kind: AuthFailureKind::of_code(code),
+            code: code.to_string(),
+            message,
+        }
+    }
+}
+
+/// Everything one verifier run reads besides the request.
+pub(crate) struct AuthContext<'a> {
+    pub security: &'a SecurityConfig,
+    pub drivers: &'a HashMap<String, Box<dyn SqlDriver>>,
+    pub sql_root: &'a Path,
+    pub http_root: &'a Path,
+    pub http_client: &'a reqwest::Client,
+    pub verifier_cache: &'a VerifierCache,
+    pub timeout: NonZeroU64,
+}
+
+/// The same context with owned (shared) parts, for a holder that outlives any one request (the MCP gate).
+pub(crate) struct OwnedAuthContext {
+    pub security: Arc<SecurityConfig>,
+    pub drivers: Arc<HashMap<String, Box<dyn SqlDriver>>>,
+    pub sql_root: PathBuf,
+    pub http_root: PathBuf,
+    pub http_client: reqwest::Client,
+    pub verifier_cache: Arc<VerifierCache>,
+    pub timeout: NonZeroU64,
+}
+
+impl OwnedAuthContext {
+    pub(crate) fn borrow(&self) -> AuthContext<'_> {
+        AuthContext {
+            security: &self.security,
+            drivers: &self.drivers,
+            sql_root: &self.sql_root,
+            http_root: &self.http_root,
+            http_client: &self.http_client,
+            verifier_cache: &self.verifier_cache,
+            timeout: self.timeout,
+        }
+    }
+}
+
+/// The one security check every caller shares (an HTTP route, an MCP tool call, the MCP gate):
+/// scheme lookup, the client-certificate precheck, the mocked or real verifier, then the required
+/// scopes. Scopes are checked on every call, including a cached verdict.
+pub(crate) async fn authorize(
+    ctx: &AuthContext<'_>,
+    scheme: &str,
+    required_scopes: &[String],
+    headers: &HeaderMap,
+    client_cert: Option<&ClientCertIdentity>,
+    mocks: &HashMap<String, MockOutcome>,
+) -> Result<(), AuthFailure> {
+    let Some(verifier) = ctx.security.verifiers.get(scheme) else {
+        // In the real `build_router` path this can't happen — a route
+        // whose scheme has no matching verifier is never registered at
+        // all (see below). The test runner discovers endpoint files
+        // directly, without that same pre-check, so this stays a
+        // reachable (if unusual) outcome there, classified the same
+        // way any other configuration mistake is.
+        return Err(AuthFailure::new(
+            "unexpected.error",
+            format!("security scheme '{scheme}' has no matching entry in security/schemes.json"),
+        ));
+    };
+
+    // Before the verifier is consulted at all (real or mocked): a
+    // certificate-dependent scheme with no certificate, or one that has
+    // outlived its validity on a long-lived connection, is refused
+    // without touching any datasource.
+    if verifier.requires_client_cert() {
+        match client_cert {
+            None => return Err(AuthFailure::new("auth.client_cert_missing", "no client certificate was presented".to_string())),
+            Some(identity) if !identity.is_valid_at(chrono::Utc::now()) => {
+                return Err(AuthFailure::new(
+                    "auth.client_cert_expired",
+                    "the client certificate is outside its validity period".to_string(),
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+
+    let granted: Option<Arc<[String]>> = match mocks.get("verifier") {
+        Some(MockOutcome::Success(mock_value)) => {
+            let holds = match &verifier.mtls {
+                Some(condition) => ClientCertIdentity::from_identity_json(mock_value).is_some_and(|identity| condition.matches(&identity)),
+                None => verifier.valid_if.evaluate(mock_value),
+            };
+            if !holds {
+                return Err(AuthFailure::new("auth.invalid_credentials", "mocked verifier: validIf did not hold".to_string()));
+            }
+            verifier.scopes_path.as_ref().and_then(|path| path.extract(mock_value))
+        }
+        Some(MockOutcome::Fail(code)) => return Err(AuthFailure::new(code, format!("mocked failure: {code}"))),
+        None => {
+            crate::security::verify(
+                scheme,
+                verifier,
+                ctx.drivers,
+                ctx.sql_root,
+                ctx.http_root,
+                ctx.http_client,
+                headers,
+                client_cert,
+                ctx.verifier_cache,
+                ctx.timeout,
+            )
+            .await
+            .map_err(|cause| AuthFailure::new(cause.code(), cause.message()))?
+            .scopes
+        }
+    };
+
+    if let Some(missing) = missing_scopes(required_scopes, granted.as_deref()) {
+        return Err(AuthFailure::new(
+            "auth.insufficient_scope",
+            format!("the credential lacks a required scope (requires: {})", missing.join(" ")),
+        ));
+    }
+    Ok(())
+}
+
+/// `Some(all required scopes)` when any is not granted (byte-exact, case-sensitive); `None` when satisfied.
+fn missing_scopes<'a>(required: &'a [String], granted: Option<&[String]>) -> Option<&'a [String]> {
+    if required.is_empty() {
+        return None;
+    }
+    let granted = granted.unwrap_or(&[]);
+    required.iter().any(|scope| !granted.contains(scope)).then_some(required)
+}
+
 /// Runs one endpoint's whole request — the security check (real, or mocked
 /// via the reserved `"verifier"` key), then source resolution (real or
 /// mocked per `mocks`) — and builds the exact `(status, body)` a caller
@@ -1052,82 +1396,23 @@ pub(crate) async fn resolve_request(
     let debug_mode = endpoint.debug_mode.unwrap_or(debug_mode);
 
     if let Some(scheme) = &endpoint.security {
-        let Some(verifier) = security.verifiers.get(scheme) else {
-            // In the real `build_router` path this can't happen — a route
-            // whose scheme has no matching verifier is never registered at
-            // all (see below). The test runner discovers endpoint files
-            // directly, without that same pre-check, so this stays a
-            // reachable (if unusual) outcome there, classified the same
-            // way any other configuration mistake is.
+        let ctx = AuthContext {
+            security,
+            drivers,
+            sql_root,
+            http_root,
+            http_client,
+            verifier_cache,
+            timeout: source_call_timeout_ms,
+        };
+        if let Err(failure) = authorize(&ctx, scheme, &endpoint.security_scopes, headers, client_cert, mocks).await {
             return error_envelope(
                 errors,
                 discovered_errors,
                 discovered_errors_path,
                 debug_mode,
-                "unexpected.error",
-                &format!("security scheme '{scheme}' has no matching entry in security/schemes.json"),
-                None,
-                &endpoint.error_overrides,
-            );
-        };
-
-        // Before the verifier is consulted at all (real or mocked): a
-        // certificate-dependent scheme with no certificate, or one that has
-        // outlived its validity on a long-lived connection, is refused
-        // without touching any datasource.
-        let cert_failure = if verifier.requires_client_cert() {
-            match client_cert {
-                None => Some(("auth.client_cert_missing", "no client certificate was presented")),
-                Some(identity) if !identity.is_valid_at(chrono::Utc::now()) => {
-                    Some(("auth.client_cert_expired", "the client certificate is outside its validity period"))
-                }
-                Some(_) => None,
-            }
-        } else {
-            None
-        };
-
-        let verify_result = if let Some((code, message)) = cert_failure {
-            Err((code.to_string(), message.to_string()))
-        } else {
-            match mocks.get("verifier") {
-                Some(MockOutcome::Success(mock_value)) => {
-                    let holds = match &verifier.mtls {
-                        Some(condition) => ClientCertIdentity::from_identity_json(mock_value).is_some_and(|identity| condition.matches(&identity)),
-                        None => verifier.valid_if.evaluate(mock_value),
-                    };
-                    if holds {
-                        Ok(())
-                    } else {
-                        Err(("auth.invalid_credentials".to_string(), "mocked verifier: validIf did not hold".to_string()))
-                    }
-                }
-                Some(MockOutcome::Fail(code)) => Err((code.clone(), format!("mocked failure: {code}"))),
-                None => crate::security::verify(
-                    scheme,
-                    verifier,
-                    drivers,
-                    sql_root,
-                    http_root,
-                    http_client,
-                    headers,
-                    client_cert,
-                    verifier_cache,
-                    source_call_timeout_ms,
-                )
-                .await
-                .map_err(|cause| (cause.code().to_string(), cause.message())),
-            }
-        };
-
-        if let Err((code, message)) = verify_result {
-            return error_envelope(
-                errors,
-                discovered_errors,
-                discovered_errors_path,
-                debug_mode,
-                &code,
-                &message,
+                &failure.code,
+                &failure.message,
                 None,
                 &endpoint.error_overrides,
             );
@@ -1359,6 +1644,9 @@ fn record_discovered_error(discovered_errors: &Mutex<DiscoveredErrors>, path: &P
         poisoned.into_inner()
     });
     discovered.record(code, definition.http_status, definition.expose_detail, message);
+    if path.as_os_str().is_empty() {
+        return;
+    }
     if let Err(e) = discovered.save(path) {
         tracing::warn!("failed to save {}: {e}", path.display());
     }
@@ -1458,7 +1746,7 @@ pub(crate) fn method_file_findings(tree: &EndpointTree, mode: MethodCase) -> Vec
 /// is the loader's normalised form (no trailing slash), and paths the loader
 /// set aside as case-ambiguous are still searched, by exact bytes, so an
 /// existing project that serves both `/Cars` and `/cars` keeps validating both.
-fn find_operation<'a>(doc: &'a crate::openapi::OpenApiDocument, url_path: &str, method: &str) -> Option<&'a Operation> {
+pub(crate) fn find_operation<'a>(doc: &'a crate::openapi::OpenApiDocument, url_path: &str, method: &str) -> Option<&'a Operation> {
     doc.operations
         .iter()
         .chain(doc.ambiguous_operations.iter())
@@ -1639,15 +1927,20 @@ pub(crate) struct SecurityShadow {
     pub unknown: bool,
     pub same_template: bool,
     pub any_method: bool,
+    /// Set when the file's scheme is acceptable but its securityScopes don't cover what the spec requires.
+    pub scope_detail: Option<String>,
 }
 
 impl SecurityShadow {
     pub(crate) fn message(&self) -> String {
         use crate::openapi::{method_token::untrusted_short, untrusted};
-        let declares = match &self.file_security {
+        let mut declares = match &self.file_security {
             Some(scheme) => format!("security '{}'", untrusted(scheme)),
             None => "no \"security\"".to_string(),
         };
+        if let Some(detail) = &self.scope_detail {
+            declares.push_str(&format!(" ({detail})"));
+        }
         let file = untrusted(&self.file.display().to_string());
         let remedy = if self.same_template {
             format!(
@@ -1763,6 +2056,7 @@ pub(crate) struct StaleVariant {
     pub operations: Vec<String>,
     pub acceptable: Vec<String>,
     pub unknown: bool,
+    pub scope_detail: Option<String>,
 }
 
 impl StaleVariant {
@@ -1776,6 +2070,7 @@ impl StaleVariant {
             &self.operations,
             &self.acceptable,
             self.unknown,
+            self.scope_detail.as_deref(),
         )
     }
 }
@@ -1789,6 +2084,7 @@ pub(crate) struct TemplateInstance {
     pub operations: Vec<String>,
     pub acceptable: Vec<String>,
     pub unknown: bool,
+    pub scope_detail: Option<String>,
 }
 
 impl TemplateInstance {
@@ -1802,6 +2098,7 @@ impl TemplateInstance {
             &self.operations,
             &self.acceptable,
             self.unknown,
+            self.scope_detail.as_deref(),
         )
     }
 }
@@ -1816,6 +2113,7 @@ fn unmatched_refusal_message(
     operations: &[String],
     acceptable: &[String],
     unknown: bool,
+    scope_detail: Option<&str>,
 ) -> String {
     use crate::openapi::untrusted;
     let declares = match file_security {
@@ -1823,12 +2121,14 @@ fn unmatched_refusal_message(
         None => "no \"security\"".to_string(),
     };
     let file = untrusted(&file.display().to_string());
+    let scopes = scope_detail.map(|detail| format!(" ({detail})")).unwrap_or_default();
     format!(
-        "{} {} ({file}): openapi.yaml secures {} ({}) — {relation} — but this file declares {declares}; make {file} declare an acceptable scheme, or fix the file name/folder",
+        "{} {} ({file}): openapi.yaml secures {} ({}) — {relation} — but this file declares {declares}{scopes}; make {file} declare an acceptable scheme{}, or fix the file name/folder",
         method_token::display_token(method),
         untrusted(url_path),
         operations.join(", "),
-        acceptable_display(acceptable, unknown)
+        acceptable_display(acceptable, unknown),
+        if scope_detail.is_some() { " and cover the required scopes" } else { "" }
     )
 }
 
@@ -1844,6 +2144,10 @@ pub(crate) struct SecurityCheck {
     pub unverifiable: Vec<UnverifiableSecuredPath>,
     pub builtin_refusals: Vec<BuiltinShadow>,
     pub builtin_warnings: Vec<String>,
+    /// Endpoint files that don't cover the scopes the spec requires of a scheme whose verifier enforces them (refused).
+    pub scope_mismatches: Vec<String>,
+    /// Scope disagreements frogs can't enforce, or a file stricter than the spec (warned).
+    pub scope_warnings: Vec<String>,
 }
 
 /// One secured operation (served, dropped or skipped) as the routing checks see it.
@@ -1858,6 +2162,7 @@ struct SecuredView {
     origin: ShadowOrigin,
     /// An unresolvable path item: stands for every method, `wire` is empty and never compared.
     any_method: bool,
+    scope_reqs: SchemeScopes,
 }
 
 fn secured_views(doc: &crate::openapi::OpenApiDocument) -> Vec<SecuredView> {
@@ -1873,6 +2178,7 @@ fn secured_views(doc: &crate::openapi::OpenApiDocument) -> Vec<SecuredView> {
                 inherited: op.security_inherited,
                 origin: ShadowOrigin::Served,
                 any_method: false,
+                scope_reqs: scheme_scopes(&op.security_alternatives, &op.security_requirement_scopes),
             });
         }
     }
@@ -1893,6 +2199,7 @@ fn secured_views(doc: &crate::openapi::OpenApiDocument) -> Vec<SecuredView> {
                 inherited: dropped.security_inherited,
                 origin: ShadowOrigin::Dropped,
                 any_method: false,
+                scope_reqs: scheme_scopes(&dropped.security_alternatives, &dropped.security_requirement_scopes),
             });
         }
     }
@@ -1907,6 +2214,7 @@ fn secured_views(doc: &crate::openapi::OpenApiDocument) -> Vec<SecuredView> {
                 inherited: skipped.security_inherited,
                 origin: ShadowOrigin::Skipped(skipped.reason.clone()),
                 any_method: skipped.any_method,
+                scope_reqs: scheme_scopes(&skipped.security_alternatives, &skipped.security_requirement_scopes),
             });
         }
     }
@@ -1927,8 +2235,98 @@ fn view_label(view: &SecuredView) -> String {
     format!("{} {}", method_or_every(view.any_method, &view.wire), crate::openapi::untrusted(&view.path))
 }
 
-fn stub_fails(stub: &Option<String>, view: &SecuredView) -> bool {
-    view.unknown || !stub.as_ref().is_some_and(|s| view.acceptable.contains(s))
+/// One security requirement of a spec operation, reduced to what a stub can answer to: the scheme
+/// (the requirement's first key, the one frogs enforces) and its scope list.
+type SchemeScopes = Vec<(String, crate::openapi::RequirementScopes)>;
+
+fn scheme_scopes(alternatives: &[Vec<String>], scopes: &[Vec<crate::openapi::RequirementScopes>]) -> SchemeScopes {
+    alternatives
+        .iter()
+        .enumerate()
+        .filter_map(|(index, alternative)| {
+            let scheme = alternative.first()?.clone();
+            // A hand-built operation with no scope data counts as "no scopes required".
+            let list = scopes.get(index).and_then(|keys| keys.first()).cloned().unwrap_or(Some(Vec::new()));
+            Some((scheme, list))
+        })
+        .collect()
+}
+
+enum ScopeCoverage {
+    Ok,
+    /// The verifier enforces scopes, and the file does not cover what the spec requires.
+    Refuse(String),
+    /// The spec requires scopes the verifier cannot enforce.
+    Uncovered(String),
+    /// The file requires more than every alternative the spec allows.
+    Stricter(String),
+}
+
+fn scope_list_text(scopes: &[String]) -> String {
+    scopes.iter().map(|scope| crate::openapi::untrusted(scope)).collect::<Vec<_>>().join(" ")
+}
+
+fn scope_coverage(scheme: &str, file_scopes: &[String], reqs: &SchemeScopes, security: &SecurityConfig) -> ScopeCoverage {
+    let alternatives: Vec<&crate::openapi::RequirementScopes> = reqs.iter().filter(|(name, _)| name == scheme).map(|(_, list)| list).collect();
+    if alternatives.is_empty() {
+        return ScopeCoverage::Ok;
+    }
+    let parseable: Vec<&Vec<String>> = alternatives.iter().filter_map(|list| list.as_ref()).collect();
+    let covered = parseable.iter().any(|list| list.iter().all(|scope| file_scopes.contains(scope)));
+    let scheme_text = crate::openapi::untrusted(scheme);
+    if covered {
+        if !file_scopes.is_empty() && parseable.iter().all(|list| file_scopes.iter().any(|scope| !list.contains(scope))) {
+            return ScopeCoverage::Stricter(format!(
+                "securityScopes ({}) asks for more than any scope list openapi.yaml allows for scheme '{scheme_text}'",
+                scope_list_text(file_scopes)
+            ));
+        }
+        return ScopeCoverage::Ok;
+    }
+    let enforceable = security.verifiers.get(scheme).is_some_and(|verifier| verifier.scopes_path.is_some());
+    let have = if file_scopes.is_empty() {
+        "declares no securityScopes".to_string()
+    } else {
+        format!("lists securityScopes ({})", scope_list_text(file_scopes))
+    };
+    if parseable.is_empty() {
+        return if enforceable {
+            ScopeCoverage::Refuse(format!(
+                "the scope list openapi.yaml gives scheme '{scheme_text}' is not an array of valid scope tokens, so no securityScopes can match it"
+            ))
+        } else {
+            ScopeCoverage::Ok
+        };
+    }
+    let wanted = parseable.iter().map(|list| format!("[{}]", scope_list_text(list))).collect::<Vec<_>>().join(" or ");
+    if enforceable {
+        ScopeCoverage::Refuse(format!(
+            "openapi.yaml requires scopes {wanted} for scheme '{scheme_text}' but the endpoint file {have}"
+        ))
+    } else if parseable.iter().any(|list| !list.is_empty()) {
+        ScopeCoverage::Uncovered(format!(
+            "openapi.yaml requires scopes {wanted} for scheme '{scheme_text}' but the endpoint file {have}, and frogs does not enforce scopes for that scheme — add securityScopes to the file and scopesFrom to the verifier"
+        ))
+    } else {
+        ScopeCoverage::Ok
+    }
+}
+
+enum StubVerdict {
+    Pass,
+    Fail(Option<String>),
+    Warn(String),
+}
+
+fn stub_verdict(stub: &Option<String>, file_scopes: &[String], view: &SecuredView, security: &SecurityConfig) -> StubVerdict {
+    let Some(scheme) = stub.as_ref().filter(|scheme| !view.unknown && view.acceptable.contains(scheme)) else {
+        return StubVerdict::Fail(None);
+    };
+    match scope_coverage(scheme, file_scopes, &view.scope_reqs, security) {
+        ScopeCoverage::Ok | ScopeCoverage::Stricter(_) => StubVerdict::Pass,
+        ScopeCoverage::Refuse(detail) => StubVerdict::Fail(Some(detail)),
+        ScopeCoverage::Uncovered(detail) => StubVerdict::Warn(detail),
+    }
 }
 
 /// Whether a file at `url_path` is a textual instance of the view's path template: same
@@ -1983,7 +2381,7 @@ pub(crate) fn unmatched_security_message(file: &Path) -> String {
 
 /// Parameter names and letter case don't matter for the fallback match: a
 /// `:`-prefixed segment becomes `{}` and the whole path is case-folded.
-fn match_key(axum_path: &str) -> String {
+pub(crate) fn match_key(axum_path: &str) -> String {
     let normalised = axum_path
         .split('/')
         .map(|segment| if segment.starts_with(':') { "{}" } else { segment })
@@ -2019,13 +2417,13 @@ fn acceptable_from_alternatives(alternatives: &[Vec<String>]) -> Option<Vec<Stri
 #[cfg(test)]
 pub(crate) fn security_check(tree: &EndpointTree, doc: &crate::openapi::OpenApiDocument) -> SecurityCheck {
     let plan = RoutePlan::build(tree, doc.method_case, &RouteContext::endpoints_only());
-    security_check_with_routes(tree, doc, &plan)
+    security_check_with_routes(tree, doc, &plan, &SecurityConfig::default())
 }
 
 /// `security_check` plus the routing questions: which less-protected route or built-in
 /// would answer a secured operation that has no file of its own, and which unmatched
 /// files stand in for a secured operation under another spelling or template.
-pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::openapi::OpenApiDocument, plan: &RoutePlan) -> SecurityCheck {
+pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::openapi::OpenApiDocument, plan: &RoutePlan, security: &SecurityConfig) -> SecurityCheck {
     let mut check = SecurityCheck::default();
     let views = secured_views(doc);
     let mut owners: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
@@ -2033,6 +2431,7 @@ pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::opena
         let Ok(contents) = std::fs::read_to_string(&file) else { continue };
         let Ok(endpoint) = serde_json::from_str::<EndpointFile>(&contents) else { continue };
         let stub = endpoint.security;
+        let file_scopes = endpoint.security_scopes;
 
         let mut matched: Vec<&Operation> = doc
             .operations
@@ -2084,10 +2483,24 @@ pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::opena
                 })
                 .collect();
             let mut refused = false;
-            let failing_stale: Vec<&SecuredView> = stale.iter().copied().filter(|v| stub_fails(&stub, v)).collect();
+            let mut stale_detail: Option<String> = None;
+            let mut failing_stale: Vec<&SecuredView> = Vec::new();
+            for view in stale.iter().copied() {
+                match stub_verdict(&stub, &file_scopes, view, security) {
+                    StubVerdict::Pass => {}
+                    StubVerdict::Fail(detail) => {
+                        stale_detail = stale_detail.or(detail);
+                        failing_stale.push(view);
+                    }
+                    StubVerdict::Warn(detail) => check
+                        .scope_warnings
+                        .push(format!("{}: {detail}", crate::openapi::untrusted(&file.display().to_string()))),
+                }
+            }
             if !failing_stale.is_empty() {
                 let (acceptable, unknown) = joined_acceptable(&failing_stale);
                 check.stale_variants.push(StaleVariant {
+                    scope_detail: stale_detail,
                     method: method.clone(),
                     url_path: url_path.clone(),
                     file: file.clone(),
@@ -2098,10 +2511,24 @@ pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::opena
                 });
                 refused = true;
             }
-            let failing_instances: Vec<&SecuredView> = instances.iter().copied().filter(|v| stub_fails(&stub, v)).collect();
+            let mut instance_detail: Option<String> = None;
+            let mut failing_instances: Vec<&SecuredView> = Vec::new();
+            for view in instances.iter().copied() {
+                match stub_verdict(&stub, &file_scopes, view, security) {
+                    StubVerdict::Pass => {}
+                    StubVerdict::Fail(detail) => {
+                        instance_detail = instance_detail.or(detail);
+                        failing_instances.push(view);
+                    }
+                    StubVerdict::Warn(detail) => check
+                        .scope_warnings
+                        .push(format!("{}: {detail}", crate::openapi::untrusted(&file.display().to_string()))),
+                }
+            }
             if !failing_instances.is_empty() {
                 let (acceptable, unknown) = joined_acceptable(&failing_instances);
                 check.template_instances.push(TemplateInstance {
+                    scope_detail: instance_detail,
                     method: method.clone(),
                     url_path: url_path.clone(),
                     file: file.clone(),
@@ -2124,6 +2551,23 @@ pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::opena
             .extend(matched.iter().map(|op| (op.http_method.clone(), op.path.clone())));
 
         let requiring: Vec<Vec<String>> = matched.iter().filter_map(|op| acceptable_schemes(op)).collect();
+        let scheme_ok = stub.as_ref().is_some_and(|s| requiring.iter().all(|other| other.contains(s)));
+        if let (true, Some(scheme)) = (scheme_ok, stub.as_ref()) {
+            let label = format!(
+                "{} {} ({})",
+                method_token::display_token(&method),
+                crate::openapi::untrusted(&url_path),
+                crate::openapi::untrusted(&file.display().to_string())
+            );
+            for op in matched.iter().filter(|op| acceptable_schemes(op).is_some()) {
+                let reqs = scheme_scopes(&op.security_alternatives, &op.security_requirement_scopes);
+                match scope_coverage(scheme, &file_scopes, &reqs, security) {
+                    ScopeCoverage::Ok => {}
+                    ScopeCoverage::Refuse(detail) => check.scope_mismatches.push(format!("{label}: {detail}")),
+                    ScopeCoverage::Uncovered(detail) | ScopeCoverage::Stricter(detail) => check.scope_warnings.push(format!("{label}: {detail}")),
+                }
+            }
+        }
         if requiring.is_empty() {
             if let Some(stub) = stub {
                 check.stricter.push(SecurityStricter { method, url_path, file, stub });
@@ -2194,13 +2638,25 @@ pub(crate) fn security_check_with_routes(tree: &EndpointTree, doc: &crate::opena
                     }
                     let Ok(contents) = std::fs::read_to_string(&planned.file) else { continue };
                     let Ok(endpoint) = serde_json::from_str::<EndpointFile>(&contents) else { continue };
-                    if !stub_fails(&endpoint.security, view) {
-                        continue;
-                    }
+                    let scope_detail = match stub_verdict(&endpoint.security, &endpoint.security_scopes, view, security) {
+                        StubVerdict::Pass => continue,
+                        StubVerdict::Warn(detail) => {
+                            if seen.insert((view.any_method, view.wire.clone(), view.path.clone(), planned.file.clone())) {
+                                check.scope_warnings.push(format!(
+                                    "{} (answering {}): {detail}",
+                                    crate::openapi::untrusted(&planned.file.display().to_string()),
+                                    view_label(view)
+                                ));
+                            }
+                            continue;
+                        }
+                        StubVerdict::Fail(detail) => detail,
+                    };
                     if !seen.insert((view.any_method, view.wire.clone(), view.path.clone(), planned.file.clone())) {
                         continue;
                     }
                     check.shadowed.push(SecurityShadow {
+                        scope_detail,
                         op_method: view.wire.clone(),
                         op_path: view.path.clone(),
                         operation_id: view.operation_id.clone(),
@@ -2440,6 +2896,7 @@ mod tests {
             valid_if: ValidIf::parse(def.valid_if()).unwrap(),
             def,
             mtls: None,
+            scopes_path: None,
         };
         let mut verifiers = HashMap::new();
         verifiers.insert("apiKeyAuth".to_string(), verifier);
@@ -3835,6 +4292,7 @@ mod tests {
                     location: "query".to_string(),
                     required: true,
                     schema_type: Some(schema_type.to_string()),
+                    ..Default::default()
                 }],
                 request_body: None,
                 response_status_codes: vec![200],
@@ -3995,6 +4453,7 @@ mod tests {
                 valid_if: ValidIf::parse(def.valid_if()).unwrap(),
                 def,
                 mtls: None,
+                scopes_path: None,
             };
             let mut verifiers = HashMap::new();
             verifiers.insert("apiKeyAuth".to_string(), verifier);
@@ -4537,6 +4996,10 @@ mod tests {
                 body: served.body.clone(),
                 unmocked: served.unmocked.to_vec(),
             });
+        }
+
+        fn gate_verifier_mock(&self) -> Option<MockOutcome> {
+            None
         }
     }
 
@@ -6585,3 +7048,9 @@ mod m4_security_tests {
         assert!(other.unmatched.is_empty());
     }
 }
+
+#[cfg(test)]
+mod accepted_routes_tests;
+
+#[cfg(test)]
+mod scope_tests;

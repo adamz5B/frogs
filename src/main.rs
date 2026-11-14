@@ -4,6 +4,7 @@ mod endpoint;
 mod errors;
 mod exit_codes;
 mod http;
+mod mcp;
 mod openapi;
 mod project;
 mod security;
@@ -164,7 +165,29 @@ enum Command {
     },
     /// Dry-run every startup check (config, SQL connections, endpoint
     /// files) without binding a port — safe to run repeatedly, e.g. in CI
-    Validate,
+    Validate {
+        /// Print exactly one JSON document on stdout instead of text (logs go to stderr)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a local MCP server on stdin/stdout that lets an AI agent read,
+    /// validate and mock-test this project (read-only). Nothing is bound,
+    /// no port is opened, and nothing is written to the project
+    Mcp {
+        /// Start the walk-up for the project root here instead of the
+        /// current directory
+        #[arg(long, value_name = "DIR")]
+        project: Option<PathBuf>,
+        /// Let the validate tool open the project's real SQL connections
+        /// when asked to (off by default: opening a SQLite connection can
+        /// create an absent database file)
+        #[arg(long)]
+        allow_connections: bool,
+        /// Also offer the tools that write to the project (`generate`,
+        /// `errors_freeze`). Off by default: an agent can then only read
+        #[arg(long)]
+        allow_writes: bool,
+    },
     /// Print an overview of frogs and the current project's status
     Help,
 }
@@ -259,7 +282,10 @@ fn main() {
     // installing a bootstrap one here first would just be immediately
     // replaced (or, for a registered project's `run`, which never reaches
     // that point, installed separately in `commands::run::run` itself).
-    if !matches!(cli.command, Command::Run { .. }) {
+    // `mcp` and `validate --json` own stdout for data, so their logs go to stderr instead.
+    if matches!(cli.command, Command::Mcp { .. } | Command::Validate { json: true }) {
+        server::logging::install_stderr_subscriber();
+    } else if !matches!(cli.command, Command::Run { .. }) {
         server::logging::install_bootstrap_subscriber();
     }
 
@@ -330,7 +356,21 @@ fn main() {
             } => commands::test::record(&cwd, &path, &method).await,
             Command::Errors { action: ErrorsCommand::Freeze } => commands::errors::freeze(&cwd),
             Command::Drivers { action: DriversCommand::List } => commands::drivers::list(),
-            Command::Validate => commands::validate::run(&cwd).await,
+            Command::Validate { json: false } => commands::validate::run(&cwd).await,
+            Command::Validate { json: true } => commands::validate::run_json(&cwd).await,
+            Command::Mcp {
+                project,
+                allow_connections,
+                allow_writes,
+            } => {
+                let start = match project {
+                    Some(dir) if dir.is_absolute() => dir,
+                    Some(dir) => cwd.join(dir),
+                    None => cwd.clone(),
+                };
+                let root = project::require_project_root(&start);
+                mcp::authoring::serve(mcp::authoring::AuthoringOptions { root, allow_connections }, allow_writes).await
+            }
             Command::Help => commands::help::run(&cwd),
         }
     });
@@ -705,7 +745,58 @@ mod tests {
 
     #[test]
     fn parses_validate() {
-        assert!(matches!(parse(&["validate"]), Command::Validate));
+        assert!(matches!(parse(&["validate"]), Command::Validate { json: false }));
+    }
+
+    #[test]
+    fn parses_validate_json() {
+        assert!(matches!(parse(&["validate", "--json"]), Command::Validate { json: true }));
+        assert!(Cli::try_parse_from(["frogs", "validate", "--bogus"]).is_err());
+    }
+
+    #[test]
+    fn parses_mcp_with_no_flags_as_no_project_and_no_connections() {
+        match parse(&["mcp"]) {
+            Command::Mcp { project, allow_connections, .. } => {
+                assert_eq!(project, None);
+                assert!(!allow_connections, "opening real connections must be opt-in");
+            }
+            _ => panic!("expected Command::Mcp"),
+        }
+    }
+
+    #[test]
+    fn parses_mcp_with_a_project_and_allow_connections() {
+        match parse(&["mcp", "--project", "some/dir", "--allow-connections"]) {
+            Command::Mcp { project, allow_connections, .. } => {
+                assert_eq!(project, Some(PathBuf::from("some/dir")));
+                assert!(allow_connections);
+            }
+            _ => panic!("expected Command::Mcp"),
+        }
+    }
+
+    #[test]
+    fn mcp_allow_writes_parses_and_defaults_off_and_unknown_flags_and_positionals_are_still_rejected() {
+        match parse(&["mcp"]) {
+            Command::Mcp { allow_writes, .. } => assert!(!allow_writes, "writing tools must be opt-in"),
+            _ => panic!("expected Command::Mcp"),
+        }
+        match parse(&["mcp", "--allow-writes", "--allow-connections"]) {
+            Command::Mcp {
+                allow_writes, allow_connections, ..
+            } => assert!(allow_writes && allow_connections, "the two opt-ins are independent flags"),
+            _ => panic!("expected Command::Mcp"),
+        }
+        match parse(&["mcp", "--allow-writes"]) {
+            Command::Mcp {
+                allow_writes, allow_connections, ..
+            } => assert!(allow_writes && !allow_connections),
+            _ => panic!("expected Command::Mcp"),
+        }
+        assert!(Cli::try_parse_from(["frogs", "mcp", "--allow-write"]).is_err());
+        assert!(Cli::try_parse_from(["frogs", "mcp", "--project"]).is_err(), "--project needs a value");
+        assert!(Cli::try_parse_from(["frogs", "mcp", "extra"]).is_err());
     }
 
     #[test]

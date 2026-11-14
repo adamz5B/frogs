@@ -1,15 +1,29 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::commands::report::{CommandError, Lines, ReportLine};
 use crate::config::{ClientAuthMode, Config, CrlPolicy, TlsConfig, TlsMode};
 use crate::project::{MANIFEST_FILE, api_base, require_project_root};
 use crate::server::tls::{CRL_EXPIRY_WARNING_DAYS, CrlStatus, build_server_config, crl_freshness};
 
-/// A finding that's worth printing but doesn't fail the run (and isn't
-/// counted in the problem total) — e.g. revocation not being checked is a
-/// legitimate (if risky) choice, not a misconfiguration.
-fn warn(message: &str) {
-    println!("  warning: {message}");
+/// What a dry run may touch beyond reading files. `check_connections` is whether SQL connections are really opened
+/// (which can create an absent SQLite database file).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ValidateOptions {
+    pub check_connections: bool,
+}
+
+/// A finished dry run: every line in print order, plus the error that stopped it early, if any.
+pub(crate) struct ValidateReport {
+    pub lines: Vec<ReportLine>,
+    pub fatal: Option<CommandError>,
+    pub connections_checked: bool,
+}
+
+impl ValidateReport {
+    pub(crate) fn problems(&self) -> usize {
+        self.lines.iter().filter(|line| line.problem).count()
+    }
 }
 
 /// A read-only dry run of everything `frogs run` would otherwise only
@@ -25,22 +39,16 @@ fn warn(message: &str) {
 /// so it validates whichever side(s) of the project actually exist.
 pub async fn run(cwd: &Path) -> io::Result<()> {
     let root = require_project_root(cwd);
-    let has_api = root.join(MANIFEST_FILE).is_file();
-    let has_web = root.join("webserve.json").is_file();
-
-    if !has_api && !has_web {
-        eprintln!("error: no {MANIFEST_FILE} or webserve.json found at {} — run `frogs generate` first", root.display());
-        std::process::exit(1);
+    let report = validate_report(&root, ValidateOptions { check_connections: true }).await;
+    for line in &report.lines {
+        println!("{}", line.render());
+    }
+    if let Some(fatal) = &report.fatal {
+        eprintln!("error: {}", fatal.message);
+        std::process::exit(fatal.exit_code);
     }
 
-    let mut problems = 0usize;
-    if has_api {
-        problems += validate_api(&root).await;
-    }
-    if has_web {
-        problems += validate_web(&root);
-    }
-
+    let problems = report.problems();
     if problems == 0 {
         println!("frogs validate: OK, no problems found");
         Ok(())
@@ -50,74 +58,209 @@ pub async fn run(cwd: &Path) -> io::Result<()> {
     }
 }
 
-async fn validate_api(root: &Path) -> usize {
-    let api_dir = api_base(root);
-    println!("API project at {}", api_dir.display());
-    let mut problems = 0usize;
+/// `frogs validate --json`: exactly one JSON document on stdout, the same exit codes as the plain form.
+pub async fn run_json(cwd: &Path) -> io::Result<()> {
+    let root = require_project_root(cwd);
+    let report = validate_report(&root, ValidateOptions { check_connections: true }).await;
+    let (document, exit_code) = json_document(&report);
+    println!("{document}");
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(())
+}
 
-    // Exits immediately with a clear message on a genuine config problem —
-    // same posture as every other command; there's nothing left worth
-    // checking (SQL connections, endpoint files) if the config that
-    // describes them didn't even load.
-    let config = Config::load_or_exit(&api_dir);
-    println!(
-        "  config: OK ({} connection(s), {} error code(s), {} security scheme(s), strictOpenApi={}, endpointSymlinks={})",
-        config.connections.len(),
-        config.errors.len(),
-        config.security.schemes.len(),
-        config.server.strict_open_api(),
-        config.server.endpoint_symlinks().as_str()
+fn json_document(report: &ValidateReport) -> (serde_json::Value, i32) {
+    if let Some(fatal) = &report.fatal {
+        return (
+            serde_json::json!({ "schemaVersion": 1, "ok": false, "fatal": { "message": fatal.message } }),
+            fatal.exit_code,
+        );
+    }
+    let problems = report.problems();
+    let document = serde_json::json!({
+        "schemaVersion": 1,
+        "ok": problems == 0,
+        "problemCount": problems,
+        "findings": findings_json(&report.lines, |text| text.to_string()),
+        "connections": if report.connections_checked { "checked" } else { "skipped" },
+    });
+    (document, i32::from(problems != 0))
+}
+
+/// The findings (everything that isn't a plain status line) as JSON; `scrub` is applied to every free-text string.
+pub(crate) fn findings_json(lines: &[ReportLine], scrub: impl Fn(&str) -> String) -> Vec<serde_json::Value> {
+    lines
+        .iter()
+        .filter(|line| line.severity != crate::commands::report::Severity::Info)
+        .map(|line| {
+            let mut finding = serde_json::json!({
+                "severity": line.severity.as_str(),
+                "problem": line.problem,
+                "section": line.section,
+                "message": scrub(&line.message),
+            });
+            if let Some(file) = &line.file {
+                finding["file"] = serde_json::Value::String(scrub(file));
+            }
+            finding
+        })
+        .collect()
+}
+
+/// The whole dry run as data; never prints and never exits.
+pub(crate) async fn validate_report(root: &Path, opts: ValidateOptions) -> ValidateReport {
+    let mut lines = Lines::default();
+    let fatal = validate_all(root, opts, &mut lines).await.err();
+    ValidateReport {
+        lines: lines.0,
+        fatal,
+        connections_checked: opts.check_connections,
+    }
+}
+
+async fn validate_all(root: &Path, opts: ValidateOptions, out: &mut Lines) -> Result<(), CommandError> {
+    let has_api = root.join(MANIFEST_FILE).is_file();
+    let has_web = root.join("webserve.json").is_file();
+
+    if !has_api && !has_web {
+        return Err(CommandError::precondition(format!(
+            "no {MANIFEST_FILE} or webserve.json found at {} — run `frogs generate` first",
+            root.display()
+        )));
+    }
+
+    if has_api {
+        validate_api_lines(root, opts, out).await?;
+    }
+    if has_web {
+        validate_web_lines(root, out);
+    }
+    Ok(())
+}
+
+/// One section printed the way a standalone run does, returning its problem count — what the sibling test modules assert on.
+#[cfg(test)]
+async fn validate_api(root: &Path) -> usize {
+    let mut lines = Lines::default();
+    let result = validate_api_lines(root, ValidateOptions { check_connections: true }, &mut lines).await;
+    for line in &lines.0 {
+        println!("{}", line.render());
+    }
+    if let Err(fatal) = result {
+        eprintln!("error: {}", fatal.message);
+        std::process::exit(fatal.exit_code);
+    }
+    lines.problems()
+}
+
+#[cfg(test)]
+fn validate_tls(label: &str, tls: &TlsConfig, tls_base: &Path) -> usize {
+    let mut lines = Lines::default();
+    validate_tls_lines(&mut lines, label, tls, tls_base);
+    lines.problems()
+}
+
+#[cfg(test)]
+fn report_spec_issues(doc: &crate::openapi::OpenApiDocument, strict: bool) -> usize {
+    let mut lines = Lines::default();
+    report_spec_issues_lines(&mut lines, doc, strict);
+    lines.problems()
+}
+
+#[cfg(test)]
+fn validate_web(root: &Path) -> usize {
+    let mut lines = Lines::default();
+    validate_web_lines(root, &mut lines);
+    for line in &lines.0 {
+        println!("{}", line.render());
+    }
+    lines.problems()
+}
+
+async fn validate_api_lines(root: &Path, opts: ValidateOptions, out: &mut Lines) -> Result<(), CommandError> {
+    let api_dir = api_base(root);
+    out.plain("project", format!("API project at {}", api_dir.display()));
+
+    // A genuine config problem ends the run with a clear message — same
+    // posture as every other command; there's nothing left worth checking
+    // (SQL connections, endpoint files) if the config that describes them
+    // didn't even load.
+    let config = Config::load(&api_dir).map_err(|err| CommandError::config_load(&api_dir, err))?;
+    out.info(
+        "config",
+        format!(
+            "config: OK ({} connection(s), {} error code(s), {} security scheme(s), strictOpenApi={}, endpointSymlinks={})",
+            config.connections.len(),
+            config.errors.len(),
+            config.security.schemes.len(),
+            config.server.strict_open_api(),
+            config.server.endpoint_symlinks().as_str()
+        ),
     );
 
     // Same read-only check generate makes before it writes anything: every
     // folder and file it would create must resolve inside the project.
     let boundary = crate::openapi::endpoint_tree::ProjectBoundary::new(root);
     if let Err(e) = crate::commands::generate::write_gate(&boundary, &api_dir) {
-        println!("  error: {e}");
-        problems += 1;
+        out.error("config", e.to_string());
     }
     let ctx = crate::commands::run::link_context(root, &config.server);
     let endpoint_tree = crate::commands::run::scan_endpoint_tree(root, &config.server);
     let links = crate::commands::generate::link_report(&endpoint_tree);
     for message in &links.errors {
-        println!("  error: {message}");
-        problems += 1;
+        out.error("endpoints", message.as_str());
     }
     for message in &links.warnings {
         if config.server.strict_open_api() {
-            println!("  error: {message}");
-            problems += 1;
+            out.error("endpoints", message.as_str());
         } else {
-            warn(message);
+            out.warning("endpoints", message.as_str());
         }
     }
 
     match crate::commands::run::method_case_notice(&config.server) {
-        None => println!("  method case: exact (caseSensitiveMethods: true)"),
+        None => out.info("config", "method case: exact (caseSensitiveMethods: true)"),
         Some((tracing::Level::WARN, message)) => {
-            println!("  method case: case-insensitive (default)");
-            warn(&message);
+            out.info("config", "method case: case-insensitive (default)");
+            out.warning("config", message);
         }
-        Some((_, _)) => println!("  method case: case-insensitive (caseSensitiveMethods: false)"),
+        Some((_, _)) => out.info("config", "method case: case-insensitive (caseSensitiveMethods: false)"),
     }
 
     // `frogs run` clamps this at startup rather than refusing to start (see
     // `ServerConfig::effective_source_call_timeout_ms`) — reported here so
     // it's visible without a live run.
     if config.server.source_call_timeout_ms.get() > crate::config::MAX_SOURCE_CALL_TIMEOUT_MS {
-        println!(
-            "  server.json: sourceCallTimeoutMs {} exceeds the hard ceiling of {} — it will be clamped at startup",
-            config.server.source_call_timeout_ms.get(),
-            crate::config::MAX_SOURCE_CALL_TIMEOUT_MS
+        out.failure(
+            "config",
+            format!(
+                "server.json: sourceCallTimeoutMs {} exceeds the hard ceiling of {} — it will be clamped at startup",
+                config.server.source_call_timeout_ms.get(),
+                crate::config::MAX_SOURCE_CALL_TIMEOUT_MS
+            ),
         );
-        problems += 1;
     }
 
-    problems += validate_tls("config/server.json", &config.server.tls, &api_dir);
+    if let Some(requested) = config.server.verifier_cache_max_entries
+        && !(crate::config::MIN_VERIFIER_CACHE_MAX_ENTRIES..=crate::config::MAX_VERIFIER_CACHE_MAX_ENTRIES).contains(&requested)
+    {
+        out.warning(
+            "config",
+            format!(
+                "server.json: verifierCacheMaxEntries {requested} is outside {}..={} — it will be clamped at startup",
+                crate::config::MIN_VERIFIER_CACHE_MAX_ENTRIES,
+                crate::config::MAX_VERIFIER_CACHE_MAX_ENTRIES
+            ),
+        );
+    }
+
+    validate_tls_lines(out, "config/server.json", &config.server.tls, &api_dir);
     if config.server.tls.client_auth.as_ref().is_some_and(|c| c.mode == ClientAuthMode::Required)
         && (config.server.features.readyz_check || config.server.features.metrics || config.server.docs_ui.mode != crate::config::DocsUiMode::Off)
     {
-        warn(
+        out.warning(
+            "tls",
             "tls.clientAuth.mode is \"required\" while readyz/metrics/docsUi is enabled — load-balancer probes and browsers without a client certificate \
              can't even connect to those; use \"optional\" and let routes decide",
         );
@@ -131,45 +274,47 @@ async fn validate_api(root: &Path) -> usize {
     });
     let route_plan = crate::endpoint::route_plan::RoutePlan::build(&endpoint_tree, route_mode, &route_ctx);
     let route_refusals = route_plan.refusals(strict_routes);
-    println!("  routes: {} registered, {} problem(s)", route_plan.routes.len(), route_refusals.len());
+    out.info(
+        "routes",
+        format!("routes: {} registered, {} problem(s)", route_plan.routes.len(), route_refusals.len()),
+    );
     for problem in &route_refusals {
-        println!("    - {}", problem.message());
+        out.bullet_problem("routes", problem.message());
     }
-    problems += route_refusals.len();
     for problem in route_plan.warnings(strict_routes) {
-        warn(problem.message());
+        out.warning("routes", problem.message());
     }
 
     match crate::openapi::load(&root.join(MANIFEST_FILE), config.server.openapi_load_options()) {
         Ok(doc) => {
-            println!("  {MANIFEST_FILE}: OK ({} operation(s))", doc.operations.len());
-            problems += report_spec_issues(&doc, config.server.strict_open_api());
+            out.info("openapi", format!("{MANIFEST_FILE}: OK ({} operation(s))", doc.operations.len()));
+            report_spec_issues_lines(out, &doc, config.server.strict_open_api());
             let plan = crate::commands::generate::plan_endpoint_files(&api_dir, &doc, &endpoint_tree, &ctx);
             for error in &plan.errors {
-                println!("  error: {}", error.message);
+                out.error("openapi", error.message.as_str());
             }
-            problems += plan.errors.len();
             for item in &plan.archive {
-                warn(&format!(
-                    "{}: orphaned {} will be moved into _backups/ by frogs generate (never deleted) — {}",
-                    item.dir.display(),
-                    crate::openapi::untrusted(&item.name),
-                    item.reason
-                ));
+                out.warning(
+                    "openapi",
+                    format!(
+                        "{}: orphaned {} will be moved into _backups/ by frogs generate (never deleted) — {}",
+                        item.dir.display(),
+                        crate::openapi::untrusted(&item.name),
+                        item.reason
+                    ),
+                );
             }
             for message in &plan.wrong_mode {
-                println!("  error: {message}");
-                problems += 1;
+                out.error("openapi", message.as_str());
             }
             for message in &plan.invalid_tokens {
                 if config.server.strict_open_api() {
-                    println!("  error: {message}");
-                    problems += 1;
+                    out.error("openapi", message.as_str());
                 } else {
-                    warn(message);
+                    out.warning("openapi", message.as_str());
                 }
             }
-            let security = crate::endpoint::security_check_with_routes(&endpoint_tree, &doc, &route_plan);
+            let security = crate::endpoint::security_check_with_routes(&endpoint_tree, &doc, &route_plan, &config.security);
             let mut security_errors: Vec<String> = Vec::new();
             security_errors.extend(security.mismatches.iter().map(|m| m.message()));
             security_errors.extend(security.ambiguous.iter().map(|m| m.message()));
@@ -178,24 +323,23 @@ async fn validate_api(root: &Path) -> usize {
             security_errors.extend(security.shadowed.iter().map(|m| m.message()));
             security_errors.extend(security.unverifiable.iter().map(|m| m.message()));
             security_errors.extend(security.builtin_refusals.iter().map(|m| m.message()));
+            security_errors.extend(security.scope_mismatches.iter().cloned());
             security_errors.extend(crate::endpoint::unresolved_parameter_routes(&endpoint_tree, &doc));
             for message in &security_errors {
-                println!("  error: {message}");
+                out.error("security", message.as_str());
             }
-            problems += security_errors.len();
-            for message in &security.builtin_warnings {
-                warn(message);
+            for message in security.builtin_warnings.iter().chain(&security.scope_warnings) {
+                out.warning("security", message.as_str());
             }
             for stricter in &security.stricter {
-                warn(&stricter.message());
+                out.warning("security", stricter.message());
             }
             for file in &security.unmatched {
                 let message = crate::endpoint::unmatched_security_message(file);
                 if config.server.strict_open_api() {
-                    println!("  error: {message} (\"strictOpenApi\" is true)");
-                    problems += 1;
+                    out.error("security", format!("{message} (\"strictOpenApi\" is true)"));
                 } else {
-                    warn(&message);
+                    out.warning("security", message);
                 }
             }
             for op in &doc.operations {
@@ -206,33 +350,39 @@ async fn validate_api(root: &Path) -> usize {
                 if let Some(verifier) = config.security.verifiers.get(scheme)
                     && !verifier.requires_client_cert()
                 {
-                    println!(
-                        "  {MANIFEST_FILE}: {} {} uses the mutualTLS scheme '{scheme}', but its verifier never looks at the client certificate \
-                         (use an mtls verifier or a cert.* parameter)",
-                        op.http_method, op.path
+                    out.failure(
+                        "security",
+                        format!(
+                            "{MANIFEST_FILE}: {} {} uses the mutualTLS scheme '{scheme}', but its verifier never looks at the client certificate \
+                             (use an mtls verifier or a cert.* parameter)",
+                            op.http_method, op.path
+                        ),
                     );
-                    problems += 1;
                 }
             }
         }
         Err(e) => {
-            println!("  {MANIFEST_FILE}: FAILED — {e}");
-            problems += 1;
+            out.failure("openapi", format!("{MANIFEST_FILE}: FAILED — {e}"));
         }
     }
 
     if config.connections.is_empty() {
-        println!("  SQL connections: none configured");
-    } else {
+        out.info("connections", "SQL connections: none configured");
+    } else if opts.check_connections {
         for (name, result) in crate::sql::try_connect_each(&config.connections).await {
             match result {
-                Ok(()) => println!("  connection '{name}': OK"),
-                Err(e) => {
-                    println!("  connection '{name}': FAILED — {e}");
-                    problems += 1;
-                }
+                Ok(()) => out.info("connections", format!("connection '{name}': OK")),
+                Err(e) => out.failure("connections", format!("connection '{name}': FAILED — {e}")),
             }
         }
+    } else {
+        out.note(
+            "connections",
+            format!(
+                "{} SQL connection(s) were not opened (connection checks are off); opening one can create an absent SQLite database file",
+                config.connections.len()
+            ),
+        );
     }
 
     let method_case = crate::openapi::method_token::MethodCase::from_case_sensitive(config.server.case_sensitive_methods());
@@ -243,11 +393,12 @@ async fn validate_api(root: &Path) -> usize {
         config.server.tls.client_identity_enabled(),
         method_case,
     );
-    println!("  endpoint files: {count} discovered, {} problem(s)", endpoint_problems.len());
+    out.info("endpoints", format!("endpoint files: {count} discovered, {} problem(s)", endpoint_problems.len()));
     for problem in &endpoint_problems {
-        println!("    - {problem}");
+        out.bullet_problem("endpoints", problem.to_string());
     }
-    problems += endpoint_problems.len();
+
+    report_mcp(out, &config, &endpoint_tree, root);
 
     let strict = config.server.strict_open_api();
     for path in crate::endpoint::reserved_stream_key_files(&endpoint_tree, method_case) {
@@ -256,51 +407,75 @@ async fn validate_api(root: &Path) -> usize {
             path.display()
         );
         if strict {
-            println!("    - {message}");
-            problems += 1;
+            out.bullet_problem("endpoints", message);
         } else {
-            warn(&message);
+            out.warning("endpoints", message);
         }
+        out.with_file(path.display().to_string());
     }
 
     for script_path in sql_script_files(&api_dir.join("datasources/sql")) {
         let Ok(contents) = std::fs::read_to_string(&script_path) else { continue };
         for name in crate::sql::truncated_placeholder_names(&contents) {
-            println!(
-                "  {}: placeholder ':{name}' is immediately followed by a non-ASCII character — only ':{name}' is bound, and an unknown name binds as NULL",
-                script_path.display()
+            out.failure(
+                "sql",
+                format!(
+                    "{}: placeholder ':{name}' is immediately followed by a non-ASCII character — only ':{name}' is bound, and an unknown name binds as NULL",
+                    script_path.display()
+                ),
             );
-            problems += 1;
+            out.with_file(script_path.display().to_string());
         }
     }
 
-    problems
+    Ok(())
 }
 
-/// Prints a loaded spec's issues and returns how many count as problems:
-/// every dropped-path (`Severity::Error`) issue, every Windows-portability
-/// finding on any OS (even where the path was kept), and — under
-/// `strictOpenApi` — every strict-class issue. Everything else is a warning.
-fn report_spec_issues(doc: &crate::openapi::OpenApiDocument, strict: bool) -> usize {
-    let mut problems = 0usize;
+/// The `mcp:` section: printed only when `features.mcp` is on or some endpoint file has an `mcp` block.
+fn report_mcp(out: &mut Lines, config: &Config, tree: &crate::openapi::endpoint_tree::EndpointTree, root: &Path) {
+    let doc = crate::openapi::load(&root.join(MANIFEST_FILE), config.server.openapi_load_options()).ok();
+    let inputs = crate::mcp::StartupInputs {
+        server: &config.server,
+        security: &config.security,
+        connections: &config.connections,
+        tree,
+        doc: doc.as_ref(),
+        client_identity_available: config.server.tls.client_identity_enabled(),
+        web_role: root.join("webserve.json").is_file(),
+        web_allow_dot_paths: &crate::commands::run::web_allow_dot_paths(root, root.join("webserve.json").is_file()),
+    };
+    let Some(report) = crate::mcp::validate_findings(&inputs) else { return };
+    let errors = report.findings.iter().filter(|(severity, _)| *severity == crate::mcp::Severity::Error).count();
+    out.info("mcp", format!("mcp: {} tool(s), {errors} problem(s)", report.tools));
+    for (severity, message) in &report.findings {
+        match severity {
+            crate::mcp::Severity::Error => out.bullet_problem("mcp", message.as_str()),
+            crate::mcp::Severity::Warning => out.warning("mcp", message.as_str()),
+        }
+    }
+}
+
+/// Reports a loaded spec's issues: every dropped-path (`Severity::Error`)
+/// issue, every Windows-portability finding on any OS (even where the path
+/// was kept), and — under `strictOpenApi` — every strict-class issue count
+/// as problems. Everything else is a warning.
+fn report_spec_issues_lines(out: &mut Lines, doc: &crate::openapi::OpenApiDocument, strict: bool) {
     let mut would_be_errors = 0usize;
     for issue in &doc.issues {
         let is_problem =
             issue.severity == crate::openapi::Severity::Error || issue.kind == crate::openapi::IssueKind::WindowsPortability || (strict && issue.kind.is_strict_error());
         if is_problem {
-            println!("  error: {}", issue.message);
-            problems += 1;
+            out.error("openapi", issue.message.as_str());
         } else {
-            println!("  warning: {}", issue.message);
+            out.warning("openapi", issue.message.as_str());
             if issue.kind.is_strict_error() {
                 would_be_errors += 1;
             }
         }
     }
     if would_be_errors > 0 {
-        println!("  note: {would_be_errors} issue(s) would be errors with \"strictOpenApi\": true");
+        out.note("openapi", format!("{would_be_errors} issue(s) would be errors with \"strictOpenApi\": true"));
     }
-    problems
 }
 
 /// Every `*.sql` file under `root`, recursively — an empty vec for a missing
@@ -329,57 +504,61 @@ fn collect_sql_scripts(dir: &Path, out: &mut Vec<PathBuf>) {
 /// uses — cert/key, CA bundle and CRLs all read and parsed, nothing bound.
 /// An already-lapsed CRL is a problem under `failClosed` (every
 /// certificate-presenting client would be refused) and a warning otherwise.
-fn validate_tls(label: &str, tls: &TlsConfig, tls_base: &Path) -> usize {
+fn validate_tls_lines(out: &mut Lines, label: &str, tls: &TlsConfig, tls_base: &Path) {
     if let Err(message) = tls.validate_structure() {
-        println!("  {label}: tls FAILED — {message}");
-        return 1;
+        out.failure("tls", format!("{label}: tls FAILED — {message}"));
+        return;
     }
     if tls.mode != TlsMode::Manual {
-        return 0;
+        return;
     }
     let built = match build_server_config(tls, tls_base) {
         Ok(built) => built,
         Err(e) => {
-            println!("  {label}: tls FAILED — {e}");
-            return 1;
+            out.failure("tls", format!("{label}: tls FAILED — {e}"));
+            return;
         }
     };
-    println!("  {label}: tls OK");
+    out.info("tls", format!("{label}: tls OK"));
     for warning in &built.warnings {
-        warn(warning);
+        out.warning("tls", warning.as_str());
     }
 
     let fail_closed = tls.client_auth.as_ref().is_some_and(|c| c.effective_crl_policy() == CrlPolicy::FailClosed);
-    let mut problems = 0usize;
     for (path, next_update, status) in crl_freshness(&built.crl_next_updates, chrono::Utc::now()) {
         match status {
-            CrlStatus::Expired if fail_closed => {
-                println!(
-                    "  {label}: CRL {} expired at {next_update} and crlPolicy is failClosed — every client presenting a certificate would be rejected",
+            CrlStatus::Expired if fail_closed => out.failure(
+                "tls",
+                format!(
+                    "{label}: CRL {} expired at {next_update} and crlPolicy is failClosed — every client presenting a certificate would be rejected",
                     path.display()
-                );
-                problems += 1;
-            }
-            CrlStatus::Expired => warn(&format!("CRL {} expired at {next_update} — revocations since then are not seen", path.display())),
-            CrlStatus::ExpiringSoon => warn(&format!(
-                "CRL {} expires at {next_update} (within {CRL_EXPIRY_WARNING_DAYS} days) — replace it and restart before then",
-                path.display()
-            )),
+                ),
+            ),
+            CrlStatus::Expired => out.warning(
+                "tls",
+                format!("CRL {} expired at {next_update} — revocations since then are not seen", path.display()),
+            ),
+            CrlStatus::ExpiringSoon => out.warning(
+                "tls",
+                format!(
+                    "CRL {} expires at {next_update} (within {CRL_EXPIRY_WARNING_DAYS} days) — replace it and restart before then",
+                    path.display()
+                ),
+            ),
         }
     }
-    problems
 }
 
-fn validate_web(root: &Path) -> usize {
-    println!("static-content project at {}", root.display());
+fn validate_web_lines(root: &Path, out: &mut Lines) {
+    out.plain("web", format!("static-content project at {}", root.display()));
     let config = match crate::webserve::load(&root.join(crate::project::WEBSERVE_FILE)) {
         Ok(config) => config,
         Err(e) => {
-            println!("  webserve.json: FAILED — {e}");
-            return 1;
+            out.failure("web", format!("webserve.json: FAILED — {e}"));
+            return;
         }
     };
-    println!("  webserve.json: OK (startPage: {})", config.start_page);
+    out.info("web", format!("webserve.json: OK (startPage: {})", config.start_page));
 
     let has_api = root.join(MANIFEST_FILE).is_file();
     let mut protected = crate::webserve::ProtectedPaths::default();
@@ -389,34 +568,32 @@ fn validate_web(root: &Path) -> usize {
         protected.add_sqlite(&api_config.connections, root);
     }
 
-    let mut problems = 0usize;
     let (page_problems, page_warnings) = crate::webserve::page_problems(root, &config, &protected);
     for message in &page_problems {
-        println!("  {message}");
-        problems += 1;
+        out.failure("web", message.as_str());
     }
     for message in &page_warnings {
-        warn(message);
+        out.warning("web", message.as_str());
     }
     for message in crate::webserve::site_identity_warnings(root, &config, &protected) {
-        warn(&message);
+        out.warning("web", message);
     }
     if root.join(".well-known").is_dir() && config.allow_dot_paths.is_empty() {
-        warn(
+        out.warning(
+            "web",
             ".well-known/ at the project root is never served (every dot-prefixed path is denied); to serve part of it, list the paths in webserve.json's \"allowDotPaths\", e.g. [\".well-known/acme-challenge\"]",
         );
     }
     if !has_api && crate::project::api_base(root).read_dir().is_ok_and(|mut entries| entries.next().is_some()) {
-        warn("api/ in a web-only project is never served");
+        out.warning("web", "api/ in a web-only project is never served");
     }
 
     // With an API role present the single listener is configured by
     // config/server.json (validated above); webserve.json's own tls
     // is ignored then, so a dry run of it would only mislead.
     if !has_api {
-        problems += validate_tls("webserve.json", &config.tls, root);
+        validate_tls_lines(out, "webserve.json", &config.tls, root);
     }
-    problems
 }
 
 #[cfg(test)]

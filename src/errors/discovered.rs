@@ -51,6 +51,34 @@ impl DiscoveredErrors {
         }
     }
 
+    /// Like `load`, but a corrupt file is reported to the caller instead of being treated as empty:
+    /// `Ok(Err(reason))` is "present but unreadable as discovered entries". Never writes.
+    pub fn load_strict(path: &Path) -> io::Result<Result<Self, String>> {
+        const MAX_STRICT_BYTES: u64 = 32 * 1024 * 1024;
+        match fs::metadata(path) {
+            Ok(meta) if meta.len() > MAX_STRICT_BYTES => return Ok(Err(format!("the file is {} bytes, over the {MAX_STRICT_BYTES}-byte limit", meta.len()))),
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Ok(Self::default())),
+            Err(err) => return Err(err),
+        }
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Ok(Self::default())),
+            Err(err) if err.kind() == io::ErrorKind::InvalidData => return Ok(Err("the file is not valid UTF-8".to_string())),
+            Err(err) => return Err(err),
+        };
+        Ok(serde_json::from_str(&contents)
+            .map(|entries| Self { entries })
+            .map_err(|err| format!("invalid JSON at line {} column {}", err.line(), err.column())))
+    }
+
+    /// Every entry sorted by code.
+    pub fn entries(&self) -> Vec<(&String, &DiscoveredEntry)> {
+        let mut entries: Vec<_> = self.entries.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        entries
+    }
+
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let json = serde_json::to_string_pretty(&self.entries).expect("discovered entries always serialize");
         fs::write(path, json)

@@ -244,6 +244,7 @@ mod tests {
             location: location.to_string(),
             required,
             schema_type: schema_type.map(str::to_string),
+            ..Default::default()
         }
     }
 

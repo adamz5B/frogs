@@ -1,0 +1,7 @@
+project root: <ROOT>
+wrote config/errors/core.json
+wrote config/connections.json (empty — add your SQL connections here)
+wrote security/schemes.json (empty — add security schemes + verifiers here, or leave empty if this API needs none)
+loaded config — debugMode=false, 0 connection(s), 14 error code(s), strictOpenApi=true, caseSensitiveMethods=false, endpointSymlinks=contained
+found 1 operation(s) in openapi.yaml:
+  GET /cars/{vin} -> getCar

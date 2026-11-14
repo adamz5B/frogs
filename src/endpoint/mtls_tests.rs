@@ -489,6 +489,9 @@ impl MockProvider for FixedProvider {
         self.0.clone()
     }
     fn observe(&self, _route: &RouteKey, _selection: &MockSelection, _served: &Served<'_>) {}
+    fn gate_verifier_mock(&self) -> Option<MockOutcome> {
+        None
+    }
 }
 
 async fn serve_mocked(verifier: &str, selection: MockSelection) -> String {

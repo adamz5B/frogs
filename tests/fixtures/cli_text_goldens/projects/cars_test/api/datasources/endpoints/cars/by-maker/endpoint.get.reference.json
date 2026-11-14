@@ -1,0 +1,29 @@
+{
+  "operationId": "listCarsByMaker",
+  "_hash": "7ec8e9967939590c",
+  "security": null,
+  "request": {
+    "query": [
+      "maker"
+    ],
+    "path": [],
+    "header": [],
+    "body": null
+  },
+  "response": {
+    "type": "array",
+    "items": {
+      "$component": "CarWithPrice",
+      "maker": "string",
+      "model": "string",
+      "year": "integer",
+      "vin": "string",
+      "price": "number",
+      "currency": "string",
+      "listedAt": "string (date-time)"
+    }
+  },
+  "availableParameterSources": [
+    "query.maker"
+  ]
+}

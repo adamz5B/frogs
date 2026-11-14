@@ -1,0 +1,11 @@
+{
+  "datasource.sql.unknown:PoolTimedOut": {
+    "_discovered": true,
+    "httpStatus": 500,
+    "exposeDetail": false,
+    "occurrences": 3,
+    "firstSeen": "2026-07-16T10:03:00Z",
+    "lastSeen": "2026-07-16T10:41:00Z",
+    "sampleMessage": "pool timed out while waiting for an open connection"
+  }
+}

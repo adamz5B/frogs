@@ -18,7 +18,8 @@ COMMANDS:
     test           Serve the API as a mock server from *.test.json mocks, or record a new case
     errors freeze  Batch config/errors.discovered.json into the canonical registry
     drivers list   Print which SQL drivers this binary was built with
-    validate       Dry-run config/SQL/endpoint checks without starting the server
+    validate       Dry-run config/SQL/endpoint checks without starting the server (--json for one JSON document)
+    mcp            Run a local MCP server on stdio: lets an agent read, validate and mock-test this project (read-only)
     help           Print this message
 
 A frogs project is any directory containing an openapi.yaml file (or, for a

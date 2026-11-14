@@ -76,7 +76,8 @@ pub(super) const GOLDEN_CONFIG: &[(&str, &str)] = &[
     "rateLimiting": false,
     "serviceRegistry": false,
     "requestValidation": true,
-    "cors": false
+    "cors": false,
+    "mcp": false
   },
   "autoMigrateEndpoints": true,
   "discoveredErrorsWarnThreshold": 20,

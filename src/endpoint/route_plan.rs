@@ -15,6 +15,9 @@ use crate::openapi::path_encoding::is_pchar_str;
 use crate::openapi::path_rules::{unsafe_segment_reason, untrusted};
 use crate::openapi::route_syntax::{SegmentKind, axum_registration_path, classify_route_segment, find_conflicts, partial_template_matches, path_for_nested_route};
 
+const MCP_BUILTIN_LABEL: &str = "MCP";
+const MCP_METADATA_LABEL: &str = "MCP protected-resource metadata";
+
 /// How many positions along one route may have both a static and a parameter
 /// sibling before matchit's backtracking per lookup is considered too costly.
 const MAX_BRANCHING_DEPTH: usize = 12;
@@ -74,6 +77,9 @@ pub(crate) struct RouteContext {
     pub readyz: bool,
     pub metrics: bool,
     pub docs: bool,
+    pub mcp: bool,
+    /// The absolute path of the RFC 9728 metadata route; set only when MCP is on and its settings parse cleanly.
+    pub mcp_metadata_path: Option<String>,
     pub extras: RootExtras,
 }
 
@@ -90,6 +96,13 @@ impl RouteContext {
             readyz: server.features.readyz_check,
             metrics: server.features.metrics,
             docs: server.docs_ui.mode != crate::config::DocsUiMode::Off,
+            mcp: server.features.mcp,
+            mcp_metadata_path: server
+                .features
+                .mcp
+                .then(|| crate::mcp::parse_auth_settings(&server.mcp_settings(), &crate::mcp::final_path(server)).0.protected)
+                .flatten()
+                .map(|protected| protected.metadata_path),
             extras: RootExtras::default(),
         }
     }
@@ -422,11 +435,29 @@ impl RoutePlan {
                 }
             }
         }
+        if ctx.api_builtins && ctx.mcp {
+            builtins.push((
+                crate::mcp::MCP_PATH.to_string(),
+                BuiltinInfo {
+                    label: MCP_BUILTIN_LABEL,
+                    field: Some("features.mcp"),
+                    methods: vec!["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "QUERY"],
+                    inherited_exempt: false,
+                    remedy: BuiltinRemedy::ConfigSwitch,
+                },
+            ));
+        }
         for (path, info) in &builtins {
+            // /mcp answers every method (405 for all but POST), so it claims them all, plus the extension-method fallback.
+            let is_mcp = info.label == MCP_BUILTIN_LABEL;
             groups.entry(final_of(path)).or_default().push(Member {
                 origin: RouteOrigin::Builtin(info.label),
-                methods: all_get_head(),
-                custom_fallback: false,
+                methods: if is_mcp {
+                    info.methods.iter().map(|m| m.to_string()).collect()
+                } else {
+                    all_get_head()
+                },
+                custom_fallback: is_mcp,
                 endpoint_path: None,
                 files: Vec::new(),
             });
@@ -452,6 +483,27 @@ impl RoutePlan {
                     files: Vec::new(),
                 });
             }
+        }
+        if let Some(path) = &ctx.mcp_metadata_path {
+            let methods = vec!["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "QUERY"];
+            root_routes.push((
+                path.clone(),
+                BuiltinInfo {
+                    label: MCP_METADATA_LABEL,
+                    field: Some("mcp.protectedResource"),
+                    methods: methods.clone(),
+                    inherited_exempt: false,
+                    remedy: BuiltinRemedy::ConfigSwitch,
+                },
+            ));
+            // Answers every method (405 for all but GET/HEAD), so it claims them all plus the extension-method fallback, like /mcp.
+            groups.entry(path.clone()).or_default().push(Member {
+                origin: RouteOrigin::Builtin(MCP_METADATA_LABEL),
+                methods: methods.into_iter().map(String::from).collect(),
+                custom_fallback: true,
+                endpoint_path: None,
+                files: Vec::new(),
+            });
         }
         if ctx.extras.control_plane {
             root_routes.push((
@@ -488,6 +540,7 @@ impl RoutePlan {
                     let hint = match &second.origin {
                         RouteOrigin::Builtin(_) => match builtins
                             .iter()
+                            .chain(root_routes.iter())
                             .find(|(_, info)| RouteOrigin::Builtin(info.label) == second.origin)
                             .and_then(|(_, i)| i.field)
                         {

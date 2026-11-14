@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use serde::Deserialize;
+use serde_json::Value;
 
 /// One `datasources/endpoints/<path>/endpoint.<method>.json` file, deserialized
 /// straight from disk. Mirrors the `sources` + `response` shape from
@@ -19,6 +20,11 @@ pub struct EndpointFile {
     /// language" scope cuts made elsewhere (`validIf`, `format`).
     #[serde(default)]
     pub security: Option<String>,
+    /// Scopes the credential must all carry (AND, byte-exact), enforced after the verifier
+    /// passes. Needs `security` and a verifier that declares `scopesFrom`; otherwise the
+    /// endpoint is unservable rather than silently unenforced.
+    #[serde(rename = "securityScopes", default)]
+    pub security_scopes: Vec<String>,
     /// The HTTP status a *successful* response returns — fully up to the
     /// user, no engine-side "201 for POST" guessing (validated against the
     /// operation's own declared response codes at generate time, see
@@ -69,6 +75,11 @@ pub struct EndpointFile {
     /// `generated` is `true` — not read for anything else.
     #[serde(rename = "_todo", default)]
     pub todo: Option<String>,
+    /// Kept as untyped JSON on purpose: a malformed `mcp` block is an MCP
+    /// problem (`mcp::tools` interprets and reports it), and must never make
+    /// the whole file unparseable, which would 503 its ordinary HTTP route.
+    #[serde(default)]
+    pub mcp: Option<Value>,
 }
 
 /// One entry in `errorOverrides` — either field can be set independently;

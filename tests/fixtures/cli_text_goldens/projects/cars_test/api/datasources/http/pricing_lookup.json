@@ -1,0 +1,10 @@
+{
+  "method": "GET",
+  "url": "https://pricing.example.com/api/v1/vehicles/{{vin}}/price",
+  "auth": {
+    "type": "bearer",
+    "tokenEnv": "PRICING_API_KEY"
+  },
+  "timeoutMs": 3000,
+  "responsePath": "data"
+}

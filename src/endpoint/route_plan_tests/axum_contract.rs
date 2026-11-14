@@ -141,3 +141,163 @@ fn the_build_resolves_a_single_matchit_so_the_route_table_probe_matches_the_rout
         "matchit changed: re-run these contract tests and the route_plan fuzz, then update this pin"
     );
 }
+
+// ---- MCP mount (A2): a fallback-free static `/mcp` router merged into a router that already nests the API
+
+fn mcp_stub() -> axum::routing::MethodRouter<()> {
+    axum::routing::any(|| async { "mcp-handler" })
+}
+
+fn api_with_param_post_and_fallbacks() -> Router {
+    let inner = Router::new()
+        .route("/x", labelled("api-x"))
+        .route(
+            "/:id",
+            axum::routing::post(|AxumPath(id): AxumPath<String>| async move { format!("post-param={id}") }),
+        )
+        .fallback(|| async { "inner-fallback" });
+    Router::new().nest("/api", inner)
+}
+
+#[tokio::test]
+async fn merging_a_fallback_free_static_mcp_router_into_a_nested_api_router_does_not_panic_and_the_static_route_wins_over_the_param_post() {
+    let app = api_with_param_post_and_fallbacks().merge(Router::new().route("/api/mcp", mcp_stub()));
+    let addr = serve_bare(app).await;
+    assert_eq!(fetch(addr, "POST", "/api/mcp").await, (200, "mcp-handler".to_string()));
+    assert_eq!(
+        fetch(addr, "GET", "/api/mcp").await,
+        (200, "mcp-handler".to_string()),
+        "`any` answers every method itself"
+    );
+    assert_eq!(
+        fetch(addr, "POST", "/api/other").await,
+        (200, "post-param=other".to_string()),
+        "the sibling param route still works"
+    );
+    assert_eq!(fetch(addr, "GET", "/api/x").await, (200, "api-x".to_string()));
+    assert_eq!(
+        fetch(addr, "GET", "/api/zzz/deeper").await,
+        (200, "inner-fallback".to_string()),
+        "the nested fallback is untouched"
+    );
+}
+
+#[tokio::test]
+async fn the_same_merge_holds_with_an_empty_api_root_where_mcp_competes_with_a_root_param_post() {
+    let main = Router::new()
+        .route(
+            "/:id",
+            axum::routing::post(|AxumPath(id): AxumPath<String>| async move { format!("post-param={id}") }),
+        )
+        .route("/x", labelled("x"));
+    let app = main.merge(Router::new().route("/mcp", mcp_stub()));
+    let addr = serve_bare(app).await;
+    assert_eq!(
+        fetch(addr, "POST", "/mcp").await,
+        (200, "mcp-handler".to_string()),
+        "matchit prefers the static segment"
+    );
+    assert_eq!(fetch(addr, "POST", "/other").await, (200, "post-param=other".to_string()));
+}
+
+#[tokio::test]
+async fn the_merged_mcp_route_is_reached_through_the_real_serving_wrapper_with_a_lowercase_method() {
+    let app = api_with_param_post_and_fallbacks().merge(Router::new().route("/api/mcp", mcp_stub()));
+    let addr = crate::server::spawn_served(app, false).await;
+    assert_eq!(
+        fetch(addr, "post", "/api/mcp").await,
+        (200, "mcp-handler".to_string()),
+        "case-insensitive method normalisation"
+    );
+    assert_eq!(
+        fetch(addr, "POST", "/api/mcp?x=1").await,
+        (200, "mcp-handler".to_string()),
+        "a query string does not change the route"
+    );
+}
+
+#[test]
+fn two_routers_that_both_set_a_router_level_fallback_cannot_be_merged_which_is_why_the_mcp_router_sets_none() {
+    let result = std::panic::catch_unwind(|| {
+        let a = Router::new().route("/a", labelled("a")).fallback(|| async { "fa" });
+        let b = Router::new().route("/b", labelled("b")).fallback(|| async { "fb" });
+        let _ = a.merge(b);
+    });
+    assert!(
+        result.is_err(),
+        "axum 0.7 panics on a double fallback merge; if this stops panicking, the MCP router's no-fallback rule can be relaxed"
+    );
+}
+
+// ---- MCP protected-resource metadata (M2): an origin-root `any()` route merged beside `nest`, the web catch-all and `/api/mcp`
+
+const WELL_KNOWN: &str = "/.well-known/oauth-protected-resource/api/mcp";
+
+fn web_catch_all() -> Router {
+    Router::new()
+        .route("/", labelled("web-root"))
+        .route("/*path", echo_param().fallback(|| async { "web-405" }))
+}
+
+fn full_stack() -> Router {
+    api_with_param_post_and_fallbacks()
+        .merge(web_catch_all())
+        .merge(Router::new().route("/api/mcp", mcp_stub()))
+        .merge(Router::new().route(WELL_KNOWN, axum::routing::any(|| async { "metadata" })))
+}
+
+#[tokio::test]
+async fn the_root_metadata_route_merges_beside_nest_the_web_catch_all_and_api_mcp_without_a_panic_and_wins_over_the_catch_all() {
+    let addr = serve_bare(full_stack()).await;
+    for method in ["GET", "POST", "PUT", "DELETE"] {
+        assert_eq!(
+            fetch(addr, method, WELL_KNOWN).await,
+            (200, "metadata".to_string()),
+            "{method}: the static route beats /*path for every method"
+        );
+    }
+    assert_eq!(fetch(addr, "POST", "/api/mcp").await, (200, "mcp-handler".to_string()));
+    assert_eq!(
+        fetch(addr, "GET", "/index.html").await,
+        (200, "param=index.html".to_string()),
+        "the catch-all still serves everything else"
+    );
+    assert_eq!(fetch(addr, "GET", "/.well-known/other").await, (200, "param=.well-known/other".to_string()));
+    assert_eq!(fetch(addr, "GET", "/api/x").await, (200, "api-x".to_string()));
+    assert_eq!(fetch(addr, "POST", "/api/other").await, (200, "post-param=other".to_string()));
+}
+
+#[tokio::test]
+async fn the_unsuffixed_well_known_path_falls_through_to_the_catch_all_not_to_the_metadata_route() {
+    let addr = serve_bare(full_stack()).await;
+    assert_eq!(
+        fetch(addr, "GET", "/.well-known/oauth-protected-resource").await,
+        (200, "param=.well-known/oauth-protected-resource".to_string())
+    );
+}
+
+#[tokio::test]
+async fn the_metadata_route_is_reached_through_the_real_serving_wrapper_with_a_lowercase_and_an_extension_method() {
+    let addr = crate::server::spawn_served(full_stack(), false).await;
+    assert_eq!(fetch(addr, "get", WELL_KNOWN).await, (200, "metadata".to_string()));
+    assert_eq!(
+        fetch(addr, "PURGE", WELL_KNOWN).await,
+        (200, "metadata".to_string()),
+        "any() answers extension methods itself"
+    );
+}
+
+#[tokio::test]
+async fn the_metadata_route_also_merges_with_an_empty_api_root_where_mcp_and_a_root_param_post_compete() {
+    let main = Router::new()
+        .route(
+            "/:id",
+            axum::routing::post(|AxumPath(id): AxumPath<String>| async move { format!("post-param={id}") }),
+        )
+        .merge(Router::new().route("/mcp", mcp_stub()))
+        .merge(Router::new().route("/.well-known/oauth-protected-resource/mcp", axum::routing::any(|| async { "metadata" })));
+    let addr = serve_bare(main).await;
+    assert_eq!(fetch(addr, "GET", "/.well-known/oauth-protected-resource/mcp").await, (200, "metadata".to_string()));
+    assert_eq!(fetch(addr, "POST", "/mcp").await, (200, "mcp-handler".to_string()));
+    assert_eq!(fetch(addr, "POST", "/other").await, (200, "post-param=other".to_string()));
+}
