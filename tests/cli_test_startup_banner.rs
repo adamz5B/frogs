@@ -67,7 +67,15 @@ fn strip_ansi(text: &str) -> String {
 fn normalize(text: &str, root: &Path) -> String {
     let plain = root.display().to_string();
     let doubled = plain.replace('\\', "\\\\");
-    let text = text.replace('\r', "").replace(&doubled, "<ROOT>").replace(&plain, "<ROOT>");
+    let mut text = text.replace('\r', "");
+    // macOS temp dirs sit behind a symlink (/var -> /private/var) and frogs prints the canonical path, so replace that form first.
+    if let Ok(canonical) = std::fs::canonicalize(root) {
+        let canonical = canonical.display().to_string();
+        if canonical != plain {
+            text = text.replace(&canonical.replace('\\', "\\\\"), "<ROOT>").replace(&canonical, "<ROOT>");
+        }
+    }
+    let text = text.replace(&doubled, "<ROOT>").replace(&plain, "<ROOT>");
     text.replace("\\\\", "/").replace('\\', "/")
 }
 
